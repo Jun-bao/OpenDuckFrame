@@ -46,11 +46,19 @@ echo "==> Generating the Xcode project (xcodegen)"
 "$XCODEGEN" generate --spec Apps/Mac/project.yml --project Apps/Mac --quiet
 
 echo "==> Building ($CONFIG)"
-xcodebuild -project Apps/Mac/KhuaPlayer.xcodeproj \
+XCODE_SETTINGS=(REGISTER_WITH_LAUNCH_SERVICES=NO)
+if [ -n "${KHUA_BUNDLE_ID:-}" ]; then
+  XCODE_SETTINGS+=(KHUA_BUNDLE_ID="$KHUA_BUNDLE_ID")
+fi
+if [ -n "${KHUA_DISPLAY_NAME:-}" ]; then
+  XCODE_SETTINGS+=(KHUA_DISPLAY_NAME="$KHUA_DISPLAY_NAME")
+fi
+xcodebuild -skipPackagePluginValidation \
+           -project Apps/Mac/KhuaPlayer.xcodeproj \
            -scheme KhuaPlayer \
            -configuration "$CONFIG" \
            -derivedDataPath .build \
-           REGISTER_WITH_LAUNCH_SERVICES=NO \
+           "${XCODE_SETTINGS[@]}" \
            build
 
 APP=.build/Build/Products/$CONFIG/Khua.app

@@ -56,7 +56,7 @@ struct MotionPresentation: Equatable {
 
     var fpsReadout: String? {
         guard hasMedia else { return nil }
-        let fps = outputFPS > 0 ? outputFPS : sourceFPS
+        let fps = outputFPS
         guard fps > 0 else { return nil }
         return String(format: "%.0f", fps)
     }

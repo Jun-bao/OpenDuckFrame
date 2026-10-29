@@ -8,6 +8,12 @@
 #include "SPFrameSelectionPolicy.hpp"
 #include "SPInterpolationRoutingPolicy.hpp"
 #include "SPMotionFrameCompatibility.hpp"
+#include "SPFPSMeter.hpp"
+#include "SPFileLanczosScaler.h"
+#include "SPFileAppleSRScaler.h"
+#include "SPFileAppleVideoSRScaler.h"
+#include "SPFileAnimationScaler.h"
+#include "SPFileMetalFXScaler.h"
 #include "SPPlayerSessionPolicy.hpp"
 #include "SPPacketDataSnapshot.hpp"
 #import "SPVideoDecoding.h"
@@ -101,14 +107,22 @@ private:
 
 // A single frame type keeps the steady-state, paused, seek, and first-frame
 // presentation paths on the same selection logic for both motion and Off modes.
-// The Off path keeps synthetic/epoch at false/0. Its nine-byte metadata overhead
+// The Off path keeps synthetic/generated/epoch at false/false/0. Its small metadata overhead
 // is negligible at a queue depth of at most 20, while a separate dispatch method
 // preserves the Off hot-path behavior.
+struct SPFrameOriginal {
+    CVPixelBufferRef buffer;
+    int64_t ptsUs;
+    SPFrameOriginal(CVPixelBufferRef b,int64_t pts):buffer(CVPixelBufferRetain(b)),ptsUs(pts) {}
+    ~SPFrameOriginal(){CVPixelBufferRelease(buffer);}
+};
 struct DecodedFrame {
     CVPixelBufferRef buffer = NULL;
+    std::shared_ptr<SPFrameOriginal> original;
     int64_t ptsUs = 0;
     int64_t gen = 0;
     bool synthetic = false;
+    bool generated = false;
     uint64_t interpolationEpoch = 0;
 };
 
@@ -723,7 +737,11 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
 
     BOOL _presentRetryPending;
     int64_t _lastFrameGeneration;
+    int64_t _lastFramePTSUs;
+    std::shared_ptr<SPFrameOriginal> _lastFrameOriginal;
+    std::atomic<int> _fileViewMode;
     BOOL _lastFrameSynthetic;
+    BOOL _lastFrameGenerated;
     uint64_t _lastFrameInterpolationEpoch;
 
     BOOL _presentRetryCompletesPausedSeek;
@@ -750,6 +768,23 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
     int64_t _fpsWindowGen;
     int64_t _fpsLastTickUs;
     std::atomic<double> _presentedFrameRateValue;
+    std::mutex _physicalFPSMutex;
+    sp::FPSMeter _physicalFPSMeter;
+    std::atomic<bool> _physicalFPSObserving;
+    std::atomic<uint64_t> _physicalFPSEpoch;
+    std::atomic<uint64_t> _physicalFPSIdentity;
+    int64_t _physicalFPSGeneration;
+    std::atomic<int64_t> _physicalFPSDelayUs;
+    std::atomic<int64_t> _physicalFPSDelayHostNs;
+    std::atomic<uint64_t> _fileScalePrepareRevision;
+    std::atomic<uint64_t> _fileProviderPrepareRevision;
+    id<SPFileFrameProvider> _preparingFileProvider, _preparedFileProvider, _selectedFileProvider;
+    int64_t _preparedFileProviderGeneration;
+    std::atomic<bool> _fileScalePreparationBusy;
+    SPFileLanczosScaler *_preparedFileLanczos;
+    int64_t _preparedFileGeneration;
+    BOOL _fileLanczosActive;
+    int _fileLanczosWidth, _fileLanczosHeight;
     BOOL _interpolationDynamicHDRUnsafe;
     BOOL _interpolationInterlaced;
     BOOL _interpolationCodedInterlacedSeen;
@@ -1038,6 +1073,8 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
     double _preludeStartSeconds;
 
     std::mutex _renderMtx;
+    // Serialize seek generation changes with the exact renderer submission.
+    std::mutex _frameSubmitGenerationMtx;
     std::mutex _lifecycleMtx;
     std::mutex _audioOutMtx;
     double _activeStartSeconds;
@@ -1240,6 +1277,19 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
 - (instancetype)initWithView:(NSView *)view previewMode:(BOOL)previewMode {
     self = [super init];
     if (self) {
+        _physicalFPSObserving.store(false);
+        _physicalFPSEpoch.store(1);
+        _physicalFPSIdentity.store(0);
+        _physicalFPSGeneration = -1;
+        _physicalFPSDelayUs.store(-1);
+        _physicalFPSDelayHostNs.store(0);
+        _fileScalePrepareRevision.store(1);
+        _fileProviderPrepareRevision.store(1);
+        _preparedFileProviderGeneration=-1;
+        _fileScalePreparationBusy.store(false);
+        _preparedFileGeneration = -1;
+        _fileLanczosActive = NO;
+        _fileLanczosWidth = 0; _fileLanczosHeight = 0;
         _previewMode = previewMode;
         _rendererConfiguredOpenGeneration.store(-1);
         _seekSettleGen.store(0);
@@ -1337,7 +1387,10 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         _loopB = -1;
         _lastFrameBuffer = NULL;
         _lastFrameGeneration = -1;
+        _lastFramePTSUs = INT64_MIN;
+        _fileViewMode.store(-1);
         _lastFrameSynthetic = NO;
+        _lastFrameGenerated = NO;
         _frameStepAheadUs = 0;
 #if SP_APP_STORE
         _motionCompareEnabled.store(false);
@@ -1401,11 +1454,11 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
                          logId:_spLogId
                      liveState:live
                        enqueue:^PushResult(CVPixelBufferRef buffer, int64_t ptsUs, int64_t generation,
-                                           BOOL synthetic, uint64_t epoch, uint64_t interruptGeneration) {
+                                           BOOL synthetic, BOOL generated, CVPixelBufferRef original, int64_t originalPTS, uint64_t epoch, uint64_t interruptGeneration) {
                            SPPlayerCore *s = weakSelf;
                            if (!s) return PushResult::Closed;
                            return [s enqueueMotionVideoBuffer:buffer ptsUs:ptsUs generation:generation
-                                                    synthetic:synthetic interpolationEpoch:epoch
+                                                    synthetic:synthetic generated:generated original:original originalPtsUs:originalPTS interpolationEpoch:epoch
                                           interruptGeneration:interruptGeneration];
                        }
                         status:^(NSString *status, BOOL active, int code) {
@@ -2496,6 +2549,10 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     [self resilientResetForNewSession];
     _vtWarmMarked = NO;
     _sessionEverPresented.store(false);
+    [self cancelPreparedFileFrameProvider];
+    [_generator setPendingFileProvider:nil];_selectedFileProvider=nil;
+    [self cancelPreparedFileLanczos];
+    [self disableFileLanczos];
     [self resetPresentedFrameRate];
     _lastSubmittedVideoGeneration.store(-1);
     _openCommittedBase = _renderer.committedFrameCount;
@@ -2504,6 +2561,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     _presentRetryCompletesPausedSeek = NO;
     _lastFrameGeneration = -1;
     _lastFrameSynthetic = NO;
+    _lastFrameGenerated = NO;
     _lastFrameInterpolationEpoch = 0;
     _approxMediaNowUs.store(0);
     _audioResyncToNow.store(false);
@@ -3754,6 +3812,31 @@ static BOOL spThumbsEnabled(void) {
     return (SPFrameInterpolationMode)_frameInterpolationModeValue.load();
 }
 
+- (BOOL)configureFileInterpolationMode:(NSInteger)mode numerator:(int64_t)numerator denominator:(int64_t)denominator {
+#ifndef SP_ENHANCE
+    return NO;
+#else
+    {
+        std::lock_guard<std::mutex> lock(_interpolationTransitionMtx);
+        if (![_generator configureFileCadenceMode:mode numerator:numerator denominator:denominator]) return NO;
+        {
+            std::lock_guard<std::mutex> submitFence(_frameSubmitGenerationMtx);
+            _interpolationPolicyEpoch.fetch_add(1);
+            [_renderer discardPendingSubmits];
+        }
+        _interpolationResetRequested.store(true);
+    }
+    [self resetPresentedFrameRate];
+    if (_running.load()) {
+        _frames->interruptPushes();
+        if (auto motionFrames = _motionFramesPublished.load()) motionFrames->interruptPushes();
+    }
+    [self wakeDecodeThread];
+    _interpolationTransitionCv.notify_all();
+    return YES;
+#endif
+}
+
 - (void)setFrameInterpolationMode:(SPFrameInterpolationMode)mode {
 #ifndef SP_ENHANCE
     // Builds without enhanced playback always converge on the normal off path.
@@ -3761,7 +3844,7 @@ static BOOL spThumbsEnabled(void) {
     mode = SPFrameInterpolationModeOff;
 #else
 
-    if (!spFullTier()) mode = SPFrameInterpolationModeOff;
+    if (!spFullTier() && !_selectedFileProvider) mode = SPFrameInterpolationModeOff;
 #endif
     if (mode != SPFrameInterpolationModeDoubleRate) mode = SPFrameInterpolationModeOff;
     // Apply the product ceiling to direct setters and automation as well as UI.
@@ -3772,7 +3855,7 @@ static BOOL spThumbsEnabled(void) {
          _interpolationDecodedResolutionLimited.load());
     if (requestedResolutionLimited) mode = SPFrameInterpolationModeOff;
     const BOOL requestedUnavailable = mode == SPFrameInterpolationModeDoubleRate &&
-                                      !SPFrameBudgetGenerator.isAvailable;
+                                      !_selectedFileProvider && !SPFrameBudgetGenerator.isAvailable;
     if (requestedUnavailable) {
         mode = SPFrameInterpolationModeOff;
     }
@@ -3781,9 +3864,12 @@ static BOOL spThumbsEnabled(void) {
         std::lock_guard<std::mutex> lock(_interpolationTransitionMtx);
         previous = _frameInterpolationModeValue.load();
         if (previous != (int)mode) {
-            _frameInterpolationModeValue.store((int)mode);
-            _interpolationPolicyEpoch.fetch_add(1);
-
+            {
+                std::lock_guard<std::mutex> submitFence(_frameSubmitGenerationMtx);
+                _frameInterpolationModeValue.store((int)mode);
+                _interpolationPolicyEpoch.fetch_add(1);
+                [_renderer discardPendingSubmits];
+            }
             _interpolationResetRequested.store(true);
         }
     }
@@ -3832,7 +3918,7 @@ static BOOL spThumbsEnabled(void) {
 }
 
 - (BOOL)frameInterpolationAvailable {
-
+    if (_selectedFileProvider) return YES;
     if (!spFullTier()) return NO;
 
     const int resolved = [SPFrameBudgetGenerator availabilityIfResolved];
@@ -3869,10 +3955,234 @@ static BOOL spThumbsEnabled(void) {
     _fpsWindowGen = -1;
     _fpsLastTickUs = 0;
     _presentedFrameRateValue.store(0.0);
+    _physicalFPSEpoch.fetch_add(1);
+    std::lock_guard<std::mutex> lock(_physicalFPSMutex);
+    _physicalFPSMeter.reset();
+    _physicalFPSGeneration = -1;
+    _physicalFPSDelayUs.store(-1);
+    _physicalFPSDelayHostNs.store(0);
 }
 
 - (double)presentedFrameRate {
     return _presentedFrameRateValue.load();
+}
+
+- (void)prepareFileFrameProvider:(id<SPFileFrameProvider>)provider completion:(void (^)(BOOL, NSString *))completion {
+    [self cancelPreparedFileFrameProvider];
+    const uint64_t revision=_fileProviderPrepareRevision.load();
+    if(!provider || !_running.load() || _audioOnlySession.load() || ![_hdrDescription isEqualToString:@"SDR"] || !_lastFrameBuffer) {
+        completion(NO,@"文件插帧需要已打开的 SDR 视频帧。");return;
+    }
+    const int64_t generation=_generation.load();
+    CVPixelBufferRef sample=CVPixelBufferRetain(_lastFrameBuffer);
+    _preparingFileProvider=provider;
+    __weak SPPlayerCore *weakSelf=self;
+    [provider prepareWithSample:sample completion:^(BOOL ready,NSString *message){
+        CVPixelBufferRelease(sample);
+        dispatch_async(dispatch_get_main_queue(),^{
+            SPPlayerCore *strong=weakSelf;
+            if(!strong || revision!=strong->_fileProviderPrepareRevision.load() || generation!=strong->_generation.load() || !strong->_running.load()) {
+                [provider invalidate];completion(NO,@"准备已取消，原设置保持不变。");return;
+            }
+            strong->_preparingFileProvider=nil;
+            if(!ready){[provider invalidate];completion(NO,message.length?message:@"文件插帧准备失败。");return;}
+            strong->_preparedFileProvider=provider;strong->_preparedFileProviderGeneration=generation;completion(YES,@"");
+        });
+    }];
+}
+- (void)cancelPreparedFileFrameProvider {
+    _fileProviderPrepareRevision.fetch_add(1);
+    [_preparingFileProvider invalidate];_preparingFileProvider=nil;
+    [_preparedFileProvider invalidate];_preparedFileProvider=nil;_preparedFileProviderGeneration=-1;
+}
+- (void)selectDefaultFileInterpolationEngine {
+    [_generator setPendingFileProvider:nil];_selectedFileProvider=nil;
+}
+- (BOOL)commitFilePlanWithInterpolation:(BOOL)interpolation usePreparedProvider:(BOOL)useProvider cadence:(NSInteger)mode numerator:(int64_t)numerator denominator:(int64_t)denominator usePreparedScaler:(BOOL)useScaler {
+#ifndef SP_ENHANCE
+    (void)interpolation;(void)useProvider;(void)mode;(void)numerator;(void)denominator;(void)useScaler;return NO;
+#else
+    if(!_running.load() || _audioOnlySession.load())return NO;
+    const int64_t generation=_generation.load();
+    if(useProvider && (!interpolation || !_preparedFileProvider || _preparedFileProviderGeneration!=generation))return NO;
+    if(useScaler && (!_preparedFileLanczos || _preparedFileGeneration!=generation))return NO;
+    if(interpolation && !useProvider && (!spFullTier() || !SPFrameBudgetGenerator.isAvailable))return NO;
+    {
+        std::lock_guard<std::mutex> transition(_interpolationTransitionMtx);
+        if(interpolation && ![_generator configureFileCadenceMode:mode numerator:numerator denominator:denominator])return NO;
+        id<SPFileFrameProvider> next=useProvider?_preparedFileProvider:nil;
+        [_generator setPendingFileProvider:next];
+        _selectedFileProvider=next;
+        if(useProvider){_preparedFileProvider=nil;_preparedFileProviderGeneration=-1;}
+        {
+            std::lock_guard<std::mutex> submitFence(_frameSubmitGenerationMtx);
+            _frameInterpolationModeValue.store(interpolation?SPFrameInterpolationModeDoubleRate:SPFrameInterpolationModeOff);
+            _interpolationPolicyEpoch.fetch_add(1);
+            [_renderer discardPendingSubmits];
+            [_renderer setFileLanczosScaler:useScaler?_preparedFileLanczos:nil];
+        }
+        if(useScaler){_fileLanczosWidth=_preparedFileLanczos.outputWidth;_fileLanczosHeight=_preparedFileLanczos.outputHeight;_preparedFileLanczos=nil;_preparedFileGeneration=-1;}
+        else {_fileLanczosWidth=0;_fileLanczosHeight=0;}
+        _fileLanczosActive=useScaler;
+        _interpolationResetRequested.store(true);
+    }
+    _frameInterpolationActiveValue.store(false);
+    _interpolationPolicyStatusCode.store(-1);
+    { std::lock_guard<std::mutex> lock(_interpolationStatusMtx); _frameInterpolationStatusValue=NSLocalizedString(interpolation ? @"memc.status.waitingCompatibleFrames" : @"memc.status.off",nil); }
+    [self resetPresentedFrameRate];
+    if(_running.load()){_frames->interruptPushes();if(auto q=_motionFramesPublished.load())q->interruptPushes();}
+    [self wakeDecodeThread];_interpolationTransitionCv.notify_all();[self notifyFrameInterpolationDidChange];return YES;
+#endif
+}
+
+- (void)prepareFileLanczosWidth:(int)width height:(int)height completion:(void (^)(BOOL, NSString *))completion {
+    [self prepareFileScalerWidth:width height:height engine:@"lanczos" completion:completion];
+}
+
+- (void)prepareFileScalerWidth:(int)width height:(int)height engine:(NSString *)engine completion:(void (^)(BOOL, NSString *))completion {
+    [self prepareFileScalerWidth:width height:height engine:engine variant:@"none" completion:completion];
+}
+
+- (void)prepareFileScalerWidth:(int)width height:(int)height engine:(NSString *)engine variant:(NSString *)variant completion:(void (^)(BOOL, NSString *))completion {
+    [self prepareFileScalerWidth:width height:height engine:engine variant:variant resourceBundle:NSBundle.mainBundle completion:completion];
+}
+
+// Injectable resource bundle keeps headless checks on the exact app resources;
+// the product entry point above always uses its own main bundle.
+- (void)prepareFileScalerWidth:(int)width height:(int)height engine:(NSString *)engine variant:(NSString *)variant resourceBundle:(NSBundle *)bundle completion:(void (^)(BOOL, NSString *))completion {
+    if (![engine isEqualToString:@"lanczos"] && ![engine isEqualToString:@"apple.low-sr"] && ![engine isEqualToString:@"apple.video-sr"] && ![engine isEqualToString:@"metalfx.spatial"] && ![engine isEqualToString:@"anime4k"] && ![engine isEqualToString:@"realcugan"]) {
+        completion(NO, @"所选文件缩放引擎尚未接入。"); return;
+    }
+    const uint64_t revision = _fileScalePrepareRevision.fetch_add(1) + 1;
+    _preparedFileLanczos = nil;
+    _preparedFileGeneration = -1;
+    if (!_running.load() || _audioOnlySession.load() || ![_hdrDescription isEqualToString:@"SDR"]) {
+        completion(NO, @"文件缩放当前需要已打开的 SDR 视频。");
+        return;
+    }
+    const OSType format = _lastFrameBuffer ? CVPixelBufferGetPixelFormatType(_lastFrameBuffer) : 0;
+    if (format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange && format != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+        completion(NO, @"文件缩放需要已呈现的 SDR 8 位 NV12 视频帧。");
+        return;
+    }
+    if (_fileScalePreparationBusy.exchange(true)) {
+        completion(NO, @"上一次文件缩放准备仍在结束，请稍后重试。");
+        return;
+    }
+    const int64_t generation = _generation.load();
+    const int64_t samplePTS = _lastFramePTSUs;
+    id<MTLDevice> device = _renderer.device;
+    CVPixelBufferRef sample = CVPixelBufferRetain(_lastFrameBuffer);
+    __weak SPPlayerCore *weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *error = nil;
+        SPFileLanczosScaler *candidate = nil;
+        if ([engine isEqualToString:@"apple.low-sr"]) {
+            candidate = [[SPFileAppleSRScaler alloc] initWithSourceWidth:(int)CVPixelBufferGetWidth(sample) sourceHeight:(int)CVPixelBufferGetHeight(sample) outputWidth:width outputHeight:height error:&error];
+        } else if ([engine isEqualToString:@"apple.video-sr"]) {
+            candidate=[[SPFileAppleVideoSRScaler alloc] initWithSourceWidth:(int)CVPixelBufferGetWidth(sample) sourceHeight:(int)CVPixelBufferGetHeight(sample) outputWidth:width outputHeight:height error:&error];
+        } else if ([engine isEqualToString:@"metalfx.spatial"]) {
+            candidate=[[SPFileMetalFXScaler alloc] initWithDevice:device sourceWidth:(int)CVPixelBufferGetWidth(sample) sourceHeight:(int)CVPixelBufferGetHeight(sample) outputWidth:width outputHeight:height error:&error];
+        } else if ([engine isEqualToString:@"anime4k"] || [engine isEqualToString:@"realcugan"]) {
+            int sourceWidth=(int)CVPixelBufferGetWidth(sample), sourceHeight=(int)CVPixelBufferGetHeight(sample);
+            if (width!=sourceWidth*2 || height!=sourceHeight*2) error=[NSError errorWithDomain:@"Khua.FileAnimation" code:10 userInfo:@{NSLocalizedDescriptionKey:@"动画超分使用来源尺寸的 2× 输出。"}];
+            else candidate=[[SPFileAnimationScaler alloc] initWithSourceWidth:sourceWidth sourceHeight:sourceHeight engine:engine variant:variant resourceBundle:bundle error:&error];
+        } else {
+            candidate=[[SPFileLanczosScaler alloc] initWithDevice:device width:width height:height error:&error];
+        }
+        void (^finish)(BOOL, NSString *) = ^(BOOL valid, NSString *message) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                SPPlayerCore *strong = weakSelf;
+                if (strong) strong->_fileScalePreparationBusy.store(false);
+                if (!strong || revision != strong->_fileScalePrepareRevision.load() || generation != strong->_generation.load() || !strong->_running.load()) {
+                    completion(NO, @"准备已取消，原设置保持不变。");
+                    return;
+                }
+                if (!valid) { completion(NO, message.length ? message : @"文件缩放准备失败。"); return; }
+                strong->_preparedFileLanczos = candidate;
+                strong->_preparedFileGeneration = generation;
+                completion(YES, @"");
+            });
+        };
+        if (!candidate) {
+            CVPixelBufferRelease(sample);
+            finish(NO, error.localizedDescription ?: @"文件缩放准备失败。");
+            return;
+        }
+        BOOL submitted = [candidate submit:sample ptsUs:samplePTS completion:^(CVPixelBufferRef output, NSError *failure) {
+            BOOL valid = output && CVPixelBufferGetWidth(output) == (size_t)width && CVPixelBufferGetHeight(output) == (size_t)height && CVPixelBufferGetPixelFormatType(output) == format;
+            if (output) CVPixelBufferRelease(output);
+            finish(valid, failure.localizedDescription ?: @"");
+        }];
+        CVPixelBufferRelease(sample);
+        if (!submitted) finish(NO, @"文件缩放准备任务繁忙。");
+    });
+}
+
+- (BOOL)activatePreparedFileLanczos {
+    if (!_preparedFileLanczos || _preparedFileGeneration != _generation.load() || !_running.load()) return NO;
+    [_renderer setFileLanczosScaler:_preparedFileLanczos];
+    _fileLanczosWidth = _preparedFileLanczos.outputWidth;
+    _fileLanczosHeight = _preparedFileLanczos.outputHeight;
+    _preparedFileLanczos = nil;
+    _preparedFileGeneration = -1;
+    _fileLanczosActive = YES;
+    [self resetPresentedFrameRate];
+    return YES;
+}
+
+- (void)cancelPreparedFileLanczos {
+    _fileScalePrepareRevision.fetch_add(1);
+    _preparedFileLanczos = nil;
+    _preparedFileGeneration = -1;
+}
+
+- (void)disableFileLanczos {
+    [self cancelPreparedFileLanczos];
+    if (_fileLanczosActive) [_renderer setFileLanczosScaler:nil];
+    _fileLanczosActive = NO;
+    _fileLanczosWidth = 0; _fileLanczosHeight = 0;
+    [self resetPresentedFrameRate];
+}
+- (BOOL)fileLanczosActive { return _fileLanczosActive; }
+- (int)fileLanczosWidth { return _fileLanczosWidth; }
+- (int)fileLanczosHeight { return _fileLanczosHeight; }
+- (NSString *)fileLanczosStatus { return _renderer.fileScaleStatus ?: @""; }
+- (NSDictionary<NSString *,id> *)fileScalerDiagnostics { return _renderer.fileScalerDiagnostics ?: @{}; }
+
+- (void)setPhysicalFPSObservationEnabled:(BOOL)enabled {
+    bool old = _physicalFPSObserving.exchange(enabled);
+    if (old == (bool)enabled) return;
+    _physicalFPSEpoch.fetch_add(1);
+    std::lock_guard<std::mutex> lock(_physicalFPSMutex);
+    _physicalFPSMeter.reset();
+    _physicalFPSGeneration = -1;
+    _physicalFPSDelayUs.store(-1);
+    _physicalFPSDelayHostNs.store(0);
+}
+
+- (double)observedInputFPS {
+    if (!_physicalFPSObserving.load() || _paused.load()) return -1;
+    std::lock_guard<std::mutex> lock(_physicalFPSMutex);
+    if (_physicalFPSGeneration != _generation.load()) return -1;
+    return _physicalFPSMeter.inputRate((int64_t)(CACurrentMediaTime() * 1e9));
+}
+
+- (double)observedPhysicalOutputFPS {
+    if (!_physicalFPSObserving.load() || _paused.load()) return -1;
+    std::lock_guard<std::mutex> lock(_physicalFPSMutex);
+    if (_physicalFPSGeneration != _generation.load()) return -1;
+    return _physicalFPSMeter.outputRate((int64_t)(CACurrentMediaTime() * 1e9));
+}
+
+- (double)observedVideoDelayMs {
+    if (!_physicalFPSObserving.load() || _paused.load()) return -1;
+    std::lock_guard<std::mutex> lock(_physicalFPSMutex);
+    if (_physicalFPSGeneration != _generation.load()) return -1;
+    int64_t now = (int64_t)(CACurrentMediaTime() * 1e9);
+    int64_t host = _physicalFPSDelayHostNs.load();
+    int64_t delay = _physicalFPSDelayUs.load();
+    return host > 0 && now >= host && now - host < 1500000000LL && delay >= 0 ? (double)delay / 1000.0 : -1;
 }
 
 - (double)frameInterpolationCoverage {
@@ -3910,7 +4220,7 @@ static BOOL spThumbsEnabled(void) {
     // refresh are known at open time, so publish the unavailable state before
     // interaction. Fast playback is transient; unknown FPS remains a runtime gate.
     const double cadenceRate = _playbackRate.load();
-    if (cadenceRate <= 1.0001 && _videoFps > 0.0 &&
+    if (!_selectedFileProvider && cadenceRate <= 1.0001 && _videoFps > 0.0 &&
         _videoFps * 2.0 * cadenceRate > _displayMaximumFPS.load() + 0.5) {
         return sp::SPInterpolationPolicyCode::DisplayCadence;
     }
@@ -3970,6 +4280,10 @@ static BOOL spThumbsEnabled(void) {
         default:
             return @"";
     }
+}
+
+- (BOOL)frameInterpolationAwaitingScan {
+    return _interpolationPolicyStatusCode.load()==static_cast<int>(SPInterpolationPolicyCode::ScanUnknown);
 }
 
 - (NSString *)frameInterpolationStatus {
@@ -4154,7 +4468,7 @@ static BOOL spThumbsEnabled(void) {
         _needsOutputModeRedraw.store(true);
     } else if (_lastFrameBuffer) {
         std::lock_guard<std::mutex> rlock(_renderMtx);
-        [_renderer renderPixelBuffer:_lastFrameBuffer];
+        [_renderer renderPixelBuffer:_lastFrameBuffer original:_lastFrameOriginal ? _lastFrameOriginal->buffer : NULL ptsUs:_lastFramePTSUs presented:nil];
     }
 }
 - (BOOL)xdrEnabled { return [_renderer sdrBoostEnabled]; }
@@ -4225,7 +4539,7 @@ static BOOL spThumbsEnabled(void) {
     if (_state == SPPlayerStatePlaying || _state == SPPlayerStateOpening) {
         _needsOutputModeRedraw.store(true);
     } else if (_lastFrameBuffer) {
-        [_renderer renderPixelBuffer:_lastFrameBuffer];
+        [_renderer renderPixelBuffer:_lastFrameBuffer original:_lastFrameOriginal ? _lastFrameOriginal->buffer : NULL ptsUs:_lastFramePTSUs presented:nil];
     }
 
     [self notifyFrameInterpolationDidChange];
@@ -4427,7 +4741,7 @@ static CGImageRef spCreateScreenshotImage(CVPixelBufferRef snapshot, sp::VideoOr
     _lastViewportPx = px;
 
     [self updateSubtitleTextureForTime:_lastPresentedPtsUs];
-    if (_lastFrameBuffer) [_renderer renderPixelBuffer:_lastFrameBuffer];
+    if (_lastFrameBuffer) [_renderer renderPixelBuffer:_lastFrameBuffer original:_lastFrameOriginal ? _lastFrameOriginal->buffer : NULL ptsUs:_lastFramePTSUs presented:nil];
 }
 
 - (void)prewarmWindowDragEffect {
@@ -4439,7 +4753,7 @@ static CGImageRef spCreateScreenshotImage(CVPixelBufferRef snapshot, sp::VideoOr
     [_renderer setDragEffectStrength:strength colorStrength:colorStrength anchorPx:anchor];
     if (_state != SPPlayerStatePlaying && _lastFrameBuffer) {
         std::lock_guard<std::mutex> rlock(_renderMtx);
-        [_renderer renderPixelBuffer:_lastFrameBuffer];
+        [_renderer renderPixelBuffer:_lastFrameBuffer original:_lastFrameOriginal ? _lastFrameOriginal->buffer : NULL ptsUs:_lastFramePTSUs presented:nil];
     }
 }
 
@@ -4646,6 +4960,8 @@ static constexpr double kSPResumeKeyframeMaxBackSec = 5.0;
     const int64_t stopT0 = spNowUs();
 
     std::lock_guard<std::mutex> lifecycleLock(_lifecycleMtx);
+    [self cancelPreparedFileFrameProvider];
+    [_generator setPendingFileProvider:nil];_selectedFileProvider=nil;
     _openGeneration++;
     [self cancelIndexWait];
     if (_trialExecutor) _trialExecutor->cancelAll();
@@ -4720,6 +5036,7 @@ static constexpr double kSPResumeKeyframeMaxBackSec = 5.0;
         _scrubHintUs.store(-1);
 
         [self destroyMotionInterpolatorOnDecodeThread];
+        [_generator applyModeReset:SPFrameInterpolationModeOff];
         [_generator discardReturnedFrames];
         _subLoadGen.fetch_add(1);
         [_subtitleRenderer resetTrack];
@@ -4784,6 +5101,7 @@ static constexpr double kSPResumeKeyframeMaxBackSec = 5.0;
     }
 
     if (_lastFrameBuffer) { CVPixelBufferRelease(_lastFrameBuffer); _lastFrameBuffer = NULL; }
+    _lastFrameOriginal.reset();
     if (_compareRealFrame) { CVPixelBufferRelease(_compareRealFrame); _compareRealFrame = NULL; }
     _compareRealFrameGen = -1;
     if (_rendererCompareActive) { [_renderer setCompareBuffer:NULL]; _rendererCompareActive = false; }
@@ -4791,6 +5109,7 @@ static constexpr double kSPResumeKeyframeMaxBackSec = 5.0;
     _presentRetryCompletesPausedSeek = NO;
     _lastFrameGeneration = -1;
     _lastFrameSynthetic = NO;
+    _lastFrameGenerated = NO;
     _lastFrameInterpolationEpoch = 0;
     _videoPackets->drain([](TaggedPacket t) { av_packet_free(&t.pkt); });
     _audioPackets->drain([](TaggedPacket t) { av_packet_free(&t.pkt); });
@@ -4809,6 +5128,7 @@ static constexpr double kSPResumeKeyframeMaxBackSec = 5.0;
     _frames->reopen();
 
     [_renderer discardPendingSubmits];
+    [_generator applyModeReset:SPFrameInterpolationModeOff];
 
     _scrubHintPending.store(false);
     _scrubHintUs.store(-1);
@@ -5482,7 +5802,7 @@ static void spAudioRecoveryTrial(const SPAudioRecoveryRequest &req, const std::a
 
         std::lock_guard<std::mutex> rlock(_renderMtx);
         [self updateSubtitleTextureForTime:_lastPresentedPtsUs];
-        [_renderer renderPixelBuffer:_lastFrameBuffer];
+        [_renderer renderPixelBuffer:_lastFrameBuffer original:_lastFrameOriginal ? _lastFrameOriginal->buffer : NULL ptsUs:_lastFramePTSUs presented:nil];
     }
 }
 
@@ -6140,6 +6460,9 @@ static void spApplyDecodeQoS() {
                                  ptsUs:(int64_t)ptsUs
                             generation:(int64_t)generation
                               synthetic:(BOOL)synthetic
+                              generated:(BOOL)generated
+                               original:(CVPixelBufferRef)original
+                          originalPtsUs:(int64_t)originalPtsUs
                       interpolationEpoch:(uint64_t)interpolationEpoch
                      interruptGeneration:(uint64_t)interruptGeneration {
     if (!buffer) return PushResult::Closed;
@@ -6150,6 +6473,8 @@ static void spApplyDecodeQoS() {
     frame.ptsUs = ptsUs;
     frame.gen = generation;
     frame.synthetic = synthetic;
+    frame.generated = generated;
+    if(original) frame.original=std::make_shared<SPFrameOriginal>(original,originalPtsUs);
     frame.interpolationEpoch = interpolationEpoch;
     PushResult result = motionFrames->pushInterruptibly(std::move(frame), interruptGeneration);
     if (result != PushResult::Pushed) return result;
@@ -6193,7 +6518,7 @@ static void spApplyDecodeQoS() {
                 spFrameQueueRelease(&_motionQueueClaimBytes);
                 auto *droppedCounter = &_generator.counters->dropped;
                 motionFrames->drain([droppedCounter](DecodedFrame f) {
-                    if (f.synthetic) droppedCounter->fetch_add(1);
+                    if (f.generated) droppedCounter->fetch_add(1);
                     if (f.buffer) CVPixelBufferRelease(f.buffer);
                 });
             }
@@ -6257,12 +6582,13 @@ static void spApplyDecodeQoS() {
             auto *droppedCounter = &self->_generator.counters->dropped;
             motionFrames->drain([self, droppedCounter](DecodedFrame f) {
                 if (f.synthetic) {
-                    droppedCounter->fetch_add(1);
+                    if (f.generated) droppedCounter->fetch_add(1);
                     if (f.buffer) CVPixelBufferRelease(f.buffer);
                     return;
                 }
                 DecodedFrame moved = f;
                 moved.synthetic = false;
+                moved.generated = false;
                 moved.interpolationEpoch = 0;
                 if (!self->_frames->pushForTransition(std::move(moved)) && f.buffer) {
 #if DEBUG && !SP_APP_STORE
@@ -6273,11 +6599,12 @@ static void spApplyDecodeQoS() {
             });
 
             if (self->_presentRetryPending && self->_lastFrameSynthetic) {
-                self->_generator.counters->dropped.fetch_add(1);
+                if (self->_lastFrameGenerated) self->_generator.counters->dropped.fetch_add(1);
                 self->_presentRetryPending = NO;
                 self->_presentRetryCompletesPausedSeek = NO;
             }
             self->_lastFrameSynthetic = NO;
+            self->_lastFrameGenerated = NO;
             self->_lastFrameInterpolationEpoch = 0;
 
             self->_motionFramesPublished.store(nullptr);
@@ -6324,6 +6651,21 @@ static void spApplyDecodeQoS() {
     CVPixelBufferRef buffer = output.pixelBuffer;
     int64_t ptsUs = output.ptsUs;
     if (!buffer) return;
+    if (_physicalFPSObserving.load() && generation == _generation.load()) {
+        __int128 ns = (__int128)ptsUs * 1000;
+        if (ns >= INT64_MIN && ns <= INT64_MAX) {
+            std::lock_guard<std::mutex> lock(_physicalFPSMutex);
+            if (_physicalFPSObserving.load() && generation == _generation.load()) {
+                if (_physicalFPSGeneration != generation) {
+                    _physicalFPSMeter.reset();
+                    _physicalFPSGeneration = generation;
+                    _physicalFPSDelayUs.store(-1);
+                    _physicalFPSDelayHostNs.store(0);
+                }
+                _physicalFPSMeter.input((int64_t)ns, (int64_t)(CACurrentMediaTime() * 1e9));
+            }
+        }
+    }
 #ifdef SP_ENHANCE
     // Observe actual geometry even while Off. Stream metadata may keep its old
     // dimensions after a decoder reconfiguration. Only publish changes, and
@@ -7219,6 +7561,18 @@ static void spApplyDecodeQoS() {
     [_generator discardReturnedFrames];
 }
 
+- (void)setFileViewMode:(int)mode {
+    if(mode<0 || mode>2)return;
+    if(_fileViewMode.exchange(mode)==mode)return;
+    {
+        std::lock_guard<std::mutex> submitFence(_frameSubmitGenerationMtx);
+        [_renderer setFileViewMode:mode];
+        if(_lastFrameBuffer && _lastFrameGeneration==_generation.load())
+            [_renderer renderPixelBuffer:_lastFrameBuffer original:_lastFrameOriginal ? _lastFrameOriginal->buffer : NULL ptsUs:_lastFramePTSUs presented:nil];
+    }
+    [self resetPresentedFrameRate];
+}
+
 - (void)setMotionCompareEnabled:(BOOL)enabled {
     _motionCompareEnabled.store(enabled);
 
@@ -7227,7 +7581,7 @@ static void spApplyDecodeQoS() {
     if (_state != SPPlayerStatePlaying && _lastFrameBuffer) {
         std::lock_guard<std::mutex> rlock(_renderMtx);
         [self syncCompareSourceForSynthetic:_lastFrameSynthetic gen:_lastFrameGeneration];
-        [_renderer renderPixelBuffer:_lastFrameBuffer];
+        [_renderer renderPixelBuffer:_lastFrameBuffer original:_lastFrameOriginal ? _lastFrameOriginal->buffer : NULL ptsUs:_lastFramePTSUs presented:nil];
     }
 }
 
@@ -7255,7 +7609,7 @@ static void spApplyDecodeQoS() {
     }
 
     if (_presentRetryPending && _lastFrameSynthetic) {
-        _generator.counters->dropped.fetch_add(1);
+        if (_lastFrameGenerated) _generator.counters->dropped.fetch_add(1);
     }
     if (!frame.synthetic &&
         _frameInterpolationCommittedModeValue.load() != SPFrameInterpolationModeOff) {
@@ -7268,9 +7622,52 @@ static void spApplyDecodeQoS() {
         [self syncCompareSourceForSynthetic:frame.synthetic gen:frame.gen];
     }
     [self updateSubtitleTextureForTime:frame.ptsUs];
-    BOOL submitted = [_renderer renderPixelBuffer:frame.buffer];
+    void (^measurement)(double) = nil;
+    if (_physicalFPSObserving.load()) {
+      __weak SPPlayerCore *weakSelf = self;
+      const int64_t measuredGeneration = frame.gen;
+      const bool originalView = _fileViewMode.load()==1;
+      const int64_t measuredPTS = originalView && frame.original ? frame.original->ptsUs : frame.ptsUs;
+      const bool held = originalView ? false : (frame.synthetic && !frame.generated);
+      const uint64_t measuredEpoch = _physicalFPSEpoch.load();
+      const uint64_t identity = _physicalFPSIdentity.fetch_add(1) + 1;
+      measurement = ^(double time) {
+        SPPlayerCore *strong = weakSelf;
+        if (!strong || !strong->_physicalFPSObserving.load() || strong->_paused.load() ||
+            measuredGeneration != strong->_generation.load() || measuredEpoch != strong->_physicalFPSEpoch.load() ||
+            !std::isfinite(time) || time <= 0 || time >= (double)INT64_MAX / 1e9) return;
+        __int128 ns = (__int128)measuredPTS * 1000;
+        if (ns < INT64_MIN || ns > INT64_MAX) return;
+        std::lock_guard<std::mutex> lock(strong->_physicalFPSMutex);
+        if (measuredEpoch != strong->_physicalFPSEpoch.load() || measuredGeneration != strong->_generation.load()) return;
+        if (measuredGeneration != strong->_physicalFPSGeneration) {
+            strong->_physicalFPSMeter.reset();
+            strong->_physicalFPSGeneration = measuredGeneration;
+            strong->_physicalFPSDelayUs.store(-1);
+            strong->_physicalFPSDelayHostNs.store(0);
+        }
+        strong->_physicalFPSMeter.presented((int64_t)ns, (int64_t)(time * 1e9), identity, held, false, true);
+        if (!held) {
+            double now = CACurrentMediaTime();
+            double callbackDelay = std::max(0.0, now - time);
+            double mediaDelay = (double)strong->_approxMediaNowUs.load() - (double)measuredPTS - callbackDelay * 1e6 * strong->_playbackRate.load();
+            if (std::isfinite(mediaDelay) && mediaDelay >= 0 && mediaDelay < 3600.0 * 1e6) {
+                strong->_physicalFPSDelayUs.store((int64_t)mediaDelay);
+                strong->_physicalFPSDelayHostNs.store((int64_t)(now * 1e9));
+            }
+        }
+      };
+    }
+    BOOL submitted = NO;
+    {
+        std::lock_guard<std::mutex> submitFence(_frameSubmitGenerationMtx);
+        if (frame.gen != _generation.load() ||
+            (frame.synthetic && frame.interpolationEpoch != _interpolationPolicyEpoch.load())) return NO;
+        if (frame.synthetic && _fileViewMode.load()>0 && !frame.original) return NO;
+        submitted = [_renderer renderPixelBuffer:frame.buffer original:frame.original ? frame.original->buffer : NULL ptsUs:frame.ptsUs presented:measurement];
+    }
     _presentRetryPending = !submitted;
-    if (submitted && frame.synthetic) _generator.counters->presented.fetch_add(1);
+    if (submitted && frame.generated) _generator.counters->presented.fetch_add(1);
     if (submitted) {
         _sessionEverPresented.store(true);
         // Only the first accepted frame of a generation needs publication.
@@ -7283,8 +7680,11 @@ static void spApplyDecodeQoS() {
     }
     if (_lastFrameBuffer) CVPixelBufferRelease(_lastFrameBuffer);
     _lastFrameBuffer = CVPixelBufferRetain(frame.buffer);
+    _lastFrameOriginal = frame.original;
     _lastFrameGeneration = frame.gen;
+    _lastFramePTSUs = frame.ptsUs;
     _lastFrameSynthetic = frame.synthetic;
+    _lastFrameGenerated = frame.generated;
     _lastFrameInterpolationEpoch = frame.interpolationEpoch;
     _presentRetryCompletesPausedSeek = NO;
     _lastPresentedPtsUs = frame.ptsUs;
@@ -7341,7 +7741,7 @@ static void spApplyDecodeQoS() {
             spEvaluateImmediateFrame(spFrameMetadata(f), context);
         if (decision.action != SPFrameSelectionAction::Select) {
 
-            if (f.synthetic) _generator.counters->dropped.fetch_add(1);
+            if (f.generated) _generator.counters->dropped.fetch_add(1);
             CVPixelBufferRelease(f.buffer);
             continue;
         }
@@ -8044,7 +8444,7 @@ static void spApplyDecodeQoS() {
             previewDecision.action ==
                 SPFrameSelectionAction::DropBeforeSeekBurst) {
 
-            if (f.synthetic) _generator.counters->dropped.fetch_add(1);
+            if (f.generated) _generator.counters->dropped.fetch_add(1);
             CVPixelBufferRelease(f.buffer);
             continue;
         }
@@ -8257,13 +8657,13 @@ static void spApplyDecodeQoS() {
     }
     if (!retryIsCurrent) {
 
-        if (motionPath && _lastFrameSynthetic) _generator.counters->dropped.fetch_add(1);
+        if (motionPath && _lastFrameGenerated) _generator.counters->dropped.fetch_add(1);
         _presentRetryPending = NO;
         _presentRetryCompletesPausedSeek = NO;
         return NO;
     }
     [self updateSubtitleTextureForTime:_lastPresentedPtsUs];
-    if ([_renderer renderPixelBuffer:_lastFrameBuffer]) {
+    if ([_renderer renderPixelBuffer:_lastFrameBuffer original:_lastFrameOriginal ? _lastFrameOriginal->buffer : NULL ptsUs:_lastFramePTSUs presented:nil]) {
         _presentRetryPending = NO;
 
         const int64_t retryGen = _seekSettleRetryGen.exchange(-1);
@@ -8274,7 +8674,7 @@ static void spApplyDecodeQoS() {
         [self noteFramePresentedForCoarseLanding:_lastFrameGeneration
                                            ptsUs:_lastPresentedPtsUs
                                        submitted:YES];
-        if (motionPath && _lastFrameSynthetic) _generator.counters->presented.fetch_add(1);
+        if (motionPath && _lastFrameGenerated) _generator.counters->presented.fetch_add(1);
         if (countPresented) { _pacePresented++; [self notePresentedFrameForRate]; }
         _sessionEverPresented.store(true);
         _lastSubmittedVideoGeneration.store(_lastFrameGeneration,
@@ -8322,7 +8722,7 @@ static void spApplyDecodeQoS() {
                 SPFrameSelectionDecision decision =
                     spEvaluateImmediateFrame(spFrameMetadata(f), context);
                 if (decision.action != SPFrameSelectionAction::Select) {
-                    if (f.synthetic) _generator.counters->dropped.fetch_add(1);
+                    if (f.generated) _generator.counters->dropped.fetch_add(1);
                     CVPixelBufferRelease(f.buffer);
                     continue;
                 }
@@ -8401,7 +8801,7 @@ static void spApplyDecodeQoS() {
                     SPFrameSelectionAction::DropStaleGeneration ||
                 decision.action ==
                     SPFrameSelectionAction::DropBeforeSeekTarget) {
-                if (f.synthetic) _generator.counters->dropped.fetch_add(1);
+                if (f.generated) _generator.counters->dropped.fetch_add(1);
                 CVPixelBufferRelease(f.buffer);
                 continue;
             }
@@ -8409,7 +8809,7 @@ static void spApplyDecodeQoS() {
                 [self clearReachedSeekTargetAtPts:f.ptsUs direct:NO];
             }
             if (got) {
-                if (selectedFrame.synthetic) _generator.counters->dropped.fetch_add(1);
+                if (selectedFrame.generated) _generator.counters->dropped.fetch_add(1);
                 CVPixelBufferRelease(selectedFrame.buffer);
                 _paceDropped++;
                 _lateDropCounter.fetch_add(1, std::memory_order_relaxed);
@@ -9010,7 +9410,7 @@ static void spApplyDecodeQoS() {
 
             if (!_presentRetryPending) _needsOutputModeRedraw.store(false);
         } else if (_needsOutputModeRedraw.load() && _lastFrameBuffer) {
-            if ([_renderer renderPixelBuffer:_lastFrameBuffer]) {
+            if ([_renderer renderPixelBuffer:_lastFrameBuffer original:_lastFrameOriginal ? _lastFrameOriginal->buffer : NULL ptsUs:_lastFramePTSUs presented:nil]) {
                 _needsOutputModeRedraw.store(false);
             }
         }
@@ -9064,7 +9464,7 @@ static void spApplyDecodeQoS() {
     if (auto motionFrames = _motionFramesPublished.load()) {
         auto *droppedCounter = &_generator.counters->dropped;
         motionFrames->drain([droppedCounter](DecodedFrame f) {
-            if (f.synthetic) droppedCounter->fetch_add(1);
+            if (f.generated) droppedCounter->fetch_add(1);
             if (f.buffer) CVPixelBufferRelease(f.buffer);
         });
     }
@@ -9098,7 +9498,13 @@ alignToleranceUs:(int64_t)alignToleranceUs {
     }
 
     _interpolationResetRequested.store(true);
-    int64_t newGen = _generation.fetch_add(1) + 1;
+    int64_t newGen;
+    {
+        std::lock_guard<std::mutex> submitFence(_frameSubmitGenerationMtx);
+        newGen = _generation.fetch_add(1) + 1;
+        // Retire slow, in-flight file effects and pending output from the old seek generation.
+        [_renderer discardPendingSubmits];
+    }
     _seekSettleRetryGen.store(-1);
 
     _settledCoarseLandingUs = -1;
@@ -9120,9 +9526,10 @@ alignToleranceUs:(int64_t)alignToleranceUs {
     _approxMediaNowUs.store(us);
 
     if (_presentRetryPending && _lastFrameSynthetic) {
-        _generator.counters->dropped.fetch_add(1);
+        if (_lastFrameGenerated) _generator.counters->dropped.fetch_add(1);
     }
     if (_lastFrameBuffer) { CVPixelBufferRelease(_lastFrameBuffer); _lastFrameBuffer = NULL; }
+    _lastFrameOriginal.reset();
     if (_compareRealFrame) { CVPixelBufferRelease(_compareRealFrame); _compareRealFrame = NULL; }
     _compareRealFrameGen = -1;
     if (_rendererCompareActive) { [_renderer setCompareBuffer:NULL]; _rendererCompareActive = false; }
@@ -9130,6 +9537,7 @@ alignToleranceUs:(int64_t)alignToleranceUs {
     _presentRetryCompletesPausedSeek = NO;
     _lastFrameGeneration = -1;
     _lastFrameSynthetic = NO;
+    _lastFrameGenerated = NO;
     _lastFrameInterpolationEpoch = 0;
     [self drainSessionQueuesForSeek];
 

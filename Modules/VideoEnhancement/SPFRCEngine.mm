@@ -53,9 +53,43 @@ struct SPFRCSlot {
     int64_t startUs = 0;
     int64_t expectedFinishUs = 0;
     SPFRCEngineCompletion completion = nil;
+    SPFRCPhasesCompletion phasesCompletion = nil;
+    BOOL phaseMode = NO;
+    BOOL sequential = NO;
+    int phaseCount = 0;
+    CMTime ptsA = kCMTimeInvalid;
+    CMTime ptsB = kCMTimeInvalid;
+    float phaseValues[3] = {};
+    CVPixelBufferRef phaseRGBA[3] = {};
     int64_t frcStartUs = 0;
     double convertGpuSec = 0.0;
 };
+
+@implementation SPOwnedPixelBuffer {
+    CVPixelBufferRef _buffer;
+}
+
+- (instancetype)initWithBufferNoCopy:(CVPixelBufferRef)buffer {
+    if (!(self = [super init])) {
+        if (buffer) CVPixelBufferRelease(buffer);
+        return nil;
+    }
+    _buffer = buffer;
+    return self;
+}
+
+- (instancetype)initRetainingBuffer:(CVPixelBufferRef)buffer {
+    if (buffer) CVPixelBufferRetain(buffer);
+    return [self initWithBufferNoCopy:buffer];
+}
+
+- (void)dealloc {
+    if (_buffer) CVPixelBufferRelease(_buffer);
+}
+
+- (CVPixelBufferRef)buffer { return _buffer; }
+
+@end
 
 @implementation SPFRCEngine {
     SPFrameBudgetMetal *_metal;
@@ -71,6 +105,7 @@ struct SPFRCSlot {
     uint64_t _completed, _failed;
     int64_t _windowStartUs;
     uint64_t _windowPairs;
+    SPFRCQuality _quality;
 }
 
 static std::atomic<int> gFRCAvailability{-1};
@@ -102,7 +137,17 @@ static std::atomic<int> gFRCAvailability{-1};
                               sessions:(unsigned)sessions
                         outputCapacity:(NSUInteger)outputCapacity
                                  error:(NSError **)error {
+    return [self initWithMetal:metal sessions:sessions outputCapacity:outputCapacity
+                       quality:SPFRCQualityNormal error:error];
+}
+
+- (nullable instancetype)initWithMetal:(SPFrameBudgetMetal *)metal
+                              sessions:(unsigned)sessions
+                        outputCapacity:(NSUInteger)outputCapacity
+                               quality:(SPFRCQuality)quality
+                                 error:(NSError **)error {
     if (!(self = [super init])) return nil;
+    _quality = quality == SPFRCQualityHigh ? SPFRCQualityHigh : SPFRCQualityNormal;
     if (!self.class.isAvailable) {
         if (error) *error = SPFRCError(1, @"VTFrameRateConversion unavailable");
         return nil;
@@ -203,13 +248,20 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
     if (s.rgbaA) { CVPixelBufferRelease(s.rgbaA); s.rgbaA = nullptr; }
     if (s.rgbaB) { CVPixelBufferRelease(s.rgbaB); s.rgbaB = nullptr; }
     if (s.rgbaOut) { CVPixelBufferRelease(s.rgbaOut); s.rgbaOut = nullptr; }
+    for (int i = 0; i < 3; ++i) {
+        if (s.phaseRGBA[i]) { CVPixelBufferRelease(s.phaseRGBA[i]); s.phaseRGBA[i] = nullptr; }
+    }
 }
 
 - (BOOL)openSlot:(SPFRCSlot &)slot error:(NSError **)error {
     if (@available(macOS 15.4, *)) {
+        const VTFrameRateConversionConfigurationQualityPrioritization quality =
+            _quality == SPFRCQualityHigh
+                ? VTFrameRateConversionConfigurationQualityPrioritizationQuality
+                : VTFrameRateConversionConfigurationQualityPrioritizationNormal;
         VTFrameRateConversionConfiguration *cfg = [[VTFrameRateConversionConfiguration alloc]
             initWithFrameWidth:_metal.width frameHeight:_metal.height usePrecomputedFlow:NO
-            qualityPrioritization:VTFrameRateConversionConfigurationQualityPrioritizationNormal
+            qualityPrioritization:quality
             revision:VTFrameRateConversionConfigurationRevision1];
         if (!cfg) {
             if (error) *error = SPFRCError(3, @"FRC configuration rejected");
@@ -338,7 +390,18 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
                       frameB:(CVPixelBufferRef)frameB
                        token:(uint64_t)token
                   completion:(SPFRCEngineCompletion)completion {
+    return [self submitPairWithFrameA:frameA frameB:frameB ptsA:CMTimeMake(0, 48000)
+                              ptsB:CMTimeMake(2002, 48000) token:token completion:completion];
+}
+
+- (BOOL)submitPairWithFrameA:(CVPixelBufferRef)frameA
+                      frameB:(CVPixelBufferRef)frameB
+                        ptsA:(CMTime)ptsA
+                        ptsB:(CMTime)ptsB
+                       token:(uint64_t)token
+                  completion:(SPFRCEngineCompletion)completion {
     if (!frameA || !frameB || !completion) return NO;
+    if (!CMTIME_IS_NUMERIC(ptsA) || !CMTIME_IS_NUMERIC(ptsB) || CMTimeCompare(ptsA, ptsB) >= 0) return NO;
     size_t idx = SIZE_MAX;
     {
         std::lock_guard<std::mutex> lock(_mtx);
@@ -353,6 +416,12 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
         s.startUs = spNowUs();
         s.expectedFinishUs = s.startUs + (int64_t)(_latencyEwma * 1e6);
         s.completion = completion;
+        s.phasesCompletion = nil;
+        s.phaseMode = NO;
+        s.phaseCount = 0;
+        s.sequential = NO;
+        s.ptsA = ptsA;
+        s.ptsB = ptsB;
         s.sourceA = CVPixelBufferRetain(frameA);
     }
     [_metal adoptColorMatrixFromFrame:frameA];
@@ -396,13 +465,19 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
 - (void)processToken:(uint64_t)token {
     SPFRCSlot slot;
     if (![self lookupToken:token slot:&slot]) return;
+    if (slot.phaseMode) {
+        [self processPhaseToken:token];
+        return;
+    }
     if (@available(macOS 15.4, *)) {
         VTFrameProcessorFrame *fa = [[VTFrameProcessorFrame alloc] initWithBuffer:slot.rgbaA
-                                                            presentationTimeStamp:CMTimeMake(0, 48000)];
+                                                            presentationTimeStamp:slot.ptsA];
         VTFrameProcessorFrame *fb = [[VTFrameProcessorFrame alloc] initWithBuffer:slot.rgbaB
-                                                            presentationTimeStamp:CMTimeMake(2002, 48000)];
+                                                            presentationTimeStamp:slot.ptsB];
+        CMTime delta = CMTimeConvertScale(CMTimeSubtract(slot.ptsB, slot.ptsA), 1000000000,
+                                           kCMTimeRoundingMethod_RoundHalfAwayFromZero);
         VTFrameProcessorFrame *fo = [[VTFrameProcessorFrame alloc] initWithBuffer:slot.rgbaOut
-                                                            presentationTimeStamp:CMTimeMake(1001, 48000)];
+                                                            presentationTimeStamp:CMTimeAdd(slot.ptsA, CMTimeMultiplyByFloat64(delta, 0.5))];
         VTFrameRateConversionParameters *params = fa && fb && fo ? [[VTFrameRateConversionParameters alloc]
             initWithSourceFrame:fa nextFrame:fb opticalFlow:nil interpolationPhase:@[@0.5f]
             submissionMode:VTFrameRateConversionParametersSubmissionModeRandom
@@ -475,6 +550,7 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
 
 - (void)completeToken:(uint64_t)token output:(CVPixelBufferRef)output error:(NSError *)error {
     SPFRCEngineCompletion completion = nil;
+    SPFRCPhasesCompletion phasesCompletion = nil;
     CVPixelBufferRef sourceA = nullptr;
     double latency = 0.0;
     SPFRCSlot retired;
@@ -492,8 +568,12 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
         SPFRCSlot &s = _slots[idx];
         latency = (spNowUs() - s.startUs) / 1e6;
         completion = s.completion;
+        phasesCompletion = s.phasesCompletion;
         sourceA = s.sourceA;
         s.completion = nil;
+        s.phasesCompletion = nil;
+        s.phaseMode = NO;
+        s.phaseCount = 0;
         s.sourceA = nullptr;
         s.busy = NO;
         s.token = 0;
@@ -516,8 +596,254 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
     }
     if (closeRetired) [self closeSlot:retired];
     if (sourceA) CVPixelBufferRelease(sourceA);
-    if (completion) completion(token, output, latency, error);
+    if (phasesCompletion) {
+        if (output) CVPixelBufferRelease(output);
+        phasesCompletion(token, nil, latency, error);
+    } else if (completion) completion(token, output, latency, error);
     else if (output) CVPixelBufferRelease(output);
+}
+
+- (BOOL)ensurePhaseBuffersLocked:(SPFRCSlot &)slot {
+    for (int i = 0; i < 3; ++i) {
+        if (slot.phaseRGBA[i]) continue;
+        slot.phaseRGBA[i] = SPFRCCreateRGBA(_metal.width, _metal.height);
+        if (!slot.phaseRGBA[i]) return NO;
+    }
+    return YES;
+}
+
+- (BOOL)submitPhasesWithFrameA:(CVPixelBufferRef)frameA
+                        frameB:(CVPixelBufferRef)frameB
+                        phases:(NSArray<NSNumber *> *)phases
+                    sequential:(BOOL)sequential
+                         token:(uint64_t)token
+                    completion:(SPFRCPhasesCompletion)completion {
+    return [self submitPhasesWithFrameA:frameA frameB:frameB ptsA:CMTimeMake(0, 48000)
+                                  ptsB:CMTimeMake(2002, 48000) phases:phases sequential:sequential token:token completion:completion];
+}
+
+- (BOOL)submitPhasesWithFrameA:(CVPixelBufferRef)frameA
+                        frameB:(CVPixelBufferRef)frameB
+                          ptsA:(CMTime)ptsA
+                          ptsB:(CMTime)ptsB
+                        phases:(NSArray<NSNumber *> *)phases
+                    sequential:(BOOL)sequential
+                         token:(uint64_t)token
+                    completion:(SPFRCPhasesCompletion)completion {
+    if (!frameA || !frameB || !completion || phases.count < 1 || phases.count > 3) return NO;
+    if (!CMTIME_IS_NUMERIC(ptsA) || !CMTIME_IS_NUMERIC(ptsB) || CMTimeCompare(ptsA, ptsB) >= 0) return NO;
+    float values[3] = {};
+    for (NSUInteger i = 0; i < phases.count; ++i) {
+        const float phase = phases[i].floatValue;
+        if (!(phase > 0.f && phase < 1.f)) return NO;
+        for (NSUInteger j = 0; j < i; ++j) {
+            float delta = values[j] - phase;
+            if (delta < 0.f) delta = -delta;
+            if (delta < 1e-4f) return NO;
+        }
+        values[i] = phase;
+    }
+    size_t idx = SIZE_MAX;
+    {
+        std::lock_guard<std::mutex> lock(_mtx);
+        if (_invalidated) return NO;
+        for (size_t i = 0; i < _slots.size(); ++i) {
+            if (!_slots[i].busy && !_slots[i].retiring) { idx = i; break; }
+        }
+        if (idx == SIZE_MAX) return NO;
+        SPFRCSlot &s = _slots[idx];
+        if (![self ensurePhaseBuffersLocked:s]) return NO;
+        s.busy = YES;
+        s.token = token;
+        s.startUs = spNowUs();
+        s.expectedFinishUs = s.startUs + (int64_t)(_latencyEwma * 1e6);
+        s.completion = nil;
+        s.phasesCompletion = completion;
+        s.phaseMode = YES;
+        s.sequential = sequential;
+        s.ptsA = ptsA;
+        s.ptsB = ptsB;
+        s.phaseCount = (int)phases.count;
+        for (int i = 0; i < s.phaseCount; ++i) s.phaseValues[i] = values[i];
+        s.sourceA = CVPixelBufferRetain(frameA);
+    }
+    [_metal adoptColorMatrixFromFrame:frameA];
+    const uint64_t slotToken = token;
+    NSMutableArray *owners = [NSMutableArray array];
+    id<MTLCommandBuffer> cb = [_metal.commandQueue commandBuffer];
+    CVPixelBufferRef rgbaA, rgbaB;
+    {
+        std::lock_guard<std::mutex> lock(_mtx);
+        rgbaA = _slots[idx].rgbaA; rgbaB = _slots[idx].rgbaB;
+    }
+    const BOOL ok = [_metal encodeConvertFrame:frameA toRGBA:rgbaA commandBuffer:cb owners:owners] &&
+                    [_metal encodeConvertFrame:frameB toRGBA:rgbaB commandBuffer:cb owners:owners];
+    if (!ok) {
+        [self completeToken:slotToken output:nullptr error:SPFRCError(6, @"input conversion encode")];
+        return YES;
+    }
+    SPFRCEngine *s = self;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)owners;
+        if (done.status != MTLCommandBufferStatusCompleted) {
+            [s completeToken:slotToken output:nullptr error:SPFRCError(7, @"input conversion GPU")];
+            return;
+        }
+        [s noteConvertGPUSeconds:(done.GPUEndTime - done.GPUStartTime) forToken:slotToken];
+        dispatch_async(s->_q, ^{ [s processToken:slotToken]; });
+    }];
+    [cb commit];
+    return YES;
+}
+
+- (void)processPhaseToken:(uint64_t)token {
+    SPFRCSlot slot;
+    if (![self lookupToken:token slot:&slot]) return;
+    if (@available(macOS 15.4, *)) {
+        if (slot.phaseCount < 1 || slot.phaseCount > 3) {
+            [self completeToken:token output:nullptr error:SPFRCError(8, @"phase count")];
+            return;
+        }
+        VTFrameProcessorFrame *fa = [[VTFrameProcessorFrame alloc] initWithBuffer:slot.rgbaA
+                                                            presentationTimeStamp:slot.ptsA];
+        VTFrameProcessorFrame *fb = [[VTFrameProcessorFrame alloc] initWithBuffer:slot.rgbaB
+                                                            presentationTimeStamp:slot.ptsB];
+        NSMutableArray<NSNumber *> *phases = [NSMutableArray array];
+        NSMutableArray<VTFrameProcessorFrame *> *destinations = [NSMutableArray array];
+        for (int i = 0; i < slot.phaseCount; ++i) {
+            CMTime delta = CMTimeConvertScale(CMTimeSubtract(slot.ptsB, slot.ptsA), 1000000000,
+                                               kCMTimeRoundingMethod_RoundHalfAwayFromZero);
+            CMTime outputPTS = CMTimeAdd(slot.ptsA, CMTimeMultiplyByFloat64(delta, slot.phaseValues[i]));
+            VTFrameProcessorFrame *fo = [[VTFrameProcessorFrame alloc] initWithBuffer:slot.phaseRGBA[i]
+                                                                presentationTimeStamp:outputPTS];
+            if (!fo) {
+                [self completeToken:token output:nullptr error:SPFRCError(8, @"phase destination")];
+                return;
+            }
+            [destinations addObject:fo];
+            [phases addObject:@(slot.phaseValues[i])];
+        }
+        const VTFrameRateConversionParametersSubmissionMode mode = slot.sequential
+            ? VTFrameRateConversionParametersSubmissionModeSequential
+            : VTFrameRateConversionParametersSubmissionModeRandom;
+        VTFrameRateConversionParameters *params = fa && fb ? [[VTFrameRateConversionParameters alloc]
+            initWithSourceFrame:fa nextFrame:fb opticalFlow:nil interpolationPhase:phases
+            submissionMode:mode destinationFrames:destinations] : nil;
+        if (!params) {
+            [self completeToken:token output:nullptr error:SPFRCError(8, @"FRC phase parameters")];
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(_mtx);
+            for (auto &s : _slots) if (s.busy && s.token == token) { s.frcStartUs = spNowUs(); break; }
+        }
+        SPFRCEngine *s = self;
+        [(VTFrameProcessor *)slot.processor processWithParameters:params
+                                               completionHandler:^(id<VTFrameProcessorParameters> p, NSError *err) {
+            (void)p;
+            const int64_t doneUs = spNowUs();
+            dispatch_async(s->_q, ^{
+                {
+                    std::lock_guard<std::mutex> lock(s->_mtx);
+                    for (auto &sl : s->_slots) {
+                        if (!sl.busy || sl.token != token || sl.frcStartUs == 0) continue;
+                        const double core = (doneUs - sl.frcStartUs) / 1e6;
+                        s->_frcCoreEwma = s->_frcCoreEwma <= 0.0 ? core : 0.75 * s->_frcCoreEwma + 0.25 * core;
+                        break;
+                    }
+                }
+                if (err) [s completeToken:token output:nullptr error:err];
+                else [s convertPhaseToken:token];
+            });
+        }];
+        return;
+    }
+    [self completeToken:token output:nullptr error:SPFRCError(1, @"unavailable")];
+}
+
+- (void)convertPhaseToken:(uint64_t)token {
+    SPFRCSlot slot;
+    if (![self lookupToken:token slot:&slot]) return;
+    NSMutableArray<SPOwnedPixelBuffer *> *boxes = [NSMutableArray array];
+    NSMutableArray *owners = [NSMutableArray array];
+    id<MTLCommandBuffer> cb = [_metal.commandQueue commandBuffer];
+    for (int i = 0; i < slot.phaseCount; ++i) {
+        CVPixelBufferRef out = nullptr;
+        const CVReturn r = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
+            kCFAllocatorDefault, _outputPool, (__bridge CFDictionaryRef)_outputAux, &out);
+        if (r != kCVReturnSuccess || !out) {
+            [self completeToken:token output:nullptr
+                          error:SPFRCError(r == kCVReturnWouldExceedAllocationThreshold ? 9 : 10,
+                                           r == kCVReturnWouldExceedAllocationThreshold ? @"output pool exhausted" : @"output alloc")];
+            return;
+        }
+        if (![_metal encodeConvertRGBA:slot.phaseRGBA[i] toFrame:out commandBuffer:cb owners:owners]) {
+            CVPixelBufferRelease(out);
+            [self completeToken:token output:nullptr error:SPFRCError(11, @"output conversion encode")];
+            return;
+        }
+        SPFRCCopyStaticAttachments(slot.sourceA, out, _metal.doviReconstruction);
+        [boxes addObject:[[SPOwnedPixelBuffer alloc] initWithBufferNoCopy:out]];
+    }
+    SPFRCEngine *s = self;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)owners;
+        if (done.status != MTLCommandBufferStatusCompleted) {
+            [s completeToken:token output:nullptr error:SPFRCError(12, @"output conversion GPU")];
+            return;
+        }
+        [s noteConvertGPUSeconds:(done.GPUEndTime - done.GPUStartTime) forToken:token];
+        [s completePhaseToken:token outputs:boxes error:nil];
+    }];
+    [cb commit];
+}
+
+- (void)completePhaseToken:(uint64_t)token
+                   outputs:(NSArray<SPOwnedPixelBuffer *> *)outputs
+                     error:(NSError *)error {
+    SPFRCPhasesCompletion completion = nil;
+    CVPixelBufferRef sourceA = nullptr;
+    double latency = 0.0;
+    SPFRCSlot retired;
+    BOOL closeRetired = NO;
+    {
+        std::lock_guard<std::mutex> lock(_mtx);
+        size_t idx = SIZE_MAX;
+        for (size_t i = 0; i < _slots.size(); ++i) {
+            if (_slots[i].busy && _slots[i].token == token) { idx = i; break; }
+        }
+        if (idx == SIZE_MAX) return;
+        SPFRCSlot &s = _slots[idx];
+        latency = (spNowUs() - s.startUs) / 1e6;
+        completion = s.phasesCompletion;
+        sourceA = s.sourceA;
+        s.completion = nil;
+        s.phasesCompletion = nil;
+        s.phaseMode = NO;
+        s.phaseCount = 0;
+        s.sourceA = nullptr;
+        s.busy = NO;
+        s.token = 0;
+        const double convert = s.convertGpuSec;
+        s.convertGpuSec = 0.0;
+        s.frcStartUs = 0;
+        if (!error) {
+            _completed++;
+            _windowPairs++;
+            _latencyEwma = _latencyEwma <= 0.0 ? latency : (0.75 * _latencyEwma + 0.25 * latency);
+            if (convert > 0.0) _convertGpuEwma = _convertGpuEwma <= 0.0 ? convert : (0.75 * _convertGpuEwma + 0.25 * convert);
+        } else {
+            _failed++;
+        }
+        if (s.retiring) {
+            retired = s;
+            closeRetired = YES;
+            _slots.erase(_slots.begin() + (long)idx);
+        }
+    }
+    if (closeRetired) [self closeSlot:retired];
+    if (sourceA) CVPixelBufferRelease(sourceA);
+    if (completion) completion(token, error ? nil : outputs, latency, error);
 }
 
 @end

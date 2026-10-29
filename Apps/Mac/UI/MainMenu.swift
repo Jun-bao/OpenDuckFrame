@@ -77,6 +77,11 @@ enum MainMenuBuilder {
         fileItem.submenu = fileMenu
         let openItem = NSMenuItem(title: L("menu.open"), action: #selector(PlayerViewController.openDocumentAction(_:)), keyEquivalent: "o")
         fileMenu.addItem(openItem)
+        let workbenchItem = NSMenuItem(title: "Quality Workbench",
+                                       action: #selector(AppDelegate.openQualityWorkbenchAction(_:)),
+                                       keyEquivalent: "e")
+        workbenchItem.keyEquivalentModifierMask = [.command, .shift]
+        fileMenu.addItem(workbenchItem)
 
         let recentItem = NSMenuItem(title: L("menu.recentPlays"), action: nil, keyEquivalent: "")
         let recentMenu = NSMenu(title: L("menu.recentPlays"))
@@ -157,6 +162,9 @@ enum MainMenuBuilder {
             }
             motionItem.submenu = motionMenu
             playMenu.addItem(motionItem)
+            playMenu.addItem(withTitle: "Quality Workbench",
+                             action: #selector(AppDelegate.openQualityWorkbenchAction(_:)),
+                             keyEquivalent: "")
             playMenu.addItem(.separator())
         }
 

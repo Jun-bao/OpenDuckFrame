@@ -6,6 +6,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import "SPFrameGeneration.h"
+#import "SPFileFrameProvider.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -31,6 +32,11 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) sp::SPFrameGeneratorCounters *counters;
 /// Starts a media session by resetting counters, static facts, and the ring.
 - (void)resetForNewMediaWithInfo:(const sp::SPFrameGeneratorMediaInfo &)info;
+/// Queue a file cadence for the next decode-thread mode reset. A failed request
+/// leaves the pending cadence unchanged. mode=1 fixed FPS, 2/3/4 multiplier.
+- (BOOL)configureFileCadenceMode:(NSInteger)mode numerator:(int64_t)numerator denominator:(int64_t)denominator;
+/// Pending provider changes take effect only on the next mode reset. nil selects Apple FRC.
+- (void)setPendingFileProvider:(nullable id<SPFileFrameProvider>)provider;
 /// Decode thread: consumes the +1 source frame unless returning Interrupted,
 /// which leaves ownership with the caller.
 - (sp::PushResult)submitSourceBuffer:(CVPixelBufferRef)buffer

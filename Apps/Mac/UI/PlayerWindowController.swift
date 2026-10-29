@@ -1,13 +1,36 @@
 import AppKit
 
+enum WorkbenchFileDisplayStep: Equatable { case wait, unavailable, exitFullscreen, move, enterFullscreen, done }
+
+enum WorkbenchFileDisplayPolicy {
+    static func next(screenExists: Bool, visible: Bool, miniaturized: Bool, transitioning: Bool,
+                     fullscreen: Bool, sameScreen: Bool, wantsFullscreen: Bool) -> WorkbenchFileDisplayStep {
+        guard screenExists, visible, !miniaturized else { return .unavailable }
+        if transitioning { return .wait }
+        if fullscreen && (!wantsFullscreen || !sameScreen) { return .exitFullscreen }
+        if !fullscreen && !sameScreen { return .move }
+        if !fullscreen && wantsFullscreen { return .enterFullscreen }
+        return .done
+    }
+}
+
 final class PlayerWindowController: NSWindowController, NSWindowDelegate {
+    private struct FileOutputRequest {
+        let id = UUID()
+        let displayID: UInt32
+        let fullscreen: Bool
+        let completion: (Bool, String) -> Void
+    }
+    private enum FileWindowTransition { case entering, exiting }
+    private var fileOutputRequest: FileOutputRequest?
+    private var fileWindowTransition: FileWindowTransition?
     private let playerVC: PlayerViewController
     var playerViewController: PlayerViewController { playerVC }
 
     // Empty windows use the welcome view's fixed 640x360 size. Cold launches
     // and Dock reopens return to this size; opening media lets
     // resizeWindowToVideoAspect choose a larger width within the screen bounds.
-    static let defaultContentSize = WelcomeView.contentSize
+    static let defaultContentSize = NSSize(width: 640, height: 360)
 
     static func mediaContentSize(on screen: NSScreen?) -> NSSize {
         let vis = (screen ?? NSScreen.main)?.visibleFrame.size ?? .zero
@@ -65,12 +88,80 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     var onWillClose: (@MainActor (PlayerWindowController) -> Void)?
 
     func windowWillClose(_ notification: Notification) {
+        cancelWorkbenchFileOutput()
         if let onWillClose {
             onWillClose(self)
         } else {
             playerVC.handleWindowClose()
         }
     }
+
+    private func fileOutputScreen(_ displayID: UInt32) -> NSScreen? {
+        if displayID == 0 { return NSScreen.screens.first ?? NSScreen.main }
+        return NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == displayID }
+    }
+
+    func applyWorkbenchFileOutput(displayID: UInt32, fullscreen: Bool, completion: @escaping (Bool, String) -> Void) {
+        let previous = fileOutputRequest
+        fileOutputRequest = FileOutputRequest(displayID: displayID, fullscreen: fullscreen, completion: completion)
+        previous?.completion(false, "新的输出设置替代了上一次请求。")
+        advanceWorkbenchFileOutput()
+    }
+
+    func cancelWorkbenchFileOutput() {
+        let previous = fileOutputRequest
+        fileOutputRequest = nil
+        previous?.completion(false, "输出切换已取消。")
+    }
+
+    private func finishWorkbenchFileOutput(_ ok: Bool, _ message: String) {
+        let request = fileOutputRequest
+        fileOutputRequest = nil
+        request?.completion(ok, message)
+    }
+
+    private func advanceWorkbenchFileOutput() {
+        guard let request = fileOutputRequest else { return }
+        guard let window else { finishWorkbenchFileOutput(false, "播放器窗口不可用。"); return }
+        let screen = fileOutputScreen(request.displayID)
+        func screenNumber(_ screen: NSScreen?) -> UInt32? {
+            (screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+        }
+        let same = screen != nil && screenNumber(window.screen) == screenNumber(screen)
+        switch WorkbenchFileDisplayPolicy.next(screenExists: screen != nil, visible: window.isVisible,
+                miniaturized: window.isMiniaturized, transitioning: fileWindowTransition != nil,
+                fullscreen: window.styleMask.contains(.fullScreen), sameScreen: same, wantsFullscreen: request.fullscreen) {
+        case .wait: return
+        case .unavailable:
+            finishWorkbenchFileOutput(false, screen == nil ? "所选显示器不可用。" : "播放器窗口不可见或已最小化。")
+        case .exitFullscreen:
+            fileWindowTransition = .exiting; window.toggleFullScreen(nil)
+        case .move:
+            guard let screen else { finishWorkbenchFileOutput(false, "所选显示器不可用。"); return }
+            let area = screen.visibleFrame
+            let width = min(window.frame.width, area.width), height = min(window.frame.height, area.height)
+            guard width > 0, height > 0 else { finishWorkbenchFileOutput(false, "所选显示器尺寸不可用。"); return }
+            window.setFrame(NSRect(x: area.midX-width/2, y: area.midY-height/2, width: width, height: height), display: true)
+            DispatchQueue.main.async { [weak self, weak window] in
+                guard let self, let window, let pending = self.fileOutputRequest, pending.id == request.id else { return }
+                guard let actual = window.screen, let target = self.fileOutputScreen(pending.displayID),
+                      screenNumber(actual) == screenNumber(target) else {
+                    self.finishWorkbenchFileOutput(false, "播放器无法移动到所选显示器。"); return
+                }
+                self.advanceWorkbenchFileOutput()
+            }
+        case .enterFullscreen:
+            fileWindowTransition = .entering; window.toggleFullScreen(nil)
+        case .done: finishWorkbenchFileOutput(true, "")
+        }
+    }
+
+    func windowWillEnterFullScreen(_ notification: Notification) { fileWindowTransition = .entering }
+    func windowDidEnterFullScreen(_ notification: Notification) { fileWindowTransition = nil; advanceWorkbenchFileOutput() }
+    func windowWillExitFullScreen(_ notification: Notification) { fileWindowTransition = .exiting }
+    func windowDidExitFullScreen(_ notification: Notification) { fileWindowTransition = nil; advanceWorkbenchFileOutput() }
+    func windowDidFailToEnterFullScreen(_ window: NSWindow) { fileWindowTransition = nil; finishWorkbenchFileOutput(false, "播放器无法进入全屏。") }
+    func windowDidFailToExitFullScreen(_ window: NSWindow) { fileWindowTransition = nil; finishWorkbenchFileOutput(false, "播放器无法退出全屏。") }
 
     func open(url: URL) {
 

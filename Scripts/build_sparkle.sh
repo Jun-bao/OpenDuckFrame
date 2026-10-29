@@ -6,6 +6,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Dependency recipes replace DEVELOPER_DIR with `xcode-select -p`. On this
+# machine that is Command Line Tools, which has no xcodebuild. Keep a caller
+# supplied full Xcode for the Sparkle schemes only; compiler paths used by the
+# recipe hash stay on the reset environment.
+CALLER_DEVELOPER_DIR="${DEVELOPER_DIR:-}"
 # shellcheck source=lib/build_common.sh
 source "$SCRIPT_DIR/lib/build_common.sh"
 sp_reset_build_env
@@ -68,8 +73,14 @@ build_scheme() {
   echo "==> Building Sparkle scheme: $scheme"
   # build_common exports compiler variables for Make/Meson recipes. xcodebuild
   # interprets those names as build-setting overrides, so remove them here.
+  local xcode_dev="${DEVELOPER_DIR:-}"
+  if [ ! -x "${xcode_dev}/usr/bin/xcodebuild" ] && [ -n "$CALLER_DEVELOPER_DIR" ] && [ -x "${CALLER_DEVELOPER_DIR}/usr/bin/xcodebuild" ]; then
+    xcode_dev="$CALLER_DEVELOPER_DIR"
+  fi
+  [ -x "${xcode_dev}/usr/bin/xcodebuild" ] || sp_die "xcodebuild is not in the active developer directory; pass DEVELOPER_DIR for a full Xcode"
   if ! env -u LD -u CC -u CXX -u AR -u RANLIB -u STRIP \
-      /usr/bin/xcodebuild -project "$SOURCE/Sparkle.xcodeproj" \
+      DEVELOPER_DIR="$xcode_dev" \
+      /usr/bin/xcodebuild -jobs 6 -project "$SOURCE/Sparkle.xcodeproj" \
       -scheme "$scheme" -configuration Release \
       -derivedDataPath "$DERIVED" \
       -clonedSourcePackagesDirPath "$SPM_CACHE" \

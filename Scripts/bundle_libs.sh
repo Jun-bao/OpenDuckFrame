@@ -81,6 +81,7 @@ BIN="$CLEAN_APP/Contents/MacOS/$APP_EXECUTABLE"
 FW="$CLEAN_APP/Contents/Frameworks"
 MAIN_INFO="$CLEAN_APP/Contents/Info.plist"
 
+
 # The tracked source plist remains channel-neutral. Add updater configuration
 # only to the clean direct-distribution bundle, before the outer signature is
 # created. Blank configuration removes every SU key and keeps the updater inert.
@@ -121,6 +122,43 @@ fi
 mkdir -p "$FW"
 find "$FW" -maxdepth 1 -type f -delete
 cp "$LIBASS" "$FW/libass.9.dylib"
+DISTIL_RUNTIME="$ROOT/.build/distil-runtime"
+if [ -d "$DISTIL_RUNTIME" ]; then
+  python3 - "$DISTIL_RUNTIME" <<'PY'
+import hashlib, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+model = root / 'DistilDRBA_720p.mlmodelc'
+expected = json.loads((root / 'SHA256.json').read_text())
+files = [p for p in model.rglob('*') if p.is_file()]
+if not model.is_dir() or any(p.is_symlink() for p in model.rglob('*')):
+    raise SystemExit('Distil model missing or contains symlinks')
+actual = {str(p.relative_to(model)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
+if actual != expected or not actual:
+    raise SystemExit('Distil model hash inventory mismatch')
+PY
+  ditto "$DISTIL_RUNTIME/DistilDRBA_720p.mlmodelc" "$CLEAN_APP/Contents/Resources/DistilDRBA_720p.mlmodelc"
+fi
+ANIME_RUNTIME="$ROOT/.build/anime4k-runtime"
+if [ -d "$ANIME_RUNTIME" ]; then
+  [ -f "$ANIME_RUNTIME/SHA256.txt" ] || { echo "Anime4K runtime has no hash inventory" >&2; exit 1; }
+  shasum -a 256 -c "$ANIME_RUNTIME/SHA256.txt" >/dev/null
+  for library in libplacebo.360.dylib libshaderc_shared.1.dylib liblcms2.2.dylib libMoltenVK.dylib; do
+    [ -f "$ANIME_RUNTIME/$library" ] || { echo "Anime4K runtime missing $library" >&2; exit 1; }
+    cp "$ANIME_RUNTIME/$library" "$FW/$library"
+  done
+fi
+CUGAN_RUNTIME="$ROOT/.build/realcugan-runtime"
+if [ -d "$CUGAN_RUNTIME" ]; then
+  [ -f "$CUGAN_RUNTIME/SHA256.txt" ] || { echo "Real-CUGAN runtime has no hash inventory" >&2; exit 1; }
+  shasum -a 256 -c "$CUGAN_RUNTIME/SHA256.txt" >/dev/null
+  [ -f "$CUGAN_RUNTIME/libkhua_realcugan.dylib" ] && [ -f "$CUGAN_RUNTIME/libMoltenVK.dylib" ] || { echo "Real-CUGAN runtime is incomplete" >&2; exit 1; }
+  if [ -f "$FW/libMoltenVK.dylib" ]; then
+    cmp -s "$FW/libMoltenVK.dylib" "$CUGAN_RUNTIME/libMoltenVK.dylib" || { echo "Anime4K and Real-CUGAN MoltenVK versions differ" >&2; exit 1; }
+  else
+    cp "$CUGAN_RUNTIME/libMoltenVK.dylib" "$FW/libMoltenVK.dylib"
+  fi
+  cp "$CUGAN_RUNTIME/libkhua_realcugan.dylib" "$FW/libkhua_realcugan.dylib"
+fi
 chmod u+w "$FW/libass.9.dylib"
 install_name_tool -id "@rpath/libass.9.dylib" "$FW/libass.9.dylib"
 BIN_RPATHS="$(otool -l "$BIN" | awk '

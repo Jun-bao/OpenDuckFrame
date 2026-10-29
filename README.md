@@ -1,3 +1,5 @@
+> **Private workbench development snapshot:** this organization repository includes the enhancement workbench changes. It is not a validated release. See [current status and known limitations](docs/workbench-status.md).
+
 <img src="Design/AppIcon/AppIcon.appiconset/AppIcon-128.png" width="96" height="96" alt="Khua Player app icon">
 
 # Khua Player

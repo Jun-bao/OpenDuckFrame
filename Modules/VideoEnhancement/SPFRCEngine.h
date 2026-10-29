@@ -3,6 +3,7 @@
 // finish after invalidation but discard their results. The planner uses
 // measured end-to-end latency to check presentation deadlines.
 #import <CoreVideo/CoreVideo.h>
+#import <CoreMedia/CoreMedia.h>
 #import <Foundation/Foundation.h>
 #import "SPFrameBudgetMetal.h"
 
@@ -12,6 +13,26 @@ NS_ASSUME_NONNULL_BEGIN
 /// NULL with an error. The callback may run on any thread; do not block.
 typedef void (^SPFRCEngineCompletion)(uint64_t token, CVPixelBufferRef _Nullable midpoint,
                                       double latencySec, NSError *_Nullable error);
+
+/// Matches the VideoToolbox quality values without exposing that header here.
+typedef NS_ENUM(NSInteger, SPFRCQuality) {
+    SPFRCQualityNormal = 1,
+    SPFRCQualityHigh = 2,
+};
+
+/// Owns one +1 CVPixelBuffer and releases it.
+@interface SPOwnedPixelBuffer : NSObject
+- (instancetype)initWithBufferNoCopy:(CVPixelBufferRef)buffer;
+/// Retains `buffer`, then takes that extra retain. Safe for Swift ARC callers.
+- (instancetype)initRetainingBuffer:(CVPixelBufferRef)buffer;
+@property (nonatomic, readonly) CVPixelBufferRef buffer;
+@end
+
+/// `outputs` elements each own a +1 buffer. The callback may run on any thread.
+typedef void (^SPFRCPhasesCompletion)(uint64_t token,
+                                      NSArray<SPOwnedPixelBuffer *> *_Nullable outputs,
+                                      double latencySec,
+                                      NSError *_Nullable error);
 
 @interface SPFRCEngine : NSObject
 
@@ -23,10 +44,16 @@ typedef void (^SPFRCEngineCompletion)(uint64_t token, CVPixelBufferRef _Nullable
 + (void)resolveAvailabilityAsync;
 
 /// sessions is in [1,8]. Exceeding outputCapacity fails that pair.
+/// The quality initializer is designated. The original initializer uses Normal.
 - (nullable instancetype)initWithMetal:(SPFrameBudgetMetal *)metal
                               sessions:(unsigned)sessions
                         outputCapacity:(NSUInteger)outputCapacity
+                               quality:(SPFRCQuality)quality
                                  error:(NSError **)error NS_DESIGNATED_INITIALIZER;
+- (nullable instancetype)initWithMetal:(SPFrameBudgetMetal *)metal
+                              sessions:(unsigned)sessions
+                        outputCapacity:(NSUInteger)outputCapacity
+                                 error:(NSError **)error;
 - (instancetype)init NS_UNAVAILABLE;
 
 @property (nonatomic, readonly) SPFrameBudgetMetal *metal;
@@ -51,10 +78,36 @@ typedef void (^SPFRCEngineCompletion)(uint64_t token, CVPixelBufferRef _Nullable
 - (void)flushIdleOutputBuffers;
 
 /// Keep A/B alive until completion. NO means no free slot or invalidation.
+/// This path always requests the single 1/2 phase used by file playback.
 - (BOOL)submitPairWithFrameA:(CVPixelBufferRef)frameA
                       frameB:(CVPixelBufferRef)frameB
                        token:(uint64_t)token
                   completion:(SPFRCEngineCompletion)completion;
+
+- (BOOL)submitPairWithFrameA:(CVPixelBufferRef)frameA
+                      frameB:(CVPixelBufferRef)frameB
+                        ptsA:(CMTime)ptsA
+                        ptsB:(CMTime)ptsB
+                       token:(uint64_t)token
+                  completion:(SPFRCEngineCompletion)completion;
+
+/// One original pair, up to three phases, one destination each. Phases must be
+/// in (0,1). Sequential is only valid when this pair continues the previous one.
+- (BOOL)submitPhasesWithFrameA:(CVPixelBufferRef)frameA
+                        frameB:(CVPixelBufferRef)frameB
+                        phases:(NSArray<NSNumber *> *)phases
+                    sequential:(BOOL)sequential
+                         token:(uint64_t)token
+                    completion:(SPFRCPhasesCompletion)completion;
+
+- (BOOL)submitPhasesWithFrameA:(CVPixelBufferRef)frameA
+                        frameB:(CVPixelBufferRef)frameB
+                          ptsA:(CMTime)ptsA
+                          ptsB:(CMTime)ptsB
+                        phases:(NSArray<NSNumber *> *)phases
+                    sequential:(BOOL)sequential
+                         token:(uint64_t)token
+                    completion:(SPFRCPhasesCompletion)completion;
 
 /// Remaining in-flight seconds per slot (idle is zero); count is at most 8.
 - (void)copySlotBusyRemaining:(double *)out count:(unsigned)count;

@@ -2,7 +2,7 @@ import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     // One window owns each media session. Closing a non-final window destroys
-    // it; closing the final window keeps a hidden welcome window for Dock reopen.
+    // it; closing the final media window returns to the workbench.
     // After launch the registry therefore remains nonempty.
     private var windowControllers: [PlayerWindowController] = []
 
@@ -30,9 +30,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         wc.playerViewController.handleWindowClose(destroyingWindow: !isLast)
         if isLast, #available(macOS 26.0, *), let notice = CaptionTaskCenter.shared.backgroundNotice {
 
-            wc.playerViewController.showWelcomeNotice(notice)
+            EnhancementWorkbenchController.shared.showNotice(notice)
         }
-        guard !isLast else { return }
+        if isLast {
+            DispatchQueue.main.async { EnhancementWorkbenchController.shared.showWorkbench() }
+            return
+        }
 
         wc.window?.delegate = nil
         wc.window?.contentViewController = nil
@@ -69,6 +72,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             ?? windowControllers.first { $0.window?.isMainWindow ?? false }
             ?? windowControllers.first
         guard let wc else { return }
+
+        if !wc.playerViewController.hasOpenMedia {
+            EnhancementWorkbenchController.shared.showWorkbench()
+            EnhancementWorkbenchController.shared.chooseFile()
+            return
+        }
 
         if !(wc.window?.isVisible ?? false) {
             wc.showWindowForReopen()
@@ -112,7 +121,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
         if !didFinishLaunchingCompleted {
             spLaunchMark("odoc 送达（文件路径此刻才可知）")
-            recordLaunchKind(bare: false)
 
             if urls.contains(where: { !SPSubtitleAutoload.isSubtitleFile($0) }) { launchOpensMedia = true }
         }
@@ -158,55 +166,179 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func applicationWillFinishLaunching(_ notification: Notification) {
         spLaunchMark("willFinishLaunching 入口")
 
-        let speculativeBare = spCLIFilePath == nil &&
-            (UserDefaults.standard.object(forKey: Self.bareLaunchHintKey) as? Bool ?? true)
-
-        let wc = makeWindowController(deferCore: speculativeBare, mediaSize: !speculativeBare)
+        let wc = makeWindowController(deferCore: spCLIFilePath == nil, mediaSize: spCLIFilePath != nil)
         spLaunchMark("窗口已创建（含 loadView/渲染器，未亮相）")
 
         if let path = spCLIFilePath {
             cliOpenIssued = true
             wc.open(url: URL(fileURLWithPath: path, isDirectory: false))
             spLaunchMark("窗口已 show（CLI 打开路径）")
-        } else if speculativeBare {
-
-            spLaunchMark("投机欢迎窗开始（上次为裸启动）")
-            wc.playerViewController.showEmptyState()
-            wc.showWindow(nil)
-            spLaunchMark("欢迎窗已 show（投机提前）")
-
-            DispatchQueue.main.async { [weak wc] in
-                wc?.playerViewController.ensureCore()
-            }
-        } else {
-
-            WelcomeView.prewarmTexture(scale: wc.window?.backingScaleFactor
-                                       ?? NSScreen.main?.backingScaleFactor ?? 2.0,
-                                       qos: .utility)
         }
     }
 
-    private static let bareLaunchHintKey = WelcomeView.bareLaunchHintKey
-    private func recordLaunchKind(bare: Bool) {
-        UserDefaults.standard.set(bare, forKey: Self.bareLaunchHintKey)
-    }
-
-    func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool { true }
-
     func applicationOpenUntitledFile(_ sender: NSApplication) -> Bool {
         spLaunchMark("openUntitledFile 信号")
-        guard let wc = windowControllers.first, !cliOpenIssued else { return true }
-
-        guard !windowControllers.contains(where: { $0.window?.isVisible ?? false }) else { return true }
-        recordLaunchKind(bare: true)
-        wc.playerViewController.showEmptyState()
-        wc.showWindow(nil)
-        spLaunchMark("欢迎窗已 show（untitled 提前）")
         return true
+    }
+
+    @MainActor func openPlayerFileFromWorkbench(_ url: URL) {
+        _ = openInWindow(url: url)
+        ensureMainMenu()
+    }
+
+    @MainActor @objc func openQualityWorkbenchAction(_ sender: Any?) {
+        EnhancementWorkbenchController.shared.showWorkbench()
+    }
+
+    private var enhancementSelfTest: Bool {
+        CommandLine.arguments.contains("--khua-enhancement-selftest")
+    }
+
+    private var sessionContract: Bool {
+        CommandLine.arguments.contains("--khua-session-contract")
+    }
+
+    private var engineProbe: Bool {
+        CommandLine.arguments.contains("--khua-engine-probe")
+    }
+
+    private var srPipelineContract: Bool {
+        CommandLine.arguments.contains("--khua-sr-pipeline-contract")
+    }
+    private var videoSRPipelineContract: Bool {
+        CommandLine.arguments.contains("--khua-video-sr-pipeline-contract")
+    }
+    private var anime4KPipelineContract: Bool {
+        CommandLine.arguments.contains("--khua-anime4k-pipeline-contract")
+    }
+    private var cuganPipelineContract: Bool {
+        CommandLine.arguments.contains("--khua-realcugan-pipeline-contract")
+    }
+
+    func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
+        !enhancementSelfTest && !sessionContract && !engineProbe && !srPipelineContract && !videoSRPipelineContract && !anime4KPipelineContract && !cuganPipelineContract
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         spLaunchMark("didFinishLaunching 入口")
+        let args = CommandLine.arguments
+        if cuganPipelineContract {
+            let output = args.firstIndex(of: "--khua-realcugan-pipeline-contract").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil } ?? "/tmp/khua-realcugan-pipeline-contract.json"
+            DispatchQueue.global(qos: .userInitiated).async {
+                var report = SPLiveProcessor.runRealCUGANPipelineContract() as? [String: Any] ?? [:]
+                var profile = EnhancementProfile(); profile.scaleEnabled = true; profile.scaleEngineID = "realcugan"; profile.scaleQualityID = "medium"; profile.outputWidth = 0; profile.outputHeight = 0
+                let data = try? JSONEncoder().encode(profile); let decoded = data.flatMap { try? JSONDecoder().decode(EnhancementProfile.self, from: $0) }
+                let profileOK = decoded == profile
+                var object = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+                object.removeValue(forKey: "scaleQualityID")
+                let legacyData = try? JSONSerialization.data(withJSONObject: object)
+                var expectedLegacy = profile; expectedLegacy.scaleQualityID = "none"
+                let legacyOK = legacyData.flatMap { EnhancementProfileStore.decode($0, fallbackName: "默认") } == expectedLegacy
+                report["profileCodingRoundTrip"] = profileOK; report["legacyProfileMigration"] = legacyOK
+                report["ok"] = (report["ok"] as? Bool == true) && profileOK && legacyOK
+                if let result = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) { try? result.write(to: URL(fileURLWithPath: output)) }
+                exit((report["ok"] as? Bool) == true ? 0 : 1)
+            }
+            return
+        }
+        if anime4KPipelineContract {
+            let output = args.firstIndex(of: "--khua-anime4k-pipeline-contract").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil } ?? "/tmp/khua-anime4k-pipeline-contract.json"
+            DispatchQueue.global(qos: .userInitiated).async {
+                var report = SPLiveProcessor.runAnime4KPipelineContract() as? [String: Any] ?? [:]
+                var profile = EnhancementProfile(); profile.scaleEnabled = true; profile.scaleEngineID = "anime4k"; profile.outputWidth = 0; profile.outputHeight = 0
+                let data = try? JSONEncoder().encode(profile); let decoded = data.flatMap { try? JSONDecoder().decode(EnhancementProfile.self, from: $0) }
+                let profileOK = decoded == profile; report["profileCodingRoundTrip"] = profileOK; report["ok"] = (report["ok"] as? Bool == true) && profileOK
+                if let result = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) { try? result.write(to: URL(fileURLWithPath: output)) }
+                exit((report["ok"] as? Bool) == true ? 0 : 1)
+            }
+            return
+        }
+        if videoSRPipelineContract {
+            let output = args.firstIndex(of: "--khua-video-sr-pipeline-contract").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil } ?? "/tmp/khua-video-sr-pipeline-contract.json"
+            DispatchQueue.global(qos: .userInitiated).async {
+                var report = SPLiveProcessor.runVideoSRPipelineContract() as? [String: Any] ?? [:]
+                var profile = EnhancementProfile()
+                profile.scaleEnabled = true; profile.scaleEngineID = "apple.video-sr"; profile.outputWidth = 1920; profile.outputHeight = 1080
+                let data = try? JSONEncoder().encode(profile)
+                let decoded = data.flatMap { try? JSONDecoder().decode(EnhancementProfile.self, from: $0) }
+                let profileOK = decoded == profile
+                report["profileCodingRoundTrip"] = profileOK
+                report["ok"] = (report["ok"] as? Bool == true) && profileOK
+                if let result = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) { try? result.write(to: URL(fileURLWithPath: output)) }
+                exit((report["ok"] as? Bool) == true ? 0 : 1)
+            }
+            return
+        }
+        if srPipelineContract {
+            let output = args.firstIndex(of: "--khua-sr-pipeline-contract").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil } ?? "/tmp/khua-sr-pipeline-contract.json"
+            DispatchQueue.global(qos: .userInitiated).async {
+                var report = SPLiveProcessor.runSRPipelineContract() as? [String: Any] ?? [:]
+                var profile = EnhancementProfile()
+                profile.scaleEnabled = true
+                profile.scaleEngineID = "apple.low-sr"
+                profile.outputWidth = 1920
+                profile.outputHeight = 1080
+                let data = try? JSONEncoder().encode(profile)
+                let decoded = data.flatMap { try? JSONDecoder().decode(EnhancementProfile.self, from: $0) }
+                let profileOK = decoded == profile
+                report["profileCodingRoundTrip"] = profileOK
+                report["ok"] = (report["ok"] as? Bool == true) && profileOK
+                if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: URL(fileURLWithPath: output)) }
+                exit((report["ok"] as? Bool) == true ? 0 : 1)
+            }
+            return
+        }
+        if let index = args.firstIndex(of: "--khua-live-log"), args.indices.contains(index + 1) {
+            EnhancementWorkbenchController.liveLogPath = args[index + 1]
+        }
+        if engineProbe {
+            let output = args.firstIndex(of: "--khua-engine-probe").flatMap { index in
+                args.indices.contains(index + 1) ? args[index + 1] : nil
+            } ?? "/tmp/khua-engine-probe.json"
+            DispatchQueue.global(qos: .userInitiated).async {
+                let report = SPLiveProcessor.runEngineProbe() as? [String: Any] ?? [:]
+                let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+                if let data { try? data.write(to: URL(fileURLWithPath: output)) }
+                exit((report["ok"] as? Bool) == true ? 0 : 1)
+            }
+            return
+        }
+        if sessionContract {
+            let output = args.firstIndex(of: "--khua-session-contract").flatMap { index in
+                args.indices.contains(index + 1) ? args[index + 1] : nil
+            } ?? "/tmp/khua-session-contract.json"
+            DispatchQueue.global(qos: .userInitiated).async {
+                var report = SPLiveProcessor.runSessionContract() as? [String: Any] ?? [:]
+                report["copyIsolation"] = WindowCaptureSource.copyIsolationCheck()
+                let copyOK = (report["copyIsolation"] as? [String: Any])?["ok"] as? Bool == true
+                let contractOK = (report["ok"] as? Bool) == true && copyOK
+                report["ok"] = contractOK
+                let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+                if let data { try? data.write(to: URL(fileURLWithPath: output)) }
+                exit(contractOK ? 0 : 1)
+            }
+            return
+        }
+        if enhancementSelfTest {
+            let args = CommandLine.arguments
+            let output = args.firstIndex(of: "--khua-enhancement-selftest").flatMap { index in
+                args.indices.contains(index + 1) ? args[index + 1] : nil
+            } ?? "/tmp/khua-enhancement-probe.json"
+            DispatchQueue.global(qos: .userInitiated).async {
+                var report = SPLiveProcessor.runProbe() as? [String: Any] ?? [:]
+                report["profileRoundTrip"] = EnhancementProfileStore.roundTripForTest()
+                let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+                if let data { try? data.write(to: URL(fileURLWithPath: output)) }
+                let combination = report["combination"] as? [String: Any]
+                let phases = report["phases"] as? [String: Any]
+                let pixelsOK = (combination?["ok"] as? Bool) == true
+                let phasesOK = (phases?["x3Count"] as? Int) == 2 && (phases?["x4Count"] as? Int) == 3
+                let scheduleOK = (report["scheduleFailures"] as? Int) == 0
+                let profileOK = (report["profileRoundTrip"] as? Bool) == true
+                exit(pixelsOK && phasesOK && scheduleOK && profileOK ? 0 : 1)
+            }
+            return
+        }
         guard let wc = windowControllers.first else { return }
         if cliOpenIssued { launchOpensMedia = true }
 
@@ -216,15 +348,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             openURLBatch(urls)
         }
 
-        if !windowControllers.contains(where: { $0.window?.isVisible ?? false }) {
-            recordLaunchKind(bare: true)
-            wc.playerViewController.showEmptyState()
-            wc.showWindow(nil)
-            spLaunchMark("欢迎窗已 show（一次成型）")
-        }
+        let showWorkbench = !launchOpensMedia || !windowControllers.contains(where: { $0.window?.isVisible ?? false })
         didFinishLaunchingCompleted = true
 
         NSApp.activate(ignoringOtherApps: true)
+        if showWorkbench {
+            wc.window?.orderOut(nil)
+            EnhancementWorkbenchController.shared.showWorkbench()
+        }
 
         // Direct-distribution updates only. An unconfigured build does not load
         // Sparkle or make a network request.
@@ -285,14 +416,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         return .terminateNow
     }
 
-    // A Dock reopen with no visible windows shows a clean empty window. Closing
-    // a window ends that active session, while reopening the same file later can
-    // still use its saved resume position.
+    // Reopen an existing media session, or return to the workbench when idle.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
 
-        if !flag, let wc = windowControllers.first {
-            wc.showWindowForReopen()
-            fireReopenTestClickIfArmed(wc)
+        if !flag {
+            if let wc = windowControllers.first(where: { $0.playerViewController.hasOpenMedia }) {
+                wc.showWindowForReopen()
+            } else {
+                EnhancementWorkbenchController.shared.showWorkbench()
+            }
         }
         return true
     }

@@ -1,0 +1,7 @@
+RIFE Metal is cinemore/rife-metal version 0.1.8.
+Tag v0.1.8 resolves to commit 06c9fc236c47a51ed08bf534854d4c67ae3eeefc.
+The library is Apache-2.0. See rife-metal-Apache-2.0.txt.
+The bundled rife-v4.25.rmw weights are Practical-RIFE v4.25 by hzwer, MIT.
+See rife-metal-THIRD-PARTY.md.
+rife-v4.26 is a separate weight file bundled with Khua, not a renamed 4.25 model.
+See rife-v4.26-SOURCE.txt for its source, license and checksum.

@@ -1,0 +1,40 @@
+diff --git a/src/gpu.cpp b/src/gpu.cpp
+index 773a659..cc9521c 100644
+--- a/src/gpu.cpp
++++ b/src/gpu.cpp
+@@ -914,6 +914,7 @@ int create_gpu_instance()
+ #endif // ENABLE_VALIDATION_LAYER
+ 
+     std::vector<const char*> enabledExtensions;
++    bool khuaPortabilityEnumeration = false;
+ 
+     uint32_t instanceExtensionPropertyCount;
+     ret = vkEnumerateInstanceExtensionProperties(NULL, &instanceExtensionPropertyCount, NULL);
+@@ -941,6 +942,8 @@ int create_gpu_instance()
+     for (uint32_t j = 0; j < instanceExtensionPropertyCount; j++)
+     {
+         const VkExtensionProperties& exp = instanceExtensionProperties[j];
++        if (strcmp(exp.extensionName, "VK_KHR_portability_enumeration") == 0)
++            khuaPortabilityEnumeration = true;
+         //         NCNN_LOGE("instance extension %s = %u", exp.extensionName, exp.specVersion);
+ 
+         if (strcmp(exp.extensionName, "VK_KHR_external_memory_capabilities") == 0)
+@@ -959,6 +962,9 @@ int create_gpu_instance()
+ #endif // __ANDROID_API__ >= 26
+     }
+ 
++    if (khuaPortabilityEnumeration)
++        enabledExtensions.push_back("VK_KHR_portability_enumeration");
++
+     if (support_VK_KHR_external_memory_capabilities)
+         enabledExtensions.push_back("VK_KHR_external_memory_capabilities");
+     if (support_VK_KHR_get_physical_device_properties2)
+@@ -1003,7 +1009,7 @@ int create_gpu_instance()
+     VkInstanceCreateInfo instanceCreateInfo;
+     instanceCreateInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+     instanceCreateInfo.pNext = 0;
+-    instanceCreateInfo.flags = 0;
++    instanceCreateInfo.flags = khuaPortabilityEnumeration ? 0x00000001 : 0;
+     instanceCreateInfo.pApplicationInfo = &applicationInfo;
+     instanceCreateInfo.enabledLayerCount = enabledLayers.size();
+     instanceCreateInfo.ppEnabledLayerNames = enabledLayers.data();

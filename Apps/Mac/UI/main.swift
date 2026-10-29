@@ -38,18 +38,6 @@ let spCLIFilePath: String? = {
 #endif
 }()
 
-if spCLIFilePath == nil,
-   !(UserDefaults.standard.object(forKey: WelcomeView.bareLaunchHintKey) as? Bool ?? true) {
-    SPPrewarmVideoDecoders()
-}
-
-if spCLIFilePath == nil,
-   UserDefaults.standard.object(forKey: WelcomeView.bareLaunchHintKey) as? Bool ?? true {
-    WelcomeView.prewarmTexture(scale: NSScreen.main?.backingScaleFactor ?? 2.0)
-
-    RecentPlaysWarmer.wakeRecentVolumesAtLaunch()
-}
-
 let app = NSApplication.shared
 
 app.appearance = NSAppearance(named: .darkAqua)

@@ -64,6 +64,7 @@ struct SPInterpolationRoutingContext {
     double playbackRate = 1.0;
     double videoFPS = 0.0;
     double displayMaximumFPS = 60.0;
+    bool enforceDisplayLimit = true;
     uint32_t width = 0;
     uint32_t height = 0;
     bool supportedPixelFormat = false;
@@ -84,7 +85,7 @@ constexpr SPInterpolationPolicyCode spEvaluateInterpolationRouting(
     if (context.playbackRate > 1.0001) {
         return SPInterpolationPolicyCode::FastPlayback;
     }
-    if (context.videoFPS > 0.0 &&
+    if (context.enforceDisplayLimit && context.videoFPS > 0.0 &&
         context.videoFPS * 2.0 * context.playbackRate >
             context.displayMaximumFPS + 0.5) {
         return SPInterpolationPolicyCode::DisplayCadence;

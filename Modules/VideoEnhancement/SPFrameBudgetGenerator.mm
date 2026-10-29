@@ -5,6 +5,7 @@
 #import "SPInterpolationRoutingPolicy.hpp"
 #import "SPMotionFrameCompatibility.hpp"
 #import "SPRuntimeGates.hpp"
+#import "SPFileCadence.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -13,6 +14,7 @@
 #include <cstdlib>
 #include <deque>
 #include <mutex>
+#include <memory>
 #include <pthread.h>
 #include <thread>
 #include <vector>
@@ -28,7 +30,13 @@ extern "C" {
 
 using namespace sp;
 
+struct SPBudgetPreviousSource {
+    CVPixelBufferRef buffer; int64_t ptsUs;
+    SPBudgetPreviousSource(CVPixelBufferRef b,int64_t pts):buffer(CVPixelBufferRetain(b)),ptsUs(pts) {}
+    ~SPBudgetPreviousSource(){CVPixelBufferRelease(buffer);}
+};
 struct SPBudgetEntry {
+    std::shared_ptr<SPBudgetPreviousSource> preceding;
     CVPixelBufferRef buffer = nullptr;
     int64_t ptsUs = 0;
     int64_t generation = 0;
@@ -44,6 +52,12 @@ struct SPBudgetEntry {
     SPBudgetPair pair;
     int64_t deltaUs = 0;
     CVPixelBufferRef synth = nullptr;
+    // File cadence adaptation: output schedule is attached to the original
+    // pair and never uses a previously generated frame as model input.
+    bool scheduledSource = true;
+    bool usesFileCadence = false;
+    std::vector<SPFileCadenceEvent> scheduledBetween;
+    std::vector<CVPixelBufferRef> generatedBetween;
     int64_t submitUs = 0;
 };
 
@@ -79,8 +93,8 @@ static uint64_t spBudgetBytesPerFrame(uint32_t width, uint32_t height, OSType fo
     return eightBit ? px * 3 / 2 : px * 3;
 }
 
-static inline int64_t spBudgetRunwayUs(size_t depth, int64_t intervalUs) {
-    return depth > 1 ? (int64_t)(depth - 1) * intervalUs / 2 : 0;
+static inline int64_t spBudgetRunwayUs(size_t depth, int64_t outputIntervalUs) {
+    return depth > 1 ? (int64_t)(depth - 1) * outputIntervalUs : 0;
 }
 
 static double spPhysFootprintGB(void) {
@@ -137,6 +151,11 @@ struct SPBudgetEmitStat { uint8_t covered = 0; uint8_t toggled = 0; float benefi
     std::mutex _mtx;
     std::condition_variable _cv;
     std::deque<SPBudgetEntry> _ring;
+    SPRateRequest _pendingFileRate;
+    SPRateRequest _activeFileRate;
+    SPFileCadence _fileCadence;
+    bool _fileCadenceStarted;
+    bool _cadenceLimitReported;
     size_t _ringCapacity;
     uint64_t _seq;
     std::deque<SPBudgetReturned> _returned;
@@ -157,6 +176,8 @@ struct SPBudgetEmitStat { uint8_t covered = 0; uint8_t toggled = 0; float benefi
     dispatch_queue_t _work;
     SPFrameBudgetMetal *_metal;
     SPFRCEngine *_engine;
+    id<SPFileFrameProvider> _pendingFileProvider, _activeFileProvider;
+    bool _fileProviderBusy, _fileProviderFailed;
     int _engineState;
     uint64_t _engineEpoch;
     uint64_t _engineBuildSeq;
@@ -383,6 +404,21 @@ struct SPBudgetEmitStat { uint8_t covered = 0; uint8_t toggled = 0; float benefi
 }
 
 - (SPFrameGeneratorCounters *)counters { return &_counters; }
+
+- (BOOL)configureFileCadenceMode:(NSInteger)mode numerator:(int64_t)numerator denominator:(int64_t)denominator {
+    SPRateRequest request;
+    if (mode == 1) {
+        if (numerator <= 0 || denominator <= 0 || (__int128)numerator > (__int128)240 * denominator) return NO;
+        request.kind = SPRateKind::FixedFPS;
+        request.fps = spMake(numerator, denominator);
+    } else if (mode >= 2 && mode <= 4) {
+        request.kind = SPRateKind::Multiplier;
+        request.multiplier = (int)mode;
+    } else return NO;
+    std::lock_guard<std::mutex> lock(_mtx);
+    _pendingFileRate = request;
+    return YES;
+}
 - (size_t)pendingSourceFrameCount {
     std::lock_guard<std::mutex> lock(_mtx);
 
@@ -402,6 +438,8 @@ struct SPBudgetEmitStat { uint8_t covered = 0; uint8_t toggled = 0; float benefi
     {
         std::lock_guard<std::mutex> lock(_mtx);
         _engineEpoch++;
+        _fileCadenceStarted = false;
+        _cadenceLimitReported = false;
         _bytesPerFrame = spBudgetBytesPerFrame((uint32_t)std::max(info.videoWidth, 1), (uint32_t)std::max(info.videoHeight, 1), 0);
         _doviEnhancementBytes = 0;
         [self applyRingCapacityLocked];
@@ -460,6 +498,10 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
         CVPixelBufferRelease(e.synth);
         e.synth = nullptr;
     }
+    for (CVPixelBufferRef b : e.generatedBetween) {
+        if (b) { _counters.dropped.fetch_add(1); CVPixelBufferRelease(b); }
+    }
+    e.generatedBetween.clear();
     if (e.buffer) {
         if (returning) { _returned.push_back({e.buffer, e.ptsUs, e.generation}); _returnedNonEmpty.store(true, std::memory_order_release); }
         else CVPixelBufferRelease(e.buffer);
@@ -513,8 +555,11 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
     const size_t depth = _queueDepth ? _queueDepth() : 0;
     if (depth < 2) return 0;
     const double rate = std::max(_live.playbackRate->load(), 0.01);
-    const int64_t T = (int64_t)((_media.frameIntervalUs > 0 ? _media.frameIntervalUs : 41667) / rate);
-    const int64_t runway = spBudgetRunwayUs(depth, T) - 10000;
+    const double sourceInterval = (double)(_media.frameIntervalUs > 0 ? _media.frameIntervalUs : 41667);
+    const double outputInterval = _activeFileRate.kind == SPRateKind::FixedFPS
+        ? (1000000.0 * _activeFileRate.fps.den / _activeFileRate.fps.num) / rate
+        : sourceInterval / (std::max(_activeFileRate.multiplier, 2) * rate);
+    const int64_t runway = spBudgetRunwayUs(depth, (int64_t)llround(outputInterval)) - 10000;
     const double latency = _engine ? _engine.latencyEstimateSec : 0.15;
     const int64_t remaining = e.submitUs + (int64_t)(latency * 1e6) - spNowUs() + 15000;
     return std::max<int64_t>(0, std::min<int64_t>({runway, remaining, 150000}));
@@ -536,11 +581,39 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
             _cv.notify_all();
             continue;
         }
+        // A file cadence needs the next original to know which timestamps
+        // belong between this frame and the next. Flush, seek and end-of-file
+        // wake this wait without manufacturing another source frame.
+        if (_ring.front().usesFileCadence && _ring.size() == 1 && !_ring.front().chainEnd && !_live.paused->load()) {
+            _cv.wait_for(lk, std::chrono::milliseconds(100), [&] {
+                return _emitterQuit || _emitterPaused || _ring.empty() || _ring.size() > 1 ||
+                    _ring.front().chainEnd || _live.paused->load() || _live.generation->load() != liveGen;
+            });
+            if (_emitterQuit) break;
+            if (_emitterPaused || _ring.empty() || _live.generation->load() != liveGen) {
+                _emitterBusy = false;
+                _cv.notify_all();
+                continue;
+            }
+            if (_ring.size() == 1 && !_ring.front().chainEnd && !_live.paused->load()) {
+                _emitterBusy = false;
+                _cv.notify_all();
+                continue;
+            }
+        }
         CVPixelBufferRef synth = nullptr;
+        bool covered = false;
         {
             SPBudgetEntry &head = _ring.front();
             const bool hasPair = _ring.size() >= 2 && head.pair.eligible && !head.chainEnd;
             if (hasPair) {
+                if (_activeFileProvider && (head.pair.state == SPBudgetPairState::Idle || head.pair.state == SPBudgetPairState::InFlight)) {
+                    const uint64_t seq=head.seq;
+                    _cv.wait(lk, [&] { return _emitterQuit || _emitterPaused || _ring.empty() || _ring.front().seq!=seq ||
+                        !_activeFileProvider || (_ring.front().pair.state!=SPBudgetPairState::Idle && _ring.front().pair.state!=SPBudgetPairState::InFlight); });
+                    if (_emitterQuit) break;
+                    if (_emitterPaused || _ring.empty() || _ring.front().seq!=seq) { _emitterBusy=false;_cv.notify_all();continue; }
+                }
                 if (head.pair.state == SPBudgetPairState::InFlight) {
                     const int64_t waitUs = [self boundedWaitUsForEntry:head];
                     if (waitUs > 0) {
@@ -558,17 +631,17 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
                     }
                 }
                 SPBudgetEntry &h = _ring.front();
-                if (h.pair.state == SPBudgetPairState::Ready && h.synth) {
-                    synth = h.synth;
-                    h.synth = nullptr;
+                if (h.pair.state == SPBudgetPairState::Ready && (h.synth || !h.generatedBetween.empty())) {
+                    covered = true;
+                    if (h.synth) { synth = h.synth; h.synth = nullptr; }
                 } else {
                     if (h.pair.state == SPBudgetPairState::Planned || h.pair.state == SPBudgetPairState::InFlight) _pairsMissed++;
                     h.pair.state = SPBudgetPairState::Skipped;
                 }
-                _coverageWindow.push_back(synth ? 1 : 0);
-                if (synth) _coverageWindowCovered++;
+                _coverageWindow.push_back(covered ? 1 : 0);
+                if (covered) _coverageWindowCovered++;
                 SPBudgetEmitStat st;
-                st.covered = synth ? 1 : 0;
+                st.covered = covered ? 1 : 0;
                 st.benefit = h.pair.probed && !h.pair.cut ? h.pair.benefit : 0.0f;
 
                 st.toggled = _emitLastCovered >= 0 && (_emitLastCovered != (int)st.covered) &&
@@ -597,12 +670,71 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
         _cv.notify_all();
         lk.unlock();
 
-        const PushResult r = _enqueue(e.buffer, e.ptsUs, e.generation, NO, e.epoch, e.interruptGeneration);
+        if (e.usesFileCadence) {
+            CVPixelBufferRef base = CVPixelBufferRetain(e.buffer);
+            PushResult sourceResult = PushResult::Pushed;
+            if (e.scheduledSource) {
+                sourceResult = _enqueue(e.buffer, e.ptsUs, e.generation, NO, NO, NULL, e.ptsUs, e.epoch, e.interruptGeneration);
+                if (sourceResult == PushResult::Pushed) e.buffer = nullptr;
+            }
+            if (sourceResult == PushResult::Pushed) {
+                size_t generatedIndex = 0;
+                for (const auto &event : e.scheduledBetween) {
+                    CVPixelBufferRef output = nullptr;
+                    BOOL generated = NO;
+                    if (event.action == SPScheduleAction::Interpolate && generatedIndex < e.generatedBetween.size()) {
+                        output = e.generatedBetween[generatedIndex];
+                        e.generatedBetween[generatedIndex++] = nullptr;
+                        generated = output != nullptr;
+                    }
+                    if (!output) output = CVPixelBufferRetain(base);
+                    const PushResult result = _enqueue(output, event.ptsUs, e.generation, YES, generated, base, e.ptsUs, e.epoch, e.interruptGeneration);
+                    if (result != PushResult::Pushed) {
+                        if (generated) _counters.dropped.fetch_add(1);
+                        CVPixelBufferRelease(output);
+                        if (result == PushResult::Interrupted) {
+                            lk.lock();
+                            // If this source was not itself a fixed-rate tick,
+                            // preserve it for the new route instead of dropping it.
+                            if (e.buffer) {
+                                _returned.push_back({e.buffer, e.ptsUs, e.generation});
+                                _returnedNonEmpty.store(true, std::memory_order_release);
+                                e.buffer = nullptr;
+                            }
+                            _emitterPaused = true;
+                            lk.unlock();
+                        }
+                        break;
+                    }
+                }
+            } else if (sourceResult == PushResult::Interrupted) {
+                lk.lock();
+                _returned.push_back({e.buffer, e.ptsUs, e.generation});
+                _returnedNonEmpty.store(true, std::memory_order_release);
+                e.buffer = nullptr;
+                _emitterPaused = true;
+                lk.unlock();
+            }
+            if (e.buffer) CVPixelBufferRelease(e.buffer);
+            CVPixelBufferRelease(base);
+            for (CVPixelBufferRef output : e.generatedBetween) {
+                if (output) { _counters.dropped.fetch_add(1); CVPixelBufferRelease(output); }
+            }
+            lk.lock();
+            _emitterBusy = false;
+            _cv.notify_all();
+            continue;
+        }
+
+        // Keep the exact pair-A source alive for this synthesized output even
+        // after enqueue transfers the original frame's ownership.
+        CVPixelBufferRef original = synth ? CVPixelBufferRetain(e.buffer) : NULL;
+        const PushResult r = _enqueue(e.buffer, e.ptsUs, e.generation, NO, NO, NULL, e.ptsUs, e.epoch, e.interruptGeneration);
         if (r == PushResult::Pushed) {
             e.buffer = nullptr;
             if (!e.pair.eligible) _counters.bypassed.fetch_add(1);
             if (synth) {
-                const PushResult r2 = _enqueue(synth, e.ptsUs + e.deltaUs / 2, e.generation, YES, e.epoch, e.interruptGeneration);
+                const PushResult r2 = _enqueue(synth, e.ptsUs + e.deltaUs / 2, e.generation, YES, YES, original, e.ptsUs, e.epoch, e.interruptGeneration);
                 if (r2 != PushResult::Pushed) { _counters.dropped.fetch_add(1); CVPixelBufferRelease(synth); }
                 synth = nullptr;
             }
@@ -619,6 +751,7 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
             if (e.buffer) { CVPixelBufferRelease(e.buffer); e.buffer = nullptr; }
             if (synth) { _counters.dropped.fetch_add(1); CVPixelBufferRelease(synth); synth = nullptr; }
         }
+        if (original) CVPixelBufferRelease(original);
         lk.lock();
         _emitterBusy = false;
         _cv.notify_all();
@@ -643,21 +776,39 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
     std::lock_guard<std::mutex> lock(_mtx);
     if (!_ring.empty()) _ring.back().chainEnd = true;
     _chainEnded = true;
+    _cv.notify_all();
+}
+
+- (void)setPendingFileProvider:(id<SPFileFrameProvider>)provider {
+    std::lock_guard<std::mutex> lock(_mtx);
+    _pendingFileProvider = provider;
 }
 
 - (void)applyModeReset:(SPFrameInterpolationMode)mode {
     {
 
         std::lock_guard<std::mutex> lock(_mtx);
-        if (!_emitterStarted && _engineState == 0 && _ring.empty() && _returned.empty() && !_emitterBusy) {
+        _activeFileRate = _pendingFileRate;
+        _fileCadenceStarted = false;
+        _cadenceLimitReported = false;
+        if (!_emitterStarted && _engineState == 0 && _ring.empty() && _returned.empty() && !_emitterBusy && _pendingFileProvider == _activeFileProvider && mode != SPFrameInterpolationModeOff) {
             _emitterPaused = false;
             return;
         }
     }
     [self quiesceEmitterFlushingRingReturning:YES];
-    if (mode == SPFrameInterpolationModeOff) {
-        [self destroyEngine];
+    id<SPFileFrameProvider> oldProvider = nil, nextProvider = nil;
+    BOOL providerChanged = NO;
+    {
+        std::lock_guard<std::mutex> lock(_mtx);
+        oldProvider = _activeFileProvider;
+        nextProvider = mode == SPFrameInterpolationModeOff ? nil : _pendingFileProvider;
+        providerChanged = oldProvider != nextProvider;
+        _activeFileProvider = nextProvider;
+        if (providerChanged) _fileProviderFailed = false;
     }
+    if (mode == SPFrameInterpolationModeOff || providerChanged) [self destroyEngine];
+    if (oldProvider && oldProvider != nextProvider) [oldProvider invalidate];
     std::lock_guard<std::mutex> lock(_mtx);
     _emitterPaused = false;
     _cv.notify_all();
@@ -840,14 +991,21 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
 
     SPInterpolationRoutingContext rc;
     rc.requested = mode != SPFrameInterpolationModeOff;
-    rc.apiAvailable = rc.requested && SPFRCEngine.isAvailable;
-    rc.dynamicHDRUnsafe = _media.dynamicHDRUnsafe ||
+    bool fileProviderSelected;
+    { std::lock_guard<std::mutex> lock(_mtx); fileProviderSelected = _activeFileProvider != nil; }
+    rc.apiAvailable = rc.requested && (fileProviderSelected || SPFRCEngine.isAvailable);
+    rc.dynamicHDRUnsafe = _media.dynamicHDRUnsafe || (fileProviderSelected && (format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange && format != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)) ||
         (_media.dynamicHDRRequiresMetadata && !spMotionDoviFrameEligible(buffer));
     rc.interlaced = _media.interlaced || ctx.interlaced;
     rc.scanUnknown = ctx.scanUnknown;
     rc.playbackRate = _live.playbackRate->load();
     rc.videoFPS = _media.videoFps;
     rc.displayMaximumFPS = _live.displayMaximumFPS->load();
+    {
+        std::lock_guard<std::mutex> lock(_mtx);
+        if (fileProviderSelected || _activeFileRate.kind == SPRateKind::FixedFPS || _activeFileRate.multiplier != 2)
+            rc.enforceDisplayLimit = false;
+    }
     rc.width = width; rc.height = height;
     rc.supportedPixelFormat = spMotionPixelFormatIsSupported(format) && CVPixelBufferGetPlaneCount(buffer) >= 2;
     rc.supportedChromaSiting = rc.supportedPixelFormat && spMotionFrameHasSupportedChromaSiting(buffer);
@@ -924,13 +1082,17 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
         if (!_live.running->load()) return PushResult::Closed;
         if (!_ring.empty() || _emitterBusy) return PushResult::Interrupted;
         lk.unlock();
-        const PushResult r = _enqueue(buffer, ptsUs, generation, NO, policyEpoch, ctx.interruptGeneration);
+        const PushResult r = _enqueue(buffer, ptsUs, generation, NO, NO, NULL, ptsUs, policyEpoch, ctx.interruptGeneration);
         if (r == PushResult::Pushed) _counters.bypassed.fetch_add(1);
         return r;
     }
     [self startObserversIfNeeded];
     [self ensureEmitterStarted];
-    if (eligible) [self ensureEngineForWidth:width height:height format:format];
+    if (eligible && !fileProviderSelected) [self ensureEngineForWidth:width height:height format:format];
+    if (eligible && fileProviderSelected) {
+        std::lock_guard<std::mutex> lock(_mtx);
+        _engineWidth=width; _engineHeight=height; _engineFormat=format; _engineState=2;
+    }
 
     SPBudgetEntry entry;
     entry.buffer = buffer;
@@ -955,6 +1117,8 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
     entry.seq = ++_seq;
     if (_engineState == 2) metal = _metal;
 
+    bool pairCanSynthesize = false;
+    bool reportCadenceLimit = false;
     if (!_ring.empty()) {
         SPBudgetEntry &prev = _ring.back();
         const bool hasPTS = ptsUs != AV_NOPTS_VALUE && prev.ptsUs != AV_NOPTS_VALUE;
@@ -964,13 +1128,19 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
         const double panelMax = _live.displayMaximumFPS->load();
         const int64_t minOut = panelMax > 1.0 ? (int64_t)llround(1000000.0 / panelMax) : 16667;
         const double midWall = validTiming ? (double)delta / (2.0 * std::max(rc.playbackRate, 0.01)) : 0.0;
-        const bool cadenceOK = validTiming && midWall + 1000.0 >= (double)minOut;
+        const bool extended = fileProviderSelected || _activeFileRate.kind == SPRateKind::FixedFPS || _activeFileRate.multiplier != 2;
+        const bool cadenceOK = validTiming && (extended || midWall + 1000.0 >= (double)minOut);
         const bool compatible = prev.eligible && eligible && !prev.chainEnd && prev.generation == generation &&
             CVPixelBufferGetWidth(prev.buffer) == width && CVPixelBufferGetHeight(prev.buffer) == height &&
             CVPixelBufferGetPixelFormatType(prev.buffer) == format &&
             spMotionPairCompatibility(prev.buffer, buffer, _media.dynamicHDRRequiresMetadata) ==
                 SPMotionPairCompatibility::Compatible;
         if (compatible && validTiming && cadenceOK) {
+            if (fileProviderSelected && _activeFileProvider &&
+                [_activeFileProvider respondsToSelector:@selector(requiresPrecedingSource)] &&
+                [_activeFileProvider requiresPrecedingSource] && prev.epoch==entry.epoch)
+                entry.preceding=std::make_shared<SPBudgetPreviousSource>(prev.buffer,prev.ptsUs);
+            pairCanSynthesize = true;
             prev.pair = SPBudgetPair{};
             prev.pair.eligible = true;
             prev.deltaUs = delta;
@@ -979,6 +1149,50 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
         } else {
             prev.pair.eligible = false;
             prev.pair.state = SPBudgetPairState::Skipped;
+        }
+    }
+
+    const bool extendedCadence = fileProviderSelected || _activeFileRate.kind == SPRateKind::FixedFPS || _activeFileRate.multiplier != 2;
+    if (extendedCadence) {
+        if (!_fileCadenceStarted || _ring.empty()) {
+            _fileCadenceStarted = _fileCadence.reset(_activeFileRate, (uint64_t)generation);
+        } else if (!pairCanSynthesize) {
+            _fileCadence.noteBoundary();
+        }
+        entry.usesFileCadence = true;
+        entry.scheduledSource = false;
+        SPFileCadenceResult schedule = _fileCadence.push(ptsUs, entry.seq, (uint64_t)generation);
+        if (schedule.reject != SPScheduleReject::None) {
+            // Discontinuous or missing timestamps start a fresh chain. Never
+            // bind a scheduled output to a frame from a prior seek.
+            _fileCadenceStarted = _fileCadence.reset(_activeFileRate, (uint64_t)generation);
+            schedule = _fileCadence.push(ptsUs, entry.seq, (uint64_t)generation);
+        }
+        if (schedule.reject != SPScheduleReject::None) {
+            entry.scheduledSource = true;
+            _fileCadenceStarted = false;
+        } else {
+            for (const auto &event : schedule.events) {
+                if (event.action == SPScheduleAction::PresentSource && event.sourceIdentity == entry.seq) {
+                    entry.scheduledSource = true;
+                } else if (!_ring.empty() && event.frameA == _ring.back().seq) {
+                    _ring.back().scheduledBetween.push_back(event);
+                }
+            }
+            if (!_ring.empty()) {
+                SPBudgetEntry &prev = _ring.back();
+                size_t phases = 0;
+                for (const auto &event : prev.scheduledBetween)
+                    if (event.action == SPScheduleAction::Interpolate) ++phases;
+                if (phases == 0 || phases > 3) {
+                    prev.pair.eligible = false;
+                    prev.pair.state = SPBudgetPairState::Skipped;
+                    if (phases > 3 && !_cadenceLimitReported) {
+                        _cadenceLimitReported = true;
+                        reportCadenceLimit = true;
+                    }
+                }
+            }
         }
     }
 
@@ -1000,6 +1214,8 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
     const bool ringNearlyFull = [self ringNearlyFullLocked];
     _cv.notify_all();
     lk.unlock();
+    if (reportCadenceLimit)
+        [self publishStatus:@"这一段原帧间隔需要超过 3 张插帧，已暂时保持原画面；可降低目标帧率。" active:YES code:static_cast<int>(SPInterpolationPolicyCode::Active)];
 
     if (probe && probeTex) {
         NSMutableArray *owners = [NSMutableArray array];
@@ -1033,7 +1249,7 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
         }
     }
 
-    if (!_filledOnce && ringNearlyFull) {
+    if (fileProviderSelected || (!_filledOnce && ringNearlyFull)) {
         dispatch_async(_work, ^{ [self tick]; });
     }
     return PushResult::Pushed;
@@ -1143,6 +1359,54 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
 
 - (void)tick {
     std::unique_lock<std::mutex> lk(_mtx);
+    id<SPFileFrameProvider> provider = _activeFileProvider;
+    if (provider) {
+        if (_fileProviderBusy || _emitterPaused) return;
+        if (_fileProviderFailed) {
+            for (auto &entry:_ring) if(entry.pair.state==SPBudgetPairState::Idle)entry.pair.state=SPBudgetPairState::Skipped;
+            _cv.notify_all(); return;
+        }
+        for (size_t i=0; i+1<_ring.size(); ++i) {
+            SPBudgetEntry &a=_ring[i], &b=_ring[i+1];
+            if (!a.pair.eligible || a.pair.state!=SPBudgetPairState::Idle || a.chainEnd) continue;
+            NSMutableArray<NSNumber *> *phases=[NSMutableArray array];
+            for (const auto &event:a.scheduledBetween) {
+                if(event.action!=SPScheduleAction::Interpolate)continue;
+                float phase=0;if(!spPhaseFitsFloat(event.phase,phase)){[phases removeAllObjects];break;}
+                [phases addObject:@(phase)];
+            }
+            if(phases.count==0 || phases.count>3){a.pair.state=SPBudgetPairState::Skipped;_cv.notify_all();continue;}
+            const bool needsPreceding=[provider respondsToSelector:@selector(requiresPrecedingSource)] && [provider requiresPrecedingSource];
+            if (needsPreceding && (!a.preceding || a.preceding->ptsUs >= a.ptsUs ||
+                ![provider respondsToSelector:@selector(submitPreceding:previous:current:precedingPTSUs:previousPTSUs:currentPTSUs:phases:token:completion:)])) {
+                a.pair.state=SPBudgetPairState::Skipped; _cv.notify_all(); continue;
+            }
+            auto preceding=a.preceding;
+            CVPixelBufferRef fa=CVPixelBufferRetain(a.buffer),fb=CVPixelBufferRetain(b.buffer);
+            const uint64_t token=a.seq, policy=a.epoch;const int64_t generation=a.generation, previousPTSUs=a.ptsUs, currentPTSUs=b.ptsUs;
+            _fileProviderBusy=true;a.pair.state=SPBudgetPairState::InFlight;a.submitUs=spNowUs();
+            __weak SPFrameBudgetGenerator *weakSelf=self;
+            lk.unlock();
+            SPFRCPhasesCompletion done=^(uint64_t returned,NSArray<SPOwnedPixelBuffer *> *outputs,double latency,NSError *error){
+                (void)latency;SPFrameBudgetGenerator *strong=weakSelf;
+                if(!strong){CVPixelBufferRelease(fa);CVPixelBufferRelease(fb);return;}
+                dispatch_async(strong->_work,^{
+                    CVPixelBufferRelease(fa);CVPixelBufferRelease(fb);
+                    [strong fileProviderCompleted:provider token:returned generation:generation policy:policy outputs:outputs error:error];
+                });
+            };
+            BOOL submitted=needsPreceding
+                ? [provider submitPreceding:preceding->buffer previous:fa current:fb precedingPTSUs:preceding->ptsUs previousPTSUs:previousPTSUs currentPTSUs:currentPTSUs phases:phases token:token completion:done]
+                : [provider submitPrevious:fa current:fb previousPTSUs:previousPTSUs currentPTSUs:currentPTSUs phases:phases token:token completion:done];
+            if(!submitted){
+                CVPixelBufferRelease(fa);CVPixelBufferRelease(fb);
+                [self fileProviderCompleted:provider token:token generation:generation policy:policy outputs:nil error:[NSError errorWithDomain:@"Khua.FileProvider" code:1 userInfo:@{NSLocalizedDescriptionKey:@"文件插帧引擎无法接收任务。"}]];
+            }
+            return;
+        }
+        [self maybePublishStatusLocked];
+        return;
+    }
     SPFRCEngine *engine = _engine;
     if (!engine || _engineState != 2) return;
     const size_t n = _ring.size();
@@ -1158,7 +1422,10 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
         ctx.paused = _live.paused->load();
 
         const size_t depth = _queueDepth ? _queueDepth() : 0;
-        ctx.headOffsetSec = (double)spBudgetRunwayUs(depth, (int64_t)llround(ctx.pairIntervalSec * 1e6)) / 1e6;
+        const double outputInterval = _activeFileRate.kind == SPRateKind::FixedFPS
+            ? (1000000.0 * _activeFileRate.fps.den / _activeFileRate.fps.num) / rate
+            : (ctx.pairIntervalSec * 1e6) / std::max(_activeFileRate.multiplier, 2);
+        ctx.headOffsetSec = (double)spBudgetRunwayUs(depth, (int64_t)llround(outputInterval)) / 1e6;
         ctx.headSeq = _ring.front().seq;
         ctx.latencySec = engine.latencyEstimateSec;
         ctx.sessions = std::max(1u, engine.sessionCount);
@@ -1197,7 +1464,34 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
             CVPixelBufferRef fb = CVPixelBufferRetain(b.buffer);
             const uint64_t token = a.seq;
             __weak SPFrameBudgetGenerator *weakSelf = self;
-            const BOOL submitted = [engine submitPairWithFrameA:fa frameB:fb token:token
+            BOOL submitted = NO;
+            if (a.usesFileCadence) {
+                NSMutableArray<NSNumber *> *phases = [NSMutableArray array];
+                for (const auto &event : a.scheduledBetween) {
+                    if (event.action != SPScheduleAction::Interpolate) continue;
+                    float phase = 0;
+                    if (!spPhaseFitsFloat(event.phase, phase)) { [phases removeAllObjects]; break; }
+                    [phases addObject:@(phase)];
+                }
+                if (phases.count > 0 && phases.count <= 3) {
+                    submitted = [engine submitPhasesWithFrameA:fa frameB:fb
+                        ptsA:CMTimeMake(a.ptsUs, 1000000) ptsB:CMTimeMake(b.ptsUs, 1000000)
+                        phases:phases sequential:NO token:token
+                        completion:^(uint64_t t, NSArray<SPOwnedPixelBuffer *> *outputs, double latency, NSError *error) {
+                            (void)latency;
+                            SPFrameBudgetGenerator *s = weakSelf;
+                            if (!s) { CVPixelBufferRelease(fa); CVPixelBufferRelease(fb); return; }
+                            NSMutableArray<SPOwnedPixelBuffer *> *kept = [NSMutableArray array];
+                            for (SPOwnedPixelBuffer *box in outputs)
+                                [kept addObject:[[SPOwnedPixelBuffer alloc] initRetainingBuffer:box.buffer]];
+                            dispatch_async(s->_work, ^{
+                                CVPixelBufferRelease(fa); CVPixelBufferRelease(fb);
+                                [s pairCompleted:t outputs:kept error:error];
+                            });
+                        }];
+                }
+            } else submitted = [engine submitPairWithFrameA:fa frameB:fb
+                ptsA:CMTimeMake(a.ptsUs, 1000000) ptsB:CMTimeMake(b.ptsUs, 1000000) token:token
                 completion:^(uint64_t t, CVPixelBufferRef midpoint, double latency, NSError *error) {
                     (void)latency;
                     SPFrameBudgetGenerator *s = weakSelf;
@@ -1299,6 +1593,30 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
     }
 }
 
+- (void)fileProviderCompleted:(id<SPFileFrameProvider>)provider token:(uint64_t)token generation:(int64_t)generation policy:(uint64_t)policy outputs:(NSArray<SPOwnedPixelBuffer *> *)outputs error:(NSError *)error {
+    BOOL current=NO, failed=NO, publishActive=NO;
+    {
+        std::lock_guard<std::mutex> lock(_mtx);
+        _fileProviderBusy=false;
+        current=provider==_activeFileProvider;
+        if(current && generation==_live.generation->load() && policy==_live.policyEpoch->load()) {
+            for(auto &entry:_ring) {
+                if(entry.seq!=token || entry.generation!=generation || entry.epoch!=policy || entry.pair.state!=SPBudgetPairState::InFlight)continue;
+                size_t required=0;for(const auto &event:entry.scheduledBetween)if(event.action==SPScheduleAction::Interpolate)++required;
+                if(!error && required>0 && outputs.count==required){
+                    for(SPOwnedPixelBuffer *box in outputs)entry.generatedBetween.push_back(CVPixelBufferRetain(box.buffer));
+                    entry.pair.state=SPBudgetPairState::Ready;_counters.generated.fetch_add(required);_filledOnce=true;
+                    if(!_publishedActive){_publishedActive=YES;_publishedCode=static_cast<int>(SPInterpolationPolicyCode::Active);_lastStatusText=@"文件插帧运行中。";publishActive=YES;}
+                }else { entry.pair.state=SPBudgetPairState::Skipped;_fileProviderFailed=true;_publishedActive=NO;failed=YES; }
+                break;
+            }
+        }
+    }
+    if(publishActive) [self publishStatus:@"文件插帧运行中。" active:YES code:static_cast<int>(SPInterpolationPolicyCode::Active)];
+    if(current && failed) [self publishStatus:error.localizedDescription ?: @"文件插帧没有返回结果。" active:NO code:static_cast<int>(SPInterpolationPolicyCode::EngineFailed)];
+    _cv.notify_all();[self tick];
+}
+
 - (void)pairCompleted:(uint64_t)token midpoint:(CVPixelBufferRef)midpoint error:(NSError *)error {
     {
         std::lock_guard<std::mutex> lock(_mtx);
@@ -1318,6 +1636,27 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
     }
     if (midpoint) { _counters.dropped.fetch_add(1); CVPixelBufferRelease(midpoint); }
     if (error && spDebug()) SPLOG(@"[Budget] FRC 对失败 token=%llu: %@", (unsigned long long)token, error.localizedDescription);
+    _cv.notify_all();
+    [self tick];
+}
+
+- (void)pairCompleted:(uint64_t)token outputs:(NSArray<SPOwnedPixelBuffer *> *)outputs error:(NSError *)error {
+    {
+        std::lock_guard<std::mutex> lock(_mtx);
+        for (auto &entry : _ring) {
+            if (entry.seq != token || entry.pair.state != SPBudgetPairState::InFlight) continue;
+            size_t required = 0;
+            for (const auto &event : entry.scheduledBetween)
+                if (event.action == SPScheduleAction::Interpolate) ++required;
+            if (!error && outputs.count == required && required > 0) {
+                for (SPOwnedPixelBuffer *box in outputs) entry.generatedBetween.push_back(CVPixelBufferRetain(box.buffer));
+                entry.pair.state = SPBudgetPairState::Ready;
+                _counters.generated.fetch_add(required);
+            } else entry.pair.state = SPBudgetPairState::Skipped;
+            break;
+        }
+    }
+    if (error && spDebug()) SPLOG(@"[Budget] FRC 多相位失败 token=%llu: %@", (unsigned long long)token, error.localizedDescription);
     _cv.notify_all();
     [self tick];
 }
@@ -1349,6 +1688,9 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
                 _engineWidth, _engineHeight, coverage, _bufferSeconds, _engine ? _engine.sessionCount : 0u];
         active = YES;
         code = static_cast<int>(SPInterpolationPolicyCode::Active);
+    }
+    if (_cadenceLimitReported) {
+        text = @"这一段原帧间隔需要超过 3 张插帧，已暂时保持原画面；可降低目标帧率。";
     }
     if (_publishedCode == code && _publishedActive == active && _lastStatusText && [_lastStatusText isEqualToString:text]) return;
     _publishedCode = code; _publishedActive = active; _lastStatusText = text;

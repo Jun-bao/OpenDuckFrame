@@ -1,4 +1,6 @@
 #include "SPMetalRenderer.h"
+#include "SPFileLanczosScaler.h"
+#include "SPFileAppleVideoSRScaler.h"
 #include "ShaderSource.h"
 #include "SPDoviRPU.hpp"
 #import "SPDoviFrame.h"
@@ -10,6 +12,7 @@
 #include <unordered_map>
 #include <vector>
 #include <unordered_set>
+#include <memory>
 
 #import <Metal/Metal.h>
 #import <CoreVideo/CoreVideo.h>
@@ -22,6 +25,17 @@
 
 static_assert(sp::dovi_gpu::FloatCount == kSPDoviUniformFloatCount,
               "Dolby RPU serialization and Video.metal uniform counts differ");
+
+struct SPFileScaleTicket {
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    CVPixelBufferRef output = NULL;
+    __strong NSString *error = nil;
+    ~SPFileScaleTicket() { if (output) CVPixelBufferRelease(output); }
+};
+struct SPFileBufferGuard {
+    CVPixelBufferRef buffer = NULL;
+    ~SPFileBufferGuard() { if (buffer) CVPixelBufferRelease(buffer); }
+};
 
 // Pure output-mode policy.  A HDR attachment requires a retry only on an EDR
 // display: an SDR display intentionally keeps mode 0 and tone-maps that same
@@ -257,7 +271,14 @@ enum class SPDoviFrameMode : uint8_t {
     // replacement. SP_RENDER_INLINE retains a synchronous diagnostic fallback.
     dispatch_queue_t _submitQueue;
     std::mutex _submitMtx;
+    std::mutex _fileScaleMtx;
+    SPFileLanczosScaler *_fileLanczosScaler;
+    NSString *_fileScaleStatus;
+    std::atomic<uint64_t> _fileScaleEpoch;
+    std::atomic<bool> _fileScaleGlobalBusy;
+    std::atomic<int> _fileViewMode;
     CVPixelBufferRef _submitPendingBuf;
+    CVPixelBufferRef _submitPendingOriginal;
     bool _submitPendingClear;
     bool _submitDrainScheduled;
     int _submitRetryCount;
@@ -269,6 +290,8 @@ enum class SPDoviFrameMode : uint8_t {
     CGRect _submitPendingSubRect;
 
     bool _submitPendingSpeculative;
+    int64_t _submitPendingPTSUs;
+    void (^_submitPendingPresented)(double);
 
     uint64_t _submitAcceptedInEpoch;
 
@@ -485,6 +508,9 @@ static_assert(kSPDragFxNearLevel <= kSPDragFxFarLevel);
 - (instancetype)initWithLayer:(CAMetalLayer *)layer logId:(unsigned)logId {
     self = [super init];
     if (self) {
+        _fileScaleEpoch.store(1);
+        _fileScaleGlobalBusy.store(false);
+        _fileViewMode.store(-1);
         _spLogId = logId;
         _layer = layer;
         int64_t tDev0 = 0;
@@ -789,6 +815,7 @@ static_assert(kSPDragFxNearLevel <= kSPDragFxFarLevel);
 }
 
 - (void)dealloc {
+    if (_submitPendingOriginal) { CVPixelBufferRelease(_submitPendingOriginal); _submitPendingOriginal=NULL; }
     if (_submitPendingBuf) {
         CVPixelBufferRelease(_submitPendingBuf);
         _submitPendingBuf = NULL;
@@ -806,6 +833,24 @@ static_assert(kSPDragFxNearLevel <= kSPDragFxFarLevel);
 }
 
 - (BOOL)isReady { return _pipeline != nil; }
+
+- (void)setFileLanczosScaler:(SPFileLanczosScaler *)scaler {
+    std::lock_guard<std::mutex> lock(_fileScaleMtx);
+    _fileLanczosScaler = scaler;
+    _fileScaleStatus = @"";
+    _fileScaleEpoch.fetch_add(1);
+}
+
+- (NSDictionary<NSString *,id> *)fileScalerDiagnostics {
+    SPFileLanczosScaler *scaler; { std::lock_guard<std::mutex> lock(_fileScaleMtx); scaler=_fileLanczosScaler; }
+    if ([scaler isKindOfClass:SPFileAppleVideoSRScaler.class]) return ((SPFileAppleVideoSRScaler *)scaler).submissionDiagnostics;
+    return @{};
+}
+
+- (NSString *)fileScaleStatus {
+    std::lock_guard<std::mutex> lock(_fileScaleMtx);
+    return _fileScaleStatus ?: @"";
+}
 
 // The synchronous renderer fallback is available only in internal builds.
 static bool spRenderInlineMode(void) {
@@ -826,7 +871,9 @@ static bool spRenderInlineMode(void) {
             CVPixelBufferRelease(_submitPendingBuf);
             _submitPendingBuf = NULL;
         }
+        if (_submitPendingOriginal) { CVPixelBufferRelease(_submitPendingOriginal); _submitPendingOriginal=NULL; }
         _submitPendingSubTex = nil;
+        _submitPendingPresented = nil;
         _submitPendingClear = true;
         _submitPendingEpoch = _submitSessionEpoch.load(std::memory_order_relaxed);
         _submitPendingSpeculative = false;
@@ -852,8 +899,10 @@ static bool spRenderInlineMode(void) {
         CVPixelBufferRelease(_submitPendingBuf);
         _submitPendingBuf = NULL;
     }
+    if (_submitPendingOriginal) { CVPixelBufferRelease(_submitPendingOriginal); _submitPendingOriginal=NULL; }
     _submitPendingClear = false;
     _submitPendingSubTex = nil;
+    _submitPendingPresented = nil;
     _submitPendingSpeculative = false;
     _submitAcceptedInEpoch = 0;
     _submitParked = false;
@@ -1583,17 +1632,37 @@ static bool spRenderInlineMode(void) {
 
 #pragma mark - Rendering
 
+- (void)setFileViewMode:(int)mode {
+    if (mode < -1 || mode > 2) return;
+    if (_fileViewMode.exchange(mode) != mode) {
+        _fileScaleEpoch.fetch_add(1);
+        [self discardPendingSubmits];
+    }
+}
+
 - (BOOL)renderPixelBuffer:(CVPixelBufferRef)buffer {
-    return [self spAcceptSubmit:buffer speculative:NO];
+    return [self spAcceptSubmit:buffer original:NULL ptsUs:INT64_MIN speculative:NO presented:nil];
+}
+
+- (BOOL)renderPixelBuffer:(CVPixelBufferRef)buffer presented:(void (^)(double))presented {
+    return [self spAcceptSubmit:buffer original:NULL ptsUs:INT64_MIN speculative:NO presented:presented];
+}
+
+- (BOOL)renderPixelBuffer:(CVPixelBufferRef)buffer ptsUs:(int64_t)ptsUs presented:(void (^)(double))presented {
+    return [self spAcceptSubmit:buffer original:NULL ptsUs:ptsUs speculative:NO presented:presented];
+}
+
+- (BOOL)renderPixelBuffer:(CVPixelBufferRef)buffer original:(CVPixelBufferRef)original ptsUs:(int64_t)ptsUs presented:(void (^)(double))presented {
+    return [self spAcceptSubmit:buffer original:original ptsUs:ptsUs speculative:NO presented:presented];
 }
 
 - (BOOL)renderSpeculativeFirstFrame:(CVPixelBufferRef)buffer {
-    return [self spAcceptSubmit:buffer speculative:YES];
+    return [self spAcceptSubmit:buffer original:NULL ptsUs:INT64_MIN speculative:YES presented:nil];
 }
 
-- (BOOL)spAcceptSubmit:(CVPixelBufferRef)buffer speculative:(BOOL)speculative {
+- (BOOL)spAcceptSubmit:(CVPixelBufferRef)buffer original:(CVPixelBufferRef)original ptsUs:(int64_t)ptsUs speculative:(BOOL)speculative presented:(void (^)(double))presented {
     if (spRenderInlineMode()) {
-        return [self renderPixelBufferInline:buffer speculative:speculative];
+        return [self renderPixelBufferInline:buffer original:original ptsUs:ptsUs speculative:speculative presented:presented];
     }
 
     if (!_pipeline || !_textureCache || !buffer) return NO;
@@ -1603,10 +1672,14 @@ static bool spRenderInlineMode(void) {
 
         if (speculative && _submitAcceptedInEpoch != 0) return NO;
         if (_submitPendingBuf) CVPixelBufferRelease(_submitPendingBuf);
+        if (_submitPendingOriginal) CVPixelBufferRelease(_submitPendingOriginal);
         _submitPendingBuf = CVPixelBufferRetain(buffer);
+        _submitPendingOriginal = original ? CVPixelBufferRetain(original) : NULL;
         _submitPendingClear = false;
         _submitPendingEpoch = _submitSessionEpoch.load(std::memory_order_relaxed);
         _submitPendingSpeculative = speculative;
+        _submitPendingPTSUs = ptsUs;
+        _submitPendingPresented = [presented copy];
         _submitAcceptedInEpoch++;
         _submitRetryCount = 0;
         _submitParked = false;
@@ -1635,10 +1708,13 @@ static bool spRenderInlineMode(void) {
 - (void)spDrainSubmits {
     for (;;) @autoreleasepool {
         CVPixelBufferRef buf = NULL;
+        SPFileBufferGuard originalGuard;
         bool clear = false;
         id<MTLTexture> subTex = nil;
         CGRect subRect = CGRectZero;
         bool speculative = false;
+        int64_t ptsUs = INT64_MIN;
+        void (^presented)(double) = nil;
         uint64_t taskEpoch = 0;
         {
             std::lock_guard<std::mutex> lk(_submitMtx);
@@ -1655,12 +1731,17 @@ static bool spRenderInlineMode(void) {
             }
             buf = _submitPendingBuf;
             _submitPendingBuf = NULL;
+            originalGuard.buffer = _submitPendingOriginal;
+            _submitPendingOriginal = NULL;
             clear = _submitPendingClear;
             _submitPendingClear = false;
             subTex = _submitPendingSubTex;
             subRect = _submitPendingSubRect;
             taskEpoch = _submitPendingEpoch;
             speculative = _submitPendingSpeculative;
+            ptsUs = _submitPendingPTSUs;
+            presented = _submitPendingPresented;
+            _submitPendingPresented = nil;
             if (!buf && !clear) {
                 _submitDrainScheduled = false;
                 return;
@@ -1670,11 +1751,11 @@ static bool spRenderInlineMode(void) {
         if (clear && !buf) {
             outcome = [self clearToBlackOutcomeWithEpoch:taskEpoch];
         } else {
-            outcome = [self renderPixelBufferOutcome:buf
+            outcome = [self renderPixelBufferOutcome:buf original:originalGuard.buffer
                                         pairedSubTex:subTex
                                        pairedSubRect:subRect
-                                           taskEpoch:taskEpoch
-                                         speculative:speculative];
+                                           taskEpoch:taskEpoch ptsUs:ptsUs
+                                         speculative:speculative presented:presented];
         }
         if (outcome != SPSubmitOutcome::Committed) {
             const bool waitsForOutputMode =
@@ -1688,11 +1769,14 @@ static bool spRenderInlineMode(void) {
 
             if (!_submitPendingBuf && !_submitPendingClear) {
                 _submitPendingBuf = buf;
+                _submitPendingOriginal = originalGuard.buffer; originalGuard.buffer=NULL;
                 _submitPendingClear = clear;
                 _submitPendingSubTex = subTex;
                 _submitPendingSubRect = subRect;
                 _submitPendingEpoch = taskEpoch;
                 _submitPendingSpeculative = speculative;
+                _submitPendingPTSUs = ptsUs;
+                _submitPendingPresented = presented;
                 if (waitsForOutputMode) {
 
                     return;
@@ -1728,11 +1812,11 @@ static bool spRenderInlineMode(void) {
 }
 
 - (BOOL)renderPixelBufferInline:(CVPixelBufferRef)buffer {
-    return [self renderPixelBufferInline:buffer speculative:NO];
+    return [self renderPixelBufferInline:buffer original:NULL ptsUs:INT64_MIN speculative:NO presented:nil];
 }
 
-- (BOOL)renderPixelBufferInline:(CVPixelBufferRef)buffer
-                    speculative:(BOOL)speculative {
+- (BOOL)renderPixelBufferInline:(CVPixelBufferRef)buffer original:(CVPixelBufferRef)original ptsUs:(int64_t)ptsUs
+                    speculative:(BOOL)speculative presented:(void (^)(double))presented {
     id<MTLTexture> liveSubTex;
     CGRect liveSubRect;
     {
@@ -1743,25 +1827,75 @@ static bool spRenderInlineMode(void) {
         liveSubTex = _subtitleTexture;
         liveSubRect = _subtitleRect;
     }
-    return [self renderPixelBufferOutcome:buffer
+    return [self renderPixelBufferOutcome:buffer original:original
                              pairedSubTex:liveSubTex
                             pairedSubRect:liveSubRect
                                 taskEpoch:_submitSessionEpoch.load(
-                                              std::memory_order_relaxed)
-                              speculative:speculative] ==
+                                              std::memory_order_relaxed) ptsUs:ptsUs
+                              speculative:speculative presented:presented] ==
            SPSubmitOutcome::Committed;
 }
 
 // Encode the retained frame and its immutable DV attachments. Failure reasons
 // distinguish stale epochs, output transitions, transient failures and commits.
-- (SPSubmitOutcome)renderPixelBufferOutcome:(CVPixelBufferRef)buffer
+- (SPSubmitOutcome)renderPixelBufferOutcome:(CVPixelBufferRef)buffer original:(CVPixelBufferRef)original
                                pairedSubTex:(id<MTLTexture>)subTex
                               pairedSubRect:(CGRect)subRect
-                                  taskEpoch:(uint64_t)taskEpoch
-                                speculative:(BOOL)speculative {
+                                  taskEpoch:(uint64_t)taskEpoch ptsUs:(int64_t)ptsUs
+                                speculative:(BOOL)speculative presented:(void (^)(double))presented {
 
     if (taskEpoch != _submitSessionEpoch.load(std::memory_order_relaxed)) {
         return SPSubmitOutcome::StaleEpoch;
+    }
+
+    const int fileView = _fileViewMode.load();
+    CVPixelBufferRef rawOriginal = original ?: buffer;
+    if (fileView == 1) buffer = rawOriginal;
+    SPFileLanczosScaler *fileScaler = nil;
+    uint64_t fileEpoch = 0;
+    {
+        std::lock_guard<std::mutex> lock(_fileScaleMtx);
+        fileScaler = _fileLanczosScaler;
+        fileEpoch = _fileScaleEpoch.load();
+    }
+    SPFileBufferGuard scaled;
+    if (fileScaler && fileView != 1) {
+        {
+            std::lock_guard<std::mutex> lock(_cfgMtx);
+            if (_hasHdr || _doviMappingEnabled || _doviIPT) {
+                std::lock_guard<std::mutex> statusLock(_fileScaleMtx);
+                if (fileEpoch == _fileScaleEpoch.load()) _fileScaleStatus = @"文件缩放当前仅支持 SDR 的 8 位 NV12 视频。";
+                return SPSubmitOutcome::Transient;
+            }
+        }
+        auto ticket = std::make_shared<SPFileScaleTicket>();
+        if (_fileScaleGlobalBusy.exchange(true)) return SPSubmitOutcome::Transient;
+        __weak SPMetalRenderer *weakRenderer = self;
+        BOOL accepted = [fileScaler submit:buffer ptsUs:ptsUs completion:^(CVPixelBufferRef output, NSError *error) {
+            ticket->output = output;
+            ticket->error = error.localizedDescription;
+            SPMetalRenderer *renderer = weakRenderer;
+            if (renderer) renderer->_fileScaleGlobalBusy.store(false);
+            dispatch_semaphore_signal(ticket->done);
+            if (renderer) [renderer kickSubmitDrain];
+        }];
+        if (!accepted) { _fileScaleGlobalBusy.store(false); return SPSubmitOutcome::Transient; }
+        while (dispatch_semaphore_wait(ticket->done, dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC)) != 0) {
+            if (taskEpoch != _submitSessionEpoch.load() || fileEpoch != _fileScaleEpoch.load()) return SPSubmitOutcome::StaleEpoch;
+        }
+        if (taskEpoch != _submitSessionEpoch.load() || fileEpoch != _fileScaleEpoch.load()) return SPSubmitOutcome::StaleEpoch;
+        if (!ticket->output) {
+            std::lock_guard<std::mutex> lock(_fileScaleMtx);
+            if (fileEpoch == _fileScaleEpoch.load()) _fileScaleStatus = ticket->error ?: @"文件缩放处理失败。";
+            return SPSubmitOutcome::Transient;
+        }
+        scaled.buffer = ticket->output;
+        ticket->output = NULL;
+        buffer = scaled.buffer;
+        {
+            std::lock_guard<std::mutex> lock(_fileScaleMtx);
+            if (fileEpoch == _fileScaleEpoch.load()) _fileScaleStatus = @"";
+        }
     }
 
     std::unique_lock<std::mutex> cfgLock(_cfgMtx);
@@ -1885,8 +2019,9 @@ static bool spRenderInlineMode(void) {
     id<MTLTexture> cmpElYTex = nil, cmpElUVTex = nil;
     CVPixelBufferRef cmpEnhancement = nullptr;
     SPDoviUniforms compareDoviSnapshot;
-    CVPixelBufferRef cmpSrc = _compareBuffer;
-    if (cmpSrc && _compareSplitEnabled && !frameDovi) {
+    const bool splitEnabled = fileView < 0 ? _compareSplitEnabled : fileView == 2;
+    CVPixelBufferRef cmpSrc = fileView == 2 ? rawOriginal : _compareBuffer;
+    if (cmpSrc && splitEnabled && !frameDovi) {
         const OSType cmpFmt = CVPixelBufferGetPixelFormatType(cmpSrc);
         if (cmpFmt != fmt && spPixelFormatIsPlanar3(cmpFmt) &&
             spPixelFormatBiPlanarEquivalent(cmpFmt) == fmt) {
@@ -1901,19 +2036,20 @@ static bool spRenderInlineMode(void) {
     const OSType compareFormat = cmpSrc ? CVPixelBufferGetPixelFormatType(cmpSrc) : fmt;
     const bool comparePlanar = cmpSrc && spPixelFormatIsPlanar3(compareFormat) && CVPixelBufferGetPlaneCount(cmpSrc)==3;
     const bool compare10 = spPixelFormatIsTenBit(compareFormat);
-    if (cmpSrc && _compareSplitEnabled &&
-        (compareFormat == fmt || (frameDovi && spDoviFrameUniforms(_compareBuffer))) &&
-        CVPixelBufferGetWidthOfPlane(cmpSrc, 0) == w0 &&
-        CVPixelBufferGetHeightOfPlane(cmpSrc, 0) == h0) {
+    if (cmpSrc && splitEnabled &&
+        (compareFormat == fmt || (frameDovi && spDoviFrameUniforms(cmpSrc))) &&
+        CVPixelBufferGetPlaneCount(cmpSrc) >= 2) {
+        const size_t cw0=CVPixelBufferGetWidthOfPlane(cmpSrc,0),ch0=CVPixelBufferGetHeightOfPlane(cmpSrc,0);
+        const size_t cw1=CVPixelBufferGetWidthOfPlane(cmpSrc,1),ch1=CVPixelBufferGetHeightOfPlane(cmpSrc,1);
         const MTLPixelFormat cmpYFmt=compare10 ? MTLPixelFormatR16Unorm : MTLPixelFormatR8Unorm;
         const MTLPixelFormat cmpCFmt=comparePlanar ? cmpYFmt : compare10 ? MTLPixelFormatRG16Unorm : MTLPixelFormatRG8Unorm;
         CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, _textureCache,
-                                                  cmpSrc, NULL, cmpYFmt, w0, h0, 0, &cmpYRef);
+                                                  cmpSrc, NULL, cmpYFmt, cw0, ch0, 0, &cmpYRef);
         CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, _textureCache,
-                                                  cmpSrc, NULL, cmpCFmt, w1, h1, 1, &cmpUVRef);
+                                                  cmpSrc, NULL, cmpCFmt, cw1, ch1, 1, &cmpUVRef);
         if (comparePlanar) {
             CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, _textureCache,
-                                                      cmpSrc, NULL, cmpCFmt, w1, h1, 2, &cmpVRef);
+                                                      cmpSrc, NULL, cmpCFmt, cw1, ch1, 2, &cmpVRef);
         }
         cmpYTex = cmpYRef ? CVMetalTextureGetTexture(cmpYRef) : nil;
         cmpUVTex = cmpUVRef ? CVMetalTextureGetTexture(cmpUVRef) : nil;
@@ -1931,10 +2067,10 @@ static bool spRenderInlineMode(void) {
     texGuard.refs[3] = cmpUVRef;
     texGuard.refs[5] = cmpVRef;
     if (cmpYTex && frameDovi) {
-        const auto *cmpDovi = spDoviFrameUniforms(_compareBuffer);
+        const auto *cmpDovi = spDoviFrameUniforms(cmpSrc);
         // FRC pairs require identical descriptions. Reject stale comparison
         // frames rather than display their pixels through another frame's RPU.
-        const bool cmpReconstructed = spDoviFrameIsReconstructed(_compareBuffer);
+        const bool cmpReconstructed = spDoviFrameIsReconstructed(cmpSrc);
         if (!cmpDovi || memcmp(cmpDovi,frameDovi,sizeof(*frameDovi))) cmpYTex = nil;
         else if (cmpDovi->values[sp::dovi_gpu::NeedsEnhancement] > .5f && !cmpReconstructed) {
             cmpEnhancement = spDoviEnhancementFrame(_compareBuffer);
@@ -2126,7 +2262,7 @@ static bool spRenderInlineMode(void) {
     [enc setFragmentTexture:(vTex ?: uvTex) atIndex:3];
     [enc setFragmentTexture:(elYTex ?: yTex) atIndex:4];
     [enc setFragmentTexture:(elUVTex ?: uvTex) atIndex:5];
-    if (cmpYTex && _compareSplitEnabled) {
+    if (cmpYTex && splitEnabled) {
 
         NSUInteger dw = drawable.texture.width, dh = drawable.texture.height;
         NSUInteger midX = dw / 2;
@@ -2267,6 +2403,7 @@ static bool spRenderInlineMode(void) {
         }
     }
 #endif
+    if (presented) [drawable addPresentedHandler:^(id<MTLDrawable> d) { presented(d.presentedTime); }];
     [cmd presentDrawable:drawable];
 
     CVMetalTextureRef elYRef = texGuard.refs[6], elUVRef = texGuard.refs[7];

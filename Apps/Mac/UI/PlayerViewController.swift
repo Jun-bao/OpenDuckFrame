@@ -80,6 +80,13 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         label: "dev.khuaplayer.directory-subtitle-ranking", qos: .utility)
 
     private let playerView = PlayerView()
+    private var workbenchFPSPlate: NSView?
+    private var workbenchFPSLabel: NSTextField?
+    private var workbenchCountdownPlate: NSView?
+    private var workbenchCountdownLabel: NSTextField?
+    private final class WorkbenchOverlayView: NSView {
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
     private var core: SPPlayerCore?
     private let playbackSleep = SPPlaybackSleepController()
 
@@ -336,7 +343,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private let initialContentSize: NSSize
 
     init(deferCoreCreation: Bool = false,
-         contentSize: NSSize = WelcomeView.contentSize) {
+         contentSize: NSSize = NSSize(width: 640, height: 360)) {
         self.deferCoreCreation = deferCoreCreation
         self.initialContentSize = contentSize
         super.init(nibName: nil, bundle: nil)
@@ -467,13 +474,6 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             win.toggleFullScreen(nil)
         }
 #endif
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            guard let self, let core = self.core, core.state == .idle,
-                  !self.hasMediaSession,
-                  self.welcome == nil || self.welcome?.isHidden == true else { return }
-            self.showEmptyState()
-        }
 
         let warmDelay: TimeInterval = (core?.state ?? .idle) == .idle ? 0.5 : 2.0
         DispatchQueue.main.asyncAfter(deadline: .now() + warmDelay) {
@@ -1200,61 +1200,12 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     func showEmptyState() {
         setIdleHintVisible(false)
-
-        if let window = view.window, !window.styleMask.contains(.fullScreen) {
-            window.styleMask.remove(.resizable)
-            window.contentAspectRatio = .zero
-            let target = WelcomeView.contentSize
-            let current = window.contentRect(forFrameRect: window.frame).size
-            if abs(current.width - target.width) >= 1
-                || abs(current.height - target.height) >= 1 {
-                window.setContentSize(target)
-                if !window.isVisible || !everStartedPlayback {
-
-                    window.center()
-                }
-            }
-
-            window.titleVisibility = .hidden
-            windowAwaitingFirstMediaFit = true
+        guard view.window?.isVisible == true, !windowDestructionPending else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.hasMediaSession, !self.windowDestructionPending else { return }
+            self.view.window?.orderOut(nil)
+            EnhancementWorkbenchController.shared.showWorkbench()
         }
-        let w: WelcomeView
-        if let existing = welcome {
-            w = existing
-        } else {
-            let t0 = CFAbsoluteTimeGetCurrent()
-            w = WelcomeView(frame: view.bounds)
-            w.autoresizingMask = [.width, .height]
-            w.onOpenFile = { [weak self] in self?.presentOpenDocumentPanel() }
-            // A 120 ms hover dwell filters incidental pointer crossings.
-            // Leaving cancels pending preparation. Once synchronous construction
-            // starts, newly queued keyboard input waits for it to finish.
-            w.onOpenIntent = { [weak self] in self?.scheduleOpenPanelHoverPrewarm() }
-            w.onOpenIntentEnd = { [weak self] in self?.cancelOpenPanelHoverPrewarm() }
-            w.onPlay = { [weak self] entry in self?.openRecentEntry(path: entry.path) }
-            w.onClearAll = { (NSApp.delegate as? AppDelegate)?.clearAllHistoryAction(nil) }
-#if !SP_APP_STORE
-            w.onSetDefault = { [weak self, weak w] in
-                SPDefaultPlayer.presentDialog(over: self?.view.window,
-                                              onApplied: { w?.hideSetDefaultOffer() })
-            }
-            // Dismiss the offer permanently and point to the menu entry.
-            w.onSetDefaultDismiss = { [weak w] in
-                SPDefaultPlayer.markWelcomeDismissed()
-                w?.showTransientNotice(L("welcome.setDefault.dismissed"))
-            }
-#endif
-            view.addSubview(w)
-            welcome = w
-            if Self.dbg {
-                NSLog("[UI] 欢迎屏安装耗时 %.1fms", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
-            }
-        }
-        w.reload()
-        w.isHidden = false
-        w.prepareTextureIfNeeded()
-        scheduleSetDefaultOfferEvaluation()
-        scheduleRecentPlaysWarm()
     }
 
     /// Resume welcome-page background work when a hidden window is shown again.
@@ -2270,9 +2221,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
         dismissFailurePresentation()
 
-        let hadWelcome = welcome != nil
         showEmptyState()
-        if hadWelcome { welcome?.rerollTexture() }
     }
 
     func playNextMedia() {
@@ -2539,6 +2488,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         let motionStatsNow = CACurrentMediaTime()
         if motionStatsNow - lastMotionStatsRefresh >= 0.5 {
             lastMotionStatsRefresh = motionStatsNow
+            core.setPhysicalFPSObservationEnabled(workbenchFPSVisible)
             transitionPresentation(.motionChanged(currentMotionPresentation(core: core)))
         }
         // Save resume position at most every five seconds and only after two
@@ -2691,9 +2641,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private func presentFailureNotice(_ reason: PlayerFailureReason) {
         shownFailureReason = reason
         lastFailedOpenURL = lastOpenRequestURL
-        guard let w = welcome else { return }
-        w.showFailureNotice(title: reason.localizedTitle, reason: reason.localizedReason,
-                            retryEnabled: lastFailedOpenURL != nil) { [weak self] in self?.retryFailedOpen() }
+        EnhancementWorkbenchController.shared.showPlaybackFailure("\(reason.localizedTitle)：\(reason.localizedReason)")
         if spDebugEnabled {
             NSLog("[UI] emptyState reason=%@ file=%@", reason.rawValue, lastFailedOpenURL?.lastPathComponent ?? "-")
         }
@@ -3488,12 +3436,169 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         return false
     }
 
-    private func applyFrameInterpolationMode(_ mode: SPFrameInterpolationMode) {
+    private func applyFrameInterpolationMode(_ mode: SPFrameInterpolationMode, preserveCadence: Bool = false) {
         guard let core else { return }
+        core.selectDefaultFileInterpolationEngine()
+
+        if mode == .doubleRate && !preserveCadence {
+            _ = core.configureFileInterpolationMode(2, numerator: 0, denominator: 1)
+        }
 
         core.frameInterpolationMode = hasVideoSession ? mode : .off
         refreshMotionSmoothingControl()
+        NotificationCenter.default.post(name: .khuaMotionPlusChanged, object: self)
     }
+
+    func workbenchSetMotionPlus(_ enabled: Bool) {
+        applyFrameInterpolationMode(enabled ? .doubleRate : .off)
+    }
+
+    func workbenchSetFileCadence(mode: Int, numerator: Int64, denominator: Int64) -> Bool {
+        guard hasVideoSession, let core,
+              core.configureFileInterpolationMode(mode, numerator: numerator, denominator: denominator) else { return false }
+        applyFrameInterpolationMode(.doubleRate, preserveCadence: true)
+        return core.frameInterpolationMode == .doubleRate
+    }
+
+    func workbenchPrepareFileRife(modelID: String, quality: String, completion: @escaping (Bool, String) -> Void) {
+        guard hasVideoSession, let core else { completion(false, "请先打开视频。"); return }
+        let provider = SPFileRifeEngine(modelID: modelID, quality: quality)
+        core.prepare(provider, completion: completion)
+    }
+    func workbenchPrepareFileLowLatency(completion: @escaping (Bool, String) -> Void) {
+        guard hasVideoSession, let core else { completion(false, "请先打开视频。"); return }
+        core.prepare(SPFileLowLatencyEngine(), completion: completion)
+    }
+    func workbenchPrepareFileDistil(completion: @escaping (Bool, String) -> Void) {
+        guard hasVideoSession, let core else { completion(false, "请先打开视频。"); return }
+        core.prepare(SPFileDistilEngine(), completion: completion)
+    }
+    func workbenchCancelFileRifePreparation() { core?.cancelPreparedFileFrameProvider() }
+    func workbenchCommitFilePlan(interpolation: Bool, rife: Bool, cadence: Int, numerator: Int64, denominator: Int64, scaler: Bool) -> Bool {
+        guard hasVideoSession, let core else { return false }
+        let committed = core.commitFilePlan(withInterpolation: interpolation, usePreparedProvider: rife, cadence: cadence, numerator: numerator, denominator: denominator, usePreparedScaler: scaler)
+        if committed {
+            refreshMotionSmoothingControl()
+            NotificationCenter.default.post(name: .khuaMotionPlusChanged, object: self)
+        }
+        return committed
+    }
+
+    func workbenchPrepareFileScaler(engine: String, variant: String, width: Int, height: Int, completion: @escaping (Bool, String) -> Void) {
+        guard hasVideoSession, let core else { completion(false, "请先打开视频。"); return }
+        let sourceWidth = Int(core.videoInfo.width), sourceHeight = Int(core.videoInfo.height)
+        let factor: Int
+        if ["anime4k", "realcugan"].contains(engine) { factor = 2 }
+        else if engine == "apple.video-sr" && (width == 0 || height == 0) {
+            guard let first = SPAppleVideoSR.readyScales(forWidth: Int32(sourceWidth), height: Int32(sourceHeight)).first else {
+                completion(false, "设备或当前输入不支持 Apple 视频超分。 "); return
+            }
+            factor = first.intValue
+        } else { factor = 1 }
+        let resolvedWidth = width == 0 ? sourceWidth * factor : width
+        let resolvedHeight = height == 0 ? sourceHeight * factor : height
+        guard (2...3840).contains(resolvedWidth), (2...2160).contains(resolvedHeight), resolvedWidth % 2 == 0, resolvedHeight % 2 == 0 else {
+            completion(false, "设备不支持或输出尺寸无效（须为偶数，最高 3840×2160）。"); return
+        }
+        core.prepareFileScalerWidth(Int32(resolvedWidth), height: Int32(resolvedHeight), engine: engine, variant: variant, completion: completion)
+    }
+    func workbenchActivateFileLanczos() -> Bool { core?.activatePreparedFileLanczos() ?? false }
+    func workbenchCancelFileLanczosPreparation() { core?.cancelPreparedFileLanczos() }
+    func workbenchDisableFileLanczos() { core?.disableFileLanczos() }
+    var workbenchFileLanczosActive: Bool { core?.fileLanczosActive ?? false }
+    var workbenchFileLanczosStatus: String { core?.fileLanczosStatus ?? "" }
+    var workbenchFileScalerDiagnostics: [String: Any] { core?.fileScalerDiagnostics ?? [:] }
+    var workbenchFileLanczosSize: (Int, Int) { (Int(core?.fileLanczosWidth ?? 0), Int(core?.fileLanczosHeight ?? 0)) }
+
+    func workbenchApplyFileOutput(displayID: UInt32, fullscreen: Bool, completion: @escaping (Bool, String) -> Void) {
+        guard let controller = view.window?.windowController as? PlayerWindowController else { completion(false, "播放器窗口不可用。"); return }
+        controller.applyWorkbenchFileOutput(displayID: displayID, fullscreen: fullscreen, completion: completion)
+    }
+    func workbenchCancelFileOutput() {
+        (view.window?.windowController as? PlayerWindowController)?.cancelWorkbenchFileOutput()
+    }
+
+    func workbenchSetFileViewMode(_ mode: String) {
+        core?.setFileViewMode(mode == "original" ? 1 : (mode == "compare" ? 2 : 0))
+    }
+
+    var workbenchSourceSize: (Int, Int) { (Int(core?.videoInfo.width ?? 0), Int(core?.videoInfo.height ?? 0)) }
+    var workbenchSourceFPS: Double { core?.videoInfo.fps ?? 0 }
+    var workbenchPresentedFPS: Double { core?.observedPhysicalOutputFPS ?? -1 }
+    var workbenchInputEstimateFPS: Double { core?.observedInputFPS ?? -1 }
+    var workbenchVideoDelayMs: Double { core?.observedVideoDelayMs ?? -1 }
+    func setWorkbenchFPSObservation(_ enabled: Bool) { core?.setPhysicalFPSObservationEnabled(enabled) }
+    var workbenchFPSVisible: Bool {
+        guard let window = view.window else { return false }
+        return window.isVisible && !window.isMiniaturized && window.occlusionState.contains(.visible) && workbenchIsPlaying
+    }
+    var workbenchInterpolationCoverage: Double { core?.frameInterpolationCoverage ?? 0 }
+    var workbenchIsPlaying: Bool { core?.isPlaying ?? false }
+    func workbenchTogglePlayback() { perform(.togglePlayback) }
+
+    func setWorkbenchFPSOverlay(text: String, enabled: Bool) {
+        if !enabled { workbenchFPSPlate?.isHidden = true; return }
+        if workbenchFPSPlate == nil {
+            let plate = WorkbenchOverlayView()
+            plate.wantsLayer = true
+            plate.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.62).cgColor
+            plate.layer?.cornerRadius = 6
+            plate.translatesAutoresizingMaskIntoConstraints = false
+            let label = NSTextField(labelWithString: "")
+            label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+            label.textColor = .white
+            label.translatesAutoresizingMaskIntoConstraints = false
+            plate.addSubview(label)
+            view.addSubview(plate, positioned: .above, relativeTo: playerView)
+            NSLayoutConstraint.activate([
+                plate.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+                plate.topAnchor.constraint(equalTo: view.topAnchor, constant: 12),
+                label.leadingAnchor.constraint(equalTo: plate.leadingAnchor, constant: 8),
+                label.trailingAnchor.constraint(equalTo: plate.trailingAnchor, constant: -8),
+                label.topAnchor.constraint(equalTo: plate.topAnchor, constant: 4),
+                label.bottomAnchor.constraint(equalTo: plate.bottomAnchor, constant: -4),
+            ])
+            workbenchFPSPlate = plate
+            workbenchFPSLabel = label
+        }
+        workbenchFPSLabel?.stringValue = text
+        workbenchFPSPlate?.isHidden = false
+    }
+
+    func setWorkbenchCountdown(_ text: String, enabled: Bool) {
+        if !enabled { workbenchCountdownPlate?.isHidden = true; return }
+        if workbenchCountdownPlate == nil {
+            let plate = WorkbenchOverlayView()
+            plate.wantsLayer = true
+            plate.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.55).cgColor
+            plate.layer?.cornerRadius = 12
+            plate.translatesAutoresizingMaskIntoConstraints = false
+            let label = NSTextField(labelWithString: "")
+            label.font = .systemFont(ofSize: 54, weight: .bold)
+            label.textColor = .white
+            label.alignment = .center
+            label.translatesAutoresizingMaskIntoConstraints = false
+            plate.addSubview(label)
+            view.addSubview(plate, positioned: .above, relativeTo: playerView)
+            NSLayoutConstraint.activate([
+                plate.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+                plate.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+                plate.widthAnchor.constraint(equalToConstant: 82),
+                plate.heightAnchor.constraint(equalToConstant: 82),
+                label.centerXAnchor.constraint(equalTo: plate.centerXAnchor),
+                label.centerYAnchor.constraint(equalTo: plate.centerYAnchor),
+            ])
+            workbenchCountdownPlate = plate
+            workbenchCountdownLabel = label
+        }
+        workbenchCountdownLabel?.stringValue = text
+        workbenchCountdownPlate?.isHidden = false
+    }
+
+    var workbenchMotionPlusRequested: Bool { core?.frameInterpolationMode == .doubleRate }
+    var workbenchMotionPlusActive: Bool { core?.frameInterpolationActive ?? false }
+    var workbenchMotionPlusStatus: String { core?.frameInterpolationStatus ?? "" }
+    var workbenchMotionPlusAwaitingScan: Bool { core?.frameInterpolationAwaitingScan ?? false }
 
     private func refreshMotionSmoothingControl() {
         guard let core else { return }
@@ -3530,7 +3635,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             available: core.frameInterpolationAvailable,
             active: core.frameInterpolationActive,
             contentBypassed: core.frameInterpolationContentBypassed,
-            outputFPS: core.presentedFrameRate,
+            outputFPS: core.observedPhysicalOutputFPS,
             sourceFPS: core.videoInfo.fps,
             coverage: core.frameInterpolationCoverage,
             status: core.frameInterpolationStatus,

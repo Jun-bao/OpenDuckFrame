@@ -3,6 +3,7 @@
 #import <Cocoa/Cocoa.h>
 #import "SPDustSnapshot.h"
 #import "SPDamageSnapshot.h"
+#import "SPFileFrameProvider.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -105,6 +106,9 @@ NS_SWIFT_UI_ACTOR
 @property (nonatomic, readonly) double playbackRate;
 
 @property (nonatomic) SPFrameInterpolationMode frameInterpolationMode;
+/// Prepare a cadence for the next frame-interpolation transaction. mode=1 is
+/// fixed FPS, 2/3/4 are multipliers. Invalid requests do not change playback.
+- (BOOL)configureFileInterpolationMode:(NSInteger)mode numerator:(int64_t)numerator denominator:(int64_t)denominator;
 @property (nonatomic, readonly) BOOL frameInterpolationAvailable;
 
 + (BOOL)fullFeatureTier;
@@ -112,6 +116,8 @@ NS_SWIFT_UI_ACTOR
 @property (nonatomic, readonly) BOOL audioOnlySession;
 @property (nonatomic, readonly) BOOL frameInterpolationActive;
 @property (nonatomic, readonly, copy) NSString *frameInterpolationStatus;
+/// True while coded scan evidence has not yet covered the current file frame.
+@property (nonatomic, readonly) BOOL frameInterpolationAwaitingScan;
 // A single user-facing sentence for the current unavailability reason.
 // Diagnostic details remain in frameInterpolationStatus; no known reason = "".
 @property (nonatomic, readonly, copy) NSString *frameInterpolationUnavailableDescription;
@@ -119,10 +125,39 @@ NS_SWIFT_UI_ACTOR
 @property (nonatomic, readonly) BOOL frameInterpolationContentBypassed;
 
 @property (nonatomic, readonly) double presentedFrameRate;
+// Observed source PTS cadence and unique physical drawable presentations.
+// Nonpositive values mean that there is no current reliable sample.
+@property (nonatomic, readonly) double observedInputFPS;
+@property (nonatomic, readonly) double observedPhysicalOutputFPS;
+/// Approximate video lateness relative to the player media clock, in milliseconds;
+/// negative means no current valid observation.
+@property (nonatomic, readonly) double observedVideoDelayMs;
+- (void)setPhysicalFPSObservationEnabled:(BOOL)enabled;
+/// Prepare on a worker; committing is a separate main-thread transaction.
+/// Preflight an injected provider against the currently decoded source; old plan remains active.
+- (void)prepareFileFrameProvider:(id<SPFileFrameProvider>)provider completion:(void (^)(BOOL ready, NSString *message))completion;
+- (void)cancelPreparedFileFrameProvider;
+/// Restore the player's original Apple FRC selection for its own controls.
+- (void)selectDefaultFileInterpolationEngine;
+/// Commit a completely prepared file plan as one generation-checked transaction.
+- (BOOL)commitFilePlanWithInterpolation:(BOOL)interpolation usePreparedProvider:(BOOL)useProvider cadence:(NSInteger)mode numerator:(int64_t)numerator denominator:(int64_t)denominator usePreparedScaler:(BOOL)useScaler;
+- (void)prepareFileLanczosWidth:(int)width height:(int)height completion:(void (^)(BOOL ready, NSString *message))completion;
+- (void)prepareFileScalerWidth:(int)width height:(int)height engine:(NSString *)engine completion:(void (^)(BOOL ready, NSString *message))completion;
+- (void)prepareFileScalerWidth:(int)width height:(int)height engine:(NSString *)engine variant:(NSString *)variant completion:(void (^)(BOOL ready, NSString *message))completion;
+- (BOOL)activatePreparedFileLanczos;
+- (void)cancelPreparedFileLanczos;
+- (void)disableFileLanczos;
+@property (nonatomic, readonly) BOOL fileLanczosActive;
+@property (nonatomic, readonly) int fileLanczosWidth;
+@property (nonatomic, readonly) int fileLanczosHeight;
+@property (nonatomic, readonly, copy) NSString *fileLanczosStatus;
+@property (nonatomic, readonly, copy) NSDictionary<NSString *, id> *fileScalerDiagnostics;
 
 @property (nonatomic, readonly) double frameInterpolationCoverage;
 
 - (void)setMotionCompareEnabled:(BOOL)enabled;
+/// 0 enhanced, 1 original, 2 side-by-side; source is bound to each output frame.
+- (void)setFileViewMode:(int)mode;
 
 @property (nonatomic, readonly, copy, nullable) NSString *currentFilePath;
 

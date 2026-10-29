@@ -3,6 +3,7 @@
 #import <Foundation/Foundation.h>
 #import <CoreVideo/CoreVideo.h>
 #import <QuartzCore/QuartzCore.h>
+@class SPFileLanczosScaler;
 
 @interface SPMetalRenderer : NSObject
 
@@ -15,6 +16,9 @@
 // Share one Metal device across rendering and subtitle modules so textures
 // and command queues always belong to the same device.
 @property (nonatomic, readonly, strong) id<MTLDevice> device;
+- (void)setFileLanczosScaler:(SPFileLanczosScaler *)scaler;
+@property (nonatomic, readonly, copy) NSDictionary<NSString *, id> *fileScalerDiagnostics;
+@property (atomic, readonly, copy) NSString *fileScaleStatus;
 
 // Warm GPU and display resources on a background launch queue.
 - (void)warmUpGPU;
@@ -24,6 +28,15 @@
 // frame was accepted, not that GPU presentation has completed. Use commit
 // counters when actual command submission is required.
 - (BOOL)renderPixelBuffer:(CVPixelBufferRef)buffer;
+// The callback belongs to this exact queued frame; it is discarded with a
+// superseded queue item and receives the actual drawable presentation time.
+- (BOOL)renderPixelBuffer:(CVPixelBufferRef)buffer presented:(void (^ _Nullable)(double))presented;
+// Keep media time with this exact queued frame for asynchronous processing.
+- (BOOL)renderPixelBuffer:(CVPixelBufferRef)buffer ptsUs:(int64_t)ptsUs presented:(void (^ _Nullable)(double))presented;
+/// `original` is the exact source or source-pair A for this output, retained with the queued item.
+- (BOOL)renderPixelBuffer:(CVPixelBufferRef)buffer original:(nullable CVPixelBufferRef)original ptsUs:(int64_t)ptsUs presented:(void (^ _Nullable)(double))presented;
+/// -1 preserves native compare, 0 enhanced, 1 original, 2 split compare.
+- (void)setFileViewMode:(int)mode;
 
 // A background speculative first frame is accepted only before this submission
 // session has accepted another frame. Late race results return NO and may be

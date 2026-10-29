@@ -1,4 +1,9 @@
 name: KhuaPlayer
+packages:
+  RifeMetal:
+    url: https://github.com/cinemore/rife-metal.git
+    # Tag v0.1.8 is commit 06c9fc236c47a51ed08bf534854d4c67ae3eeefc.
+    exactVersion: 0.1.8
 include:
   - path: project.sparkle.yml
     enable: ${KHUA_ENABLE_SPARKLE}
@@ -30,6 +35,7 @@ settings:
     MARKETING_VERSION: "0.7.0"
     CURRENT_PROJECT_VERSION: "12"
     KHUA_BUNDLE_ID: app.khuaplayer.KhuaPlayer
+    KHUA_DISPLAY_NAME: Khua
     KHUA_DEVELOPMENT_TEAM: ""
     ENABLE_USER_SCRIPT_SANDBOXING: NO
     HEADER_SEARCH_PATHS:
@@ -38,9 +44,11 @@ settings:
       - $(KHUA_REPO_ROOT)/Modules/MediaCore/Core
       - $(KHUA_REPO_ROOT)/Modules/MediaCore/Bridge
       - $(KHUA_REPO_ROOT)/Modules/VideoEnhancement
+      - $(SRCROOT)/Capture
       - $(KHUA_REPO_ROOT)/ThirdParty/ffmpeg-min/include
       - $(KHUA_REPO_ROOT)/ThirdParty/dav1d-min/include
       - $(KHUA_REPO_ROOT)/ThirdParty/subtitles-min/include
+      - $(KHUA_REPO_ROOT)/ThirdParty/libplacebo/include
   configs:
     Debug:
       CODE_SIGN_IDENTITY: "-"
@@ -94,6 +102,17 @@ targets:
         basedOnDependencyAnalysis: false
     sources:
       - path: UI
+      - path: Capture
+        excludes:
+          - SPAppleLowLatencySR.h
+          - SPAppleLowLatencySR.mm
+          - SPAppleVideoSR.h
+          - SPAppleVideoSR.mm
+          - SPAnime4K.h
+          - SPAnime4K.mm
+          - SPRealCUGAN.h
+          - SPRealCUGAN.mm
+      - path: ../../Modules/VideoEnhancement/Tests/SPRateScheduleTests.cpp
       - path: CaptionsHost
       - path: ../../Modules/Captions
       - path: Resources/Localizable.xcstrings
@@ -107,8 +126,21 @@ targets:
         buildPhase: resources
       - path: ../../THIRD_PARTY_NOTICES.md
         buildPhase: resources
+      - path: Resources/Notices
+        buildPhase: resources
+      - path: Resources/Models
+        buildPhase: resources
     dependencies:
       - sdk: QuartzCore.framework
+      - sdk: Metal.framework
+      - sdk: MetalFX.framework
+      - sdk: ScreenCaptureKit.framework
+      - sdk: VideoToolbox.framework
+      - package: RifeMetal
+        product: RifeMetal
+      - sdk: CoreVideo.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreML.framework
       - sdk: AppKit.framework
       - sdk: IOKit.framework
       - sdk: UniformTypeIdentifiers.framework
@@ -135,7 +167,7 @@ targets:
       path: Info.plist
       properties:
         CFBundleName: Khua
-        CFBundleDisplayName: Khua
+        CFBundleDisplayName: $(KHUA_DISPLAY_NAME)
         SPProductName: Khua Player
         CFBundleDevelopmentRegion: en
         CFBundleShortVersionString: $(MARKETING_VERSION)
@@ -146,6 +178,7 @@ targets:
         LSApplicationCategoryType: public.app-category.video
         NSHumanReadableCopyright: "Copyright © 2026 Khua contributors"
         NSSpeechRecognitionUsageDescription: "Khua generates subtitles from the audio of the media you open. Processing takes place on this Mac."
+        NSScreenCaptureUsageDescription: "Khua shows and enhances the window or display you select. Capture stays on this Mac."
         # Folder and volume privacy prompts appear only when Khua scans the
         # folder of a video you opened. Translations: Resources/InfoPlist.xcstrings.
         NSDesktopFolderUsageDescription: "Used to find subtitles and the next episode in the folder of the video you open."
@@ -303,11 +336,20 @@ targets:
     type: framework
     platform: macOS
     sources:
+      - path: Capture/SPAppleLowLatencySR.h
+      - path: Capture/SPAppleLowLatencySR.mm
+      - path: Capture/SPAppleVideoSR.h
+      - path: Capture/SPAppleVideoSR.mm
+      - path: Capture/SPAnime4K.h
+      - path: Capture/SPAnime4K.mm
+      - path: Capture/SPRealCUGAN.h
+      - path: Capture/SPRealCUGAN.mm
       - path: ../../Modules/MediaCore/Core
       - path: ../../Modules/MediaCore/Bridge
       - path: ../../Modules/VideoEnhancement
         excludes:
           - Shaders
+          - Tests
       - path: Support/KhuaPlayer-Bridging-Header.h
       - path: ../../Platform/macOS
       - path: ../../Modules/MediaCore/Shaders/Video.metal
@@ -344,7 +386,10 @@ targets:
     dependencies:
       - sdk: CoreMedia.framework
       - sdk: CoreVideo.framework
+      - sdk: CoreGraphics.framework
       - sdk: Metal.framework
+      - sdk: MetalFX.framework
+      - sdk: MetalPerformanceShaders.framework
       - sdk: QuartzCore.framework
       - sdk: AppKit.framework
       - sdk: VideoToolbox.framework

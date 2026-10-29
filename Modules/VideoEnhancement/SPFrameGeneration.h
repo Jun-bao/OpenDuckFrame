@@ -62,8 +62,13 @@ struct SPFrameGeneratorSubmitContext {
 
 } // namespace sp
 
+// synthetic also covers scheduled holds so stale plan epochs are rejected;
+// generated is true only for an actual model result and drives its counters.
 typedef sp::PushResult (^SPFrameGeneratorEnqueue)(CVPixelBufferRef buffer, int64_t ptsUs,
                                               int64_t generation, BOOL synthetic,
+                                              BOOL generated,
+                                              CVPixelBufferRef _Nullable original,
+                                              int64_t originalPtsUs,
                                               uint64_t interpolationEpoch,
                                               uint64_t interruptGeneration);
 #pragma clang diagnostic pop

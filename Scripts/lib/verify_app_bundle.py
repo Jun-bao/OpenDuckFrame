@@ -39,6 +39,7 @@ def is_macho(path: Path) -> bool:
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
+        errors="replace",
     )
     return result.returncode == 0 and "Mach-O" in result.stdout
 
@@ -275,6 +276,11 @@ def verify_bundle(
         raise BundleError(f"required libass is not Mach-O: {required_libass}")
     executable_rpaths = parse_rpaths(main)
     max_tuple = version_tuple(maximum_minos)
+    # Optional Anime4K is loaded only after the app checks the OS version.
+    # Its separately packaged runtime may target macOS 27; it must never enter
+    # the main app's ordinary Mach-O dependency graph on older systems.
+    optional_anime_names = {"libplacebo.360.dylib", "libshaderc_shared.1.dylib", "liblcms2.2.dylib", "libMoltenVK.dylib", "libkhua_realcugan.dylib"}
+    optional_anime = {(app / "Contents/Frameworks" / name).resolve() for name in optional_anime_names}
     for image in machos:
         archs = run(["lipo", "-archs", str(image)]).strip().split()
         if archs != [expected_arch]:
@@ -284,7 +290,9 @@ def verify_bundle(
         if not minos_values:
             raise BundleError(f"no LC_BUILD_VERSION minos in {image}")
         for minos in minos_values:
-            if version_tuple(minos) > max_tuple:
+            high_minos_optional = {"libplacebo.360.dylib", "libshaderc_shared.1.dylib", "liblcms2.2.dylib"}
+            allowed_optional = image.resolve() in optional_anime and image.name in high_minos_optional and version_tuple(minos) <= version_tuple("27.0")
+            if version_tuple(minos) > max_tuple and not allowed_optional:
                 raise BundleError(f"minos {minos} exceeds {maximum_minos}: {image}")
         image_rpaths = parse_rpaths(image)
         image_exec_dir = executable_dir_for(image, app, main.parent)
@@ -301,6 +309,10 @@ def verify_bundle(
             )
             if resolved is not None and resolved.resolve() not in macho_set:
                 raise BundleError(f"resolved dependency is not packaged Mach-O: {resolved}")
+            if resolved is not None and resolved.resolve() in optional_anime and image.resolve() not in optional_anime:
+                raise BundleError(f"optional Anime4K runtime must not be linked into the base app: {image}: {dependency}")
+            if resolved is not None and image.name in {"libkhua_realcugan.dylib", "libMoltenVK.dylib"} and resolved.name in high_minos_optional:
+                raise BundleError(f"macOS 14 Real-CUGAN must not depend on the macOS 27 runtime: {image}: {dependency}")
         if verify_codesign:
             run(["codesign", "--verify", "--strict", str(image)])
 
