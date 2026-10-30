@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <deque>
 
@@ -22,10 +23,35 @@ public:
         input_.push_back({ptsNs, hostNs, 0}); trim(input_,hostNs);
     }
     void presented(int64_t ptsNs, int64_t hostNs, uint64_t id, bool held, bool originalSynthetic, bool visible) {
-        if (!visible || held || originalSynthetic || !id || hostNs <= 0 ||
-            (!output_.empty() && (ptsNs <= output_.back().pts || hostNs <= output_.back().host || id == output_.back().id))) return;
-        if (!output_.empty() && hostNs - output_.back().host > stale) output_.clear();
-        output_.push_back({ptsNs, hostNs, id}); trim(output_,hostNs);
+        if (!visible || held || originalSynthetic || !id || hostNs <= 0) return;
+        // Callbacks may arrive out of order. Keep the window in actual
+        // presentation-time order; never discard a PTS reversal here.
+        if (!output_.empty()) {
+            const int64_t newest = output_.back().host;
+            if (hostNs > newest && hostNs - newest > stale) output_.clear();
+            else if (hostNs < newest && newest - hostNs > stale) return;
+        }
+        Point point{ptsNs, hostNs, id};
+        auto less = [](const Point &a, const Point &b) {
+            if (a.host != b.host) return a.host < b.host;
+            if (a.pts != b.pts) return a.pts < b.pts;
+            return a.id < b.id;
+        };
+        // Duplicate IDs, PTS and identical presentation timestamps must not
+        // occupy the bounded window. Prefer the earliest physical timestamp.
+        for (const auto &existing : output_) {
+            if ((existing.id == id || existing.pts == ptsNs || existing.host == hostNs) && !less(point, existing)) return;
+        }
+        output_.erase(std::remove_if(output_.begin(), output_.end(), [&](const Point &existing) {
+            return existing.id == id || existing.pts == ptsNs || existing.host == hostNs;
+        }), output_.end());
+        auto at = std::lower_bound(output_.begin(), output_.end(), point, [](const Point &a, const Point &b) {
+            if (a.host != b.host) return a.host < b.host;
+            if (a.pts != b.pts) return a.pts < b.pts;
+            return a.id < b.id;
+        });
+        output_.insert(at, point);
+        trim(output_, output_.back().host);
     }
     double inputRate(int64_t now) {
         trim(input_,now);
@@ -36,8 +62,8 @@ public:
     double outputRate(int64_t now) {
         trim(output_,now);
         if (output_.size()<2 || now<output_.back().host || now-output_.back().host>stale) return -1;
-        int64_t elapsed=output_.back().host-output_.front().host;
-        return elapsed>0 ? (double)(output_.size()-1)*1e9/(double)elapsed : -1;
+        const int64_t elapsed = output_.back().host - output_.front().host;
+        return elapsed > 0 ? (double)(output_.size() - 1)*1e9/(double)elapsed : -1;
     }
 };
 }

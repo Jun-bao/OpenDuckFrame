@@ -3,10 +3,24 @@ enum AppLanguage { static var current: String? { nil }; static func effectiveLan
 
 @main struct TestRunner {
  @MainActor static func main() throws {
+  precondition(WorkbenchDimensionPolicy.editable(sizeIndex: 4, scaleEnabled: true))
+  for index in [0, 1, 2, 3, 5] { precondition(!WorkbenchDimensionPolicy.editable(sizeIndex: index, scaleEnabled: true)) }
+  precondition(!WorkbenchDimensionPolicy.editable(sizeIndex: 4, scaleEnabled: false))
+  precondition(WorkbenchDimensionPolicy.value("1920") == 1920 && WorkbenchDimensionPolicy.value(" 1081 ") == 1080)
+  for invalid in ["", "—", "abc", "-2", "1", "99999999999999999999999999", "3.5"] { precondition(WorkbenchDimensionPolicy.value(invalid) == nil) }
+  precondition(WorkbenchDimensionPolicy.text(0) == "—" && WorkbenchDimensionPolicy.text(1920) == "1920")
   let temp=FileManager.default.temporaryDirectory.appendingPathComponent("khua-config-contract-"+UUID().uuidString)
   try FileManager.default.createDirectory(at:temp,withIntermediateDirectories:true)
   defer { try? FileManager.default.removeItem(at:temp) }
   EnhancementProfileStore.testDirectory=temp
+  var native=EnhancementProfile(); native.interpolationEngineID="apple.lowlatency"; native.scaleEnabled=true; native.outputWidth=1920; native.outputHeight=1080
+  applyNativeQualityPreset(&native)
+  precondition(native.interpolationEnabled && native.interpolationEngineID == "apple.frc" && native.modelID == "vt.frc.quality" && native.interpolationQuality == "quality" && native.rate == .multiplier(2) && !native.scaleEnabled && native.outputWidth == 0 && native.outputHeight == 0)
+  precondition(EnhancementProfileStore.presets.contains { $0.id == "preset:native" })
+  let sizeStats: [String: Any] = ["sizeChain": ["sourceGeneration": UInt64(4), "configVersion": UInt64(7), "endpoint": "output", "sourceWidth": 2560, "sourceHeight": 1440, "processingWidth": 1920, "processingHeight": 1080, "bufferWidth": 1920, "bufferHeight": 1080, "drawableWidth": 2560, "drawableHeight": 1440, "downsampled": true]]
+  let sizeText=LiveSizeChain.text(sizeStats,generation:4,config:7)
+  precondition(sizeText.contains("2560×1440") && sizeText.contains("1920×1080") && sizeText.contains("Drawable") && sizeText.contains("Downsampled"))
+  precondition(LiveSizeChain.text(sizeStats,generation:4,config:8).isEmpty && LiveSizeChain.text(sizeStats,generation:5,config:7).isEmpty)
   var custom=EnhancementProfile();custom.configName="游戏";custom.interpolationEngineID="rife.metal";custom.modelID="rife-v4.26";custom.rate = .multiplier(3)
   try EnhancementProfileStore.saveNamed(custom)
   precondition(EnhancementProfileStore.resolvedID(custom)=="custom:游戏")

@@ -70,7 +70,7 @@ typedef NS_ENUM(NSInteger, SPLiveViewMode) {
 @end
 
 @interface SPLivePreviewView : NSView
-/// Returns NO when the draw queue is already full. The presented dictionary is
+/// Returns NO on synchronous rejection and reports its reason. The presented dictionary is
 /// filled only from the drawable presented handler.
 - (BOOL)presentEnhanced:(nullable CVPixelBufferRef)enhanced
                original:(nullable CVPixelBufferRef)original
@@ -81,8 +81,11 @@ typedef NS_ENUM(NSInteger, SPLiveViewMode) {
                  ptsDen:(int64_t)ptsDen
               synthetic:(BOOL)synthetic
                 frameID:(uint64_t)frameID
-                 counts:(BOOL)counts;
+                 counts:(BOOL)counts
+                 reason:(NSString * _Nullable * _Nullable)reason;
 @property (nonatomic, copy, nullable) void (^presented)(NSDictionary<NSString *, id> *info);
+/// Asynchronous post-admission failures, tagged with submission identity.
+@property (nonatomic, copy, nullable) void (^presentationFailure)(NSDictionary<NSString *, id> *info);
 /// Successful GPU completion for a drawable submission; does not imply physical presentation.
 @property (nonatomic, copy, nullable) void (^surfaceReady)(NSDictionary<NSString *, id> *info);
 - (void)setGeneration:(uint64_t)generation;
@@ -109,6 +112,8 @@ typedef NS_ENUM(NSInteger, SPLiveViewMode) {
 @property (nonatomic, copy, nullable) void (^outputSurfaceHandler)(uint64_t generation, uint64_t configVersion, uint64_t token);
 @property (nonatomic, readonly) SPLiveResolvedPlan *resolvedPlan;
 @property (nonatomic, readonly) NSDictionary<NSString *, id> *stats;
+/// Explicit bounded diagnostic export; events remain in callback arrival order.
+- (NSDictionary<NSString *, id> *)presentationOrderDiagnostics;
 /// Install once after assigning both views, on the main thread.
 - (void)installPresentationHooks;
 - (void)awaitOutputSurfaceWithToken:(uint64_t)token;
@@ -150,7 +155,13 @@ typedef NS_ENUM(NSInteger, SPLiveViewMode) {
 + (NSDictionary<NSString *, id> *)runLowLatencyPrescaleSmoke;
 + (NSDictionary<NSString *, id> *)runLiveSwitchContract;
 + (NSDictionary<NSString *, id> *)runLiveQualityProbe;
+/// Explicit synthetic, headless comparison through the application bridges.
++ (NSDictionary<NSString *, id> *)runNativeBridgeQualityProbeWithBundle:(NSBundle *)bundle;
 + (NSDictionary<NSString *, id> *)runStaticHoldContract;
+/// Real FRC setup and synthetic buffer dimension lifecycle; no window.
++ (NSDictionary<NSString *, id> *)runSourceSizeLifecycleContract;
+/// Deterministic source clock, phase deadlines and stale-work contract.
++ (NSDictionary<NSString *, id> *)runSourceClockSchedulingContract;
 @end
 
 NS_ASSUME_NONNULL_END

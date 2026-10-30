@@ -371,6 +371,7 @@ enum EnhancementProfileStore {
 
     static let presets: [(id: String, name: String, english: String, symbol: String)] = [
         ("preset:default", "默认", "Default", "doc.text"),
+        ("preset:native", "原生画质 X2", "Native quality X2", "viewfinder"),
         ("preset:game", "游戏", "Game", "gamecontroller"),
         ("preset:film", "电影", "Film", "film"),
         ("preset:anime", "动画", "Animation", "photo"),
@@ -542,6 +543,49 @@ enum VideoSRAvailability {
     }
 }
 
+@MainActor private enum LiveSizeChain {
+    static func text(_ stats: [String: Any], generation: UInt64, config: UInt64) -> String {
+        guard let chain = stats["sizeChain"] as? [String: Any],
+              let gen = chain["sourceGeneration"] as? UInt64, gen == generation,
+              let version = chain["configVersion"] as? UInt64, version == config,
+              let endpoint = chain["endpoint"] as? String, ["output", "preview"].contains(endpoint),
+              let sw = chain["sourceWidth"] as? Int, let sh = chain["sourceHeight"] as? Int,
+              let pw = chain["processingWidth"] as? Int, let ph = chain["processingHeight"] as? Int,
+              let bw = chain["bufferWidth"] as? Int, let bh = chain["bufferHeight"] as? Int,
+              let dw = chain["drawableWidth"] as? Int, let dh = chain["drawableHeight"] as? Int,
+              [sw, sh, pw, ph, bw, bh, dw, dh].allSatisfy({ $0 > 0 }) else { return "" }
+        let endpointText = endpoint == "output" ? EnhancementText.t("Output", "输出") : EnhancementText.t("Preview", "预览")
+        let down = (chain["downsampled"] as? Bool) == true ? " · " + EnhancementText.t("Downsampled", "已降采样") : ""
+        return endpointText + ": " + EnhancementText.t("Input", "输入") + " \(sw)×\(sh) → " +
+            EnhancementText.t("Processing", "处理") + " \(pw)×\(ph) → " +
+            EnhancementText.t("Buffer", "缓冲") + " \(bw)×\(bh) → " +
+            EnhancementText.t("Drawable", "显示面") + " \(dw)×\(dh)" + down
+    }
+}
+
+// Only used after the user selects the native preset; does not touch saved settings.
+private func applyNativeQualityPreset(_ profile: inout EnhancementProfile) {
+    profile.interpolationEnabled = true
+    profile.interpolationEngineID = "apple.frc"
+    profile.interpolationQuality = "quality"
+    profile.modelID = "vt.frc.quality"
+    profile.rate = .multiplier(2)
+    profile.scaleEnabled = false
+    profile.outputWidth = 0
+    profile.outputHeight = 0
+}
+
+private enum WorkbenchDimensionPolicy {
+    static func value(_ text: String) -> Int? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.allSatisfy({ $0.isASCII && $0.isNumber }),
+              let number = Int(trimmed), number >= 2 else { return nil }
+        return number & ~1
+    }
+    static func text(_ value: Int) -> String { value > 0 ? String(value) : "—" }
+    static func editable(sizeIndex: Int, scaleEnabled: Bool) -> Bool { scaleEnabled && sizeIndex == 4 }
+}
+
 final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate, NSTextFieldDelegate {
     /// Capture callbacks call only the processor's queueing entry points.
     private final class CaptureProcessorSink: @unchecked Sendable {
@@ -549,6 +593,14 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         init(_ processor: SPLiveProcessor) { self.processor = processor }
     }
     static let shared = EnhancementWorkbenchController()
+
+    private final class WorkbenchWindow: NSWindow {
+        var beforeMouseDown: ((NSEvent) -> Void)?
+        override func sendEvent(_ event: NSEvent) {
+            if event.type == .leftMouseDown { beforeMouseDown?(event) }
+            super.sendEvent(event)
+        }
+    }
 
     private let processor = SPLiveProcessor()
     private let capture = WindowCaptureSource()
@@ -582,6 +634,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let statusLabel = NSTextField(labelWithString: "")
     private let statsLabel = NSTextField(wrappingLabelWithString: "")
     private let planLabel = NSTextField(wrappingLabelWithString: "")
+    private let sizeChainLabel = NSTextField(wrappingLabelWithString: "")
     private let sourceLabel = NSTextField(labelWithString: "")
     private let fileLimitLabel = NSTextField(wrappingLabelWithString: "")
     private let interpolationSwitch = NSSwitch()
@@ -608,6 +661,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let sizePopup = NSPopUpButton()
     private let widthField = NSTextField()
     private let heightField = NSTextField()
+    private var dimensionEditOriginal: [ObjectIdentifier: String] = [:]
     private let displayPopup = NSPopUpButton()
     private let fullscreenCheck = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     private let fpsSwitch = NSSwitch()
@@ -678,7 +732,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private struct SCDisplayBox { var title: String; var display: Any }
 
     private init() {
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1180, height: 760),
+        let window = WorkbenchWindow(contentRect: NSRect(x: 0, y: 0, width: 1180, height: 760),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable],
                               backing: .buffered, defer: false)
         window.title = EnhancementText.t("Quality Workbench", "画质工作台")
@@ -687,6 +741,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         profile.configID = EnhancementProfileStore.resolvedID(profile)
         window.delegate = self
         window.contentView = build()
+        window.initialFirstResponder = sourceKindControl
+        window.beforeMouseDown = { [weak self] event in self?.endDimensionEditingBeforeClick(event) }
         installCountdownLabels()
         installFPSLabels()
         wire()
@@ -1401,6 +1457,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         statusColumn.spacing = 2
         statusColumn.addArrangedSubview(statusLabel)
         statusColumn.addArrangedSubview(planLabel)
+        sizeChainLabel.maximumNumberOfLines = 2
+        sizeChainLabel.textColor = .secondaryLabelColor
+        sizeChainLabel.preferredMaxLayoutWidth = 520
+        statusColumn.addArrangedSubview(sizeChainLabel)
         statsLabel.font = .systemFont(ofSize: 11)
         statsLabel.textColor = .secondaryLabelColor
         statusColumn.addArrangedSubview(statsLabel)
@@ -1610,6 +1670,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private func applyPresetDefaults(_ id: String) {
         switch id {
+        case "preset:native":
+            applyNativeQualityPreset(&profile)
         case "preset:game":
             profile.interpolationEnabled = true
             profile.interpolationEngineID = "apple.lowlatency"
@@ -1818,7 +1880,53 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         editor?.removeFromSuperview()
     }
 
+    private func endDimensionEditingBeforeClick(_ event: NSEvent) {
+        guard let window, let content = window.contentView,
+              let field = [widthField, heightField].first(where: { $0.currentEditor() === window.firstResponder }),
+              let editor = field.currentEditor() else { return }
+        let point = content.superview?.convert(event.locationInWindow, from: nil) ?? event.locationInWindow
+        let target = content.hitTest(point)
+        if let target, target === field || target.isDescendant(of: field) || target === editor || target.isDescendant(of: editor) { return }
+        // The original event is still delivered by NSWindow.sendEvent.
+        window.makeFirstResponder(nil)
+    }
+
+    func controlTextDidBeginEditing(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField,
+              field === widthField || field === heightField else { return }
+        dimensionEditOriginal[ObjectIdentifier(field)] = field.stringValue
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        guard let field = control as? NSTextField, field === widthField || field === heightField else { return false }
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            textView.string = dimensionEditOriginal[ObjectIdentifier(field)] ?? field.stringValue
+            window?.makeFirstResponder(nil)
+            return true
+        }
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            window?.makeFirstResponder(nil)
+            return true
+        }
+        if commandSelector == #selector(NSResponder.insertTab(_:)), field === widthField, heightField.isEditable {
+            return window?.makeFirstResponder(heightField) ?? false
+        }
+        if commandSelector == #selector(NSResponder.insertBacktab(_:)), field === heightField, widthField.isEditable {
+            return window?.makeFirstResponder(widthField) ?? false
+        }
+        return false // Other key-view navigation remains with AppKit.
+    }
+
     func controlTextDidEndEditing(_ notification: Notification) {
+        if let field = notification.object as? NSTextField, field === widthField || field === heightField {
+            let previous = dimensionEditOriginal.removeValue(forKey: ObjectIdentifier(field))
+            let fallback = field === widthField ? profile.outputWidth : profile.outputHeight
+            let value = WorkbenchDimensionPolicy.value(field.stringValue) ??
+                previous.flatMap(WorkbenchDimensionPolicy.value) ?? (fallback >= 2 ? fallback : (field === widthField ? 1920 : 1080))
+            field.stringValue = String(value)
+            controlChanged()
+            return
+        }
         guard let editor = notification.object as? ConfigRenameField, editor === renameEditor else { return }
         let movement = (notification.userInfo?["NSTextMovement"] as? NSNumber)?.intValue
         if movement == NSReturnTextMovement { commitRename(editor) }
@@ -2170,7 +2278,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         widthField.stringValue = "1920"
         heightField.stringValue = "1080"
         for field in [fpsNum, fpsDen, widthField, heightField] {
-            field.formatter = NumberFormatter()
+            if field === widthField || field === heightField { field.delegate = self }
+            else { field.formatter = NumberFormatter() }
             field.target = self
             field.action = #selector(controlChanged)
             field.translatesAutoresizingMaskIntoConstraints = false
@@ -2852,6 +2961,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func applyModeVisibility() {
+        let editable = WorkbenchDimensionPolicy.editable(sizeIndex: sizePopup.indexOfSelectedItem, scaleEnabled: scaleSwitch.state == .on)
+        for (field, value) in [(widthField, profile.outputWidth), (heightField, profile.outputHeight)] {
+            if field.isEditable != editable { field.isEditable = editable }
+            if field.isSelectable != editable { field.isSelectable = editable }
+            if field.currentEditor() == nil { field.stringValue = WorkbenchDimensionPolicy.text(value) }
+        }
         let native2x = profile.scaleEngineID == "anime4k" || profile.scaleEngineID == "realcugan"
         if profile.sourceKind == "file" && profile.scaleEngineID == "apple.video-sr" {
             sizePopup.item(at: 0)?.title = appleVideoSRCandidate
@@ -3221,6 +3336,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             || profile.outputHeight != baseline.outputHeight
             || (profile.sourceKind == "file" && (profile.outputDisplayID != baseline.outputDisplayID || profile.outputFullscreen != baseline.outputFullscreen))
         let pending = formDiffers ? EnhancementText.t("Pending", "待应用") + " \(Self.engineDisplayName(profile.interpolationEngineID, model: profile.modelID)) \(rate)" : ""
+        sizeChainLabel.stringValue = profile.sourceKind != "file" && capture.running && processor.resolvedPlan.committed
+            ? LiveSizeChain.text(lastStats, generation: capture.currentGeneration, config: processor.resolvedPlan.configVersion) : ""
         planLabel.stringValue = [live, pending, limited ? EnhancementText.t("Display is \(screenHz) Hz", "显示器 \(screenHz) Hz，不能完整呈现该帧率") : "", profile.sourceKind == "file" ? fileStatus() : ""].filter { !$0.isEmpty }.joined(separator: " · ")
         fileLimitLabel.stringValue = profile.sourceKind == "file" ? fileStatus() : ""
     }
@@ -3379,8 +3496,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         case 3: profile.outputWidth = 2560; profile.outputHeight = 1440
         case 5: profile.outputWidth = 0; profile.outputHeight = 0
         default:
-            profile.outputWidth = max(2, Int(widthField.stringValue) ?? profile.outputWidth) & ~1
-            profile.outputHeight = max(2, Int(heightField.stringValue) ?? profile.outputHeight) & ~1
+            profile.outputWidth = WorkbenchDimensionPolicy.value(widthField.stringValue) ?? (profile.outputWidth >= 2 ? profile.outputWidth : 1920)
+            profile.outputHeight = WorkbenchDimensionPolicy.value(heightField.stringValue) ?? (profile.outputHeight >= 2 ? profile.outputHeight : 1080)
         }
         profile.outputFullscreen = fullscreenCheck.state == .on
         profile.viewMode = ["enhanced", "original", "compare"][max(0, viewMode.selectedSegment)]
