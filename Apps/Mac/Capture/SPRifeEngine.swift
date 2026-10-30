@@ -1,13 +1,15 @@
 import CoreVideo
+import CoreMedia
 import CryptoKit
 import Foundation
 import RifeMetal
 import VideoToolbox
+import os
 
 @objc(SPRifeBridge)
 final class SPRifeBridge: NSObject {
     static let packageVersion = "0.1.8"
-    static let packageCommit = "06c9fc236c47a51ed08bf534854d4c67ae3eeefc"
+    static let packageCommit = "ac6408022eb6bc1a53181f5b2716a9f5ded507c2"
     static let model426SHA256 = "01c6ce74e26a3b2eb3430eb2c0bdb490e2725cb2f2bf6136c2b0e98148bc0ee1"
 
     private let resourceBundle: Bundle
@@ -22,6 +24,14 @@ final class SPRifeBridge: NSObject {
     private var epoch: UInt64 = 0
     private var loadedModelID = ""
     private var loadedQuality = "fast"
+    // Only touched on exec. Retaining the source prevents pixel-buffer pool reuse.
+    private var stream: RifeStream?
+    private var streamEpoch: UInt64 = 0
+    private var streamPrevious: CVPixelBuffer?
+    private var streamKey: SPRifeContinuityKey?
+    private var outputPool: CVPixelBufferPool?
+    private var streamHits = 0, streamResets = 0, poolRequests = 0, poolFailures = 0
+    private let traceLog = OSLog(subsystem: "app.chuanflow.throughput", category: "RIFE")
 
     @objc(prepareModelID:quality:width:height:error:)
     func prepare(modelID: String, quality: String, width: Int32, height: Int32) throws {
@@ -63,6 +73,11 @@ final class SPRifeBridge: NSObject {
                 return
             }
             let started = CFAbsoluteTimeGetCurrent()
+            let trace = ProcessInfo.processInfo.environment["CHUANFLOW_THROUGHPUT_TRACE"] == "1"
+            let log = self.traceLog
+            let signpost = trace ? OSSignpostID(log: log) : .invalid
+            if trace { os_signpost(.begin, log: log, name: "RIFE stateless", signpostID: signpost) }
+            defer { if trace { os_signpost(.end, log: log, name: "RIFE stateless", signpostID: signpost) } }
             do {
                 let left = try self.ownedBGRA(previous)
                 let right = try self.ownedBGRA(current)
@@ -84,13 +99,119 @@ final class SPRifeBridge: NSObject {
         return true
     }
 
+    @objc(submitLivePrevious:current:previousID:currentID:previousPTS:currentPTS:generation:clockEpoch:timesteps:token:completion:)
+    func submitLive(previous: CVPixelBuffer, current: CVPixelBuffer, previousID: UInt64, currentID: UInt64,
+                    previousPTS: CMTime, currentPTS: CMTime, generation: UInt64, clockEpoch: UInt64,
+                    timesteps: [NSNumber], token: UInt64,
+                    completion: @escaping (UInt64, [SPOwnedPixelBuffer]?, Double, Error?) -> Void) -> Bool {
+        // Default remains the proven stateless bridge until equivalence is measured.
+        guard ProcessInfo.processInfo.environment["CHUANFLOW_RIFE_STREAM"] == "1" else {
+            return submit(previous: previous, current: current, timesteps: timesteps, token: token, completion: completion)
+        }
+        let phases = timesteps.map(\.floatValue)
+        guard !phases.isEmpty, phases.allSatisfy({ $0 > 0 && $0 < 1 }),
+              previousPTS.isNumeric, currentPTS.isNumeric, CMTimeCompare(previousPTS, currentPTS) < 0,
+              previousID != currentID else { return false }
+        state.lock(); let engine = interpolator; let seen = epoch; state.unlock()
+        guard let engine else { return false }
+        exec.async {
+            let started = CFAbsoluteTimeGetCurrent()
+            let trace = ProcessInfo.processInfo.environment["CHUANFLOW_THROUGHPUT_TRACE"] == "1"
+            let log = self.traceLog
+            let signpost = trace ? OSSignpostID(log: log) : .invalid
+            if trace { os_signpost(.begin, log: log, name: "RIFE stream", signpostID: signpost) }
+            defer { if trace { os_signpost(.end, log: log, name: "RIFE stream", signpostID: signpost) } }
+            self.state.lock(); let active = self.epoch == seen; self.state.unlock()
+            guard active else { completion(token, nil, 0, Self.error(1, "RIFE 结果属于旧会话")); return }
+            do {
+                let width = CVPixelBufferGetWidth(previous), height = CVPixelBufferGetHeight(previous)
+                guard width == CVPixelBufferGetWidth(current), height == CVPixelBufferGetHeight(current) else {
+                    throw Self.error(2, "RIFE 输入尺寸不一致")
+                }
+                if self.stream == nil || self.streamEpoch != seen || self.stream?.width != width || self.stream?.height != height {
+                    self.stream = try engine.makeStream(width: width, height: height)
+                    self.streamEpoch = seen; self.streamPrevious = nil; self.streamKey = nil; self.outputPool = nil
+                }
+                let stream = self.stream!
+                let previousKey = SPRifeContinuityKey(address: UInt(bitPattern: Unmanaged.passUnretained(previous).toOpaque()),
+                    identity: previousID, pts: previousPTS, generation: generation, clockEpoch: clockEpoch)
+                let hit = self.streamPrevious === previous && self.streamKey?.matches(previousKey) == true
+                if hit { self.streamHits += 1 } else {
+                    stream.reset(); self.streamPrevious = nil; self.streamKey = nil; self.streamResets += 1
+                    let left = try self.ownedBGRA(previous)
+                    guard try stream.push(left, timesteps: []).isEmpty else { throw Self.error(2, "RIFE 缓存初始化失败") }
+                }
+                let right = try self.ownedBGRA(current)
+                let frames: [CVPixelBuffer]
+                if phases.count == 1 && phases[0] == 0.5 {
+                    let output = try self.pooledOutput(width: width, height: height)
+                    guard try stream.push(right, into: output) else { throw Self.error(2, "RIFE 中间帧缺失") }
+                    frames = [output]
+                } else {
+                    frames = try stream.push(right, timesteps: phases)
+                }
+                guard frames.count == phases.count, frames.allSatisfy({ CVPixelBufferGetWidth($0) == width && CVPixelBufferGetHeight($0) == height }) else {
+                    throw Self.error(2, "RIFE 输出数量或尺寸不一致")
+                }
+                self.streamPrevious = current
+                self.streamKey = SPRifeContinuityKey(address: UInt(bitPattern: Unmanaged.passUnretained(current).toOpaque()),
+                    identity: currentID, pts: currentPTS, generation: generation, clockEpoch: clockEpoch)
+                self.state.lock(); let stillActive = self.epoch == seen; self.state.unlock()
+                guard stillActive else { stream.reset(); self.streamPrevious = nil; self.streamKey = nil; throw Self.error(1, "RIFE 结果属于旧会话") }
+                let owned = frames.map { buffer in
+                    CVBufferPropagateAttachments(previous, buffer); Self.attach709IfMissing(buffer)
+                    return SPOwnedPixelBuffer(retaining: buffer)
+                }
+                completion(token, owned, max(0, CFAbsoluteTimeGetCurrent() - started), nil)
+            } catch {
+                self.stream?.reset(); self.streamPrevious = nil; self.streamKey = nil; self.streamResets += 1
+                completion(token, nil, max(0, CFAbsoluteTimeGetCurrent() - started), Self.explain(error))
+            }
+        }
+        return true
+    }
+
+    private func pooledOutput(width: Int, height: Int) throws -> CVPixelBuffer {
+        if outputPool == nil {
+            let attrs: [String: Any] = [kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height,
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:], kCVPixelBufferMetalCompatibilityKey as String: true]
+            var pool: CVPixelBufferPool?
+            guard CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attrs as CFDictionary, &pool) == kCVReturnSuccess, let pool else {
+                throw Self.error(2, "RIFE 输出池创建失败")
+            }
+            outputPool = pool
+        }
+        poolRequests += 1
+        var buffer: CVPixelBuffer?
+        let aux = [kCVPixelBufferPoolAllocationThresholdKey as String: 4] as CFDictionary
+        let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault, outputPool!, aux, &buffer)
+        if status == kCVReturnWouldExceedAllocationThreshold {
+            poolFailures += 1; throw Self.error(10, "RIFE 输出池繁忙，等待已持有的画面释放。")
+        }
+        guard status == kCVReturnSuccess, let buffer, CVPixelBufferGetIOSurface(buffer) != nil else {
+            poolFailures += 1; throw Self.error(2, "RIFE 输出池分配失败（\(status)）")
+        }
+        return buffer
+    }
+
+    @objc func streamDiagnostics() -> [String: Any] {
+        exec.sync { ["hits": streamHits, "resets": streamResets, "poolRequests": poolRequests, "poolFailures": poolFailures] }
+    }
+
     @objc func invalidate() {
         state.lock()
         epoch &+= 1
+        let invalidatedEpoch = epoch
         let engine = interpolator
         interpolator = nil
         state.unlock()
-        exec.async { _ = engine }
+        exec.async {
+            if self.streamEpoch < invalidatedEpoch {
+                self.stream?.reset(); self.stream = nil; self.streamPrevious = nil; self.streamKey = nil; self.outputPool = nil
+            }
+            _ = engine
+        }
     }
 
     @objc class func probe() -> [String: Any] {
@@ -101,6 +222,7 @@ final class SPRifeBridge: NSObject {
             "version": packageVersion,
             "commit": packageCommit,
             "bundledModel": bundled.path,
+            "bundledModelSHA256": sha256(of: bundled),
             "bundledOutsideExperiment": bundledOutsideExperiment,
             "sdrOnly": true,
             "pixelFormats": ["BGRA8", "RGBA8"],

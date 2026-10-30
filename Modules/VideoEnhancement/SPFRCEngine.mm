@@ -2,9 +2,11 @@
 #include <atomic>
 #import "SPMotionFrameCompatibility.hpp"
 #import "SPRuntimeGates.hpp"
+#import "SPFRCContinuity.hpp"
 
 #import <CoreMedia/CoreMedia.h>
 #import <VideoToolbox/VideoToolbox.h>
+#import <os/signpost.h>
 
 #include <algorithm>
 #include <mutex>
@@ -13,6 +15,13 @@
 static NSError *SPFRCError(NSInteger code, NSString *message) {
     return [NSError errorWithDomain:@"dev.khuaplayer.FRCEngine" code:code
                            userInfo:@{NSLocalizedDescriptionKey: message ?: @""}];
+}
+
+static os_log_t SPFRCTrace(void) {
+    static os_log_t log;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ log = os_log_create("app.chuanflow.throughput", "FRC"); });
+    return log;
 }
 
 // Display metadata stays immutable. Reconstruction has already consumed any EL.
@@ -49,6 +58,12 @@ struct SPFRCSlot {
     CVPixelBufferRef rgbaB = nullptr;
     CVPixelBufferRef rgbaOut = nullptr;
     CVPixelBufferRef sourceA = nullptr;
+    CVPixelBufferRef sourceB = nullptr;
+    CVPixelBufferRef cachedB = nullptr;
+    uint64_t cachedID = 0, cachedGeneration = 0, cachedClockEpoch = 0;
+    CMTime cachedPTS = kCMTimeInvalid;
+    uint64_t pendingID = 0, pendingGeneration = 0, pendingClockEpoch = 0;
+    BOOL liveContinuity = NO;
     uint64_t token = 0;
     int64_t startUs = 0;
     int64_t expectedFinishUs = 0;
@@ -103,6 +118,7 @@ struct SPFRCSlot {
     double _frcCoreEwma;
     double _convertGpuEwma;
     uint64_t _completed, _failed;
+    uint64_t _randomModes, _sequentialModes, _continuityResets;
     int64_t _windowStartUs;
     uint64_t _windowPairs;
     SPFRCQuality _quality;
@@ -245,6 +261,7 @@ static CVPixelBufferRef SPFRCCreateRGBA(uint32_t w, uint32_t h) {
 }
 
 static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
+    if (s.cachedB) { CVPixelBufferRelease(s.cachedB); s.cachedB = nullptr; }
     if (s.rgbaA) { CVPixelBufferRelease(s.rgbaA); s.rgbaA = nullptr; }
     if (s.rgbaB) { CVPixelBufferRelease(s.rgbaB); s.rgbaB = nullptr; }
     if (s.rgbaOut) { CVPixelBufferRelease(s.rgbaOut); s.rgbaOut = nullptr; }
@@ -411,6 +428,8 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
         }
         if (idx == SIZE_MAX) return NO;
         SPFRCSlot &s = _slots[idx];
+        if (s.cachedB) { CVPixelBufferRelease(s.cachedB); s.cachedB = nullptr; _continuityResets++; }
+        s.liveContinuity = NO;
         s.busy = YES;
         s.token = token;
         s.startUs = spNowUs();
@@ -491,9 +510,13 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
             for (auto &s : _slots) if (s.busy && s.token == token) { s.frcStartUs = spNowUs(); break; }
         }
         SPFRCEngine *s = self;
+        const BOOL trace = [[[NSProcessInfo processInfo] environment][@"CHUANFLOW_THROUGHPUT_TRACE"] isEqualToString:@"1"];
+        const os_signpost_id_t signpost = trace ? os_signpost_id_generate(SPFRCTrace()) : OS_SIGNPOST_ID_INVALID;
+        if (trace) os_signpost_interval_begin(SPFRCTrace(), signpost, "FRC VT", "mode=%{public}s", slot.sequential ? "sequential" : "random");
         [(VTFrameProcessor *)slot.processor processWithParameters:params
                                                completionHandler:^(id<VTFrameProcessorParameters> p, NSError *err) {
             (void)p;
+            if (trace) os_signpost_interval_end(SPFRCTrace(), signpost, "FRC VT");
             const int64_t doneUs = spNowUs();
             dispatch_async(s->_q, ^{
                 {
@@ -552,6 +575,7 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
     SPFRCEngineCompletion completion = nil;
     SPFRCPhasesCompletion phasesCompletion = nil;
     CVPixelBufferRef sourceA = nullptr;
+    CVPixelBufferRef sourceB = nullptr;
     double latency = 0.0;
     SPFRCSlot retired;
     BOOL closeRetired = NO;
@@ -570,6 +594,9 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
         completion = s.completion;
         phasesCompletion = s.phasesCompletion;
         sourceA = s.sourceA;
+        sourceB = s.sourceB;
+        s.sourceB = nullptr;
+        if (s.cachedB) { CVPixelBufferRelease(s.cachedB); s.cachedB = nullptr; _continuityResets++; }
         s.completion = nil;
         s.phasesCompletion = nil;
         s.phaseMode = NO;
@@ -596,6 +623,7 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
     }
     if (closeRetired) [self closeSlot:retired];
     if (sourceA) CVPixelBufferRelease(sourceA);
+    if (sourceB) CVPixelBufferRelease(sourceB);
     if (phasesCompletion) {
         if (output) CVPixelBufferRelease(output);
         phasesCompletion(token, nil, latency, error);
@@ -622,6 +650,11 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
                                   ptsB:CMTimeMake(2002, 48000) phases:phases sequential:sequential token:token completion:completion];
 }
 
+- (NSDictionary<NSString *, NSNumber *> *)continuityDiagnostics {
+    std::lock_guard<std::mutex> lock(_mtx);
+    return @{ @"random": @(_randomModes), @"sequential": @(_sequentialModes), @"resets": @(_continuityResets) };
+}
+
 - (BOOL)submitPhasesWithFrameA:(CVPixelBufferRef)frameA
                         frameB:(CVPixelBufferRef)frameB
                           ptsA:(CMTime)ptsA
@@ -630,6 +663,29 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
                     sequential:(BOOL)sequential
                          token:(uint64_t)token
                     completion:(SPFRCPhasesCompletion)completion {
+    // Preserve the original API: the caller owns this session-order claim.
+    return [self submitPhasesInternalA:frameA frameB:frameB ptsA:ptsA ptsB:ptsB
+        frameIDA:0 frameIDB:0 generation:0 clockEpoch:0 legacyMode:sequential ? 1 : 0
+        phases:phases token:token completion:completion];
+}
+
+- (BOOL)submitLivePhasesWithFrameA:(CVPixelBufferRef)frameA frameB:(CVPixelBufferRef)frameB
+                              ptsA:(CMTime)ptsA ptsB:(CMTime)ptsB
+                           frameIDA:(uint64_t)frameIDA frameIDB:(uint64_t)frameIDB
+                         generation:(uint64_t)generation clockEpoch:(uint64_t)clockEpoch
+                             phases:(NSArray<NSNumber *> *)phases token:(uint64_t)token
+                         completion:(SPFRCPhasesCompletion)completion {
+    return [self submitPhasesInternalA:frameA frameB:frameB ptsA:ptsA ptsB:ptsB
+        frameIDA:frameIDA frameIDB:frameIDB generation:generation clockEpoch:clockEpoch legacyMode:-1
+        phases:phases token:token completion:completion];
+}
+
+- (BOOL)submitPhasesInternalA:(CVPixelBufferRef)frameA frameB:(CVPixelBufferRef)frameB
+                         ptsA:(CMTime)ptsA ptsB:(CMTime)ptsB
+                      frameIDA:(uint64_t)frameIDA frameIDB:(uint64_t)frameIDB
+                    generation:(uint64_t)generation clockEpoch:(uint64_t)clockEpoch
+                    legacyMode:(int)legacyMode phases:(NSArray<NSNumber *> *)phases
+                         token:(uint64_t)token completion:(SPFRCPhasesCompletion)completion {
     if (!frameA || !frameB || !completion || phases.count < 1 || phases.count > 3) return NO;
     if (!CMTIME_IS_NUMERIC(ptsA) || !CMTIME_IS_NUMERIC(ptsB) || CMTimeCompare(ptsA, ptsB) >= 0) return NO;
     float values[3] = {};
@@ -660,23 +716,36 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
         s.completion = nil;
         s.phasesCompletion = completion;
         s.phaseMode = YES;
-        s.sequential = sequential;
+        s.liveContinuity = legacyMode < 0 && frameIDA != 0 && frameIDB != 0 && frameIDA != frameIDB &&
+            [[[NSProcessInfo processInfo] environment][@"CHUANFLOW_FRC_CONTINUOUS"] isEqualToString:@"1"];
+        s.sequential = spFRCSelectSequential(legacyMode, spFRCContinues(s.liveContinuity, s.cachedB, frameA, s.cachedID, frameIDA, frameIDB,
+            s.cachedGeneration, generation, s.cachedClockEpoch, clockEpoch,
+            CMTIME_IS_NUMERIC(s.cachedPTS) && CMTimeCompare(s.cachedPTS, ptsA) == 0));
+        if (s.liveContinuity && s.sequential) {
+            // Preserve the actual previous next-frame buffer as the new source.
+            std::swap(s.rgbaA, s.rgbaB);
+        } else {
+            if (s.cachedB) { CVPixelBufferRelease(s.cachedB); s.cachedB = nullptr; _continuityResets++; }
+        }
+        s.pendingID = frameIDB; s.pendingGeneration = generation; s.pendingClockEpoch = clockEpoch;
         s.ptsA = ptsA;
         s.ptsB = ptsB;
         s.phaseCount = (int)phases.count;
         for (int i = 0; i < s.phaseCount; ++i) s.phaseValues[i] = values[i];
         s.sourceA = CVPixelBufferRetain(frameA);
+        s.sourceB = CVPixelBufferRetain(frameB);
     }
     [_metal adoptColorMatrixFromFrame:frameA];
     const uint64_t slotToken = token;
     NSMutableArray *owners = [NSMutableArray array];
     id<MTLCommandBuffer> cb = [_metal.commandQueue commandBuffer];
     CVPixelBufferRef rgbaA, rgbaB;
+    BOOL skipA;
     {
         std::lock_guard<std::mutex> lock(_mtx);
-        rgbaA = _slots[idx].rgbaA; rgbaB = _slots[idx].rgbaB;
+        rgbaA = _slots[idx].rgbaA; rgbaB = _slots[idx].rgbaB; skipA = _slots[idx].liveContinuity && _slots[idx].sequential;
     }
-    const BOOL ok = [_metal encodeConvertFrame:frameA toRGBA:rgbaA commandBuffer:cb owners:owners] &&
+    const BOOL ok = (skipA || [_metal encodeConvertFrame:frameA toRGBA:rgbaA commandBuffer:cb owners:owners]) &&
                     [_metal encodeConvertFrame:frameB toRGBA:rgbaB commandBuffer:cb owners:owners];
     if (!ok) {
         [self completeToken:slotToken output:nullptr error:SPFRCError(6, @"input conversion encode")];
@@ -735,12 +804,20 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
         }
         {
             std::lock_guard<std::mutex> lock(_mtx);
-            for (auto &s : _slots) if (s.busy && s.token == token) { s.frcStartUs = spNowUs(); break; }
+            for (auto &s : _slots) if (s.busy && s.token == token) {
+                s.frcStartUs = spNowUs();
+                if (slot.sequential) _sequentialModes++; else _randomModes++;
+                break;
+            }
         }
         SPFRCEngine *s = self;
+        const BOOL trace = [[[NSProcessInfo processInfo] environment][@"CHUANFLOW_THROUGHPUT_TRACE"] isEqualToString:@"1"];
+        const os_signpost_id_t signpost = trace ? os_signpost_id_generate(SPFRCTrace()) : OS_SIGNPOST_ID_INVALID;
+        if (trace) os_signpost_interval_begin(SPFRCTrace(), signpost, "FRC VT", "mode=%{public}s", slot.sequential ? "sequential" : "random");
         [(VTFrameProcessor *)slot.processor processWithParameters:params
                                                completionHandler:^(id<VTFrameProcessorParameters> p, NSError *err) {
             (void)p;
+            if (trace) os_signpost_interval_end(SPFRCTrace(), signpost, "FRC VT");
             const int64_t doneUs = spNowUs();
             dispatch_async(s->_q, ^{
                 {
@@ -803,6 +880,7 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
                      error:(NSError *)error {
     SPFRCPhasesCompletion completion = nil;
     CVPixelBufferRef sourceA = nullptr;
+    CVPixelBufferRef sourceB = nullptr;
     double latency = 0.0;
     SPFRCSlot retired;
     BOOL closeRetired = NO;
@@ -817,6 +895,14 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
         latency = (spNowUs() - s.startUs) / 1e6;
         completion = s.phasesCompletion;
         sourceA = s.sourceA;
+        sourceB = s.sourceB;
+        s.sourceB = nullptr;
+        if (s.cachedB) { CVPixelBufferRelease(s.cachedB); s.cachedB = nullptr; }
+        if (!error && s.liveContinuity && !_invalidated) {
+            s.cachedB = sourceB; sourceB = nullptr;
+            s.cachedID = s.pendingID; s.cachedPTS = s.ptsB;
+            s.cachedGeneration = s.pendingGeneration; s.cachedClockEpoch = s.pendingClockEpoch;
+        } else if (s.liveContinuity) { _continuityResets++; }
         s.completion = nil;
         s.phasesCompletion = nil;
         s.phaseMode = NO;
@@ -843,6 +929,7 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
     }
     if (closeRetired) [self closeSlot:retired];
     if (sourceA) CVPixelBufferRelease(sourceA);
+    if (sourceB) CVPixelBufferRelease(sourceB);
     if (completion) completion(token, error ? nil : outputs, latency, error);
 }
 

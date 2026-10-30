@@ -100,6 +100,15 @@ typedef void (^SPFRCPhasesCompletion)(uint64_t token,
                          token:(uint64_t)token
                     completion:(SPFRCPhasesCompletion)completion;
 
+/// Live-only continuity candidate; mode is derived inside the owning session.
+- (BOOL)submitLivePhasesWithFrameA:(CVPixelBufferRef)frameA frameB:(CVPixelBufferRef)frameB
+                              ptsA:(CMTime)ptsA ptsB:(CMTime)ptsB
+                           frameIDA:(uint64_t)frameIDA frameIDB:(uint64_t)frameIDB
+                         generation:(uint64_t)generation clockEpoch:(uint64_t)clockEpoch
+                             phases:(NSArray<NSNumber *> *)phases token:(uint64_t)token
+                         completion:(SPFRCPhasesCompletion)completion;
+- (NSDictionary<NSString *, NSNumber *> *)continuityDiagnostics;
+
 - (BOOL)submitPhasesWithFrameA:(CVPixelBufferRef)frameA
                         frameB:(CVPixelBufferRef)frameB
                           ptsA:(CMTime)ptsA

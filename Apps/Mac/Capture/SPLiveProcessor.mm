@@ -1063,7 +1063,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     uint64_t _syntheticOK, _syntheticFail, _presentedSource, _presentedSynthetic;
     uint64_t _scheduledSynthetic, _submitted;
     uint64_t _deadlineDrops, _sceneSkips, _queueDrops, _presentedCallbacks, _renderDrops;
-    uint64_t _engineUnavailableDrops, _inflightLimitDrops, _engineSubmissionRejectedDrops;
+    uint64_t _engineUnavailableDrops, _inflightLimitDrops, _engineSubmissionRejectedDrops, _rifePoolPressureDrops;
     NSMutableDictionary *_presentationFailuresLifetime, *_presentationFailuresEpoch;
     NSMutableDictionary *_firstPresentationFailureLifetime, *_firstPresentationFailureEpoch, *_ignoredPresentedCallbacks;
     uint64_t _staticHoldPhases, _epochStaticHoldPhases;
@@ -1265,6 +1265,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"sceneSkips": @(_sceneSkips),
         @"queueDrops": @(_queueDrops),
         @"engineUnavailableDropsLifetime": @(_engineUnavailableDrops), @"inflightLimitDropsLifetime": @(_inflightLimitDrops),
+        @"rifePoolPressureDropsLifetime": @(_rifePoolPressureDrops),
         @"engineSubmissionRejectedDropsLifetime": @(_engineSubmissionRejectedDrops),
         @"stoppedDrops": @(_stoppedDrops),
         @"generationDrops": @(_generationDrops),
@@ -3168,9 +3169,6 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         b=[self lowPrescaledForIdentity:events.front().frameB];
         if (!a || !b) { _syntheticFail += 1; [self publishStatus:@"低延迟前置缩放失败" failed:YES]; return; }
     }
-    // Sessions are pooled and pairs may land on different sessions, so do not
-    // claim sequential submission even though the timestamps are now real.
-    BOOL sequential = NO;
     SPLiveJob *job = new SPLiveJob();
     job->configVersion = _configVersion;
     job->generation = generation;
@@ -3214,7 +3212,17 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             }
         }
     }
-    else if (wantRife) submitted = [_rife submitPrevious:a current:b timesteps:phases token:token completion:finish];
+    else if (wantRife) {
+        auto heldA = _held.find(job->frameA), heldB = _held.find(job->frameB);
+        if (heldA != _held.end() && heldB != _held.end()) {
+            const auto pa = heldA->second.pts, pb = heldB->second.pts;
+            if (pa.den > 0 && pa.den <= INT32_MAX && pb.den > 0 && pb.den <= INT32_MAX) {
+                submitted = [_rife submitLivePrevious:a current:b previousID:job->frameA currentID:job->frameB
+                    previousPTS:CMTimeMake(pa.num, (int32_t)pa.den) currentPTS:CMTimeMake(pb.num, (int32_t)pb.den)
+                    generation:generation clockEpoch:_clockEpoch timesteps:phases token:token completion:finish];
+            }
+        }
+    }
     else if (wantDistil) {
         auto heldA = _held.find(job->frameA);
         auto previous = heldA == _held.end() ? _held.end() : _held.find(heldA->second.previousIdentity);
@@ -3233,9 +3241,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         if (heldA != _held.end() && heldB != _held.end()) {
             const auto pa = heldA->second.pts, pb = heldB->second.pts;
             if (pa.den > 0 && pa.den <= INT32_MAX && pb.den > 0 && pb.den <= INT32_MAX) {
-                submitted = [_engine submitPhasesWithFrameA:a frameB:b
+                submitted = [_engine submitLivePhasesWithFrameA:a frameB:b
                     ptsA:CMTimeMake(pa.num, (int32_t)pa.den) ptsB:CMTimeMake(pb.num, (int32_t)pb.den)
-                    phases:phases sequential:sequential token:token completion:finish];
+                    frameIDA:job->frameA frameIDB:job->frameB generation:generation clockEpoch:_clockEpoch
+                    phases:phases token:token completion:finish];
             }
         }
     }
@@ -3320,6 +3329,13 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         }
     }
     if (error || outputs.count == 0) {
+        if (_rife && [error.domain isEqualToString:@"app.khuaplayer.rife"] && error.code == SPRifeBridgeErrorOutputPoolExhausted) {
+            uint64_t dropped = (uint64_t)job->count + (uint64_t)_rifePending.size();
+            _rifePoolPressureDrops += dropped; _queueDrops += dropped; _epochQueueDrops += dropped;
+            [self clearPendingRife];
+            for (int i = 0; i < job->count; ++i) [self erasePending:job->pts[i]];
+            [self trimHeld]; delete job; return;
+        }
         [self clearPendingRife];
         for (int i = 0; i < job->count; ++i) [self erasePending:job->pts[i]];
         _syntheticFail += (uint64_t)MAX((NSUInteger)1, outputs.count);
@@ -3478,7 +3494,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
                                                 pixelFormat:kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
                                                       error:&local];
         SPFRCQuality quality = _request.quality == SPFRCQualityHigh ? SPFRCQualityHigh : SPFRCQualityNormal;
-        _engine = _metal ? [[SPFRCEngine alloc] initWithMetal:_metal sessions:2 outputCapacity:8 quality:quality error:&local] : nil;
+        const BOOL continuousFRC = [[[NSProcessInfo processInfo] environment][@"CHUANFLOW_FRC_CONTINUOUS"] isEqualToString:@"1"];
+        _engine = _metal ? [[SPFRCEngine alloc] initWithMetal:_metal sessions:continuousFRC ? 1 : 2 outputCapacity:8 quality:quality error:&local] : nil;
         if (!_engine) {
             if (error) *error = local ?: SPLiveError(32, @"插帧会话创建失败");
             _resolved.interpolationActive = NO;
