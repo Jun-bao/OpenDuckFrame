@@ -26,6 +26,11 @@ private final class OwnedFrameCopier {
     private var inUse = 0
     private var peak = 0
     private var poolDrops = 0
+    private var poolExhaustions = 0
+    private var allocationFailures = 0
+    private var prepareFailures = 0
+    private var copyFailures = 0
+    private(set) var lastFailurePoolExhausted = false
     private var aliased = 0
     private var copyNs: [Int64] = []
 
@@ -34,18 +39,24 @@ private final class OwnedFrameCopier {
     }
 
     func copy(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+        lastFailurePoolExhausted = false
         let sourceWidth = CVPixelBufferGetWidth(source)
         let sourceHeight = CVPixelBufferGetHeight(source)
         let sourceFormat = CVPixelBufferGetPixelFormatType(source)
         if pool == nil || sourceWidth != width || sourceHeight != height || sourceFormat != format {
-            guard prepare(width: sourceWidth, height: sourceHeight, format: sourceFormat) else { return nil }
+            guard prepare(width: sourceWidth, height: sourceHeight, format: sourceFormat) else {
+                lock.lock(); prepareFailures += 1; poolDrops += 1; lock.unlock()
+                return nil
+            }
         }
         guard let pool else { return nil }
         var destination: CVPixelBuffer?
         let aux: [CFString: Any] = [kCVPixelBufferPoolAllocationThresholdKey: cap as NSNumber]
         let created = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault, pool, aux as CFDictionary, &destination)
         guard created == kCVReturnSuccess, let destination else {
+            lastFailurePoolExhausted = created == kCVReturnWouldExceedAllocationThreshold
             lock.lock()
+            if lastFailurePoolExhausted { poolExhaustions += 1 } else { allocationFailures += 1 }
             poolDrops += 1
             lock.unlock()
             return nil
@@ -65,6 +76,7 @@ private final class OwnedFrameCopier {
         }
         if !transferred && !copyPlanes(from: source, to: destination) {
             lock.lock()
+            copyFailures += 1
             poolDrops += 1
             lock.unlock()
             return nil
@@ -99,6 +111,10 @@ private final class OwnedFrameCopier {
             "ownedCap": cap,
             "ownedBudgetBytes": budgetBytes,
             "poolDrops": poolDrops,
+            "poolExhaustions": poolExhaustions,
+            "allocationFailures": allocationFailures,
+            "prepareFailures": prepareFailures,
+            "copyFailures": copyFailures,
             "aliasedTransfers": aliased,
             "copyP95ms": p95,
             "sckBufferRetained": false,
@@ -213,13 +229,20 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         init(_ value: Result<SCShareableContent, Error>) { self.value = value }
     }
     var onFrame: (@Sendable (CVPixelBuffer, Int64, Int64, Int64, Int64, UInt64) -> Void)?
+    var onRawFrame: (@Sendable (Int64, Int64, Int64, Int32, Int32, UInt64) -> Void)?
     var onStatus: (@Sendable (String, Bool) -> Void)?
     var onNote: (@Sendable (Int) -> Void)?
     var onSource: (@Sendable (String, String, String) -> Void)?
     var onGeneration: (@Sendable (UInt64) -> Void)?
     var onDiagnostic: (@Sendable (String) -> Void)?
+    var onPoolPressure: (@Sendable (UInt64) -> Void)?
     var excludedWindowIDs: () -> [Int] = { [] }
-    var paused = false
+    private let pauseLock = NSLock()
+    private var pauseValue = false
+    var paused: Bool {
+        get { pauseLock.lock(); defer { pauseLock.unlock() }; return pauseValue }
+        set { pauseLock.lock(); pauseValue = newValue; pauseLock.unlock() }
+    }
     private(set) var running = false
     private(set) var currentGeneration: UInt64 = 0
     private(set) var target: CaptureTarget?
@@ -228,6 +251,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     var canRestart: Bool { filter != nil }
 
     private var stream: SCStream?
+    private let streamBinding = CaptureStreamBinding()
     private let queue = DispatchQueue(label: "app.khuaplayer.capture", qos: .userInitiated)
     private var filter: SCContentFilter?
     private var selectionRevision: UInt64 = 0
@@ -236,13 +260,17 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     private var screenRectValue: CGRect?
     private var pickerArmed = false
     private var issuedGeneration: UInt64 = 0
-    private var boundGeneration: UInt64 = 0
     private var completeCount = 0
     private var idleCount = 0
     private var blankCount = 0
     private var suspendedCount = 0
     private var stoppedCount = 0
     private var acceptedCount = 0
+    private var receivedSequence: UInt64 = 0
+    private var lastReceivedHost: UInt64 = 0
+    private var lastCompleteHost: UInt64 = 0
+    private var lastAcceptedHost: UInt64 = 0
+    private var requestedCaptureFPS = 0
     private var pausedDrops = 0
     private var retiredDrops = 0
     private let copier = OwnedFrameCopier()
@@ -327,7 +355,6 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         } else { target = nil }
         issuedGeneration += 1
         let generation = issuedGeneration
-        boundGeneration = generation
         currentGeneration = generation
         geometryLock.lock()
         screenRectGeneration = generation
@@ -338,6 +365,10 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         blankCount = 0
         suspendedCount = 0
         acceptedCount = 0
+        receivedSequence = 0
+        lastReceivedHost = 0
+        lastCompleteHost = 0
+        lastAcceptedHost = 0
         pausedDrops = 0
         retiredDrops = 0
         firstPTS = .invalid
@@ -372,6 +403,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
 
     private func stopStream() {
         let current = stream
+        streamBinding.retire()
         stream = nil
         running = false
         current?.stopCapture { [weak self] error in
@@ -425,11 +457,8 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
             : kCVPixelFormatType_32BGRA
         configuration.queueDepth = 3
-        if captureCapFPS == 30 {
-            configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
-        } else if captureCapFPS == 60 {
-            configuration.minimumFrameInterval = CMTime(value: 1, timescale: 60)
-        }
+        requestedCaptureFPS = captureCapFPS == 30 || captureCapFPS == 60 ? captureCapFPS : 0
+        CaptureRatePolicy.configure(configuration, capFPS: captureCapFPS)
         configuration.showsCursor = false
         configuration.capturesAudio = false
         configuration.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2
@@ -437,6 +466,8 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
         do {
             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+            self.stream = stream
+            streamBinding.activate(stream, generation: generation)
             stream.startCapture { [weak self] error in
                 DispatchQueue.main.async {
                     guard let self else { return }
@@ -458,7 +489,6 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
                     }
                 }
             }
-            self.stream = stream
         } catch {
             if biplanar {
                 onDiagnostic?("addStreamOutput failed: \(error.localizedDescription); retry BGRA")
@@ -499,14 +529,15 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen else { return }
-        guard stream === self.stream else {
+        guard let generation = streamBinding.snapshot(stream) else {
             retiredDrops += 1
             if retiredDrops <= 3 || retiredDrops % 60 == 0 {
                 onDiagnostic?("ignored sample from a retired stream")
             }
             return
         }
-        let generation = boundGeneration
+        receivedSequence &+= 1
+        lastReceivedHost = mach_absolute_time()
         if #available(macOS 13.1, *),
            let items = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
            let dictionary = items.first?[.screenRect] as? NSDictionary,
@@ -516,7 +547,8 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             if screenRectGeneration == generation { screenRectValue = rect }
             geometryLock.unlock()
         }
-        let status = frameStatus(sampleBuffer)
+        let observedStatus = frameStatus(sampleBuffer)
+        let status = observedStatus ?? .complete // preserve prior display compatibility
         if status == .idle {
             idleCount += 1
             if idleCount <= 3 || idleCount % 60 == 0 {
@@ -534,6 +566,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             return
         }
         completeCount += 1
+        lastCompleteHost = mach_absolute_time()
         onNote?(0)
         guard !paused, let image = sampleBuffer.imageBuffer else {
             if paused {
@@ -544,18 +577,12 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             }
             return
         }
-        let captureHost = mach_absolute_time()
-        borrowedPeak = max(borrowedPeak, 1)
-        guard let owned = copier.copy(image) else {
-            if completeCount <= 5 || completeCount % 30 == 0 {
-                onDiagnostic?("capture pool full; dropped complete \(completeCount)")
-            }
-            return
-        }
+        let captureHost = lastReceivedHost
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let ptsNum: Int64
         let ptsDen: Int64
-        if time.isValid && !time.isIndefinite && time.timescale > 0 {
+        let validPTS = time.isValid && !time.isIndefinite && time.timescale > 0
+        if validPTS {
             ptsNum = time.value
             ptsDen = Int64(time.timescale)
         } else {
@@ -565,6 +592,24 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             ptsNum = host * Int64(info.numer) / Int64(info.denom)
             ptsDen = 1_000_000_000
         }
+        // Only metadata leaves this callback; do not retain the borrowed SCK
+        // surface. Observe even when the owned capture pool cannot copy it.
+        if CaptureCallbackPolicy.isRawCadenceEvidence(status: observedStatus,
+                                                       valid: CMSampleBufferIsValid(sampleBuffer),
+                                                       dataReady: CMSampleBufferDataIsReady(sampleBuffer)) {
+            guard streamBinding.withCurrent(stream, generation: generation, {
+                onRawFrame?(ptsNum, validPTS ? ptsDen : 0, Int64(captureHost),
+                            Int32(CVPixelBufferGetWidth(image)), Int32(CVPixelBufferGetHeight(image)), generation)
+            }) else { retiredDrops += 1; return }
+        }
+        borrowedPeak = max(borrowedPeak, 1)
+        guard let owned = copier.copy(image) else {
+            if copier.lastFailurePoolExhausted { onPoolPressure?(generation) }
+            if completeCount <= 5 || completeCount % 30 == 0 {
+                onDiagnostic?(copier.lastFailurePoolExhausted ? "capture pool full; dropped complete \(completeCount)" : "capture copy failed; dropped complete \(completeCount)")
+            }
+            return
+        }
         let readyHost = mach_absolute_time()
         let timescale = CMTimeScale(min(max(ptsDen, 1), Int64(Int32.max)))
         if !firstPTS.isValid { firstPTS = time.isValid ? time : CMTime(value: ptsNum, timescale: timescale) }
@@ -573,11 +618,15 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         lastHost = captureHost
         pixelWidth = CVPixelBufferGetWidth(owned)
         pixelHeight = CVPixelBufferGetHeight(owned)
+        let admitted = streamBinding.withCurrent(stream, generation: generation) {
+            onFrame?(owned, ptsNum, ptsDen, Int64(captureHost), Int64(readyHost), generation)
+        }
+        guard admitted else { retiredDrops += 1; return }
         acceptedCount += 1
+        lastAcceptedHost = captureHost
         if completeCount <= 5 || completeCount % 30 == 0 {
             onDiagnostic?("\(pixelWidth)x\(pixelHeight) complete \(completeCount) idle \(idleCount) pts \(ptsNum)/\(ptsDen) host \(captureHost) generation \(generation)")
         }
-        onFrame?(owned, ptsNum, ptsDen, Int64(captureHost), Int64(readyHost), generation)
     }
 
     func diagnostics() -> [String: Any] {
@@ -600,6 +649,12 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             "running": running,
             "paused": paused,
             "captureCapFPS": captureCapFPS,
+            "requestedCaptureFPS": requestedCaptureFPS,
+            "receivedSequence": receivedSequence,
+            "lastReceivedHost": lastReceivedHost,
+            "lastCompleteHost": lastCompleteHost,
+            "lastAcceptedHost": lastAcceptedHost,
+            "captureRateNote": requestedCaptureFPS == 0 ? "system maximum request; actual cadence may be lower" : "requested ceiling, not measured source FPS",
             "queueDepth": 3,
             "pixelWidth": pixelWidth,
             "pixelHeight": pixelHeight,
@@ -675,10 +730,10 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         ]
     }
 
-    private func frameStatus(_ sample: CMSampleBuffer) -> SCFrameStatus {
+    private func frameStatus(_ sample: CMSampleBuffer) -> SCFrameStatus? {
         guard let array = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let raw = array.first?[.status] as? Int,
-              let status = SCFrameStatus(rawValue: raw) else { return .complete }
+              let status = SCFrameStatus(rawValue: raw) else { return nil }
         return status
     }
 
@@ -686,5 +741,200 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         geometryLock.lock()
         defer { geometryLock.unlock() }
         return screenRectGeneration == currentGeneration ? screenRectValue : nil
+    }
+}
+
+/// Headless test entry point; it drives the real copier and processor queues.
+/// It never starts ScreenCaptureKit or shows a window.
+private final class OwnedCadenceSnapshots: @unchecked Sendable {
+    private let lock=NSLock()
+    private var rows: [[String: Any]]=[]
+    func append(_ row: [String: Any]) { lock.lock(); rows.append(row); lock.unlock() }
+    func read() -> [[String: Any]] { lock.lock(); defer { lock.unlock() }; return rows }
+}
+
+@objc(SPOwnedCaptureContract)
+final class SPOwnedCaptureContract: NSObject {
+    @objc static func runNative120() -> [String: Any] {
+        runNative120Scenario(width:2560, height:1410, format:kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, expectedCap:16)
+    }
+
+    @objc static func runNative120BGRA() -> [String: Any] {
+        runNative120Scenario(width:2560, height:1440, format:kCVPixelFormatType_32BGRA, expectedCap:6)
+    }
+
+    private static func runNative120Scenario(width: Int, height: Int, format: OSType, expectedCap: Int) -> [String: Any] {
+        let count=240
+        let copier=OwnedFrameCopier()
+        let processor=SPLiveProcessor()
+        processor.ownedContractConfigureNative(width: Int32(width), height: Int32(height))
+        let attrs: [CFString: Any] = [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+                                      kCVPixelBufferMetalCompatibilityKey: true]
+        var raw: CVPixelBuffer?
+        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, format,
+                                  attrs as CFDictionary, &raw) == kCVReturnSuccess, let raw else {
+            processor.stop(); return ["ok":false,"reason":"source allocation"]
+        }
+        // Warm the actual conversion, processor queue and playout clock outside
+        // the measured interval. Negative PTS precedes every measured frame.
+        for i in -3..<0 {
+            autoreleasepool {
+                if let owned=copier.copy(raw) {
+                    processor.push(owned, ptsNum:Int64(i), ptsDen:120, host:Int64(mach_absolute_time()), generation:1)
+                }
+            }
+        }
+        _ = processor.ownedContractFence()
+        Thread.sleep(forTimeInterval:0.2)
+        var accepted=0, failed=0, first: UInt64=0, last: UInt64=0
+        var intervalsMs: [Double] = []
+        var scheduleLatenessMs: [Double] = [], copyWallMs: [Double] = []
+        var info=mach_timebase_info_data_t(); mach_timebase_info(&info)
+        let segments=OwnedCadenceSnapshots()
+        let start=CACurrentMediaTime()
+        for i in 0..<count {
+            let target=start+Double(i)/120.0
+            // A short, bounded busy wait avoids coalesced background sleeps;
+            // host timing is still measured and must pass the pacing check.
+            while CACurrentMediaTime()<target {}
+            scheduleLatenessMs.append(max(0,(CACurrentMediaTime()-target)*1000))
+            let host=mach_absolute_time()
+            if first==0 { first=host }
+            else { intervalsMs.append(Double(host-last)*Double(info.numer)/Double(info.denom)/1_000_000) }
+            last=host
+            processor.noteRawCapture(ptsNum:Int64(i), ptsDen:120, host:Int64(host), width:Int32(width), height:Int32(height), generation:1)
+            let copyStart=CACurrentMediaTime()
+            autoreleasepool {
+                if let owned=copier.copy(raw) {
+                    processor.push(owned, ptsNum:Int64(i), ptsDen:120, host:Int64(host), readyHost:Int64(mach_absolute_time()), generation:1)
+                    accepted += 1
+                } else { failed += 1 }
+            }
+            copyWallMs.append((CACurrentMediaTime()-copyStart)*1000)
+            if [119,159,199,239].contains(i) {
+                let frameNumber=i+1, requestedAt=host, poolAtRequest=copier.snapshot()
+                processor.ownedContractAsyncFence { snapshot in
+                    segments.append(["requestFrame":frameNumber, "requestHost":requestedAt,
+                                     "processor":snapshot, "capturePoolAtRequest":poolAtRequest])
+                }
+            }
+        }
+        let fence=processor.ownedContractFence()
+        let stats=processor.stats
+        let pool=copier.snapshot()
+        let span=Double(last-first)*Double(info.numer)/Double(info.denom)/1_000_000_000
+        let fps=span>0 ? Double(count-1)/span : 0
+        let sorted=intervalsMs.sorted()
+        let p95=sorted.isEmpty ? -1 : sorted[(sorted.count-1)*95/100]
+        let orderedCopy=copyWallMs.sorted(), orderedLateness=scheduleLatenessMs.sorted()
+        let copyP95=orderedCopy.isEmpty ? -1 : orderedCopy[(orderedCopy.count-1)*95/100]
+        let latenessP95=orderedLateness.isEmpty ? -1 : orderedLateness[(orderedLateness.count-1)*95/100]
+        // This test targets 120 callback deliveries. The rate threshold uses
+        // the gate's 95% host entry bound; 1.35 periods is its slow interval bound.
+        let pacing=fps>=120*0.95 && p95>0 && p95<=1000.0/120.0*1.35
+        let processed=(fence["processed"] as? NSNumber)?.intValue ?? 0
+        let sources=(fence["playoutSource"] as? NSNumber)?.intValue ?? 0
+        let active=(fence["nativeBudgetActive"] as? NSNumber)?.boolValue ?? false
+        let samples=segments.read()
+        var continuous=samples.count==4
+        for i in 1..<samples.count {
+            guard let previous=samples[i-1]["processor"] as? [String: Any], let current=samples[i]["processor"] as? [String: Any] else { continuous=false; continue }
+            let previousProcessed=(previous["processed"] as? NSNumber)?.intValue ?? 0, currentProcessed=(current["processed"] as? NSNumber)?.intValue ?? 0
+            let previousSource=(previous["playoutSource"] as? NSNumber)?.intValue ?? 0, currentSource=(current["playoutSource"] as? NSNumber)?.intValue ?? 0
+            let currentSlots=(current["slots"] as? NSNumber)?.intValue ?? 0, cap=(current["slotCap"] as? NSNumber)?.intValue ?? 0
+            continuous = continuous && (previous["nativeBudgetActive"] as? NSNumber)?.boolValue == true && (current["nativeBudgetActive"] as? NSNumber)?.boolValue == true &&
+                currentProcessed>previousProcessed && currentSource>previousSource && currentSlots<=cap
+        }
+        let ok=pacing && continuous && accepted>0 && processed>0 && sources>0 && active && failed==0 && (pool["ownedCap"] as? Int)==expectedCap
+        processor.stop()
+        return ["ok":ok, "inputFormat":format == kCVPixelFormatType_32BGRA ? "BGRA" : "420v/NV12", "width":width, "height":height, "callbacks":count,
+                "requestedCallbackHz":120, "callbackDeliveryHz":fps, "callbackIntervalP95ms":p95, "callbackIntervalsMs":intervalsMs,
+                "scheduleLatenessP95ms":latenessP95, "scheduleLatenessMaxMs":scheduleLatenessMs.max() ?? -1,
+                "scheduleLatenessMs":scheduleLatenessMs, "copyAndEnqueueWallP95ms":copyP95, "copyAndEnqueueWallMs":copyWallMs,
+                "callbackPacingValid":pacing, "copyAccepted":accepted, "copyFailed":failed, "pumpProcessed":processed,
+                "sourcePlayout":sources, "nativeBudgetActive":active, "continuousNativeSegments":continuous, "segments":samples, "processorFence":fence, "capturePool":pool,
+                "rawPTSRate":stats["rawCallbackPTSRate"] ?? -1, "rawHostRate":stats["rawCallbackHostRate"] ?? -1,
+                "copyAcceptedHostRate":stats["copyAcceptedHostRate"] ?? -1, "pumpArrivalRate":stats["pumpArrivalRate"] ?? -1,
+                "scope":"production metadata, owned copier and processor queues with synthetic paced buffers and an unprepared RIFE bridge; no SCK, model inference, drawable, physical FPS or GUI"]
+    }
+
+    @objc static func run() -> [String: Any] {
+        var results: [[String: Any]] = []
+        for format in [kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange] {
+            for cap in [4, 6, 7, 8, 16] {
+                let bytes = format == kCVPixelFormatType_32BGRA ? 64 * 64 * 4 : 64 * 64 * 3 / 2
+                let copier = OwnedFrameCopier(budgetBytes: bytes * cap)
+                let processor = SPLiveProcessor()
+                let attrs: [CFString: Any] = [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+                                               kCVPixelBufferMetalCompatibilityKey: true]
+                var raw: CVPixelBuffer?
+                guard CVPixelBufferCreate(kCFAllocatorDefault, 64, 64, format, attrs as CFDictionary, &raw) == kCVReturnSuccess,
+                      let raw else { return ["ok": false, "reason": "source allocation"] }
+                var accepted = 0
+                for i in 1...120 {
+                    autoreleasepool {
+                        CVPixelBufferLockBaseAddress(raw, [])
+                        let p = CVPixelBufferIsPlanar(raw) ? CVPixelBufferGetBaseAddressOfPlane(raw, 0) : CVPixelBufferGetBaseAddress(raw)
+                        p?.storeBytes(of: UInt8(i), as: UInt8.self)
+                        CVPixelBufferUnlockBaseAddress(raw, [])
+                        if let owned = copier.copy(raw) {
+                            processor.push(owned, ptsNum: Int64(i), ptsDen: 60, host: Int64(mach_absolute_time()), generation: 1)
+                            accepted += 1
+                        }
+                    }
+                    // At the smallest BGRA pool, allow the real playout clock
+                    // to retire queued source slots before the next sample.
+                    if cap == 4 && format == kCVPixelFormatType_32BGRA {
+                        Thread.sleep(forTimeInterval: 1.0 / 60.0)
+                    }
+                    _ = processor.ownedContractFence()
+                }
+                let before = processor.ownedContractFence()
+                // A distinct production-copy buffer is held only by the
+                // idle redraw slot, never by held/pending/playout. Releasing
+                // the local reference leaves pressure as its only releaser.
+                processor.ownedContractStabilizePlayout()
+                var installed = false
+                var redrawToken: UInt64 = 0
+                autoreleasepool {
+                    if let redraw = copier.copy(raw) {
+                        redrawToken = UInt64(UInt(bitPattern: Unmanaged.passUnretained(redraw).toOpaque()))
+                        processor.ownedContractInstallRedraw(redraw)
+                        installed = true
+                    }
+                }
+                let redrawHeldBefore = redrawToken != 0 && processor.ownedContractRedrawIdentity() == redrawToken
+                let pinned = processor.ownedContractPinOldest()
+                let old = processor.ownedContractByte(forIdentity: pinned)
+                var consumers: [CVPixelBuffer] = []
+                while let frame = copier.copy(raw) { consumers.append(frame) }
+                let exhausted = copier.copy(raw) == nil
+                // Consumers remain retained through the pressure operation and
+                // recovery allocation. No test-side release creates headroom.
+                processor.noteCapturePoolPressure(forGeneration: 0)
+                _ = processor.ownedContractFence()
+                let stalePreserved = processor.ownedContractRedrawIdentity() == redrawToken && copier.copy(raw) == nil && old == processor.ownedContractByte(forIdentity: pinned)
+                processor.ownedContractQueueCurrentThenStalePressure()
+                _ = processor.ownedContractFence()
+                let pressureReleased = installed && processor.ownedContractRedrawIdentity() == 0
+                let pinnedAfterPressure = pinned != 0 && old >= 0 && old == processor.ownedContractByte(forIdentity: pinned)
+                let recovered = copier.copy(raw)
+                let resumed = recovered != nil
+                withExtendedLifetime(consumers) { withExtendedLifetime(recovered) {} }
+                processor.ownedContractCompleteIdentity(pinned, stale: true)
+                let secondPin = processor.ownedContractPinOldest()
+                if secondPin != 0 { processor.ownedContractCompleteIdentity(secondPin, stale: false) }
+                let snapshot = copier.snapshot()
+                let processed = (before["processed"] as? NSNumber)?.intValue ?? 0
+                let ok = accepted >= 100 && processed >= 100 && installed && redrawHeldBefore && exhausted && stalePreserved && pinnedAfterPressure && pressureReleased && resumed && (snapshot["ownedCap"] as? Int) == cap
+                results.append(["format": format, "cap": cap, "accepted": accepted, "processed": processed,
+                                "independentRedrawInstalled": installed && redrawHeldBefore, "exhaustedImmediatelyBeforePressure": exhausted,
+                                "stalePressurePreservedRedrawAndPin": stalePreserved, "pinnedImmutableAfterPressure": pinnedAfterPressure, "pressureReleasedRedraw": pressureReleased,
+                                "resumedBeforeConsumerRelease": resumed, "ok": ok])
+                processor.stop()
+            }
+        }
+        return ["ok": results.allSatisfy { ($0["ok"] as? Bool) == true }, "results": results,
+                "scope": "production copier and processor queue, synthetic input, simulated pinned completion and idle-redraw pressure; no SCK, GPU/VT job, stream cache or drawable"]
     }
 }

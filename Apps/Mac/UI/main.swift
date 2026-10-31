@@ -25,6 +25,8 @@ spLaunchMark("main 入口")
 @inline(__always) func spLaunchMark(_ label: String) {}
 #endif
 
+let app = NSApplication.shared
+SingleInstanceCoordinator.enforce(app, arguments: CommandLine.arguments)
 SPPrewarmMetalDevice()
 
 let spCLIFilePath: String? = {
@@ -37,8 +39,6 @@ let spCLIFilePath: String? = {
     return arg
 #endif
 }()
-
-let app = NSApplication.shared
 
 app.appearance = NSAppearance(named: .darkAqua)
 let delegate = AppDelegate()

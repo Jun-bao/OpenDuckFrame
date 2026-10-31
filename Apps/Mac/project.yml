@@ -35,7 +35,9 @@ settings:
     MARKETING_VERSION: "0.7.0"
     CURRENT_PROJECT_VERSION: "12"
     KHUA_BUNDLE_ID: app.khuaplayer.KhuaPlayer
-    KHUA_DISPLAY_NAME: Khua
+    KHUA_DISPLAY_NAME: 小川帧流
+    KHUA_CANDIDATE_LABEL: "r6"
+    KHUA_SINGLE_INSTANCE_LOCK_VERSION: "1"
     KHUA_DEVELOPMENT_TEAM: ""
     ENABLE_USER_SCRIPT_SANDBOXING: NO
     HEADER_SEARCH_PATHS:
@@ -68,6 +70,7 @@ settings:
       STRIP_STYLE: all
       DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
     AppStore:
+      KHUA_SINGLE_INSTANCE_LOCK_VERSION: "0"
       CODE_SIGN_STYLE: Automatic
       CODE_SIGN_IDENTITY: "Apple Distribution"
       CODE_SIGNING_REQUIRED: YES
@@ -166,9 +169,12 @@ targets:
     info:
       path: Info.plist
       properties:
-        CFBundleName: Khua
+        CFBundleName: 小川帧流
         CFBundleDisplayName: $(KHUA_DISPLAY_NAME)
-        SPProductName: Khua Player
+        SPProductName: 小川帧流 · ChuanFlow
+        SPCandidateLabel: $(KHUA_CANDIDATE_LABEL)
+        SPSingleInstanceProtocol: 1
+        SPSingleInstanceLockVersion: $(KHUA_SINGLE_INSTANCE_LOCK_VERSION)
         CFBundleDevelopmentRegion: en
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)

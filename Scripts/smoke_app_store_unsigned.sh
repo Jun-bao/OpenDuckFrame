@@ -176,9 +176,9 @@ done
 
 MAIN_ID="$(plist_value "$APP/Contents/Info.plist" CFBundleIdentifier)"
 assert_equal "main bundle name" \
-  "$(plist_value "$APP/Contents/Info.plist" CFBundleName)" "Khua"
+  "$(plist_value "$APP/Contents/Info.plist" CFBundleName)" "小川帧流"
 assert_equal "main display name" \
-  "$(plist_value "$APP/Contents/Info.plist" CFBundleDisplayName)" "Khua"
+  "$(plist_value "$APP/Contents/Info.plist" CFBundleDisplayName)" "小川帧流"
 assert_equal "main executable name" \
   "$(plist_value "$APP/Contents/Info.plist" CFBundleExecutable)" "Khua"
 assert_equal "Quick Look display name" \

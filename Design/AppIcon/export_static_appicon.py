@@ -20,6 +20,7 @@ except ModuleNotFoundError as error:
 
 
 ROOT = Path(__file__).resolve().parent
+DEFAULT_ORIGINAL = ROOT / "ChuanFlow-Xiaochuan-FullBleed-Original.png"
 DEFAULT_MASTER = ROOT / "KhuaPlayer-StaticMaster-1024.png"
 DEFAULT_OUTPUT = ROOT / "AppIcon.appiconset"
 DEFAULT_MANIFEST = ROOT / "export-manifest.json"
@@ -82,7 +83,7 @@ def validate_master(master_path: Path) -> Image.Image:
     source.load()
     if source.size != (1024, 1024):
         raise SystemExit(f"Master must be 1024x1024; found {source.size}")
-    if source.mode != "RGB":
+    if source.mode != "RGB" or "transparency" in source.info:
         raise SystemExit(f"Master must be an opaque RGB PNG; found {source.mode}")
     if "srgb" not in source.info and "icc_profile" not in source.info:
         raise SystemExit("Master must declare an sRGB color profile")
@@ -101,7 +102,7 @@ def render(master_path: Path, output: Path) -> dict[str, object]:
             else master.resize((size, size), Image.Resampling.LANCZOS)
         )
         if image.mode != "RGB":
-            image = image.convert("RGB")
+            raise SystemExit("AppIcon output must remain opaque RGB")
         destination = output / f"AppIcon-{size}.png"
         save_png(image, destination)
         files.append(
@@ -117,6 +118,11 @@ def render(master_path: Path, output: Path) -> dict[str, object]:
     atomic_write(output / "Contents.json", stable_json(CONTENTS))
     return {
         "schemaVersion": 1,
+        "original": {
+            "file": DEFAULT_ORIGINAL.name,
+            "sha256": sha256(DEFAULT_ORIGINAL),
+            "colorSpace": "sRGB assumed; original has no embedded profile",
+        },
         "source": {
             "file": master_path.name,
             "sha256": sha256(master_path),
@@ -135,6 +141,18 @@ def render(master_path: Path, output: Path) -> dict[str, object]:
     }
 
 
+def render_master(original: Path, output: Path) -> None:
+    source = Image.open(original)
+    source.load()
+    if source.mode != "RGB" or "transparency" in source.info:
+        raise SystemExit("Original must be an opaque RGB PNG")
+    if source.width != source.height or source.width < 1024:
+        raise SystemExit("Original must be square and at least 1024 pixels")
+    if "icc_profile" in source.info:
+        raise SystemExit("Original has an embedded profile; convert to sRGB explicitly")
+    save_png(source.resize((1024, 1024), Image.Resampling.LANCZOS), output)
+
+
 def compare_file(expected: Path, actual: Path) -> list[str]:
     if not actual.is_file():
         return [f"missing: {actual}"]
@@ -145,12 +163,14 @@ def compare_file(expected: Path, actual: Path) -> list[str]:
 
 def check(master: Path, output: Path, manifest: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="khua-appicon-check.") as temporary:
+        expected_master = Path(temporary) / "master.png"
+        render_master(DEFAULT_ORIGINAL, expected_master)
+        errors: list[str] = compare_file(expected_master, master)
         expected_output = Path(temporary) / "AppIcon.appiconset"
         expected_manifest = Path(temporary) / "export-manifest.json"
         manifest_value = render(master, expected_output)
         atomic_write(expected_manifest, stable_json(manifest_value))
 
-        errors: list[str] = []
         for size in SIZES:
             filename = f"AppIcon-{size}.png"
             errors.extend(compare_file(expected_output / filename, output / filename))
@@ -173,6 +193,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--master", type=Path, default=DEFAULT_MASTER)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument("--refresh-master", action="store_true", help="recreate master from the full-bleed original")
     parser.add_argument(
         "--check",
         action="store_true",
@@ -186,10 +207,14 @@ def main() -> None:
     master = arguments.master.resolve()
     output = arguments.output.resolve()
     manifest = arguments.manifest.resolve()
+    if arguments.check and arguments.refresh_master:
+        raise SystemExit("--check and --refresh-master cannot be combined")
     if arguments.check:
         check(master, output, manifest)
         return
 
+    if arguments.refresh_master:
+        render_master(DEFAULT_ORIGINAL, master)
     manifest_value = render(master, output)
     atomic_write(manifest, stable_json(manifest_value))
     print(f"Exported AppIcon: {output}")

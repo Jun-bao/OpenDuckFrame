@@ -1,8 +1,13 @@
 {
   "schemaVersion": 1,
+  "original": {
+    "file": "ChuanFlow-Xiaochuan-FullBleed-Original.png",
+    "sha256": "8df291fdaf00e513a1f63fa81854691834857436c23040a38e4d53fed23fe288",
+    "colorSpace": "sRGB assumed; original has no embedded profile"
+  },
   "source": {
     "file": "KhuaPlayer-StaticMaster-1024.png",
-    "sha256": "e0840f48d183a096ad5a3f5bcc824f78646fa6ac3dea8a97b3b2bbd16959342b",
+    "sha256": "e3c3a62d65fa18c3f49fd04f4e71eabac0da2504f1ed7be5dc1bee213dbdfc9a",
     "width": 1024,
     "height": 1024,
     "mode": "RGB",
@@ -12,54 +17,54 @@
     "alpha": false,
     "colorSpace": "sRGB IEC61966-2.1",
     "resampling": "Pillow LANCZOS; every size is rendered directly from the 1024 px master",
-    "pillowVersion": "12.3.0"
+    "pillowVersion": "13.0.0"
   },
   "files": [
     {
       "file": "AppIcon-16.png",
-      "sha256": "cd017832d898b062a83976cd517b6867c1ca5162245b75a28a988a065ce85679",
+      "sha256": "ec8ac12aacddf113c845ae9cb8f07fff196d184ebf156896d6f5829b47fc737f",
       "width": 16,
       "height": 16,
       "mode": "RGB"
     },
     {
       "file": "AppIcon-32.png",
-      "sha256": "2589ced501237c445ca49b560b7da869b937778a827941b64f10cf399d0b8041",
+      "sha256": "7f5a0f1d1167c5c9fe6a2005f4c43beac9c0b0cae0d9f282c26e1e41fd16fa48",
       "width": 32,
       "height": 32,
       "mode": "RGB"
     },
     {
       "file": "AppIcon-64.png",
-      "sha256": "01d6c687c22cabe83b81e53ff9bf474b93667d34027baeca4984b729f6377358",
+      "sha256": "2b55f2e15e758f7c94e71fc74624dc4e817e3c8c1564d0b03476c461b42caf6c",
       "width": 64,
       "height": 64,
       "mode": "RGB"
     },
     {
       "file": "AppIcon-128.png",
-      "sha256": "b99717636653363f3159a2d9190d6c883acd5f12060e48290911ca91151e5f57",
+      "sha256": "8596a5c2928fd30d2b08de44cf957fed44474d3dbad320ed96d071f621027e0e",
       "width": 128,
       "height": 128,
       "mode": "RGB"
     },
     {
       "file": "AppIcon-256.png",
-      "sha256": "b0d46719821d9e797740072b284cf46ba6b38794acadd88bd9d6bfbb350e066e",
+      "sha256": "05c18c1cf526797fbf3bd7c759d838c84aaa761d509d85b910fd9b0fe51ca6ab",
       "width": 256,
       "height": 256,
       "mode": "RGB"
     },
     {
       "file": "AppIcon-512.png",
-      "sha256": "6bfdd25d33bd4804615117ba56ad0fffc99ddb7571274c064756904be83b7009",
+      "sha256": "72f421a7f495b87f63aed90a34084dfab6ef1d47398f1c653e2b8a0b6d89ebf0",
       "width": 512,
       "height": 512,
       "mode": "RGB"
     },
     {
       "file": "AppIcon-1024.png",
-      "sha256": "2ea45d13b278d38a151c9fc6b8d99f9f0034b8e6733f19126bff95471081df88",
+      "sha256": "e3c3a62d65fa18c3f49fd04f4e71eabac0da2504f1ed7be5dc1bee213dbdfc9a",
       "width": 1024,
       "height": 1024,
       "mode": "RGB"

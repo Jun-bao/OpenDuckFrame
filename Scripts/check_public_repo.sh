@@ -5,6 +5,32 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# This repository is now an independently developed private product. The
+# upstream export fingerprint is meaningful only when checking a legacy export;
+# it must never be refreshed to make local product changes appear unchanged.
+case "${1:-}" in
+  "")
+    python3 Scripts/check_private_repo.py
+    while IFS= read -r script; do /bin/bash -n "$script"; done < <(find Scripts Apps/Mac/Scripts -type f -name '*.sh' | sort)
+    python3 -m json.tool ThirdParty/deps.lock.json >/dev/null
+    python3 -m json.tool Design/AppIcon/KhuaPlayer.icon/icon.json >/dev/null
+    python3 -m json.tool Design/AppIcon/export-manifest.json >/dev/null
+    python3 -m json.tool Apps/Mac/Resources/Assets.xcassets/Contents.json >/dev/null
+    python3 -m json.tool Apps/Mac/Resources/Assets.xcassets/AppIcon.appiconset/Contents.json >/dev/null
+    python3 Design/AppIcon/check_appicon.py --shipping Apps/Mac/Resources/Assets.xcassets/AppIcon.appiconset
+    python3 Scripts/l10n.py check --full
+    for plist in Apps/Mac/Info.plist Apps/Mac/KhuaPlayer.entitlements Apps/Mac/QuickLook/Info.plist Apps/Mac/QuickLook/KhuaPlayerQuickLook.entitlements Apps/Mac/Resources/PrivacyInfo.xcprivacy; do
+      plutil -lint "$plist" >/dev/null
+    done
+    echo "Private product repository checks passed."
+    exit 0
+    ;;
+  --legacy-export) shift ;;
+  *) echo "usage: $0 [--legacy-export]" >&2; exit 2 ;;
+esac
+[ "$#" -eq 0 ] || { echo "usage: $0 [--legacy-export]" >&2; exit 2; }
+
+# Historical, read-only upstream public export contract follows unchanged.
 managed_source_digest() {
   python3 Scripts/lib/runtime_source.py "$1"
 }

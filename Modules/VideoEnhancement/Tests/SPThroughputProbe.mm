@@ -33,7 +33,7 @@ struct ProbeState {
     dispatch_semaphore_t readySignal = dispatch_semaphore_create(0);
     uint64_t completionOrder = 0;
     Clock::time_point origin = Clock::now();
-    ProbeState() : samples(35) {}
+    explicit ProbeState(int count) : samples(count) {}
 };
 static CVPixelBufferRef frame(int shiftPixels, NSString *pattern, OSType format) {
     const int w=2560,h=1440;
@@ -132,6 +132,7 @@ int main(int argc,const char **argv) { @autoreleasepool {
     auto setupStart=Clock::now(); NSError *setupError=nil; SPRifeBridge *rifeBridge=nil; SPFRCEngine *frcEngine=nil;
     if(rife) {
         rifeBridge=[[NSClassFromString(@"SPRifeBridge") alloc] initWithResourceBundle:bundle];
+        rifeBridge.liveStreamEnabled = [environment[@"CHUANFLOW_PROBE_RIFE_REQUEST"] isEqualToString:@"1"];
         if(![rifeBridge prepareModelID:@"rife-v4.25" quality:quality width:2560 height:1440 error:&setupError]) rifeBridge=nil;
     } else {
         id<MTLDevice> device=MTLCreateSystemDefaultDevice(); NSString *metalPath=[NSProcessInfo processInfo].environment[@"CHUANFLOW_FRAMEBUDGET_METALLIB"];
@@ -161,7 +162,7 @@ int main(int argc,const char **argv) { @autoreleasepool {
         NSData *json=[NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingPrettyPrinted error:nil]; fwrite(json.bytes,1,json.length,stdout); putchar('\n'); return all?0:1;
     }
     if(rife && [environment[@"CHUANFLOW_PROBE_CASES"] isEqualToString:@"1"]) {
-        if(![environment[@"CHUANFLOW_RIFE_STREAM"] isEqualToString:@"1"]) return fail(@"contract_mode",@"CHUANFLOW_RIFE_STREAM=1 is required",2);
+        if(!rifeBridge.liveStreamEnabled && ![environment[@"CHUANFLOW_RIFE_STREAM"] isEqualToString:@"1"]) return fail(@"contract_mode",@"CHUANFLOW_PROBE_RIFE_REQUEST=1 or CHUANFLOW_RIFE_STREAM=1 is required",2);
         SPRifeBridge *reference=[[NSClassFromString(@"SPRifeBridge") alloc] initWithResourceBundle:bundle]; NSError *referenceError=nil;
         if(![reference prepareModelID:@"rife-v4.25" quality:quality width:2560 height:1440 error:&referenceError]) return fail(@"reference_prepare",referenceError.localizedDescription,4);
         NSMutableArray *cases=[NSMutableArray array]; __block BOOL all=YES;
@@ -196,6 +197,13 @@ int main(int argc,const char **argv) { @autoreleasepool {
         run(@"clock change D/E",3,4,1,2,@[@0.5],@"reset");
         run(@"generation change E/F",4,5,2,2,@[@0.5],@"reset");
         run(@"F/G",5,6,2,2,@[@0.5],@"hit");
+        NSDictionary *beforePressure=[rifeBridge streamDiagnostics];
+        [rifeBridge relieveCapturePressure];
+        run(@"pressure reset G/H",6,7,2,2,@[@0.5],@"reset");
+        NSDictionary *afterPressure=[rifeBridge streamDiagnostics];
+        BOOL pressureReset=[afterPressure[@"pressureResets"] integerValue]==[beforePressure[@"pressureResets"] integerValue]+1;
+        all=all && pressureReset;
+        [cases addObject:@{ @"case":@"capture pressure released cached input", @"ok":@(pressureReset) }];
         BOOL repeatAccepted=[rifeBridge submitLivePrevious:inputs[0] current:inputs[0] previousID:1 currentID:1 previousPTS:CMTimeMake(0,60) currentPTS:CMTimeMake(1,60) generation:1 clockEpoch:1 timesteps:@[@0.5] token:999 completion:^(uint64_t t,NSArray<SPOwnedPixelBuffer *> *o,double d,NSError *e){(void)t;(void)o;(void)d;(void)e;}];
         all=all && !repeatAccepted; [cases addObject:@{ @"case":@"same frame identity rejected",@"ok":@(!repeatAccepted) }];
         CVPixelBufferRef small=nullptr; NSDictionary *attrs=@{(id)kCVPixelBufferIOSurfacePropertiesKey:@{},(id)kCVPixelBufferMetalCompatibilityKey:@YES};
@@ -205,6 +213,19 @@ int main(int argc,const char **argv) { @autoreleasepool {
         BOOL dimensionFailed=dimensionError!=nil; all=all && dimensionFailed;
         [cases addObject:@{ @"case":@"bad dimensions",@"ok":@(dimensionFailed),@"error":dimensionError.localizedDescription ?: @"allocation failed" }];
         run(@"error recovery B/C",1,2,2,2,@[@0.5],@"reset");
+        NSDictionary *beforeFallback=[rifeBridge streamDiagnostics];
+        [rifeBridge injectStreamFailureForContract];
+        NSError *fallbackError=nil,*fallbackReferenceError=nil;
+        NSArray *fallbackRef=infer(reference,NO,inputs[2],inputs[3],2,3,2,2,@[@0.5],&fallbackReferenceError);
+        NSArray *fallbackOut=infer(rifeBridge,YES,inputs[2],inputs[3],2,3,2,2,@[@0.5],&fallbackError);
+        NSDictionary *afterFallback=[rifeBridge streamDiagnostics];
+        NSDictionary *fallbackDiff=fallbackRef.count && fallbackOut.count ? pixelDifference(((SPOwnedPixelBuffer *)fallbackRef[0]).buffer,((SPOwnedPixelBuffer *)fallbackOut[0]).buffer) : @{};
+        BOOL fallbackOK=!fallbackError && !fallbackReferenceError && fallbackDiff.count>0 && [fallbackDiff[@"mae8bit"] doubleValue]<=0.5 &&
+            [afterFallback[@"fallbackSucceeded"] integerValue]==[beforeFallback[@"fallbackSucceeded"] integerValue]+1;
+        all=all && fallbackOK;
+        [cases addObject:@{ @"case":@"injected stream failure falls back", @"ok":@(fallbackOK), @"difference":fallbackDiff,
+            @"fallbackSucceededDelta":@([afterFallback[@"fallbackSucceeded"] integerValue]-[beforeFallback[@"fallbackSucceeded"] integerValue]) }];
+
         NSMutableArray<SPOwnedPixelBuffer *> *held=[NSMutableArray array]; NSMutableArray<NSString *> *heldHashes=[NSMutableArray array]; NSError *poolError=nil;
         for(int i=0;i<12;i++) { @autoreleasepool {
             NSError *e=nil; NSArray<SPOwnedPixelBuffer *> *outputs=infer(rifeBridge,YES,inputs[0],inputs[1],0,1,3,3,@[@0.5],&e);
@@ -240,9 +261,12 @@ int main(int argc,const char **argv) { @autoreleasepool {
         [reference invalidate]; [rifeBridge invalidate]; for(auto p:inputs) CVPixelBufferRelease(p);
         NSData *json=[NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingPrettyPrinted error:nil]; fwrite(json.bytes,1,json.length,stdout); putchar('\n'); return all?0:1;
     }
-    NSMutableArray *samples=[NSMutableArray arrayWithCapacity:35];
-    for(int i=0;i<35;i++) [samples addObject:[NSNull null]];
-    ProbeState state; ProbeState *shared=&state;
+    int measured=environment[@"CHUANFLOW_PROBE_MEASURED"] ? [environment[@"CHUANFLOW_PROBE_MEASURED"] intValue] : 30;
+    if(measured<30 || measured>600) return fail(@"sample_count",@"CHUANFLOW_PROBE_MEASURED must be 30 through 600",2);
+    const int total=5+measured;
+    NSMutableArray *samples=[NSMutableArray arrayWithCapacity:total];
+    for(int i=0;i<total;i++) [samples addObject:[NSNull null]];
+    ProbeState state(total); ProbeState *shared=&state;
     NSUInteger completed=0,failed=0,rejected=0,measuredSuccess=0,maxInflight=0;
     __strong SPOwnedPixelBuffer *selected=nil, *heldOutput=nil;
     NSString *heldBefore=@"";
@@ -268,8 +292,8 @@ int main(int argc,const char **argv) { @autoreleasepool {
                     }
                     dispatch_semaphore_signal(shared->readySignal);
                 };
-                BOOL accepted=rife ? [rifeBridge submitLivePrevious:inputs[i] current:inputs[i+1] previousID:i+1 currentID:i+2 previousPTS:CMTimeMake(i,60) currentPTS:CMTimeMake(i+1,60) generation:1 clockEpoch:1 timesteps:phases token:i+1 completion:cb] :
-                  [frcEngine submitLivePhasesWithFrameA:inputs[i] frameB:inputs[i+1] ptsA:CMTimeMake(i,60) ptsB:CMTimeMake(i+1,60) frameIDA:i+1 frameIDB:i+2 generation:1 clockEpoch:1 phases:phases token:i+1 completion:cb];
+                BOOL accepted=rife ? [rifeBridge submitLivePrevious:inputs[i%36] current:inputs[(i+1)%36] previousID:i+1 currentID:i+2 previousPTS:CMTimeMake(i,60) currentPTS:CMTimeMake(i+1,60) generation:1 clockEpoch:1 timesteps:phases token:i+1 completion:cb] :
+                  [frcEngine submitLivePhasesWithFrameA:inputs[i%36] frameB:inputs[(i+1)%36] ptsA:CMTimeMake(i,60) ptsB:CMTimeMake(i+1,60) frameIDA:i+1 frameIDB:i+2 generation:1 clockEpoch:1 phases:phases token:i+1 completion:cb];
                 sample.accepted=accepted;
                 if(accepted) { inFlight++; maxInflight=MAX(maxInflight,(NSUInteger)inFlight); }
                 else {
@@ -313,7 +337,7 @@ int main(int argc,const char **argv) { @autoreleasepool {
     };
     runBatch(0,5);
     heldBefore=digest(heldOutput.buffer);
-    auto measuredStart=runBatch(5,35); auto measuredEnd=Clock::now(); measuredWall=ms(measuredStart,measuredEnd);
+    auto measuredStart=runBatch(5,total); auto measuredEnd=Clock::now(); measuredWall=ms(measuredStart,measuredEnd);
     NSString *raw=[prefix stringByAppendingString:@".raw"]; BOOL saved=dump(selected.buffer,raw);
     CVPixelBufferRef gt=frame(21,pattern,format); NSString *gtPath=[prefix stringByAppendingString:@".gt.raw"];
     BOOL gtSaved=phases[selectedPhase].doubleValue==0.5 && dump(gt,gtPath); if(gt) CVPixelBufferRelease(gt);
@@ -324,15 +348,15 @@ int main(int argc,const char **argv) { @autoreleasepool {
     NSDictionary *diag=rife?[rifeBridge streamDiagnostics]:[frcEngine continuityDiagnostics];
     if(rife)[rifeBridge invalidate]; else [frcEngine invalidate];
     for(auto p:inputs) CVPixelBufferRelease(p);
-    BOOL validRun=measuredSuccess==30 && completed==35 && failed==0 && rejected==0 && saved && sourceUnchanged && heldUnchanged;
+    BOOL validRun=measuredSuccess==measured && completed==total && failed==0 && rejected==0 && saved && sourceUnchanged && heldUnchanged;
     NSMutableArray *completionSequence=[NSMutableArray array];
-    std::vector<int> order; for(int i=0;i<35;i++) if(state.samples[i].accepted) order.push_back(i);
+    std::vector<int> order; for(int i=0;i<total;i++) if(state.samples[i].accepted) order.push_back(i);
     std::sort(order.begin(),order.end(),[&](int a,int b){return state.samples[a].callback<state.samples[b].callback;});
     for(int i:order) [completionSequence addObject:@(i)];
     NSDictionary *result=@{ @"scope":@"headless app bridge; no display or subjective acceptance", @"engine":engine,@"quality":quality,@"pattern":pattern,@"pace":pace,
         @"frcMode":frc?frcMode:@"not-applicable",@"sessions":@(frc?concurrency:0),@"maxInflight":@(maxInflight),
         @"inputSize":@[@2560,@1440],@"inputFormat":@(format),@"phases":phases,@"selectedPhase":phases[selectedPhase],@"setupMs":@(setupMs),
-        @"warmup":@5,@"requestedMeasured":@30,@"completedAll":@(completed),@"failedAll":@(failed),@"rejectedAll":@(rejected),
+        @"warmup":@5,@"fixtureCycleFrames":@36,@"requestedMeasured":@(measured),@"completedAll":@(completed),@"failedAll":@(failed),@"rejectedAll":@(rejected),
         @"measuredCompleted":@(measuredSuccess),@"measuredWallMs":@(measuredWall),@"measuredCallbackWallMs":@(lastCallback.time_since_epoch().count()?ms(measuredStart,lastCallback):0),
         @"measuredPairsPerSecond":@(measuredWall>0?measuredSuccess*1000.0/measuredWall:0),@"gpuTime":@"unknown",@"diagnostics":diag ?: @{},
         @"selectedPairIndex":@10,@"selectedRaw":saved?raw:@"",@"syntheticGT":gtSaved?gtPath:@"",@"inputSHA256Before":beforeHashes,@"inputSHA256After":afterHashes,

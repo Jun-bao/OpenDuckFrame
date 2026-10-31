@@ -7,7 +7,10 @@ import argparse
 import hashlib
 import json
 import struct
+import subprocess
+import sys
 import zlib
+from PIL import Image
 from pathlib import Path
 
 
@@ -45,7 +48,7 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def png_properties(path: Path) -> tuple[int, int, int, int, bool]:
+def png_properties(path: Path) -> tuple[int, int, int, int, bool, bool]:
     data = path.read_bytes()
     if not data.startswith(PNG_SIGNATURE):
         fail(f"not a PNG: {path}")
@@ -53,6 +56,7 @@ def png_properties(path: Path) -> tuple[int, int, int, int, bool]:
     position = len(PNG_SIGNATURE)
     width = height = bit_depth = color_type = -1
     has_srgb = False
+    has_transparency = False
     saw_iend = False
     while position < len(data):
         if position + 12 > len(data):
@@ -77,6 +81,8 @@ def png_properties(path: Path) -> tuple[int, int, int, int, bool]:
             width, height, bit_depth, color_type = struct.unpack(">IIBB", payload[:10])
         elif chunk_type == b"sRGB":
             has_srgb = True
+        elif chunk_type == b"tRNS":
+            has_transparency = True
         elif chunk_type == b"IEND":
             saw_iend = True
             position = crc_end
@@ -85,19 +91,29 @@ def png_properties(path: Path) -> tuple[int, int, int, int, bool]:
 
     if not saw_iend or position != len(data):
         fail(f"invalid PNG ending: {path}")
-    return width, height, bit_depth, color_type, has_srgb
+    return width, height, bit_depth, color_type, has_srgb, has_transparency
 
 
 def validate_png(path: Path, size: int) -> None:
     if not path.is_file():
         fail(f"missing PNG: {path}")
-    width, height, bit_depth, color_type, has_srgb = png_properties(path)
+    width, height, bit_depth, color_type, has_srgb, has_transparency = png_properties(path)
     if (width, height) != (size, size):
         fail(f"wrong dimensions for {path}: {width}x{height}")
-    if bit_depth != 8 or color_type != 2:
-        fail(f"{path} must be 8-bit opaque RGB; PNG color type is {color_type}")
+    if bit_depth != 8 or color_type != 2 or has_transparency:
+        fail(f"{path} must be opaque 8-bit RGB; PNG color type is {color_type}")
     if not has_srgb:
         fail(f"missing sRGB declaration: {path}")
+    with Image.open(path) as image:
+        corners = [image.getpixel(point) for point in ((0, 0), (size - 1, 0), (0, size - 1), (size - 1, size - 1))]
+        if any(blue <= red for red, green, blue in corners):
+            fail(f"expected blue background at each corner: {path}")
+        edges = [[image.getpixel((i, 0)) for i in range(size)],
+                 [image.getpixel((i, size - 1)) for i in range(size)],
+                 [image.getpixel((0, i)) for i in range(size)],
+                 [image.getpixel((size - 1, i)) for i in range(size)]]
+        if any(sum(all(channel >= 240 for channel in pixel) for pixel in edge) > size * 0.9 for edge in edges):
+            fail(f"near-white border detected: {path}")
 
 
 def validate_icon_composer_source() -> None:
@@ -131,6 +147,9 @@ def validate_manifest() -> None:
     manifest = json.loads((ROOT / "export-manifest.json").read_text(encoding="utf-8"))
     if manifest.get("schemaVersion") != 1:
         fail("unsupported export-manifest.json schema")
+    original = ROOT / "ChuanFlow-Xiaochuan-FullBleed-Original.png"
+    if not original.is_file() or manifest.get("original", {}).get("sha256") != sha256(original) or manifest.get("original", {}).get("file") != original.name:
+        fail("full-bleed original does not match export-manifest.json")
     master = ROOT / "KhuaPlayer-StaticMaster-1024.png"
     validate_png(master, 1024)
     source = manifest.get("source", {})
@@ -145,7 +164,7 @@ def validate_manifest() -> None:
         fail("static master metadata is invalid in export-manifest.json")
     export = manifest.get("export", {})
     if export.get("alpha") is not False or export.get("colorSpace") != "sRGB IEC61966-2.1":
-        fail("production export must remain opaque sRGB")
+        fail("production export must remain opaque RGB sRGB")
 
     records = manifest.get("files")
     if not isinstance(records, list):
@@ -224,6 +243,7 @@ def main() -> None:
     validate_icon_composer_source()
     validate_manifest()
     validate_asset_manifest()
+    subprocess.run([sys.executable, str(ROOT / "export_static_appicon.py"), "--check"], check=True)
     if arguments.shipping is not None:
         validate_shipping_copy(arguments.shipping.resolve())
     print(f"AppIcon source and export validation passed: {ROOT}")

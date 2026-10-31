@@ -64,10 +64,9 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         window.backgroundColor = .black
         window.titlebarAppearsTransparent = true
         window.center()
-        // The app name is identical across locales. Use a literal during bootstrap
-        // to avoid loading the localization catalog before the first window appears.
-        // A media filename replaces it on open; idle states use L("app.displayName").
-        window.title = "Khua"
+        // Use the workbench language setting without loading the localization
+        // catalog before the first window appears. Idle states use the catalog.
+        window.title = EnhancementText.t("ChuanFlow", "小川帧流")
         window.minSize = NSSize(width: 480, height: 270)
         window.isReleasedWhenClosed = false
 

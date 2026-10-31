@@ -11,6 +11,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var pendingOpenURLs: [URL] = []
     private var cliOpenIssued = false
     private var didFinishLaunchingCompleted = false
+    private var singleInstanceServer: SingleInstanceIPC.Server?
+    private var singleInstanceTerminating = false
     private var launchOpensMedia = false
 #if SP_INTERNAL_BUILD && !SP_APP_STORE
     private var reopenTestClickDelay: Double?
@@ -219,9 +221,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         !enhancementSelfTest && !sessionContract && !engineProbe && !srPipelineContract && !videoSRPipelineContract && !anime4KPipelineContract && !cuganPipelineContract
     }
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
+    @MainActor func applicationDidFinishLaunching(_ notification: Notification) {
         spLaunchMark("didFinishLaunching 入口")
         let args = CommandLine.arguments
+        if args.contains(PixelDiagnosticsPolicy.flag) && !PixelDiagnosticsPolicy.enabled(args) {
+            fputs("--khua-pixel-diagnostics requires absolute --khua-isolated-profile and --khua-live-log paths\n", stderr)
+            exit(2)
+        }
+        if let index = args.firstIndex(of: "--khua-isolated-profile") {
+            guard args.indices.contains(index + 1), args[index + 1].hasPrefix("/") else {
+                fputs("--khua-isolated-profile requires an absolute directory\n", stderr)
+                exit(2)
+            }
+            EnhancementProfileStore.testDirectory = URL(fileURLWithPath: args[index + 1], isDirectory: true)
+        }
         if cuganPipelineContract {
             let output = args.firstIndex(of: "--khua-realcugan-pipeline-contract").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil } ?? "/tmp/khua-realcugan-pipeline-contract.json"
             DispatchQueue.global(qos: .userInitiated).async {
@@ -351,6 +364,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let showWorkbench = !launchOpensMedia || !windowControllers.contains(where: { $0.window?.isVisible ?? false })
         didFinishLaunchingCompleted = true
 
+        let handleHandoff: @MainActor @Sendable (Int32, [URL]) -> Bool = { [weak self] pid, urls in
+            guard let self, SingleInstanceCoordinator.isProductProcess(pid) else { return false }
+            NSApp.unhide(nil)
+            if urls.isEmpty {
+                let visible = NSApp.windows.contains { $0.isVisible && $0.canBecomeKey }
+                _ = self.applicationShouldHandleReopen(NSApp, hasVisibleWindows: visible)
+            } else {
+                self.application(NSApp, open: urls)
+            }
+            NSApp.activate(ignoringOtherApps: true)
+            return true
+        }
+        let installServer: @MainActor @Sendable (SingleInstanceIPC.Server?) -> Void = { [weak self] server in
+            guard let self, !self.singleInstanceTerminating else { server?.stop(); return }
+            self.singleInstanceServer = server
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let server = SingleInstanceIPC.Server.start(handler: handleHandoff)
+            if server == nil { fputs("Single-instance handoff server could not start.\n", stderr) }
+            DispatchQueue.main.async { installServer(server) }
+        }
+
         NSApp.activate(ignoringOtherApps: true)
         if showWorkbench {
             wc.window?.orderOut(nil)
@@ -403,6 +438,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationWillTerminate(_ notification: Notification) {
+        singleInstanceTerminating = true
+        singleInstanceServer?.stop()
+        singleInstanceServer = nil
         RecentPlaysWarmer.noteAppTerminating()
     }
 
@@ -567,32 +605,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     @objc func languageAction(_ sender: NSMenuItem) {
         let target = sender.representedObject as? String
-        guard target != AppLanguage.current else { return }
-        AppLanguage.apply(target)
-
-        let running = Bundle.main.preferredLocalizations.first
-        guard AppLanguage.effectiveLanguage(for: target) != running else {
-            return
-        }
-        let alert = NSAlert()
-        alert.messageText = L("settings.language.restart.title")
-        alert.informativeText = L("settings.language.restart.message")
-        alert.addButton(withTitle: L("settings.language.restart.now"))
-        alert.addButton(withTitle: L("settings.language.restart.later"))
-        let respond: (NSApplication.ModalResponse) -> Void = { resp in
-            guard resp == .alertFirstButtonReturn else { return }
-
-            let config = NSWorkspace.OpenConfiguration()
-            config.createsNewApplicationInstance = true
-            NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL,
-                                               configuration: config) { _, _ in
-                DispatchQueue.main.async { NSApp.terminate(nil) }
+        LanguageChangePolicy.change(target: target, current: AppLanguage.current,
+            running: Bundle.main.preferredLocalizations.first, effective: AppLanguage.effectiveLanguage,
+            persist: AppLanguage.apply) {
+            let alert = NSAlert()
+            alert.messageText = L("settings.language.restart.title")
+            alert.informativeText = L("settings.language.restart.message")
+            alert.addButton(withTitle: L("privacy.summary.ok"))
+            if let window = sheetHostWindow {
+                alert.beginSheetModal(for: window, completionHandler: nil)
+            } else {
+                alert.runModal()
             }
-        }
-        if let window = sheetHostWindow {
-            alert.beginSheetModal(for: window, completionHandler: respond)
-        } else {
-            respond(alert.runModal())
         }
     }
 }

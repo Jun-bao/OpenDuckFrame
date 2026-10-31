@@ -59,6 +59,14 @@ public:
         __int128 elapsed=(__int128)input_.back().pts-input_.front().pts;
         return elapsed>0 ? (double)(input_.size()-1)*1e9/(double)elapsed : -1;
     }
+    // Arrival rate uses callback host time, not stream timestamps. Require a
+    // sustained sample before using it to suppress inference.
+    double inputArrivalRate(int64_t now) {
+        trim(input_,now);
+        if (input_.size() < 30 || now < input_.back().host || now - input_.back().host > stale) return -1;
+        int64_t elapsed = input_.back().host - input_.front().host;
+        return elapsed >= 500000000LL ? (double)(input_.size()-1)*1e9/(double)elapsed : -1;
+    }
     double outputRate(int64_t now) {
         trim(output_,now);
         if (output_.size()<2 || now<output_.back().host || now-output_.back().host>stale) return -1;

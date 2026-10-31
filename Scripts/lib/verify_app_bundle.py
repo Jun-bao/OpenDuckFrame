@@ -244,12 +244,12 @@ def verify_bundle(
             info = plistlib.load(handle)
     except (OSError, plistlib.InvalidFileException) as exc:
         raise BundleError(f"invalid Info.plist: {exc}") from exc
-    if str(info.get("CFBundleName", "")) != "Khua":
-        raise BundleError("Info.plist CFBundleName must be Khua")
-    if str(info.get("CFBundleDisplayName", "")) != "Khua":
-        raise BundleError("Info.plist CFBundleDisplayName must be Khua")
-    if info.get("SPProductName") != "Khua Player":
-        raise BundleError("Info.plist SPProductName must be Khua Player for About")
+    if str(info.get("CFBundleName", "")) != "小川帧流":
+        raise BundleError("Info.plist CFBundleName must be 小川帧流")
+    if str(info.get("CFBundleDisplayName", "")) != "小川帧流":
+        raise BundleError("Info.plist CFBundleDisplayName must be 小川帧流")
+    if info.get("SPProductName") != "小川帧流 · ChuanFlow":
+        raise BundleError("Info.plist SPProductName must be 小川帧流 · ChuanFlow for About")
     executable_name = str(info.get("CFBundleExecutable", ""))
     if executable_name != "Khua":
         raise BundleError("Info.plist CFBundleExecutable must be Khua")

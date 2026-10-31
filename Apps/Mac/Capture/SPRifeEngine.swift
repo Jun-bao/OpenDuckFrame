@@ -27,10 +27,18 @@ final class SPRifeBridge: NSObject {
     // Only touched on exec. Retaining the source prevents pixel-buffer pool reuse.
     private var stream: RifeStream?
     private var streamEpoch: UInt64 = 0
+    @objc var liveStreamEnabled = false
+    private var contractFailNext = false // exec queue only
+    private var pressureResetQueued = false // protected by state
+    private var streamPreviousFormat: OSType = 0
     private var streamPrevious: CVPixelBuffer?
     private var streamKey: SPRifeContinuityKey?
     private var outputPool: CVPixelBufferPool?
-    private var streamHits = 0, streamResets = 0, poolRequests = 0, poolFailures = 0
+    private let diagnosticLock = NSLock()
+    private var diagnosticCounts: [String: Int] = [:]
+    private func count(_ name: String) {
+        diagnosticLock.lock(); diagnosticCounts[name, default: 0] += 1; diagnosticLock.unlock()
+    }
     private let traceLog = OSLog(subsystem: "app.chuanflow.throughput", category: "RIFE")
 
     @objc(prepareModelID:quality:width:height:error:)
@@ -105,7 +113,7 @@ final class SPRifeBridge: NSObject {
                     timesteps: [NSNumber], token: UInt64,
                     completion: @escaping (UInt64, [SPOwnedPixelBuffer]?, Double, Error?) -> Void) -> Bool {
         // Default remains the proven stateless bridge until equivalence is measured.
-        guard ProcessInfo.processInfo.environment["CHUANFLOW_RIFE_STREAM"] == "1" else {
+        guard liveStreamEnabled || ProcessInfo.processInfo.environment["CHUANFLOW_RIFE_STREAM"] == "1" else {
             return submit(previous: previous, current: current, timesteps: timesteps, token: token, completion: completion)
         }
         let phases = timesteps.map(\.floatValue)
@@ -115,57 +123,95 @@ final class SPRifeBridge: NSObject {
         state.lock(); let engine = interpolator; let seen = epoch; state.unlock()
         guard let engine else { return false }
         exec.async {
-            let started = CFAbsoluteTimeGetCurrent()
-            let trace = ProcessInfo.processInfo.environment["CHUANFLOW_THROUGHPUT_TRACE"] == "1"
-            let log = self.traceLog
-            let signpost = trace ? OSSignpostID(log: log) : .invalid
-            if trace { os_signpost(.begin, log: log, name: "RIFE stream", signpostID: signpost) }
-            defer { if trace { os_signpost(.end, log: log, name: "RIFE stream", signpostID: signpost) } }
-            self.state.lock(); let active = self.epoch == seen; self.state.unlock()
-            guard active else { completion(token, nil, 0, Self.error(1, "RIFE 结果属于旧会话")); return }
-            do {
-                let width = CVPixelBufferGetWidth(previous), height = CVPixelBufferGetHeight(previous)
-                guard width == CVPixelBufferGetWidth(current), height == CVPixelBufferGetHeight(current) else {
-                    throw Self.error(2, "RIFE 输入尺寸不一致")
+            autoreleasepool {
+                let started = CFAbsoluteTimeGetCurrent()
+                let trace = ProcessInfo.processInfo.environment["CHUANFLOW_THROUGHPUT_TRACE"] == "1"
+                let log = self.traceLog
+                let signpost = trace ? OSSignpostID(log: log) : .invalid
+                if trace { os_signpost(.begin, log: log, name: "RIFE stream", signpostID: signpost) }
+                defer { if trace { os_signpost(.end, log: log, name: "RIFE stream", signpostID: signpost) } }
+                self.state.lock(); let active = self.epoch == seen; self.state.unlock()
+                guard active else { completion(token, nil, 0, Self.error(1, "RIFE 结果属于旧会话")); return }
+                do {
+                    let width = CVPixelBufferGetWidth(previous), height = CVPixelBufferGetHeight(previous)
+                    guard width == CVPixelBufferGetWidth(current), height == CVPixelBufferGetHeight(current) else {
+                        throw Self.error(2, "RIFE 输入尺寸不一致")
+                    }
+                    if self.stream == nil || self.streamEpoch != seen || self.stream?.width != width || self.stream?.height != height {
+                        self.stream = try engine.makeStream(width: width, height: height)
+                        self.streamEpoch = seen; self.streamPrevious = nil; self.streamKey = nil; self.outputPool = nil
+                    }
+                    let stream = self.stream!
+                    if self.contractFailNext {
+                        self.contractFailNext = false
+                        throw Self.error(99, "injected stream failure")
+                    }
+                    let previousKey = SPRifeContinuityKey(address: UInt(bitPattern: Unmanaged.passUnretained(previous).toOpaque()),
+                        identity: previousID, pts: previousPTS, generation: generation, clockEpoch: clockEpoch)
+                    let previousFormat = CVPixelBufferGetPixelFormatType(previous)
+                    let currentFormat = CVPixelBufferGetPixelFormatType(current)
+                    let hit = previousFormat == currentFormat && self.streamPreviousFormat == previousFormat &&
+                        self.streamPrevious === previous && self.streamKey?.matches(previousKey) == true
+                    if hit { self.count("hits") } else {
+                        self.count("misses")
+                        stream.reset(); self.streamPrevious = nil; self.streamKey = nil; self.count("resets")
+                        let left = try self.ownedBGRA(previous)
+                        guard try stream.push(left, timesteps: []).isEmpty else { throw Self.error(2, "RIFE 缓存初始化失败") }
+                    }
+                    let right = try self.ownedBGRA(current)
+                    let frames: [CVPixelBuffer]
+                    if phases.count == 1 && phases[0] == 0.5 {
+                        let output = try self.pooledOutput(width: width, height: height)
+                        guard try stream.push(right, into: output) else { throw Self.error(2, "RIFE 中间帧缺失") }
+                        frames = [output]
+                    } else {
+                        frames = try stream.push(right, timesteps: phases)
+                    }
+                    guard frames.count == phases.count, frames.allSatisfy({ CVPixelBufferGetWidth($0) == width && CVPixelBufferGetHeight($0) == height }) else {
+                        throw Self.error(2, "RIFE 输出数量或尺寸不一致")
+                    }
+                    self.streamPrevious = current
+                    self.streamPreviousFormat = currentFormat
+                    self.streamKey = SPRifeContinuityKey(address: UInt(bitPattern: Unmanaged.passUnretained(current).toOpaque()),
+                        identity: currentID, pts: currentPTS, generation: generation, clockEpoch: clockEpoch)
+                    self.state.lock(); let stillActive = self.epoch == seen; self.state.unlock()
+                    guard stillActive else { stream.reset(); self.streamPrevious = nil; self.streamKey = nil; throw Self.error(1, "RIFE 结果属于旧会话") }
+                    let owned = frames.map { buffer in
+                        CVBufferPropagateAttachments(previous, buffer); Self.attach709IfMissing(buffer)
+                        return SPOwnedPixelBuffer(retaining: buffer)
+                    }
+                    completion(token, owned, max(0, CFAbsoluteTimeGetCurrent() - started), nil)
+                } catch {
+                    self.stream?.reset(); self.streamPrevious = nil; self.streamKey = nil; self.count("resets")
+                    let failure = Self.explain(error) as NSError
+                    if failure.domain == "app.khuaplayer.rife" && failure.code == 10 {
+                        completion(token, nil, max(0, CFAbsoluteTimeGetCurrent() - started), failure)
+                        return
+                    }
+                    // Retry with the same model, quality, resolution and phases.
+                    // A retired epoch is never allowed to publish fallback output.
+                    do {
+                        self.state.lock(); let active = self.epoch == seen; self.state.unlock()
+                        guard active else { throw Self.error(1, "RIFE 结果属于旧会话") }
+                        let left = try self.ownedBGRA(previous), right = try self.ownedBGRA(current)
+                        let frames = try engine.interpolate(previous: left, current: right, timesteps: phases)
+                        guard frames.count == phases.count, frames.allSatisfy({
+                            CVPixelBufferGetWidth($0) == CVPixelBufferGetWidth(previous) &&
+                            CVPixelBufferGetHeight($0) == CVPixelBufferGetHeight(previous)
+                        }) else { throw Self.error(2, "RIFE 回退输出数量或尺寸不一致") }
+                        self.state.lock(); let stillActive = self.epoch == seen; self.state.unlock()
+                        guard stillActive else { throw Self.error(1, "RIFE 结果属于旧会话") }
+                        let owned = frames.map { buffer in
+                            CVBufferPropagateAttachments(left, buffer); Self.attach709IfMissing(buffer)
+                            return SPOwnedPixelBuffer(retaining: buffer)
+                        }
+                        self.count("fallbackSucceeded")
+                        completion(token, owned, max(0, CFAbsoluteTimeGetCurrent() - started), nil)
+                    } catch {
+                        self.count("fallbackFailed")
+                        completion(token, nil, max(0, CFAbsoluteTimeGetCurrent() - started), Self.explain(error))
+                    }
                 }
-                if self.stream == nil || self.streamEpoch != seen || self.stream?.width != width || self.stream?.height != height {
-                    self.stream = try engine.makeStream(width: width, height: height)
-                    self.streamEpoch = seen; self.streamPrevious = nil; self.streamKey = nil; self.outputPool = nil
-                }
-                let stream = self.stream!
-                let previousKey = SPRifeContinuityKey(address: UInt(bitPattern: Unmanaged.passUnretained(previous).toOpaque()),
-                    identity: previousID, pts: previousPTS, generation: generation, clockEpoch: clockEpoch)
-                let hit = self.streamPrevious === previous && self.streamKey?.matches(previousKey) == true
-                if hit { self.streamHits += 1 } else {
-                    stream.reset(); self.streamPrevious = nil; self.streamKey = nil; self.streamResets += 1
-                    let left = try self.ownedBGRA(previous)
-                    guard try stream.push(left, timesteps: []).isEmpty else { throw Self.error(2, "RIFE 缓存初始化失败") }
-                }
-                let right = try self.ownedBGRA(current)
-                let frames: [CVPixelBuffer]
-                if phases.count == 1 && phases[0] == 0.5 {
-                    let output = try self.pooledOutput(width: width, height: height)
-                    guard try stream.push(right, into: output) else { throw Self.error(2, "RIFE 中间帧缺失") }
-                    frames = [output]
-                } else {
-                    frames = try stream.push(right, timesteps: phases)
-                }
-                guard frames.count == phases.count, frames.allSatisfy({ CVPixelBufferGetWidth($0) == width && CVPixelBufferGetHeight($0) == height }) else {
-                    throw Self.error(2, "RIFE 输出数量或尺寸不一致")
-                }
-                self.streamPrevious = current
-                self.streamKey = SPRifeContinuityKey(address: UInt(bitPattern: Unmanaged.passUnretained(current).toOpaque()),
-                    identity: currentID, pts: currentPTS, generation: generation, clockEpoch: clockEpoch)
-                self.state.lock(); let stillActive = self.epoch == seen; self.state.unlock()
-                guard stillActive else { stream.reset(); self.streamPrevious = nil; self.streamKey = nil; throw Self.error(1, "RIFE 结果属于旧会话") }
-                let owned = frames.map { buffer in
-                    CVBufferPropagateAttachments(previous, buffer); Self.attach709IfMissing(buffer)
-                    return SPOwnedPixelBuffer(retaining: buffer)
-                }
-                completion(token, owned, max(0, CFAbsoluteTimeGetCurrent() - started), nil)
-            } catch {
-                self.stream?.reset(); self.streamPrevious = nil; self.streamKey = nil; self.streamResets += 1
-                completion(token, nil, max(0, CFAbsoluteTimeGetCurrent() - started), Self.explain(error))
             }
         }
         return true
@@ -182,21 +228,48 @@ final class SPRifeBridge: NSObject {
             }
             outputPool = pool
         }
-        poolRequests += 1
+        count("poolRequests")
         var buffer: CVPixelBuffer?
         let aux = [kCVPixelBufferPoolAllocationThresholdKey as String: 4] as CFDictionary
         let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault, outputPool!, aux, &buffer)
         if status == kCVReturnWouldExceedAllocationThreshold {
-            poolFailures += 1; throw Self.error(10, "RIFE 输出池繁忙，等待已持有的画面释放。")
+            count("poolFailures"); throw Self.error(10, "RIFE 输出池繁忙，等待已持有的画面释放。")
         }
         guard status == kCVReturnSuccess, let buffer, CVPixelBufferGetIOSurface(buffer) != nil else {
-            poolFailures += 1; throw Self.error(2, "RIFE 输出池分配失败（\(status)）")
+            count("poolFailures"); throw Self.error(2, "RIFE 输出池分配失败（\(status)）")
         }
         return buffer
     }
 
+    @objc func relieveCapturePressure() {
+        state.lock()
+        if pressureResetQueued { state.unlock(); return }
+        pressureResetQueued = true
+        state.unlock()
+        // Serialized after previously submitted work; never releases an input
+        // while the stream is still using it on the GPU.
+        exec.async {
+            if self.streamPrevious != nil {
+                self.stream?.reset(); self.streamPrevious = nil; self.streamKey = nil
+                self.count("pressureResets")
+            }
+            self.state.lock(); self.pressureResetQueued = false; self.state.unlock()
+        }
+    }
+
+    @objc func injectStreamFailureForContract() {
+        exec.sync { contractFailNext = true }
+    }
+
     @objc func streamDiagnostics() -> [String: Any] {
-        exec.sync { ["hits": streamHits, "resets": streamResets, "poolRequests": poolRequests, "poolFailures": poolFailures] }
+        diagnosticLock.lock(); let counts = diagnosticCounts; diagnosticLock.unlock()
+        let environment = ProcessInfo.processInfo.environment["CHUANFLOW_RIFE_STREAM"] == "1"
+        return ["requested": liveStreamEnabled, "effective": liveStreamEnabled || environment,
+                "enableSource": liveStreamEnabled ? "request" : (environment ? "environment" : "disabled"),
+                "hits": counts["hits", default: 0], "misses": counts["misses", default: 0],
+                "resets": counts["resets", default: 0], "pressureResets": counts["pressureResets", default: 0], "fallbackSucceeded": counts["fallbackSucceeded", default: 0],
+                "fallbackFailed": counts["fallbackFailed", default: 0], "poolRequests": counts["poolRequests", default: 0],
+                "poolFailures": counts["poolFailures", default: 0]]
     }
 
     @objc func invalidate() {

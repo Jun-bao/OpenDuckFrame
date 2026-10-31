@@ -47,6 +47,8 @@ typedef NS_ENUM(NSInteger, SPLiveViewMode) {
 @property (nonatomic, copy) NSString *modelID;
 /// normal, quality, fast, balanced, or hq. The value belongs to the selected engine.
 @property (nonatomic, copy) NSString *qualityID;
+/// Opt-in RIFE live stream cache. Other engines and file playback are unaffected.
+@property (nonatomic) BOOL rifeStreamEnabled;
 @end
 
 @interface SPLiveResolvedPlan : NSObject
@@ -117,6 +119,10 @@ typedef NS_ENUM(NSInteger, SPLiveViewMode) {
 /// Install once after assigning both views, on the main thread.
 - (void)installPresentationHooks;
 - (void)awaitOutputSurfaceWithToken:(uint64_t)token;
+/// Require the revealed output to originate at or after this mach host time.
+- (void)awaitOutputSurfaceWithToken:(uint64_t)token minimumCaptureHost:(int64_t)captureHost;
+/// Opt-in isolated-test sampling; records fingerprints, never image files.
+- (void)enablePixelDiagnostics;
 
 - (void)updateRequest:(SPLivePlanRequest *)request;
 - (void)setViewMode:(SPLiveViewMode)mode;
@@ -126,6 +132,18 @@ typedef NS_ENUM(NSInteger, SPLiveViewMode) {
 - (uint64_t)resumeSource;
 - (void)stop;
 - (void)noteCaptureStatus:(NSInteger)statusCode;
+/// Release only idle capture-owned history in response to actual pool pressure.
+- (void)noteCapturePoolPressureForGeneration:(uint64_t)generation;
+/// Update the physical capture/display context independently of model state.
+- (void)setRawCadenceRefreshHz:(double)refreshHz captureLimit:(int)captureLimit displayID:(uint64_t)displayID
+    NS_SWIFT_NAME(setRawCadence(refreshHz:captureLimit:displayID:));
+/// The active output display changed physical refresh rate.
+- (void)updateDisplayRefreshHz:(double)refreshHz;
+- (void)updateCaptureLimitFPS:(int)captureLimit;
+/// Complete capture callback metadata, before the borrowed surface is copied.
+- (void)noteRawCapturePTSNum:(int64_t)ptsNum ptsDen:(int64_t)ptsDen host:(int64_t)host
+                       width:(int)width height:(int)height generation:(uint64_t)generation
+    NS_SWIFT_NAME(noteRawCapture(ptsNum:ptsDen:host:width:height:generation:));
 - (void)pushPixelBuffer:(CVPixelBufferRef)buffer
                  ptsNum:(int64_t)ptsNum
                  ptsDen:(int64_t)ptsDen
@@ -138,6 +156,19 @@ typedef NS_ENUM(NSInteger, SPLiveViewMode) {
                    host:(int64_t)host
               readyHost:(int64_t)readyHost
              generation:(uint64_t)generation;
+/// Headless contract hooks. Call only from the isolated capture contract.
+- (NSDictionary<NSString *, id> *)ownedContractFence;
+- (void)ownedContractAsyncFence:(void (^)(NSDictionary<NSString *, id> *))completion;
+- (void)ownedContractConfigureNativeWidth:(int)width height:(int)height
+    NS_SWIFT_NAME(ownedContractConfigureNative(width:height:));
+- (uint64_t)ownedContractPinOldest;
+- (int)ownedContractByteForIdentity:(uint64_t)identity;
+- (BOOL)ownedContractInstallRedrawForIdentity:(uint64_t)identity;
+- (void)ownedContractInstallRedrawBuffer:(CVPixelBufferRef)buffer;
+- (void)ownedContractStabilizePlayout;
+- (uint64_t)ownedContractRedrawIdentity;
+- (void)ownedContractCompleteIdentity:(uint64_t)identity stale:(BOOL)stale;
+- (void)ownedContractQueueCurrentThenStalePressure;
 /// Blocks until queued GPU work for this probe finishes. Not for the main thread of a live session.
 + (NSDictionary<NSString *, id> *)runProbe;
 /// Generation ownership and absolute-PTS scheduling. Does not start a capture stream.
@@ -162,6 +193,9 @@ typedef NS_ENUM(NSInteger, SPLiveViewMode) {
 + (NSDictionary<NSString *, id> *)runSourceSizeLifecycleContract;
 /// Deterministic source clock, phase deadlines and stale-work contract.
 + (NSDictionary<NSString *, id> *)runSourceClockSchedulingContract;
++ (NSDictionary<NSString *, id> *)runPendingReplacementContract;
++ (NSDictionary<NSString *, id> *)runRejectedPTSContract;
++ (NSDictionary<NSString *, id> *)runPresentationBudgetContract;
 @end
 
 NS_ASSUME_NONNULL_END

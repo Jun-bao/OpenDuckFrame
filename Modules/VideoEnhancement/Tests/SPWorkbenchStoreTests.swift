@@ -119,6 +119,13 @@ enum AppLanguage { static var current: String? { nil }; static func effectiveLan
   precondition(TargetOverlayPolicy.outputFrame(target:targetFrame,fullscreen:false,display:primary)==targetFrame)
   precondition(TargetOverlayPolicy.outputFrame(target:targetFrame,fullscreen:true,display:primary)==primary)
   precondition(TargetOverlayPolicy.outputFrame(target:targetFrame,fullscreen:true,display:nil)==nil)
+  precondition(TargetOverlayPolicy.followsTarget(fullscreen:false,viewerFollowOverride:false))
+  precondition(!TargetOverlayPolicy.followsTarget(fullscreen:true,viewerFollowOverride:false))
+  precondition(TargetOverlayPolicy.followsTarget(fullscreen:true,viewerFollowOverride:true))
+  let cadenceScreens = [NSRect(x:0,y:0,width:1000,height:800), NSRect(x:1000,y:0,width:1000,height:800)]
+  precondition(TargetOverlayPolicy.screenIndex(target:NSRect(x:700,y:50,width:400,height:300),screens:cadenceScreens)==0)
+  precondition(TargetOverlayPolicy.screenIndex(target:NSRect(x:900,y:50,width:400,height:300),screens:cadenceScreens)==1)
+  precondition(TargetOverlayPolicy.screenIndex(target:NSRect(x:2100,y:50,width:100,height:100),screens:cadenceScreens)==nil)
   precondition(VideoSRAvailability.readyFactors(isFile:false,inputReady:true,factors:[2]) == [])
   let ll=LiveEngineSelection.fromPopup(1,quality:"fast"), rife=LiveEngineSelection.fromPopup(3,quality:"fast")
   precondition(LiveCoverage.modelScheduled(total:100,held:100)==0 && LiveCoverage.modelScheduled(total:100,held:40)==60 && LiveCoverage.modelScheduled(total:0,held:1)==0)

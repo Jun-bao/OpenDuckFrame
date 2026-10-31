@@ -1,5 +1,6 @@
 import AppKit
 import CoreVideo
+import Darwin
 @preconcurrency import ScreenCaptureKit
 
 extension Notification.Name {
@@ -256,6 +257,18 @@ enum TargetOverlayPolicy {
     static func outputFrame(target: NSRect, fullscreen: Bool, display: NSRect?) -> NSRect? {
         fullscreen ? display : target
     }
+    static func followsTarget(fullscreen: Bool, viewerFollowOverride: Bool) -> Bool {
+        !fullscreen || viewerFollowOverride
+    }
+    static func screenIndex(target: NSRect, screens: [NSRect]) -> Int? {
+        guard !target.isEmpty else { return nil }
+        let candidates = screens.enumerated().map { index, frame -> (Int, CGFloat) in
+            let overlap = frame.intersection(target)
+            return (index, overlap.isNull ? 0 : overlap.width * overlap.height)
+        }
+        guard let best = candidates.max(by: { $0.1 < $1.1 }), best.1 > 0 else { return nil }
+        return best.0
+    }
 }
 
 struct RecentEnhancementSource: Codable, Equatable {
@@ -300,6 +313,7 @@ struct EnhancementProfile: Codable, Equatable {
     var interpolationEnabled = false
     var interpolationEngineID = "apple.frc"
     var interpolationQuality = "normal"
+    var rifeStreamEnabled = false
     var rate = RateRequest.multiplier(2)
     var scaleEnabled = false
     var scaleEngineID = "lanczos"
@@ -330,6 +344,7 @@ enum EnhancementProfileStore {
 
     static func decode(_ data: Data, fallbackName: String) -> EnhancementProfile? {
         guard var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        if object["rifeStreamEnabled"] == nil { object["rifeStreamEnabled"] = false }
         if object["captureLimit"] == nil { object["captureLimit"] = "auto" }
         if object["configName"] == nil { object["configName"] = fallbackName }
         if object["scaleQualityID"] == nil { object["scaleQualityID"] = "none" }
@@ -607,6 +622,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let preview = SPLivePreviewView(frame: .zero)
     private let outputPreview = SPLivePreviewView(frame: .zero)
     private var outputWindow: NSWindow?
+    private var outputFollowsWindow = false
+    private var viewerActive = false
+    private var viewerFollowOverride = false
+    private var viewerReturnPID: pid_t?
+    private var viewerControls: NSView?
+    private var viewerControlsPanel: NSPanel?
     private var targetHUD: NSPanel?
     private var targetCountdownHUD: NSPanel?
     private let targetFPS = NSTextField(labelWithString: "")
@@ -622,10 +643,14 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private var outputHiddenReason = "no_target"
     private var hudHiddenReason = "no_target"
     private var outputWarmupToken: UInt64 = 0
+    private var outputMinimumCaptureHost: Int64 = 0
     private var outputWarmupStartedAt: TimeInterval = 0
     private var outputWarmupWarningShown = false
     private var profile = EnhancementProfileStore.load()
     private var applied = EnhancementProfile()
+    private var cadenceRefreshHz: Double = -1
+    private var cadenceCaptureLimit: Int = -1
+    private var cadenceDisplayID: UInt32 = 0
     private var fileURL: URL?
     private var shareableWindows: [SCWindowBox] = []
     private var shareableDisplays: [SCDisplayBox] = []
@@ -638,6 +663,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let sourceLabel = NSTextField(labelWithString: "")
     private let fileLimitLabel = NSTextField(wrappingLabelWithString: "")
     private let interpolationSwitch = NSSwitch()
+    private let rifeStreamCheck = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     private let scaleSwitch = NSSwitch()
     private let qualityPopup = NSPopUpButton()
     private let rateMode = NSSegmentedControl(labels: ["FPS", "X"], trackingMode: .selectOne, target: nil, action: nil)
@@ -735,7 +761,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let window = WorkbenchWindow(contentRect: NSRect(x: 0, y: 0, width: 1180, height: 760),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable],
                               backing: .buffered, defer: false)
-        window.title = EnhancementText.t("Quality Workbench", "画质工作台")
+        let candidate = (Bundle.main.object(forInfoDictionaryKey: "SPCandidateLabel") as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        window.title = EnhancementText.t("Quality Workbench", "画质工作台") + (candidate.isEmpty ? "" : " · " + candidate)
         window.minSize = NSSize(width: 1100, height: 760)
         super.init(window: window)
         profile.configID = EnhancementProfileStore.resolvedID(profile)
@@ -783,11 +811,14 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             plate.translatesAutoresizingMaskIntoConstraints = false
             label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
             label.textColor = .white
+            label.maximumNumberOfLines = 0
+            label.lineBreakMode = .byWordWrapping
             label.translatesAutoresizingMaskIntoConstraints = false
             plate.addSubview(label)
             host.addSubview(plate)
             NSLayoutConstraint.activate([
                 plate.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 12),
+                plate.trailingAnchor.constraint(lessThanOrEqualTo: host.trailingAnchor, constant: -12),
                 plate.topAnchor.constraint(equalTo: host.topAnchor, constant: 12),
                 label.leadingAnchor.constraint(equalTo: plate.leadingAnchor, constant: 8),
                 label.trailingAnchor.constraint(equalTo: plate.trailingAnchor, constant: -8),
@@ -812,10 +843,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             lastStatsReceipt = 0
             processor.resetFPSObservations()
         }
-        let input = FPSPresentation.rate(lastStats["overlayInputEstimateFPS"] as? Double, observing: canObserve, now: now, receipt: lastStatsReceipt)
-        let output = FPSPresentation.rate(lastStats["overlayPresentedFPS"] as? Double, observing: fpsOutputObservable, now: now, receipt: lastStatsReceipt)
-        let inputText = input.map { String(format: "%.1f", $0) } ?? "—"
-        let outputText = output.map { String(format: "%.1f", $0) } ?? "—"
         let players = NSApp.windows.compactMap { $0.contentViewController as? PlayerViewController }
         let selectedPlayer = selectedFilePlayer()
         for player in players {
@@ -826,14 +853,23 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let fileInputText = fileInput > 0 ? String(format: "%.1f", fileInput) : "—"
         let fileOutputText = fileOutput > 0 ? String(format: "%.1f", fileOutput) : "—"
         let hasPlan = isFile ? ((selectedPlayer?.workbenchMotionPlusRequested ?? false) || (selectedPlayer?.workbenchFileLanczosActive ?? false)) :
-            (capture.running && (processor.resolvedPlan.interpolationActive || processor.resolvedPlan.scaleActive))
-        let text = EnhancementText.t("Input≈", "输入≈") + " \(isFile ? fileInputText : inputText)" +
-            (hasPlan ? " → " + EnhancementText.t("Output", "输出") + " \(isFile ? fileOutputText : outputText)" : "") + " FPS"
+            (capture.running && processor.resolvedPlan.committed && (processor.resolvedPlan.interpolationActive || processor.resolvedPlan.scaleActive))
+        let text: String
+        if isFile {
+            text = EnhancementText.t("Input≈", "输入≈") + " \(fileInputText)" +
+                (hasPlan ? " → " + EnhancementText.t("Output", "输出") + " \(fileOutputText)" : "") + " FPS"
+        } else {
+            text = LiveFPSOverlay.text(stats: lastStats, now: now, receipt: lastStatsReceipt,
+                generation: capture.currentGeneration, config: processor.resolvedPlan.configVersion,
+                running: capture.running, paused: capture.paused, committed: processor.resolvedPlan.committed,
+                interpolation: processor.resolvedPlan.interpolationActive, canObserve: canObserve,
+                outputObservable: fpsOutputObservable, chinese: EnhancementText.chinese)
+        }
         for label in [previewFPS, targetFPS] {
             label.stringValue = text
         }
         if !isFile && outputWarmupWarningShown && outputWindow?.isVisible == true && (outputWindow?.alphaValue ?? 1) < 1 {
-            targetFPS.stringValue += EnhancementText.t(" · Output not ready; retry", " · 输出未就绪，请重试")
+            targetFPS.stringValue += EnhancementText.t(" · Not ready", " · 未就绪")
         }
         previewFPS.superview?.isHidden = !enabled || isFile
         outputFPS.superview?.isHidden = true
@@ -928,7 +964,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         root.addSubview(sourceHost)
         root.addSubview(libraryHost)
 
-        let brand = NSTextField(labelWithString: "Khua")
+        let brand = NSTextField(labelWithString: EnhancementText.t("ChuanFlow", "小川帧流"))
         brand.font = .systemFont(ofSize: 26, weight: .bold)
         brand.textColor = .labelColor
         let brandSub = NSTextField(labelWithString: EnhancementText.t("Quality", "画质"))
@@ -1395,6 +1431,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let frameQuality = row(EnhancementText.t("Quality", "质量"), qualityPopup)
         interpolationQualityRow = frameQuality
         frames.addArrangedSubview(frameQuality)
+        frames.addArrangedSubview(rifeStreamCheck)
         phaseLabel.maximumNumberOfLines = 4
         phaseLabel.textColor = .secondaryLabelColor
         phaseLabel.preferredMaxLayoutWidth = 220
@@ -2288,6 +2325,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         interpolationSwitch.target = self
         interpolationSwitch.action = #selector(controlChanged)
+        rifeStreamCheck.title = EnhancementText.t("RIFE stream cache (experimental)", "RIFE 连续缓存（实验）")
+        rifeStreamCheck.toolTip = EnhancementText.t("Live capture only. Uses the selected model and quality; failures fall back to normal processing.", "仅实时采集。使用当前模型和质量；失败时回退普通处理。")
+        rifeStreamCheck.target = self
+        rifeStreamCheck.action = #selector(controlChanged)
         scaleSwitch.target = self
         scaleSwitch.action = #selector(controlChanged)
         fullscreenCheck.target = self
@@ -2307,6 +2348,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         processor.preview = preview
         processor.outputPreview = outputPreview
         processor.installPresentationHooks()
+        if PixelDiagnosticsPolicy.enabled(CommandLine.arguments) { processor.enablePixelDiagnostics() }
         visibilityTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.preview.refreshVisibilitySnapshot()
@@ -2353,6 +2395,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         processor.statusHandler = { [weak self] text, failed, requestID in
             guard let self else { return }
             guard requestID == 0 ? self.liveApply.pending == nil : requestID == self.liveApply.serial else { return }
+            if text == LiveRuntimeStatus.interactiveBudgetWarning && self.nativePassthroughIsCurrent() {
+                self.clearObsoleteBudgetWarningIfNeeded()
+                return
+            }
             self.statusLabel.stringValue = EnhancementText.runtime(text)
             self.statusLabel.textColor = failed ? .systemRed : .labelColor
             self.refreshActions()
@@ -2365,6 +2411,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             guard matched else { self.recordPlanEvent("ack", extra: event); return }
             if state == 2, let pending = self.pendingApply {
                 self.applied = pending
+                self.cadenceRefreshHz = -1
+                self.syncRawCadenceEnvironment()
+                self.viewerFollowOverride = false
                 self.pendingApply = nil
                 self.pendingSourceGeneration = nil
                 self.liveApplyFailure = ""
@@ -2389,11 +2438,11 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         processor.outputSurfaceHandler = { [weak self] generation, config, token in
             guard let self, let panel = self.outputWindow else { return }
-            let targetReady = self.capture.running && self.capture.target != nil && self.targetFrontmost && panel.isVisible
+            let targetReady = self.capture.running && !self.capture.paused && self.capture.target != nil && self.targetFrontmost && panel.isVisible
             if token == self.outputWarmupToken && targetReady && generation == self.capture.currentGeneration &&
                 config != self.processor.resolvedPlan.configVersion {
                 self.outputWarmupToken &+= 1
-                self.processor.awaitOutputSurface(withToken: self.outputWarmupToken)
+                self.processor.awaitOutputSurface(withToken: self.outputWarmupToken, minimumCaptureHost: self.outputMinimumCaptureHost)
                 return
             }
             guard TargetOverlayPolicy.canReveal(token: token, currentToken: self.outputWarmupToken,
@@ -2416,20 +2465,29 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                     self.liveApply.cancel(); self.pendingApply = nil; self.pendingSourceGeneration = nil
                 }
                 self.targetWasOnscreen = false
+                self.viewerActive = false
+                self.viewerFollowOverride = false
+                self.viewerReturnPID = nil
+                self.viewerControlsPanel?.orderOut(nil)
+                (self.outputWindow as? TargetPanel)?.viewerKeyboard = false
                 self.outputWarmupToken &+= 1
+                self.outputMinimumCaptureHost = 0
                 self.outputWindow?.orderOut(nil)
+                self.targetHUD?.orderOut(nil)
+                self.targetCountdownHUD?.orderOut(nil)
                 self.outputPreview.refreshVisibilitySnapshot()
                 self.lastStats = [:]
                 self.lastStatsReceipt = 0
                 self.updateFPSOverlay()
                 self.generation = generation
+                self.syncRawCadenceEnvironment()
                 self.processor.adoptSourceGeneration(generation)
                 self.preview.setGeneration(generation)
                 self.outputPreview.setGeneration(generation)
                 let active = self.processor.resolvedPlan.interpolationActive || self.processor.resolvedPlan.scaleActive
                 self.statusLabel.stringValue = active
-                    ? EnhancementText.t("Source changed. The applied enhancement continues.", "已换源，当前增强继续。")
-                    : EnhancementText.t("Original preview. Press Start to enhance.", "正在预览原画面。按开始后增强。")
+                    ? EnhancementText.t("Source changed; waiting for the new frame.", "已换源，等待新画面。")
+                    : EnhancementText.t("Waiting for the new source frame.", "等待新来源画面。")
                 self.statusLabel.textColor = .labelColor
                 self.emptyOverlay.isHidden = true
             }
@@ -2459,10 +2517,16 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         let sink = CaptureProcessorSink(processor)
         capture.onNote = { code in sink.processor.noteCaptureStatus(code) }
+        capture.onRawFrame = { ptsNum, ptsDen, host, width, height, generation in
+            sink.processor.noteRawCapture(ptsNum: ptsNum, ptsDen: ptsDen, host: host,
+                                          width: width, height: height, generation: generation)
+        }
+        capture.onPoolPressure = { generation in sink.processor.noteCapturePoolPressure(forGeneration: generation) }
         capture.onFrame = { buffer, ptsNum, ptsDen, captureHost, readyHost, generation in
             sink.processor.push(buffer, ptsNum: ptsNum, ptsDen: ptsDen, host: captureHost, readyHost: readyHost, generation: generation)
         }
         NotificationCenter.default.addObserver(self, selector: #selector(motionChanged), name: .khuaMotionPlusChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(displayParametersChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(foregroundApplicationChanged), name: NSWorkspace.didActivateApplicationNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(pendingTextChanged(_:)), name: NSControl.textDidChangeNotification, object: nil)
         DistributedNotificationCenter.default.addObserver(self, selector: #selector(appearanceChanged), name: Notification.Name("AppleInterfaceThemeChangedNotification"), object: nil)
@@ -2506,10 +2570,27 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         cuganLibraryButton?.isEnabled = cuganCandidate
     }
 
+    private func nativePassthroughIsCurrent() -> Bool {
+        LiveRuntimeStatus.nativePassthroughIsCurrent(stats: lastStats, now: ProcessInfo.processInfo.systemUptime,
+            receipt: lastStatsReceipt, generation: capture.currentGeneration, config: processor.resolvedPlan.configVersion,
+            running: capture.running, paused: capture.paused, committed: processor.resolvedPlan.committed,
+            interpolation: processor.resolvedPlan.interpolationActive, pending: liveApply.pending != nil)
+    }
+
+    private func clearObsoleteBudgetWarningIfNeeded() {
+        let warning = EnhancementText.runtime(LiveRuntimeStatus.interactiveBudgetWarning)
+        if LiveRuntimeStatus.shouldClearDisplayedWarning(statusLabel.stringValue, localizedWarning: warning,
+                                                         nativeCurrent: nativePassthroughIsCurrent()) {
+            statusLabel.stringValue = EnhancementText.t("Enhancement running", "增强运行")
+            statusLabel.textColor = .labelColor
+        }
+    }
+
     private func render(stats: [String: Any]) {
         if capture.running, let incoming = stats["sourceGeneration"] as? UInt64, incoming != capture.currentGeneration { return }
         lastStats = stats
         lastStatsReceipt = ProcessInfo.processInfo.systemUptime
+        clearObsoleteBudgetWarningIfNeeded()
         if profile.interpolationEngineID == "apple.lowlatency" { phaseLabel.stringValue = lowLatencyPhaseText() }
         updateAppleSRCapability()
         refreshActions()
@@ -2527,10 +2608,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let scheduled = LiveCoverage.modelScheduled(total: (stats["epochScheduled"] as? Int) ?? 0,
                                                      held: (stats["epochStaticHoldPhases"] as? Int) ?? 0)
         let limited = processor.resolvedPlan.presentationLimited
-        let short = scheduled > 120 && presented * 20 < scheduled * 19
-        let hint = (limited || short)
-            ? EnhancementText.t(" Output is below the requested rate. A lighter engine is available.", " 实际输出低于请求。可以改用更轻的引擎。")
-            : ""
+        let budgetSkipped = (stats["nativeBudgetSkippedPhases"] as? Int) ?? 0
+        let attempted = max(0, scheduled - budgetSkipped)
+        let short = attempted > 120 && presented * 20 < attempted * 19
+        let hint = limited
+            ? EnhancementText.t(" Requested rate exceeds the display refresh rate.", " 请求帧率超过显示器刷新率。")
+            : (short ? EnhancementText.t(" Output is below the requested rate. A lighter engine is available.", " 实际输出低于请求。可以改用更轻的引擎。") : "")
         let output = FPSPresentation.rate(stats["overlayPresentedFPS"] as? Double, observing: fpsOutputObservable,
                                           now: ProcessInfo.processInfo.systemUptime, receipt: lastStatsReceipt)
         let rate = output.map { String(format: EnhancementText.t("Output %.1f FPS", "输出 %.1f FPS"), $0) }
@@ -2538,10 +2621,11 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let targetFPS = (stats["estimatedRequestedFPS"] as? Double) ?? -1
         let targetText = targetFPS > 0 ? String(format: (stats["requestedFPSIsEstimated"] as? Bool) == true
             ? EnhancementText.t("Target ≈%.0f", "目标 ≈%.0f") : EnhancementText.t("Target %.0f", "目标 %.0f"), targetFPS) : ""
-        let coverage = scheduled > 0 ? "\(EnhancementText.t("Synthesized", "合成")) \(presented)/\(scheduled)" : ""
+        let coverage = attempted > 0 ? "\(EnhancementText.t("Synthesized", "合成")) \(presented)/\(attempted)" : ""
+        let budget = budgetSkipped > 0 ? "\(EnhancementText.t("Display budget skipped", "显示上限跳过")) \(budgetSkipped)" : ""
         let holds = ((stats["epochStaticHoldPhases"] as? Int) ?? 0) > 0
             ? EnhancementText.t("Identical frames held", "静止画面保持原图") : ""
-        statsLabel.stringValue = capture.running ? [targetText, rate, coverage, holds].filter { !$0.isEmpty }.joined(separator: " · ") + hint : ""
+        statsLabel.stringValue = capture.running ? [targetText, rate, coverage, budget, holds].filter { !$0.isEmpty }.joined(separator: " · ") + hint : ""
     }
 
     @objc private func captureCapChanged() {
@@ -2549,6 +2633,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let previous = profile.captureLimit
         readControls()
         capture.captureCapFPS = Int(profile.captureLimit) ?? 0
+        syncRawCadenceEnvironment()
         persist()
         if capture.running && previous != profile.captureLimit {
             capture.restart()
@@ -2577,6 +2662,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         var line: [String: Any] = [
             "t": Date().timeIntervalSince1970,
             "realWindowCapture": capture.running,
+            "capturePaused": capture.paused,
             "sourceKind": activeSourceKind.isEmpty ? profile.sourceKind : activeSourceKind,
             "sourceTitle": activeSourceTitle,
             "profileSourceTitle": profile.sourceTitle,
@@ -2601,6 +2687,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             "targetOverlayFrame": [targetFrame.origin.x, targetFrame.origin.y, targetFrame.width, targetFrame.height],
             "targetContentRectVerified": targetContentRectVerified,
             "outputPanelVisible": outputWindow?.isVisible ?? false,
+            "outputPanelAlpha": outputWindow?.alphaValue ?? 0,
+            "outputMinimumCaptureHost": outputMinimumCaptureHost,
+            "outputPanelIsOpaque": outputWindow?.isOpaque ?? false,
+            "outputLayerIsOpaque": outputPreview.layer?.isOpaque ?? false,
+            "outputFollowsWindow": outputFollowsWindow,
+            "outputFullscreenApplied": applied.outputFullscreen,
             "hudPanelVisible": targetHUD?.isVisible ?? false,
             "countdownPanelVisible": targetCountdownHUD?.isVisible ?? false,
             "outputPanelClickThrough": outputWindow?.ignoresMouseEvents ?? true,
@@ -2849,15 +2941,22 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             return
         }
         capture.stop()
+        viewerActive = false; viewerFollowOverride = false; viewerReturnPID = nil
+        viewerControlsPanel?.orderOut(nil)
+        (outputWindow as? TargetPanel)?.viewerKeyboard = false
         liveApply.cancel(); pendingApply = nil; pendingSourceGeneration = nil
         capture.paused = false
         pauseButton?.title = EnhancementText.t("Pause", "暂停")
         outputWarmupToken &+= 1
+        outputMinimumCaptureHost = 0
         outputWindow?.orderOut(nil)
         targetHUD?.orderOut(nil)
         targetCountdownHUD?.orderOut(nil)
         outputPreview.refreshVisibilitySnapshot()
         processor.stop()
+        lastStats = [:]
+        lastStatsReceipt = 0
+        updateFPSOverlay()
         statusLabel.stringValue = EnhancementText.t("Stopped", "已停止")
         statusLabel.textColor = .labelColor
         statsLabel.stringValue = ""
@@ -2872,12 +2971,30 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             pauseButton?.title = player.workbenchIsPlaying ? EnhancementText.t("Pause", "暂停") : EnhancementText.t("Resume", "继续")
             return
         }
+        let resuming = capture.paused
+        outputMinimumCaptureHost = resuming ? Int64(mach_absolute_time()) : 0
         capture.paused.toggle()
+        outputWarmupToken &+= 1
+        outputWarmupStartedAt = 0
+        outputWarmupWarningShown = false
+        if capture.paused {
+            viewerActive = false; viewerReturnPID = nil
+            (outputWindow as? TargetPanel)?.viewerKeyboard = false
+            outputWindow?.orderOut(nil); targetHUD?.orderOut(nil)
+            targetCountdownHUD?.orderOut(nil); viewerControlsPanel?.orderOut(nil)
+            outputPreview.refreshVisibilitySnapshot()
+        }
+        lastStats = [:]
+        lastStatsReceipt = 0
+        processor.resetFPSObservations()
         pauseButton?.title = capture.paused ? EnhancementText.t("Resume", "继续") : EnhancementText.t("Pause", "暂停")
         statusLabel.stringValue = capture.paused
             ? EnhancementText.t("Paused. Capture stays connected.", "已暂停，捕获仍连接")
             : EnhancementText.t("Resumed", "已继续")
         statusLabel.textColor = .labelColor
+        updateTargetPanels()
+        updateFPSOverlay()
+        recordPlanEvent(capture.paused ? "pause" : "resume")
     }
 
     @objc private func showLibrary() { showPage(2) }
@@ -2961,6 +3078,13 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func applyModeVisibility() {
+        fullscreenCheck.title = profile.sourceKind == "file"
+            ? EnhancementText.t("Fullscreen on output display", "在输出显示器全屏")
+            : EnhancementText.t("Fullscreen viewer (Esc to return to interaction)", "全屏预览（Esc 返回交互）")
+        fullscreenCheck.toolTip = profile.sourceKind == "file" ? nil : EnhancementText.t(
+            "Fullscreen pauses source input. Use the on-screen button or Esc to return.",
+            "全屏暂停来源输入；可用画面内按钮或 Esc 返回交互。")
+        rifeStreamCheck.isHidden = profile.sourceKind == "file" || profile.interpolationEngineID != "rife.metal"
         let editable = WorkbenchDimensionPolicy.editable(sizeIndex: sizePopup.indexOfSelectedItem, scaleEnabled: scaleSwitch.state == .on)
         for (field, value) in [(widthField, profile.outputWidth), (heightField, profile.outputHeight)] {
             if field.isEditable != editable { field.isEditable = editable }
@@ -3231,6 +3355,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         request.engineID = engine
         request.modelID = profile.modelID
         request.qualityID = profile.interpolationQuality
+        request.rifeStreamEnabled = profile.rifeStreamEnabled
         request.interpolationEnabled = profile.interpolationEnabled && (engine == "apple.frc" || engine == "apple.lowlatency" || engine == "rife.metal" || engine == "distildrba.coreml")
         if engine == "apple.lowlatency" {
             let frames2: Bool
@@ -3266,9 +3391,35 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         case "compare": request.viewMode = .compare
         default: request.viewMode = .enhanced
         }
-        request.displayRefreshHz = Double((outputScreen(for: profile.outputDisplayID) ?? NSScreen.screens.first)?.maximumFramesPerSecond ?? 60)
+        request.displayRefreshHz = Double(cadenceScreen(for: profile)?.maximumFramesPerSecond ?? 60)
         request.captureCapFPS = Int32(Int(profile.captureLimit) ?? 0)
         return request
+    }
+
+    private func cadenceScreen(for output: EnhancementProfile) -> NSScreen? {
+        if TargetOverlayPolicy.followsTarget(fullscreen: output.outputFullscreen, viewerFollowOverride: viewerFollowOverride) && capture.target != nil && !targetFrame.isEmpty {
+            let screens = NSScreen.screens
+            if let index = TargetOverlayPolicy.screenIndex(target: targetFrame, screens: screens.map(\.frame)) { return screens[index] }
+        }
+        return outputScreen(for: output.outputDisplayID) ?? NSScreen.screens.first
+    }
+
+    private func syncRawCadenceEnvironment() {
+        let output = processor.resolvedPlan.committed ? applied : profile
+        let screen = cadenceScreen(for: output)
+        let hz = Double(screen?.maximumFramesPerSecond ?? 60)
+        let displayID = (screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
+        let limit = capture.captureCapFPS
+        guard cadenceRefreshHz != hz || cadenceCaptureLimit != limit || cadenceDisplayID != displayID else { return }
+        cadenceRefreshHz = hz; cadenceCaptureLimit = limit; cadenceDisplayID = displayID
+        processor.setRawCadence(refreshHz: hz, captureLimit: Int32(limit), displayID: UInt64(displayID))
+        processor.updateDisplayRefreshHz(hz)
+        processor.updateCaptureLimitFPS(Int32(limit))
+    }
+
+    @objc private func displayParametersChanged() {
+        cadenceRefreshHz = -1
+        syncRawCadenceEnvironment()
     }
 
     private func refreshPlanLabel() {
@@ -3329,6 +3480,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             || profile.modelID != baseline.modelID
             || profile.rate != baseline.rate
             || profile.interpolationQuality != baseline.interpolationQuality
+            || (profile.interpolationEngineID == "rife.metal" && profile.rifeStreamEnabled != baseline.rifeStreamEnabled)
             || profile.scaleEnabled != baseline.scaleEnabled
             || profile.scaleEngineID != baseline.scaleEngineID
             || (profile.scaleEngineID == "realcugan" && profile.scaleQualityID != baseline.scaleQualityID)
@@ -3354,6 +3506,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private func loadControls() {
         interpolationSwitch.state = profile.interpolationEnabled ? .on : .off
+        rifeStreamCheck.state = profile.rifeStreamEnabled ? .on : .off
         switch profile.interpolationEngineID {
         case "apple.lowlatency": enginePopup.selectItem(at: 1)
         case "rife.metal": enginePopup.selectItem(at: profile.modelID == "rife-v4.26" ? 3 : 2)
@@ -3399,6 +3552,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         refreshSourceBar()
         reloadDisplays()
+        if !capture.running { syncRawCadenceEnvironment() }
         rebuildConfigRows()
         applyModeVisibility()
         refreshPlanLabel()
@@ -3466,6 +3620,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private func readControls() {
         profile.interpolationEnabled = interpolationSwitch.state == .on
+        profile.rifeStreamEnabled = rifeStreamCheck.state == .on
         readEngineSelection()
         if profile.interpolationEngineID == "rife.metal" {
             let title = qualityPopup.titleOfSelectedItem ?? "balanced"
@@ -3541,8 +3696,17 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private final class TargetPanel: NSPanel {
-        override var canBecomeKey: Bool { false }
+        var viewerKeyboard = false
+        var exitViewer: (() -> Void)?
+        override var canBecomeKey: Bool { viewerKeyboard }
         override var canBecomeMain: Bool { false }
+        override func sendEvent(_ event: NSEvent) {
+            if viewerKeyboard && (event.type == .keyDown || event.type == .keyUp || event.type == .flagsChanged) {
+                if event.type == .keyDown && event.keyCode == 53 { exitViewer?() }
+                return
+            }
+            super.sendEvent(event)
+        }
     }
 
     private func overlayPanel() -> NSPanel {
@@ -3560,9 +3724,47 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private func placeOutput() {
         guard outputWindow == nil else { return }
         let panel = overlayPanel()
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        outputPreview.layer?.isOpaque = false
         panel.title = EnhancementText.t("Enhanced output", "增强输出")
         panel.contentView = outputPreview
+        let controls = NSStackView()
+        controls.orientation = .horizontal
+        controls.alignment = .centerY
+        controls.spacing = 10
+        controls.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)
+        controls.wantsLayer = true
+        controls.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.78).cgColor
+        controls.layer?.cornerRadius = 8
+        let label = NSTextField(labelWithString: EnhancementText.t("Fullscreen viewer · input paused", "全屏预览 · 输入已暂停"))
+        label.textColor = .white
+        let back = NSButton(title: EnhancementText.t("Return to interaction", "返回交互"), target: self, action: #selector(exitFullscreenViewer))
+        back.bezelStyle = .rounded
+        controls.addArrangedSubview(label)
+        controls.addArrangedSubview(back)
+        let controlsPanel = overlayPanel()
+        controlsPanel.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 2)
+        controlsPanel.backgroundColor = .clear
+        controlsPanel.isOpaque = false
+        controlsPanel.ignoresMouseEvents = false
+        controlsPanel.contentView = controls
+        viewerControlsPanel = controlsPanel
+        viewerControls = controls
+        if let targetPanel = panel as? TargetPanel { targetPanel.exitViewer = { [weak self] in self?.exitFullscreenViewer() } }
         outputWindow = panel
+    }
+
+    @objc private func exitFullscreenViewer() {
+        guard viewerActive else { return }
+        viewerActive = false
+        viewerFollowOverride = true // session-only; keep the saved fullscreen preference
+        viewerControlsPanel?.orderOut(nil)
+        if let panel = outputWindow as? TargetPanel { panel.viewerKeyboard = false; panel.ignoresMouseEvents = true }
+        outputWindow?.orderOut(nil)
+        if let pid = viewerReturnPID, let app = NSRunningApplication(processIdentifier: pid) { app.activate(options: []) }
+        viewerReturnPID = nil
+        DispatchQueue.main.async { [weak self] in self?.updateTargetPanels() }
     }
 
     private func ensureTargetHUD() -> (NSPanel, NSPanel) {
@@ -3585,6 +3787,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         plate.layer?.cornerRadius = 6
         targetFPS.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         targetFPS.textColor = .white
+        targetFPS.maximumNumberOfLines = 0
+        targetFPS.lineBreakMode = .byWordWrapping
         targetCountdown.font = .systemFont(ofSize: 54, weight: .bold)
         targetCountdown.textColor = .white
         targetCountdown.alignment = .center
@@ -3677,6 +3881,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private func updateTargetPanels() {
         guard profile.sourceKind != "file", let target = capture.target else {
+            viewerActive = false
+            viewerReturnPID = nil
+            (outputWindow as? TargetPanel)?.viewerKeyboard = false
             targetOnscreen = false
             targetFrontmost = false
             targetFrame = .zero
@@ -3684,21 +3891,27 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             targetDecision = [:]; targetDecisionReason = "no_target"
             outputHiddenReason = "no_target"; hudHiddenReason = "no_target"
             if outputWindow?.isVisible == true { outputWarmupToken &+= 1 }
-            outputWindow?.orderOut(nil); targetHUD?.orderOut(nil); targetCountdownHUD?.orderOut(nil)
+            outputWindow?.orderOut(nil); targetHUD?.orderOut(nil); targetCountdownHUD?.orderOut(nil); viewerControlsPanel?.orderOut(nil)
             outputPreview.refreshVisibilitySnapshot()
             return
         }
         let state = targetWindowState(target)
+        let ownViewerFront = viewerActive && NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier
+        let targetReady = state.front || (ownViewerFront && state.exists && state.onscreen)
         targetOnscreen = state.onscreen
-        targetFrontmost = state.front
+        targetFrontmost = targetReady
         targetFrame = state.frame
+        syncRawCadenceEnvironment()
         targetContentRectVerified = state.contentRectVerified
         if state.onscreen { targetWasOnscreen = true }
         if targetDecisionReason == "target_identity_changed_in_ordered_list" || (targetDecisionReason != "target_metadata_incomplete" && targetDecisionReason != "window_list_unavailable" && TargetOverlayPolicy.shouldCancel(exists: state.exists, onscreen: state.onscreen, wasOnscreen: targetWasOnscreen)) {
             cancelCountdown()
         }
-        guard capture.running && state.front && !state.frame.isEmpty else {
-            let reason = !capture.running ? "capture_not_running" : (!state.front ? targetDecisionReason : "geometry_unavailable")
+        guard capture.running && !capture.paused && targetReady && !state.frame.isEmpty else {
+            viewerActive = false
+            viewerControlsPanel?.orderOut(nil)
+            (outputWindow as? TargetPanel)?.viewerKeyboard = false
+            let reason = !capture.running ? "capture_not_running" : (capture.paused ? "paused" : (!targetReady ? targetDecisionReason : "geometry_unavailable"))
             outputHiddenReason = reason; hudHiddenReason = reason
             if outputWindow?.isVisible == true { outputWarmupToken &+= 1 }
             outputWindow?.orderOut(nil); targetHUD?.orderOut(nil); targetCountdownHUD?.orderOut(nil)
@@ -3706,8 +3919,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             return
         }
         let planActive = processor.resolvedPlan.committed && (processor.resolvedPlan.interpolationActive || processor.resolvedPlan.scaleActive)
-        let screenFrame = applied.outputFullscreen ? outputScreen(for: applied.outputDisplayID)?.frame : nil
-        let outputFrame = TargetOverlayPolicy.outputFrame(target: state.frame, fullscreen: applied.outputFullscreen, display: screenFrame)
+        let fullscreen = !TargetOverlayPolicy.followsTarget(fullscreen: applied.outputFullscreen, viewerFollowOverride: viewerFollowOverride)
+        let screenFrame = fullscreen ? outputScreen(for: applied.outputDisplayID)?.frame : nil
+        let outputFrame = TargetOverlayPolicy.outputFrame(target: state.frame, fullscreen: fullscreen, display: screenFrame)
         outputHiddenReason = !planActive ? "no_plan" : (!state.contentRectVerified ? "content_rect_unverified" : (outputFrame == nil ? "output_display_unavailable" : (outputWindow == nil ? "output_not_created" : "none")))
         if planActive && (!state.contentRectVerified || outputFrame == nil) && !targetGeometryWarned {
             targetGeometryWarned = true
@@ -3719,9 +3933,34 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         var hudFrame = state.frame
         if planActive && state.contentRectVerified, let frame = outputFrame, let panel = outputWindow {
             let followsWindow: Bool
-            if case .window = target { followsWindow = !applied.outputFullscreen }
+            if case .window = target { followsWindow = !fullscreen }
             else { followsWindow = false }
+            outputFollowsWindow = followsWindow
+            panel.isOpaque = !followsWindow
+            panel.backgroundColor = followsWindow ? .clear : .black
+            outputPreview.layer?.isOpaque = !followsWindow
             outputPreview.setFollowTargetContent(followsWindow)
+            // A scaled fullscreen picture is not aligned with the source.
+            // Absorb pointer input instead of misdirecting it underneath; the
+            // aligned follow-window mode retains normal click-through.
+            panel.ignoresMouseEvents = !fullscreen
+            let enteringViewer = fullscreen && !viewerActive
+            if enteringViewer {
+                viewerReturnPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                viewerActive = true
+                (panel as? TargetPanel)?.viewerKeyboard = true
+            } else if !fullscreen && viewerActive {
+                viewerActive = false
+                viewerReturnPID = nil
+                (panel as? TargetPanel)?.viewerKeyboard = false
+            }
+            if fullscreen, let controlsPanel = viewerControlsPanel, let controls = viewerControls {
+                let fit = controls.fittingSize
+                let width = min(frame.width - 24, max(220, fit.width))
+                let height = max(40, fit.height)
+                controlsPanel.setFrame(NSRect(x: frame.maxX - width - 12, y: frame.maxY - height - 12, width: width, height: height), display: true)
+                if !controlsPanel.isVisible { controlsPanel.orderFrontRegardless() }
+            } else { viewerControlsPanel?.orderOut(nil) }
             hudFrame = frame
             if panel.frame != frame { panel.setFrame(frame, display: true) }
             if !panel.isVisible {
@@ -3729,8 +3968,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 panel.alphaValue = 0.001
                 outputWarmupStartedAt = ProcessInfo.processInfo.systemUptime
                 outputWarmupWarningShown = false
-                processor.awaitOutputSurface(withToken: outputWarmupToken)
+                processor.awaitOutputSurface(withToken: outputWarmupToken, minimumCaptureHost: outputMinimumCaptureHost)
                 panel.orderFrontRegardless()
+            }
+            if enteringViewer {
+                NSApp.activate(ignoringOtherApps: true)
+                panel.makeKeyAndOrderFront(nil)
             }
             if panel.alphaValue < 1 {
                 outputHiddenReason = "warming"
@@ -3741,15 +3984,20 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 }
             }
         } else {
+            if viewerActive { exitFullscreenViewer() }
             if outputWindow?.isVisible == true { outputWarmupToken &+= 1 }
             outputWindow?.orderOut(nil)
+            viewerControlsPanel?.orderOut(nil)
         }
         if countdown.active || fpsSwitch.state == .on {
             hudHiddenReason = "none"
             let (fpsPanel, countdownPanel) = ensureTargetHUD()
             if fpsSwitch.state == .on {
-                let width = min(360, max(80, targetFPS.fittingSize.width + 16))
-                let fpsFrame = NSRect(x: hudFrame.minX + 12, y: hudFrame.maxY - 42, width: width, height: 30)
+                let natural = targetFPS.fittingSize
+                let width = min(max(80, hudFrame.width - 24), max(80, natural.width + 16))
+                let cellHeight = targetFPS.cell?.cellSize(forBounds: NSRect(x: 0, y: 0, width: width - 16, height: 1000)).height ?? natural.height
+                let height = max(30, cellHeight + 8)
+                let fpsFrame = NSRect(x: hudFrame.minX + 12, y: hudFrame.maxY - height - 12, width: width, height: height)
                 if fpsPanel.frame != fpsFrame { fpsPanel.setFrame(fpsFrame, display: true) }
                 if !fpsPanel.isVisible { fpsPanel.orderFrontRegardless() }
             } else { fpsPanel.orderOut(nil) }
@@ -3766,7 +4014,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func excludedIDs() -> [Int] {
-        [window?.windowNumber, outputWindow?.windowNumber, targetHUD?.windowNumber, targetCountdownHUD?.windowNumber].compactMap { $0 }.filter { $0 > 0 }
+        [window?.windowNumber, outputWindow?.windowNumber, targetHUD?.windowNumber, targetCountdownHUD?.windowNumber, viewerControlsPanel?.windowNumber].compactMap { $0 }.filter { $0 > 0 }
     }
 
     private func applyAppearance() {

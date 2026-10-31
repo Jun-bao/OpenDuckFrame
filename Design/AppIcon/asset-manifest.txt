@@ -21,3 +21,5 @@ AppIcon.appiconset/AppIcon-256.png
 AppIcon.appiconset/AppIcon-512.png
 AppIcon.appiconset/AppIcon-1024.png
 README.md
+ChuanFlow-Xiaochuan-Original.png
+ChuanFlow-Xiaochuan-FullBleed-Original.png

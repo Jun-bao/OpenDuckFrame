@@ -104,7 +104,7 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>Khua</string>
+	<string>小川帧流</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -136,7 +136,13 @@
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Khua generates subtitles from the audio of the media you open. Processing takes place on this Mac.</string>
 	<key>SPProductName</key>
-	<string>Khua Player</string>
+	<string>小川帧流 · ChuanFlow</string>
+	<key>SPCandidateLabel</key>
+	<string>$(KHUA_CANDIDATE_LABEL)</string>
+	<key>SPSingleInstanceProtocol</key>
+	<integer>1</integer>
+	<key>SPSingleInstanceLockVersion</key>
+	<string>$(KHUA_SINGLE_INSTANCE_LOCK_VERSION)</string>
 	<key>UTImportedTypeDeclarations</key>
 	<array>
 		<dict>

@@ -396,9 +396,9 @@ verify_profile() {
 
 verify_info "main app" "$MAIN_INFO" "$BUNDLE_ID"
 verify_info "Quick Look extension" "$APPEX_INFO" "$BUNDLE_ID.QuickLook"
-assert_equal "main bundle name" "$(plist_value "$MAIN_INFO" CFBundleName)" "Khua"
-assert_equal "main display name" "$(plist_value "$MAIN_INFO" CFBundleDisplayName)" "Khua"
-assert_equal "About product name" "$(plist_value "$MAIN_INFO" SPProductName)" "Khua Player"
+assert_equal "main bundle name" "$(plist_value "$MAIN_INFO" CFBundleName)" "小川帧流"
+assert_equal "main display name" "$(plist_value "$MAIN_INFO" CFBundleDisplayName)" "小川帧流"
+assert_equal "About product name" "$(plist_value "$MAIN_INFO" SPProductName)" "小川帧流 · ChuanFlow"
 assert_equal "main executable name" "$(plist_value "$MAIN_INFO" CFBundleExecutable)" "Khua"
 assert_equal "Quick Look display name" \
   "$(plist_value "$APPEX_INFO" CFBundleDisplayName)" "Khua Quick Look"

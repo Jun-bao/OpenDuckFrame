@@ -12,6 +12,7 @@ static const NSInteger SPRifeBridgeErrorOutputPoolExhausted = 10;
 /// Calls return immediately; inference runs on the adapter queue, not the live queue.
 @interface SPRifeBridge : NSObject
 - (instancetype)initWithResourceBundle:(NSBundle *)bundle;
+@property (nonatomic) BOOL liveStreamEnabled;
 
 - (BOOL)prepareModelID:(NSString *)modelID
                quality:(NSString *)quality
@@ -31,6 +32,10 @@ static const NSInteger SPRifeBridgeErrorOutputPoolExhausted = 10;
                 timesteps:(NSArray<NSNumber *> *)timesteps token:(uint64_t)token
                completion:(SPFRCPhasesCompletion)completion;
 - (NSDictionary<NSString *, id> *)streamDiagnostics;
+/// Controlled failure injection for the headless bridge contract only.
+- (void)injectStreamFailureForContract;
+/// Asynchronously discard the cached input after all earlier GPU work.
+- (void)relieveCapturePressure;
 - (void)invalidate;
 + (NSDictionary<NSString *, id> *)probe;
 
