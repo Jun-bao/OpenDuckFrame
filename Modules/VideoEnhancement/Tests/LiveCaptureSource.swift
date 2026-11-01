@@ -90,6 +90,8 @@ enum QualityScene {
 // capture/processor counters. CADisplayLink requests are best-effort.
 final class SourceView: NSView {
     var frameNumber = 0
+    var callbackSequence = 0
+    var contentFPS: Int?
     var drawnSequence = 0
     var drawCount = 0
     var scrollCount = 0
@@ -149,6 +151,7 @@ final class SourceView: NSView {
     override func keyUp(with event: NSEvent) { recordInput("keyUp", event) }
     override func flagsChanged(with event: NSEvent) { recordInput("modifiers", event) }
     func setRate(_ fps: Int) {
+        if contentFPS != nil && fps != 120 { print("content-fps requires 120Hz callbacks"); return }
         targetFPS = fps
         link?.preferredFrameRateRange = CAFrameRateRange(minimum: Float(fps), maximum: Float(fps), preferred: Float(fps))
         callbacks.removeAll(); draws.removeAll()
@@ -166,7 +169,10 @@ final class SourceView: NSView {
         lastCallback = now
         callbacks.append(now)
         callbacks.removeAll { now - $0 > 2 }
-        frameNumber += 1
+        callbackSequence += 1
+        if let contentFPS {
+            if callbackSequence % (120 / contentFPS) == 0 { frameNumber += 1 }
+        } else { frameNumber += 1 }
         needsDisplay = true
     }
     func reportHeartbeat() {
@@ -174,7 +180,7 @@ final class SourceView: NSView {
         callbacks.removeAll { now - $0 > 2 }; draws.removeAll { now - $0 > 2 }
         let callbackAge = lastCallback > 0 ? (now-lastCallback)*1000 : -1
         let drawAge = lastDraw > 0 ? (now-lastDraw)*1000 : -1
-        print(String(format: "source=native monotonic=%.3f appActive=%@ windowVisible=%@ callbackSequence=%d drawnSequence=%d drawCount=%d requested=%d callbackHz=%.2f drawHz=%.2f lastCallbackAgeMs=%.1f lastDrawAgeMs=%.1f clicks=%d scrolls=%d drags=%d keys=%d", now, String(NSApp.isActive), String(window?.occlusionState.contains(.visible) ?? false), frameNumber, drawnSequence, drawCount, targetFPS, rate(callbacks), rate(draws), callbackAge, drawAge, clickCount, scrollCount, dragCount, keyCount))
+        print(String(format: "source=native monotonic=%.3f appActive=%@ windowVisible=%@ callbackSequence=%d drawnSequence=%d drawCount=%d requested=%d callbackHz=%.2f drawHz=%.2f lastCallbackAgeMs=%.1f lastDrawAgeMs=%.1f clicks=%d scrolls=%d drags=%d keys=%d", now, String(NSApp.isActive), String(window?.occlusionState.contains(.visible) ?? false), callbackSequence, drawnSequence, drawCount, targetFPS, rate(callbacks), rate(draws), callbackAge, drawAge, clickCount, scrollCount, dragCount, keyCount))
         fflush(stdout)
     }
     func rate(_ values: [CFTimeInterval]) -> Double {
@@ -189,13 +195,15 @@ final class SourceView: NSView {
         drawCount += 1
         if qualityScene, let context = NSGraphicsContext.current?.cgContext {
             QualityScene.draw(context, bounds, Double(drawnSequence))
-            print(String(format: "sourceDraw qualityScene=true monotonic=%.9f mach=%llu callbackSequence=%d drawnSequence=%d encodedSequence=%d drawCount=%d contentPoints=%.1fx%.1f", now, mach_absolute_time(), frameNumber, drawnSequence, drawnSequence & 0x00ff_ffff, drawCount, bounds.width, bounds.height))
+            print(String(format: "sourceDraw qualityScene=true monotonic=%.9f mach=%llu callbackSequence=%d drawnSequence=%d encodedSequence=%d drawCount=%d contentPoints=%.1fx%.1f", now, mach_absolute_time(), callbackSequence, drawnSequence, drawnSequence & 0x00ff_ffff, drawCount, bounds.width, bounds.height))
             return
         }
         NSColor(calibratedWhite: 0.10, alpha: 1).setFill(); bounds.fill()
         let x = CGFloat(frameNumber % max(1, Int(bounds.width - 120)))
         NSColor.systemOrange.setFill(); NSRect(x: x, y: bounds.height * 0.38, width: 100, height: 100).fill()
-        let text = String(format: "FRAME %08d  TIME %.3f s\nSCROLL %d   CLICK %d   DRAG %d   KEY %d\nREQUEST %d Hz   CALLBACK %.1f Hz   DRAW %.1f Hz\nKEY 6: 60 Hz   KEY 1: 120 Hz", frameNumber, now-started, scrollCount, clickCount, dragCount, keyCount, targetFPS, rate(callbacks), rate(draws))
+        let text = contentFPS == nil
+            ? String(format: "FRAME %08d  TIME %.3f s\nSCROLL %d   CLICK %d   DRAG %d   KEY %d\nREQUEST %d Hz   CALLBACK %.1f Hz   DRAW %.1f Hz\nKEY 6: 60 Hz   KEY 1: 120 Hz", frameNumber, now-started, scrollCount, clickCount, dragCount, keyCount, targetFPS, rate(callbacks), rate(draws))
+            : String(format: "CONTENT FRAME %08d", frameNumber)
         text.draw(at: NSPoint(x: 36, y: bounds.height * 0.20), withAttributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 30, weight: .bold), .foregroundColor: NSColor.white])
         // 64 high-contrast cells: 8-bit marker, 24-bit draw sequence,
         // its complement, 8-bit marker. Coordinates are normalized to the
@@ -217,7 +225,7 @@ final class SourceView: NSView {
         NSGraphicsContext.current?.shouldAntialias = true
         // Draw callback is not proof of window-server or display presentation.
         print(String(format: "sourceDraw monotonic=%.9f mach=%llu callbackSequence=%d drawnSequence=%d encodedSequence=%d drawCount=%d contentPoints=%.1fx%.1f",
-                     now, mach_absolute_time(), frameNumber, drawnSequence, drawnSequence & 0x00ff_ffff,
+                     now, mach_absolute_time(), callbackSequence, drawnSequence, drawnSequence & 0x00ff_ffff,
                      drawCount, bounds.width, bounds.height))
     }
 }
@@ -373,6 +381,18 @@ final class WebSource {
         if args.contains(where: { $0.hasPrefix("--quality-") && $0 != "--quality-scene" }) {
             fputs("invalid quality option\n", stderr); exit(2)
         }
+        var contentFPS: Int?
+        let contentPositions = args.indices.filter { args[$0] == "--content-fps" }
+        if !contentPositions.isEmpty {
+            let fpsPositions = args.indices.filter { args[$0] == "--fps" }
+            guard contentPositions.count == 1, let i = contentPositions.first, i + 1 < args.count,
+                  let fps = Int(args[i + 1]), [24, 30, 60].contains(fps),
+                  fpsPositions.count == 1, let f = fpsPositions.first, f + 1 < args.count, args[f + 1] == "120",
+                  !args.contains("--web") else {
+                fputs("--content-fps requires 24, 30, or 60 with --fps 120 and native source\n", stderr); exit(2)
+            }
+            contentFPS = fps
+        }
         let app = NSApplication.shared; app.setActivationPolicy(.regular)
         let scale = NSScreen.main?.backingScaleFactor ?? 1
         func dimension(_ option: String, fallback: CGFloat) -> CGFloat {
@@ -384,6 +404,7 @@ final class WebSource {
                            height: dimension("--height-points", fallback: 1440 / scale))
         let view = SourceView(frame: frame)
         view.logInput = args.contains("--input-events")
+        view.contentFPS = contentFPS
         view.qualityScene = args.contains("--quality-scene")
         if let index = args.firstIndex(of: "--fps"), index + 1 < args.count, let fps = Int(args[index + 1]), [60, 120].contains(fps) { view.targetFPS = fps }
         let web = args.contains("--web") ? WebSource(frame: frame) : nil
@@ -398,7 +419,7 @@ final class WebSource {
             if let web { web.reportHeartbeat() } else { view.reportHeartbeat() }
         }
         RunLoop.main.add(heartbeat, forMode: .common)
-        print("source pid=\(ProcessInfo.processInfo.processIdentifier) mode=\(web == nil ? "native" : "web") backingScale=\(scale) requestedContentPoints=\(frame.width)x\(frame.height) inputEvents=\(view.logInput); callback and draw are not physical presentation; actual window size and content rate must be verified")
+        print("source pid=\(ProcessInfo.processInfo.processIdentifier) mode=\(web == nil ? "native" : "web") contentFPS=\(contentFPS.map(String.init) ?? "unlimited") backingScale=\(scale) requestedContentPoints=\(frame.width)x\(frame.height) inputEvents=\(view.logInput); callback and draw are not physical presentation; actual window size and content rate must be verified")
         fflush(stdout)
         app.run()
     }

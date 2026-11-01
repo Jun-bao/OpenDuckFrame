@@ -382,6 +382,13 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     private var pausedDrops = 0
     private var retiredDrops = 0
     private let copier = OwnedFrameCopier()
+    private let contentFrameGate = ContentFrameGate()
+    private let contentTimebase: mach_timebase_info_data_t = {
+        var info = mach_timebase_info_data_t(); mach_timebase_info(&info); return info
+    }()
+    private func contentHostNs(_ host: UInt64) -> Int64 {
+        Int64(Double(host) * Double(contentTimebase.numer) / Double(max(1, contentTimebase.denom)))
+    }
     private var pixelWidth = 0
     private var pixelHeight = 0
     private var firstPTS = CMTime.invalid
@@ -682,9 +689,12 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         lastFrameStatus = observedStatus?.rawValue ?? -1
         if let items = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]], let info = items.first {
             lastDisplayTime = (info[.displayTime] as? NSNumber)?.uint64Value ?? 0
-            if let rects = info[.dirtyRects] as? [NSValue] {
-                lastDirtyRectCount = rects.count
-                lastDirtyRectArea = rects.reduce(0) { $0 + Double(max(0, $1.rectValue.width) * max(0, $1.rectValue.height)) }
+            if let dictionaries = info[.dirtyRects] as? [NSDictionary] {
+                let rects = dictionaries.compactMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) }
+                if rects.count == dictionaries.count && rects.allSatisfy({ $0.width.isFinite && $0.height.isFinite }) {
+                    lastDirtyRectCount = rects.count
+                    lastDirtyRectArea = rects.reduce(0) { $0 + Double(max(0, $1.width) * max(0, $1.height)) }
+                } else { lastDirtyRectCount = -1; lastDirtyRectArea = 0 }
             } else { lastDirtyRectCount = -1; lastDirtyRectArea = 0 }
         }
         let status = observedStatus ?? .complete // preserve prior display compatibility
@@ -720,6 +730,9 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         let captureHost = lastReceivedHost
         let frameGeometry = geometryMetadata(sampleBuffer, width: CVPixelBufferGetWidth(image), height: CVPixelBufferGetHeight(image), generation: generation)
         guard streamBinding.withCurrent(stream, generation: generation, { onGeometry?(frameGeometry, generation) }) else { retiredDrops += 1; return }
+        // Geometry remains current even for a duplicate, but duplicate pixels do
+        // not become native-cadence evidence or enter the processor queue.
+        if contentFrameGate.evaluate(buffer: image, generation: generation, hostNs: contentHostNs(captureHost)) == .duplicate { return }
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let ptsNum: Int64
         let ptsDen: Int64
@@ -853,6 +866,9 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             "hostSpanSec": hostSpan,
         ]
         for (key, value) in copier.snapshot() {
+            report[key] = value
+        }
+        for (key, value) in contentFrameGate.diagnostics(nowNs: contentHostNs(mach_absolute_time()), expectedGeneration: currentGeneration) {
             report[key] = value
         }
         return report

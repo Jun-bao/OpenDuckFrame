@@ -32,7 +32,7 @@ enum LiveFPSOverlay {
             ? (chinese ? " · 原生直通" : " · Native passthrough") : ""
         let approximate = !fresh || (stats["requestedFPSIsEstimated"] as? Bool) == true
         let targetLabel = chinese ? (approximate ? "目标≈" : "目标") : (approximate ? "Target≈" : "Target")
-        return (chinese ? "输入/采集≈" : "Capture≈") + " \(value(input)) · " + targetLabel + " \(value(target))\(suffix) FPS\n" +
+        return (chinese ? "内容≈" : "Content≈") + " \(value(input)) · " + targetLabel + " \(value(target))\(suffix) FPS\n" +
             (chinese ? "呈现" : "Presented") + " \(value(output)) FPS · " + (chinese ? "屏幕" : "Display") + " \(screen) Hz" + passthrough
     }
 }
