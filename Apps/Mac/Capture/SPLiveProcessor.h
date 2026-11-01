@@ -84,6 +84,7 @@ typedef NS_ENUM(NSInteger, SPLiveViewMode) {
               synthetic:(BOOL)synthetic
                 frameID:(uint64_t)frameID
                  counts:(BOOL)counts
+         captureGeometry:(nullable NSDictionary<NSString *, id> *)captureGeometry
                  reason:(NSString * _Nullable * _Nullable)reason;
 @property (nonatomic, copy, nullable) void (^presented)(NSDictionary<NSString *, id> *info);
 /// Asynchronous post-admission failures, tagged with submission identity.
@@ -97,9 +98,18 @@ typedef NS_ENUM(NSInteger, SPLiveViewMode) {
 - (void)setFollowTargetContent:(BOOL)follow;
 /// Refreshes the atomically read visibility snapshot on the AppKit main thread.
 - (void)refreshVisibilitySnapshot;
+/// Geometry is valid only for a verified target and a matching, visible
+/// presented drawable. This bridge does not intercept or forward input.
+- (void)observeVerifiedWindowGeometry:(nullable NSDictionary<NSString *, id> *)geometry;
+- (void)invalidateSharedGeometry;
+- (NSDictionary<NSString *, id> *)sharedGeometrySnapshot;
+- (nullable NSDictionary<NSString *, NSNumber *> *)mapOutputPixel:(NSPoint)point geometryVersion:(uint64_t)version;
+- (nullable NSDictionary<NSString *, NSNumber *> *)mapQuartzOutputPoint:(CGPoint)point geometryVersion:(uint64_t)version clamp:(BOOL)clamp;
 @property (nonatomic, readonly) BOOL windowVisibleSnapshot;
 @property (nonatomic, readonly) BOOL drawableVisibleSnapshot;
 @property (nonatomic, readonly) BOOL exposedSnapshot;
+/// CPU-only bridge/state contract; no window or drawable is presented.
++ (NSDictionary<NSString *, id> *)runSharedGeometryBridgeContract;
 @end
 
 @interface SPLiveProcessor : NSObject
@@ -132,6 +142,11 @@ typedef NS_ENUM(NSInteger, SPLiveViewMode) {
 - (uint64_t)resumeSource;
 - (void)stop;
 - (void)noteCaptureStatus:(NSInteger)statusCode;
+/// Capture-queue metadata update; nil invalidates the matching source epoch.
+- (void)observeCaptureGeometry:(nullable NSDictionary<NSString *, id> *)geometry generation:(uint64_t)generation;
+/// Thread-safe read-only geometry access for the bounded input router.
+- (NSDictionary<NSString *, id> *)inputGeometrySnapshot;
+- (nullable NSDictionary<NSString *, NSNumber *> *)mapQuartzOutputPoint:(CGPoint)point geometryVersion:(uint64_t)version clamp:(BOOL)clamp;
 /// Release only idle capture-owned history in response to actual pool pressure.
 - (void)noteCapturePoolPressureForGeneration:(uint64_t)generation;
 /// Update the physical capture/display context independently of model state.
@@ -196,6 +211,8 @@ typedef NS_ENUM(NSInteger, SPLiveViewMode) {
 + (NSDictionary<NSString *, id> *)runPendingReplacementContract;
 + (NSDictionary<NSString *, id> *)runRejectedPTSContract;
 + (NSDictionary<NSString *, id> *)runPresentationBudgetContract;
+/// CPU-only production-queue budget, recovery and stale callback contract.
++ (NSDictionary<NSString *, id> *)runR9FRCBudgetContract;
 @end
 
 NS_ASSUME_NONNULL_END

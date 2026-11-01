@@ -5,6 +5,107 @@ import IOSurface
 import VideoToolbox
 @preconcurrency import ScreenCaptureKit
 
+// Explicit controlled-fixture decoder. It samples only the high-contrast
+// barcode in an owned buffer; marker and complement failures stay unknown.
+enum R8FixtureDecoder {
+    static func decode(_ buffer: CVPixelBuffer) -> UInt32? {
+        let format = CVPixelBufferGetPixelFormatType(buffer)
+        let planar = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        guard planar || format == kCVPixelFormatType_32BGRA else { return nil }
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        let width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer)
+        let base = planar ? CVPixelBufferGetBaseAddressOfPlane(buffer, 0) : CVPixelBufferGetBaseAddress(buffer)
+        let stride = planar ? CVPixelBufferGetBytesPerRowOfPlane(buffer, 0) : CVPixelBufferGetBytesPerRow(buffer)
+        guard let base, width >= 128, height >= 80 else { return nil }
+        let bytes = base.assumingMemoryBound(to: UInt8.self)
+        let marker = [true, true, false, true, false, false, true, true]
+        for row in 0...70 {
+            let y = min(height - 1, Int(Double(height) * (0.02 + Double(row) * 0.004)))
+            var bits = [Bool](); bits.reserveCapacity(64)
+            for column in 0..<64 {
+                let x = min(width - 1, Int(Double(width) * (0.08 + 0.84 * (Double(column) + 0.5) / 64)))
+                let offset = y * stride + x * (planar ? 1 : 4)
+                let level = planar ? Int(bytes[offset]) : (Int(bytes[offset]) + Int(bytes[offset + 1]) + Int(bytes[offset + 2])) / 3
+                if level > 175 { bits.append(true) }
+                else if level < 80 { bits.append(false) }
+                else { break }
+            }
+            guard bits.count == 64 else { continue }
+            guard Array(bits[0..<8]) == marker, Array(bits[56..<64]) == Array(marker.reversed()) else { continue }
+            var value: UInt32 = 0
+            var valid = true
+            for i in 0..<24 {
+                if bits[8+i] == bits[32+i] { valid = false; break }
+                value = (value << 1) | (bits[8+i] ? 1 : 0)
+            }
+            if valid { return value }
+        }
+        return nil
+    }
+}
+
+// Fixture-only orange motion evidence. The three rows are in full-buffer
+// coordinates; failure to see a coherent stripe is explicitly unknown.
+enum R8FixtureMotionProbe {
+    static func sample(_ buffer: CVPixelBuffer) -> [String: Any] {
+        let started = mach_absolute_time()
+        var timebase = mach_timebase_info_data_t(); mach_timebase_info(&timebase)
+        func result(_ valid: Bool, _ centroid: Double, _ first: Int, _ last: Int, _ active: Int, _ width: Int, _ reason: String) -> [String: Any] {
+            let elapsed = Double(mach_absolute_time() - started) * Double(timebase.numer) / Double(max(1, timebase.denom))
+            return ["valid": valid, "centroidX": centroid, "centroidNorm": valid ? centroid / Double(width) : -1,
+                    "firstX": first, "lastX": last, "activeColumns": active, "bufferWidth": width,
+                    "sampleDurationNs": elapsed, "reason": reason, "rows": [0.41, 0.43, 0.45],
+                    "coordinateSpace": "full_pixel_buffer", "metric": "orange_chroma_weighted_centroid"]
+        }
+        let format = CVPixelBufferGetPixelFormatType(buffer)
+        let planar = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        let width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer)
+        guard (planar || format == kCVPixelFormatType_32BGRA), width >= 128, height >= 80 else {
+            return result(false, -1, -1, -1, 0, width, "unsupported")
+        }
+        guard CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else {
+            return result(false, -1, -1, -1, 0, width, "lock_failed")
+        }
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let p0 = planar ? CVPixelBufferGetBaseAddressOfPlane(buffer, 0) : CVPixelBufferGetBaseAddress(buffer) else {
+            return result(false, -1, -1, -1, 0, width, "missing_base")
+        }
+        let bytes = p0.assumingMemoryBound(to: UInt8.self)
+        let stride = planar ? CVPixelBufferGetBytesPerRowOfPlane(buffer, 0) : CVPixelBufferGetBytesPerRow(buffer)
+        let uv = planar ? CVPixelBufferGetBaseAddressOfPlane(buffer, 1)?.assumingMemoryBound(to: UInt8.self) : nil
+        let uvStride = planar ? CVPixelBufferGetBytesPerRowOfPlane(buffer, 1) : 0
+        if planar && uv == nil { return result(false, -1, -1, -1, 0, width, "missing_chroma") }
+        let ys = [0.41, 0.43, 0.45].map { min(height - 1, Int(Double(height) * $0)) }
+        var sum: Double = 0, weighted: Double = 0
+        var first = width, last = -1, active = 0
+        for x in 0..<width {
+            var votes = 0, strength = 0
+            for y in ys {
+                let score: Int
+                if planar {
+                    let offset = (y / 2) * uvStride + (x / 2) * 2
+                    let luminance = Int(bytes[y * stride + x])
+                    score = luminance > 35 ? max(0, min(Int(uv![offset + 1]) - 128, 128 - Int(uv![offset]))) : 0
+                } else {
+                    let offset = y * stride + x * 4
+                    let b = Int(bytes[offset]), g = Int(bytes[offset + 1]), r = Int(bytes[offset + 2])
+                    score = r > 50 ? max(0, min(r - g, g - b)) : 0
+                }
+                if score >= 8 { votes += 1; strength += score }
+            }
+            if votes >= 2 {
+                first = min(first, x); last = x; active += 1
+                sum += Double(strength); weighted += Double(strength) * Double(x)
+            }
+        }
+        let span = last >= first ? last - first + 1 : 0
+        let valid = span >= max(8, width / 100) && span <= width / 4 && active * 100 >= span * 65 && sum > 0
+        return result(valid, valid ? weighted / sum : -1, valid ? first : -1, valid ? last : -1, active, width,
+                      valid ? "ok" : "no_coherent_orange_stripe")
+    }
+}
+
 private final class PoolTicket: NSObject {
     let onRelease: () -> Void
     init(_ onRelease: @escaping () -> Void) { self.onRelease = onRelease }
@@ -229,6 +330,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         init(_ value: Result<SCShareableContent, Error>) { self.value = value }
     }
     var onFrame: (@Sendable (CVPixelBuffer, Int64, Int64, Int64, Int64, UInt64) -> Void)?
+    var onGeometry: (@Sendable ([String: Any]?, UInt64) -> Void)?
     var onRawFrame: (@Sendable (Int64, Int64, Int64, Int32, Int32, UInt64) -> Void)?
     var onStatus: (@Sendable (String, Bool) -> Void)?
     var onNote: (@Sendable (Int) -> Void)?
@@ -258,6 +360,8 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     private let geometryLock = NSLock()
     private var screenRectGeneration: UInt64 = 0
     private var screenRectValue: CGRect?
+    private var screenRectHost: UInt64 = 0
+    private var geometryTarget: CaptureTarget?
     private var pickerArmed = false
     private var issuedGeneration: UInt64 = 0
     private var completeCount = 0
@@ -268,6 +372,10 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     private var acceptedCount = 0
     private var receivedSequence: UInt64 = 0
     private var lastReceivedHost: UInt64 = 0
+    private var lastFrameStatus: Int = -1
+    private var lastDisplayTime: UInt64 = 0
+    private var lastDirtyRectCount = -1
+    private var lastDirtyRectArea: Double = 0
     private var lastCompleteHost: UInt64 = 0
     private var lastAcceptedHost: UInt64 = 0
     private var requestedCaptureFPS = 0
@@ -281,6 +389,18 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     private var firstHost: UInt64 = 0
     private var lastHost: UInt64 = 0
     private var borrowedPeak = 0
+    private var r8FixtureEvents: [[String: Any]] = []
+    private var r8FixtureSuccess: UInt64 = 0
+    private var r8FixtureFailure: UInt64 = 0
+    private var r8FixtureEnabled: Bool {
+        let args = CommandLine.arguments
+        func absolute(_ flag: String) -> Bool {
+            guard let i = args.firstIndex(of: flag), args.indices.contains(i + 1) else { return false }
+            return args[i + 1].hasPrefix("/")
+        }
+        return args.contains("--khua-r8-fixture-diagnostics") && args.contains("--khua-r8-quality-diagnostics") && args.contains("--khua-pixel-diagnostics") &&
+            absolute("--khua-isolated-profile") && absolute("--khua-live-log")
+    }
 
     func presentPicker(windows: Bool) {
         let picker = SCContentSharingPicker.shared
@@ -359,6 +479,8 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         geometryLock.lock()
         screenRectGeneration = generation
         screenRectValue = nil
+        screenRectHost = 0
+        geometryTarget = target
         geometryLock.unlock()
         completeCount = 0
         idleCount = 0
@@ -366,7 +488,13 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         suspendedCount = 0
         acceptedCount = 0
         receivedSequence = 0
+        r8FixtureEvents.removeAll(keepingCapacity: true)
+        r8FixtureSuccess = 0; r8FixtureFailure = 0
         lastReceivedHost = 0
+        lastFrameStatus = -1
+        lastDisplayTime = 0
+        lastDirtyRectCount = -1
+        lastDirtyRectArea = 0
         lastCompleteHost = 0
         lastAcceptedHost = 0
         pausedDrops = 0
@@ -513,6 +641,9 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
+        if let generation = streamBinding.snapshot(stream) {
+            _ = streamBinding.withCurrent(stream, generation: generation) { onGeometry?(nil, generation) }
+        }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             guard self.stream === stream else {
@@ -544,10 +675,18 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
            let rect = CGRect(dictionaryRepresentation: dictionary as CFDictionary),
            rect.width > 1, rect.height > 1, rect.minX.isFinite, rect.minY.isFinite, rect.width.isFinite, rect.height.isFinite {
             geometryLock.lock()
-            if screenRectGeneration == generation { screenRectValue = rect }
+            if screenRectGeneration == generation { screenRectValue = rect; screenRectHost = lastReceivedHost }
             geometryLock.unlock()
         }
         let observedStatus = frameStatus(sampleBuffer)
+        lastFrameStatus = observedStatus?.rawValue ?? -1
+        if let items = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]], let info = items.first {
+            lastDisplayTime = (info[.displayTime] as? NSNumber)?.uint64Value ?? 0
+            if let rects = info[.dirtyRects] as? [NSValue] {
+                lastDirtyRectCount = rects.count
+                lastDirtyRectArea = rects.reduce(0) { $0 + Double(max(0, $1.rectValue.width) * max(0, $1.rectValue.height)) }
+            } else { lastDirtyRectCount = -1; lastDirtyRectArea = 0 }
+        }
         let status = observedStatus ?? .complete // preserve prior display compatibility
         if status == .idle {
             idleCount += 1
@@ -558,6 +697,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             return
         }
         if status == .blank || status == .suspended || status == .stopped {
+            _ = streamBinding.withCurrent(stream, generation: generation) { onGeometry?(nil, generation) }
             if status == .blank { blankCount += 1 }
             if status == .suspended { suspendedCount += 1 }
             if status == .stopped { stoppedCount += 1 }
@@ -578,6 +718,8 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             return
         }
         let captureHost = lastReceivedHost
+        let frameGeometry = geometryMetadata(sampleBuffer, width: CVPixelBufferGetWidth(image), height: CVPixelBufferGetHeight(image), generation: generation)
+        guard streamBinding.withCurrent(stream, generation: generation, { onGeometry?(frameGeometry, generation) }) else { retiredDrops += 1; return }
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let ptsNum: Int64
         let ptsDen: Int64
@@ -618,10 +760,43 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         lastHost = captureHost
         pixelWidth = CVPixelBufferGetWidth(owned)
         pixelHeight = CVPixelBufferGetHeight(owned)
+        let geometryKey = "app.khuaplayer.capture.geometry" as CFString
+        CVBufferRemoveAttachment(owned, geometryKey)
+        if let frameGeometry { CVBufferSetAttachment(owned, geometryKey, frameGeometry as CFDictionary, .shouldNotPropagate) }
         let admitted = streamBinding.withCurrent(stream, generation: generation) {
             onFrame?(owned, ptsNum, ptsDen, Int64(captureHost), Int64(readyHost), generation)
         }
         guard admitted else { retiredDrops += 1; return }
+        if r8FixtureEnabled {
+            let sequence = R8FixtureDecoder.decode(owned)
+            let motion = R8FixtureMotionProbe.sample(owned)
+            let attachment = (CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]])?.first
+            geometryLock.lock()
+            let sourceTarget = screenRectGeneration == generation ? geometryTarget : nil
+            geometryLock.unlock()
+            var sourceWindowID: Any = NSNull(), sourcePID: Any = NSNull(), sourceDisplayID: Any = NSNull()
+            switch sourceTarget {
+            case let .window(id, owner): sourceWindowID = id; sourcePID = owner
+            case let .display(id): sourceDisplayID = id
+            case nil: break
+            }
+            func rectValue(_ key: SCStreamFrameInfo) -> Any {
+                guard let dictionary = attachment?[key] as? NSDictionary,
+                      let rect = CGRect(dictionaryRepresentation: dictionary as CFDictionary),
+                      rect.origin.x.isFinite, rect.origin.y.isFinite, rect.width.isFinite, rect.height.isFinite else { return NSNull() }
+                return [rect.origin.x, rect.origin.y, rect.width, rect.height]
+            }
+            if sequence != nil { r8FixtureSuccess &+= 1 } else { r8FixtureFailure &+= 1 }
+            r8FixtureEvents.append(["generation": generation, "receivedSequence": receivedSequence,
+                "captureHost": captureHost, "readyHost": readyHost, "ptsNum": ptsNum, "ptsDen": ptsDen,
+                "decoded": sequence != nil, "frameNumber": sequence.map(Int.init) ?? -1, "motion": motion,
+                "bufferPixels": [pixelWidth, pixelHeight], "contentRectSurfacePoints": rectValue(.contentRect),
+                "screenRect": rectValue(.screenRect), "contentScale": (attachment?[.contentScale] as? NSNumber).map { $0 as Any } ?? NSNull(),
+                "scaleFactor": (attachment?[.scaleFactor] as? NSNumber).map { $0 as Any } ?? NSNull(),
+                "sourceWindowID": sourceWindowID, "sourcePID": sourcePID, "sourceDisplayID": sourceDisplayID,
+                "geometryVersion": NSNull()])
+            if r8FixtureEvents.count > 128 { r8FixtureEvents.removeFirst(r8FixtureEvents.count - 128) }
+        }
         acceptedCount += 1
         lastAcceptedHost = captureHost
         if completeCount <= 5 || completeCount % 30 == 0 {
@@ -652,6 +827,12 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             "requestedCaptureFPS": requestedCaptureFPS,
             "receivedSequence": receivedSequence,
             "lastReceivedHost": lastReceivedHost,
+            "r8Fixture": ["enabled": r8FixtureEnabled, "decoded": r8FixtureSuccess, "failed": r8FixtureFailure,
+                           "events": r8FixtureEvents, "note": "owned buffer samples; frame number is source-drawn sequence modulo 2^24"],
+            "lastFrameStatus": lastFrameStatus,
+            "lastDisplayTimeMachAbsolute": lastDisplayTime,
+            "lastDirtyRectCount": lastDirtyRectCount,
+            "lastDirtyRectAreaPixels": lastDirtyRectArea,
             "lastCompleteHost": lastCompleteHost,
             "lastAcceptedHost": lastAcceptedHost,
             "captureRateNote": requestedCaptureFPS == 0 ? "system maximum request; actual cadence may be lower" : "requested ceiling, not measured source FPS",
@@ -737,10 +918,42 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         return status
     }
 
+    // A missing/invalid attachment is deliberately not reconstructed from a
+    // previous frame; the receiving geometry authority must invalidate it.
+    private func geometryMetadata(_ sample: CMSampleBuffer, width: Int, height: Int, generation: UInt64) -> [String: Any]? {
+        guard let info = (CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]])?.first,
+              let screenDictionary = info[.screenRect] as? NSDictionary,
+              let contentDictionary = info[.contentRect] as? NSDictionary,
+              let screen = CGRect(dictionaryRepresentation: screenDictionary as CFDictionary),
+              let content = CGRect(dictionaryRepresentation: contentDictionary as CFDictionary),
+              let factor = info[.scaleFactor] as? NSNumber, let contentScale = info[.contentScale] as? NSNumber,
+              [Double(screen.minX), Double(screen.minY), Double(screen.width), Double(screen.height), Double(content.minX), Double(content.minY), Double(content.width), Double(content.height),
+               factor.doubleValue, contentScale.doubleValue].allSatisfy({ $0.isFinite }),
+              screen.width > 0, screen.height > 0, content.width > 0, content.height > 0,
+              factor.doubleValue > 0, contentScale.doubleValue > 0 else { return nil }
+        geometryLock.lock()
+        let selected = screenRectGeneration == generation ? geometryTarget : nil
+        geometryLock.unlock()
+        guard case let .window(id, owner) = selected, id != 0, owner > 0 else { return nil }
+        let value: [String: Any] = ["generation": generation, "windowID": id, "pid": owner,
+            "bufferWidth": width, "bufferHeight": height,
+            "screenRect": [screen.minX, screen.minY, screen.width, screen.height],
+            "contentRect": [content.minX, content.minY, content.width, content.height],
+            "scaleFactor": factor, "contentScale": contentScale]
+        return value
+    }
+
     func latestScreenRect() -> CGRect? {
         geometryLock.lock()
         defer { geometryLock.unlock() }
         return screenRectGeneration == currentGeneration ? screenRectValue : nil
+    }
+
+    func latestScreenRectSnapshot() -> (rect: CGRect, host: UInt64)? {
+        geometryLock.lock()
+        defer { geometryLock.unlock() }
+        guard screenRectGeneration == currentGeneration, let rect = screenRectValue, screenRectHost > 0 else { return nil }
+        return (rect, screenRectHost)
     }
 }
 

@@ -3,6 +3,37 @@ enum AppLanguage { static var current: String? { nil }; static func effectiveLan
 
 @main struct TestRunner {
  @MainActor static func main() throws {
+  let p0Args = ["--khua-p0-controls", "--khua-r7-opaque"]
+  precondition(P0DiagnosticPolicy.controlsEnabled(args:p0Args,isolated:true))
+  precondition(!P0DiagnosticPolicy.controlsEnabled(args:p0Args,isolated:false))
+  precondition(P0DiagnosticPolicy.flag("--khua-r7-opaque",args:p0Args,isolated:true,overrideValue:nil))
+  precondition(!P0DiagnosticPolicy.flag("--khua-r7-opaque",args:p0Args,isolated:true,overrideValue:false))
+  precondition(P0DiagnosticPolicy.flag("--khua-r7-activate",args:p0Args,isolated:true,overrideValue:true))
+  precondition(!P0DiagnosticPolicy.flag("--khua-r7-activate",args:p0Args,isolated:false,overrideValue:true))
+  precondition(!P0DiagnosticPolicy.flag("--khua-r7-activate",args:[],isolated:true,overrideValue:true))
+  precondition(WorkbenchTitle.text("Quality Workbench",candidate:" P1 ") == "Quality Workbench · P1")
+  precondition(WorkbenchTitle.text("画质工作台",candidate:"P1") == "画质工作台 · P1")
+  precondition(WorkbenchTitle.text("画质工作台",candidate:"") == "画质工作台")
+  var oldProfile = try JSONSerialization.jsonObject(with: JSONEncoder().encode(EnhancementProfile())) as! [String: Any]
+  oldProfile.removeValue(forKey:"windowOutputMode")
+  let oldData = try JSONSerialization.data(withJSONObject:oldProfile)
+  precondition(EnhancementProfileStore.decode(oldData,fallbackName:"legacy")?.windowOutputMode == "follow")
+  oldProfile["sourceKind"] = "display"; oldProfile["outputFullscreen"] = true
+  let displayOld = EnhancementProfileStore.decode(try JSONSerialization.data(withJSONObject:oldProfile),fallbackName:"legacy")!
+  precondition(displayOld.windowOutputMode == "follow" && displayOld.outputFullscreen &&
+    TargetOverlayPolicy.usesFullscreen(windowTarget:false,explicitViewer:false,interactiveAvailable:false,diagnosticFullscreen:false,legacyFullscreen:displayOld.outputFullscreen,viewerFollowOverride:false))
+  oldProfile["sourceKind"] = "window"
+  let windowOld = EnhancementProfileStore.decode(try JSONSerialization.data(withJSONObject:oldProfile),fallbackName:"legacy")!
+  precondition(windowOld.windowOutputMode == "follow" && !TargetOverlayPolicy.usesFullscreen(windowTarget:true,explicitViewer:false,interactiveAvailable:false,diagnosticFullscreen:false,legacyFullscreen:windowOld.outputFullscreen,viewerFollowOverride:false))
+  oldProfile["sourceKind"] = "file"
+  let fileOld = EnhancementProfileStore.decode(try JSONSerialization.data(withJSONObject:oldProfile),fallbackName:"legacy")!
+  precondition(fileOld.sourceKind == "file" && fileOld.outputFullscreen)
+  oldProfile["windowOutputMode"] = "unknown"
+  let unknownData = try JSONSerialization.data(withJSONObject:oldProfile)
+  precondition(EnhancementProfileStore.decode(unknownData,fallbackName:"legacy")?.windowOutputMode == "follow")
+  oldProfile["windowOutputMode"] = "absolute"
+  let absoluteData = try JSONSerialization.data(withJSONObject:oldProfile)
+  precondition(EnhancementProfileStore.decode(absoluteData,fallbackName:"legacy")?.windowOutputMode == "absolute")
   precondition(WorkbenchDimensionPolicy.editable(sizeIndex: 4, scaleEnabled: true))
   for index in [0, 1, 2, 3, 5] { precondition(!WorkbenchDimensionPolicy.editable(sizeIndex: index, scaleEnabled: true)) }
   precondition(!WorkbenchDimensionPolicy.editable(sizeIndex: 4, scaleEnabled: false))
@@ -107,6 +138,72 @@ enum AppLanguage { static var current: String? { nil }; static func effectiveLan
   precondition(TargetOverlayPolicy.evaluateWindow([targetWindow],orderedOnscreen:[otherBrowserWindow],id:101,owner:77,frontPID:77).reason=="target_not_in_ordered_list")
   precondition(TargetOverlayPolicy.evaluateWindow([targetWindow],orderedOnscreen:[cgWindow(101,88,0,1200,800)],id:101,owner:77,frontPID:77).reason=="target_identity_changed_in_ordered_list")
   precondition(decision([cgWindow(101,77,0,1200,800,true,0)]).reason=="target_transparent")
+  // Preparation, failure/revoke, and geometry-loss never click through.
+  precondition(!TargetOverlayPolicy.interactionCanPassThrough(available:true,routerActive:false))
+  precondition(TargetOverlayPolicy.interactionCanPassThrough(available:true,routerActive:true))
+  precondition(!TargetOverlayPolicy.interactionCanPassThrough(available:false,routerActive:false))
+  let owned=TargetOverlayPolicy.interactionOwnedPassThrough(output:202,controls:203,huds:[204])
+  precondition(owned == Set([202,203,204]) && !owned.contains(301)) // ordinary workbench/other windows remain competitors
+  precondition(P1AXInvestigation.rectMatches(CGRect(x:10,y:20,width:640,height:512),CGRect(x:11,y:20,width:640,height:512)))
+  precondition(!P1AXInvestigation.rectMatches(CGRect(x:10,y:20,width:640,height:512),CGRect(x:14,y:20,width:640,height:512)))
+  precondition(P1AXInvestigation.uniqueGeometry(total:2,readable:2,matches:1,listSucceeded:true))
+  precondition(!P1AXInvestigation.uniqueGeometry(total:2,readable:1,matches:1,listSucceeded:true))
+  precondition(!P1AXInvestigation.uniqueGeometry(total:2,readable:2,matches:2,listSucceeded:true))
+  precondition(!P1AXInvestigation.uniqueGeometry(total:9,readable:9,matches:1,listSucceeded:true))
+  precondition(!P1AXInvestigation.uniqueGeometry(total:1,readable:1,matches:1,listSucceeded:false))
+  precondition(P1FocusPolicy.decide(targetReady:false,acquired:false,ownFront:true,now:2,deadline:5) == .wait)
+  precondition(P1FocusPolicy.decide(targetReady:false,acquired:false,ownFront:true,now:5,deadline:5) == .cancel)
+  precondition(P1FocusPolicy.decide(targetReady:false,acquired:false,ownFront:false,now:2,deadline:5) == .cancel)
+  precondition(P1FocusPolicy.decide(targetReady:true,acquired:false,ownFront:false,now:2,deadline:5) == .ready)
+  precondition(P1FocusPolicy.decide(targetReady:false,acquired:true,ownFront:true,now:2,deadline:5) == .cancel)
+  var wait=P1ObstructionWait()
+  precondition(wait.observe(blocked:true,now:100,generation:1,config:2))
+  precondition(wait.observe(blocked:true,now:104.9,generation:1,config:2))
+  precondition(wait.observe(blocked:false,now:104.95,generation:1,config:2))
+  precondition(wait.observe(blocked:true,now:105,generation:1,config:2))
+  precondition(!wait.observe(blocked:true,now:110,generation:1,config:2))
+  wait.reset(); precondition(wait.observe(blocked:true,now:111,generation:1,config:2))
+  precondition(!wait.observe(blocked:false,now:116,generation:1,config:2)) // clear after deadline cannot revive
+  wait.reset(); precondition(wait.observe(blocked:true,now:120,generation:1,config:2))
+  precondition(!wait.observe(blocked:true,now:121,generation:2,config:2))
+  precondition(wait.observe(blocked:true,now:130,generation:1,config:2))
+  precondition(!wait.observe(blocked:true,now:131,generation:1,config:3))
+  wait.reset(); precondition(!wait.observe(blocked:true,now:0,generation:0,config:2))
+  let sourceRect=CGRect(x:10,y:20,width:640,height:480)
+  func clear(_ windows:[[String:Any]]?,_ passthrough:Set<CGWindowID> = []) -> Bool {
+   TargetOverlayPolicy.interactionUnobstructed(windows,id:101,owner:77,source:sourceRect,passthrough:passthrough)
+  }
+  let smallPopup=cgWindow(207,77,8,20,20)
+  precondition(clear([targetWindow]))
+  precondition(!clear([smallPopup,targetWindow]))
+  precondition(!clear([anotherAppWindow,targetWindow]))
+  precondition(clear([floatingAux,targetWindow],[202]))
+  precondition(!clear([transparentAux,targetWindow])) // alpha alone does not establish hit-test pass-through
+  precondition(!clear([cgWindow(209,88,9,20,20,true,0.005),targetWindow]))
+  precondition(!clear(nil) && !clear([smallPopup]) && !clear([missingMetadata,targetWindow]))
+  var noAlpha=smallPopup; noAlpha.removeValue(forKey:kCGWindowAlpha as String)
+  precondition(!clear([noAlpha,targetWindow]))
+  // A real prior-policy counterexample: valid disjoint bounds with missing
+  // metadata failed normalizeWindow, but cannot intercept any source point.
+  let farPartial: [String:Any] = [kCGWindowNumber as String: 901,
+      kCGWindowBounds as String: ["X": 4000, "Y": 4000, "Width": 0.5, "Height": 0.5]]
+  precondition(TargetOverlayPolicy.normalizeWindow(farPartial) == nil && clear([farPartial,targetWindow]))
+  var farMissingID=farPartial; farMissingID.removeValue(forKey:kCGWindowNumber as String)
+  precondition(clear([farMissingID,targetWindow]))
+  let tinyOverlap=cgWindow(208,77,9,0.5,0.5)
+  let tinyResult=TargetOverlayPolicy.interactionGuard([tinyOverlap,targetWindow],id:101,owner:77,source:sourceRect,passthrough:[])
+  precondition(!tinyResult.clear && tinyResult.reason == "overlapping_window" && (tinyResult.blocker["windowID"] as? CGWindowID) == 208)
+  var unknownBounds=smallPopup; unknownBounds.removeValue(forKey:kCGWindowBounds as String)
+  let unknownResult=TargetOverlayPolicy.interactionGuard([unknownBounds,targetWindow],id:101,owner:77,source:sourceRect,passthrough:[])
+  precondition(!unknownResult.clear && unknownResult.missing.contains("bounds") && unknownResult.targetFound == "yes")
+  let missingAlphaResult=TargetOverlayPolicy.interactionGuard([noAlpha,targetWindow],id:101,owner:77,source:sourceRect,passthrough:[])
+  precondition(!missingAlphaResult.clear && missingAlphaResult.missing.contains("alpha"))
+  var noTargetAlpha=targetWindow; noTargetAlpha.removeValue(forKey:kCGWindowAlpha as String)
+  precondition(!clear([noTargetAlpha]) && !clear([cgWindow(101,88,0,1200,800)]))
+  var workbench=anotherAppWindow; workbench[kCGWindowName as String]="private title"
+  let workbenchResult=TargetOverlayPolicy.interactionGuard([workbench,targetWindow],id:101,owner:77,source:sourceRect,passthrough:owned)
+  precondition(!workbenchResult.clear && workbenchResult.reason == "overlapping_window" && workbenchResult.blocker["title"] == nil && workbenchResult.blocker[kCGWindowName as String] == nil)
+  precondition(clear([floatingAux,targetWindow],[202]))
   func reveals(_ t:UInt64,_ g:UInt64,_ c:UInt64,_ visible:Bool)->Bool {
    TargetOverlayPolicy.canReveal(token:t,currentToken:3,generation:g,currentGeneration:4,config:c,currentConfig:5,targetReady:visible)
   }
@@ -116,6 +213,57 @@ enum AppLanguage { static var current: String? { nil }; static func effectiveLan
   let target=CGRect(x:-2680,y:-160,width:800,height:400)
   precondition(TargetOverlayPolicy.nativeFrame(target,cgDisplay:display,screen:screen)==NSRect(x:-1340,y:780,width:400,height:200))
   let primary=NSRect(x:0,y:0,width:1920,height:1080), targetFrame=NSRect(x:50,y:60,width:800,height:600)
+  // A stalled old generation/config must never spend a new one's single retry.
+  var health = R7PresentationHealth()
+  func sample(_ gen: UInt64, _ config: UInt64, _ accepted: UInt64, _ presented: UInt64, _ changing: Bool = true, _ running: Bool = true) -> (Bool, Bool) {
+   let result = health.observe(generation: gen, config: config, running: running, visible: true, accepted: accepted, presented: presented, changingContent: changing)
+   return (result.firstStall, result.rearm)
+  }
+  precondition(!sample(1,1,10,2).1)
+  precondition(!sample(1,1,11,2).1 && !sample(1,1,12,2).1)
+  let firstStall = sample(1,1,13,2); precondition(firstStall.0 && firstStall.1)
+  precondition(!sample(1,1,14,2).1)
+  precondition(!sample(2,1,1,0).1 && health.stallSeconds == 0 && !health.recoveryAttempted)
+  precondition(!sample(2,1,2,0).1 && !sample(2,1,3,0).1 && sample(2,1,4,0).1)
+  precondition(!sample(2,2,5,0).1 && health.stallSeconds == 0 && !health.recoveryAttempted)
+  precondition(!sample(2,2,6,0,false).1 && !sample(2,2,7,0,false).1 && !sample(2,2,8,0,false).1)
+  precondition(sample(2,2,9,0,true).1)
+  precondition(!sample(2,2,9,0,true,false).1 && !health.recoveryAttempted && health.stallSeconds == 0)
+  precondition(!sample(2,2,10,0).1 && !sample(2,2,11,0).1 && !sample(2,2,12,0).1 && sample(2,2,13,0).1)
+  precondition(!sample(2,2,14,1).1 && !health.recoveryAttempted)
+  precondition(!sample(2,2,1,0).1 && health.stallSeconds == 0)
+  func freshChange(_ now: UInt64, _ host: UInt64, _ gen: UInt64 = 7, _ cfg: UInt64 = 8, _ epoch: UInt64 = 9, _ stale: Bool = false) -> Bool {
+   R7ContentChangeEvidence.isFresh(now: now, host: host, numer: 1, denom: 1, generation: 7, config: 8, epoch: 9,
+     evidenceGeneration: gen, evidenceConfig: cfg, evidenceEpoch: epoch, snapshotStale: stale)
+  }
+  precondition(freshChange(2_000_000_000, 1_000_000_000))
+  precondition(!freshChange(3_000_000_001, 1_000_000_000) && !freshChange(2_000_000_000, 0))
+  precondition(!freshChange(2_000_000_000, 1_000_000_000, 6) && !freshChange(2_000_000_000, 1_000_000_000, 7, 7))
+  precondition(!freshChange(2_000_000_000, 1_000_000_000, 7, 8, 8) && !freshChange(2_000_000_000, 1_000_000_000, 7, 8, 9, true))
+  precondition(!freshChange(999_999_999, 1_000_000_000))
+  var staticAfterMotion = R7PresentationHealth()
+  for tick in 0...7 {
+   let now = UInt64(2 + tick) * 1_000_000_000
+   let result = staticAfterMotion.observe(generation: 7, config: 8, running: true, visible: true,
+       accepted: UInt64(100 + tick), presented: 3, changingContent: freshChange(now, 1_000_000_000))
+   precondition(!result.rearm) // Accepted frames keep advancing long after the last actual sampled change.
+  }
+  precondition(staticAfterMotion.stallSeconds >= 3 && !staticAfterMotion.recoveryAttempted)
+  let freshMotion = staticAfterMotion.observe(generation: 7, config: 8, running: true, visible: true,
+      accepted: 108, presented: 3, changingContent: freshChange(10_000_000_000, 9_800_000_000))
+  precondition(freshMotion.rearm)
+  let footer = FooterMetrics.lines(target:"目标 ≈120",output:"输出 59.5 FPS",generation:"生成 1.0/秒 · 按期合成 0.0/秒",
+    budget:"插帧预算不足（需要 124 ms，可用 71 ms）",stalled:"",overdue:"",supplemental:["合成 1/100", "显示器上限"])
+  precondition(footer.primary == "目标 ≈120 · 输出 59.5 FPS · 生成 1.0/秒 · 按期合成 0.0/秒")
+  precondition(footer.secondary.hasPrefix("插帧预算不足（需要 124 ms，可用 71 ms）") && footer.secondary.contains("合成 1/100"))
+  let englishFooter = FooterMetrics.lines(target:"Target ≈120",output:"Output 59.5 FPS",generation:"Generated 1.0/s · on-time 0.0/s",
+    budget:"FRC budget limited (needs 124 ms, allows 71 ms)",stalled:"",overdue:"",supplemental:[])
+  precondition(englishFooter.primary.contains("Target ≈120") && englishFooter.primary.contains("Output 59.5 FPS") && englishFooter.primary.contains("on-time 0.0/s"))
+  precondition(englishFooter.secondary == "FRC budget limited (needs 124 ms, allows 71 ms)")
+  precondition(FooterMetrics.lines(target:"",output:"",generation:"",budget:"",stalled:"",overdue:"",supplemental:[]).primary.isEmpty)
+  precondition(TargetOverlayPolicy.windowInputAligned(viewMode:"enhanced"))
+  precondition(TargetOverlayPolicy.windowInputAligned(viewMode:"original"))
+  precondition(!TargetOverlayPolicy.windowInputAligned(viewMode:"compare"))
   precondition(TargetOverlayPolicy.outputFrame(target:targetFrame,fullscreen:false,display:primary)==targetFrame)
   precondition(TargetOverlayPolicy.outputFrame(target:targetFrame,fullscreen:true,display:primary)==primary)
   precondition(TargetOverlayPolicy.outputFrame(target:targetFrame,fullscreen:true,display:nil)==nil)
@@ -144,6 +292,6 @@ enum AppLanguage { static var current: String? { nil }; static func effectiveLan
   _ = EnhancementText.t("Technology Library","技术库")
   precondition(EnhancementText.translated("技术库",chinese:false)=="Technology Library")
   precondition(EnhancementText.translated("用户来源",chinese:false)=="用户来源")
-  print("{\"ok\":true,\"legacyCollisionPreserved\":true,\"presetSeparate\":true,\"editReadback\":true,\"renameAndRestoreMetadata\":true,\"countdownCancelAndIdempotence\":true,\"fpsPreference\":true,\"browserMetadataSelection\":true,\"onscreenOrderUsed\":true,\"competingNormalWindowHidden\":true,\"auxiliaryAndNonzeroTarget\":true,\"offscreenAndOtherOwner\":true,\"nameValidation\":true,\"isolatedLanguagePreferences\":true,\"fileVideoSRCombinationReadback\":true,\"videoSRLiveFactorBoundary\":true,\"scope\":\"isolated store/timer/CG metadata/preferences contract; no GUI or live user config\"}")
+  print("{\"ok\":true,\"legacyCollisionPreserved\":true,\"presetSeparate\":true,\"editReadback\":true,\"renameAndRestoreMetadata\":true,\"countdownCancelAndIdempotence\":true,\"fpsPreference\":true,\"browserMetadataSelection\":true,\"onscreenOrderUsed\":true,\"competingNormalWindowHidden\":true,\"auxiliaryAndNonzeroTarget\":true,\"offscreenAndOtherOwner\":true,\"nameValidation\":true,\"isolatedLanguagePreferences\":true,\"fileVideoSRCombinationReadback\":true,\"videoSRLiveFactorBoundary\":true,\"r7RecoveryLifecycle\":true,\"scope\":\"isolated store/timer/CG metadata/preferences contract; no GUI or live user config\"}")
  }
 }

@@ -58,6 +58,8 @@ typedef void (^SPFRCPhasesCompletion)(uint64_t token,
 
 @property (nonatomic, readonly) SPFrameBudgetMetal *metal;
 @property (nonatomic, readonly) unsigned sessionCount;
+/// Opt-in per-live-task diagnostics; callback is observational and may be on any thread.
+@property (atomic, copy, nullable) void (^diagnosticHandler)(NSDictionary<NSString *, id> *event);
 @property (nonatomic, readonly) unsigned busyCount;
 /// End-to-end latency in seconds; initially an estimate.
 @property (nonatomic, readonly) double latencyEstimateSec;

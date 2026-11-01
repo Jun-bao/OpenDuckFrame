@@ -78,6 +78,11 @@ struct SPFRCSlot {
     CVPixelBufferRef phaseRGBA[3] = {};
     int64_t frcStartUs = 0;
     double convertGpuSec = 0.0;
+    int64_t r8InputDoneUs = 0, r8ProcessQueueUs = 0, r8VTDoneUs = 0, r8OutputStartUs = 0, r8OutputDoneUs = 0;
+    double r8InputGPUms = 0, r8OutputGPUms = 0;
+    uint64_t r8FrameA = 0, r8FrameB = 0, r8Generation = 0, r8ClockEpoch = 0;
+    unsigned r9SlotID = 0;
+    int r9ContinuityReason = 0;
 };
 
 @implementation SPOwnedPixelBuffer {
@@ -228,6 +233,22 @@ static std::atomic<int> gFRCAvailability{-1};
 - (void)noteConvertGPUSeconds:(double)sec forToken:(uint64_t)token {
     std::lock_guard<std::mutex> lock(_mtx);
     for (auto &s : _slots) if (s.busy && s.token == token) { s.convertGpuSec += sec; break; }
+}
+
+- (void)r8Stage:(uint64_t)token stage:(int)stage gpuMs:(double)gpuMs {
+    if (!self.diagnosticHandler) return;
+    std::lock_guard<std::mutex> lock(_mtx);
+    for (auto &s : _slots) if (s.busy && s.token == token) {
+        int64_t now = spNowUs();
+        switch (stage) {
+            case 1: s.r8InputDoneUs=now; s.r8InputGPUms=gpuMs; break;
+            case 2: s.r8ProcessQueueUs=now; break;
+            case 3: s.r8VTDoneUs=now; break;
+            case 4: s.r8OutputStartUs=now; break;
+            case 5: s.r8OutputDoneUs=now; s.r8OutputGPUms=gpuMs; break;
+        }
+        break;
+    }
 }
 
 - (uint64_t)completedPairs { std::lock_guard<std::mutex> lock(_mtx); return _completed; }
@@ -712,15 +733,22 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
         s.busy = YES;
         s.token = token;
         s.startUs = spNowUs();
+        s.r8InputDoneUs=0; s.r8ProcessQueueUs=0; s.r8VTDoneUs=0; s.r8OutputStartUs=0; s.r8OutputDoneUs=0;
+        s.r8InputGPUms=0; s.r8OutputGPUms=0;
+        s.r8FrameA=frameIDA; s.r8FrameB=frameIDB; s.r8Generation=generation; s.r8ClockEpoch=clockEpoch;
         s.expectedFinishUs = s.startUs + (int64_t)(_latencyEwma * 1e6);
         s.completion = nil;
         s.phasesCompletion = completion;
         s.phaseMode = YES;
         s.liveContinuity = legacyMode < 0 && frameIDA != 0 && frameIDB != 0 && frameIDA != frameIDB &&
             [[[NSProcessInfo processInfo] environment][@"CHUANFLOW_FRC_CONTINUOUS"] isEqualToString:@"1"];
+        BOOL ptsEqual = CMTIME_IS_NUMERIC(s.cachedPTS) && CMTimeCompare(s.cachedPTS, ptsA) == 0;
+        s.r9SlotID = (unsigned)idx;
+        s.r9ContinuityReason = !s.liveContinuity ? 1 : (!s.cachedB ? 2 : (s.cachedB != frameA ? 3 :
+            (s.cachedID != frameIDA ? 4 : (s.cachedGeneration != generation ? 5 :
+            (s.cachedClockEpoch != clockEpoch ? 6 : (!ptsEqual ? 7 : 0))))));
         s.sequential = spFRCSelectSequential(legacyMode, spFRCContinues(s.liveContinuity, s.cachedB, frameA, s.cachedID, frameIDA, frameIDB,
-            s.cachedGeneration, generation, s.cachedClockEpoch, clockEpoch,
-            CMTIME_IS_NUMERIC(s.cachedPTS) && CMTimeCompare(s.cachedPTS, ptsA) == 0));
+            s.cachedGeneration, generation, s.cachedClockEpoch, clockEpoch, ptsEqual));
         if (s.liveContinuity && s.sequential) {
             // Preserve the actual previous next-frame buffer as the new source.
             std::swap(s.rgbaA, s.rgbaB);
@@ -759,6 +787,7 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
             return;
         }
         [s noteConvertGPUSeconds:(done.GPUEndTime - done.GPUStartTime) forToken:slotToken];
+        [s r8Stage:slotToken stage:1 gpuMs:(done.GPUEndTime - done.GPUStartTime) * 1000.0];
         dispatch_async(s->_q, ^{ [s processToken:slotToken]; });
     }];
     [cb commit];
@@ -766,6 +795,7 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
 }
 
 - (void)processPhaseToken:(uint64_t)token {
+    [self r8Stage:token stage:2 gpuMs:0];
     SPFRCSlot slot;
     if (![self lookupToken:token slot:&slot]) return;
     if (@available(macOS 15.4, *)) {
@@ -819,6 +849,7 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
             (void)p;
             if (trace) os_signpost_interval_end(SPFRCTrace(), signpost, "FRC VT");
             const int64_t doneUs = spNowUs();
+            [s r8Stage:token stage:3 gpuMs:0];
             dispatch_async(s->_q, ^{
                 {
                     std::lock_guard<std::mutex> lock(s->_mtx);
@@ -839,6 +870,7 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
 }
 
 - (void)convertPhaseToken:(uint64_t)token {
+    [self r8Stage:token stage:4 gpuMs:0];
     SPFRCSlot slot;
     if (![self lookupToken:token slot:&slot]) return;
     NSMutableArray<SPOwnedPixelBuffer *> *boxes = [NSMutableArray array];
@@ -870,6 +902,7 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
             return;
         }
         [s noteConvertGPUSeconds:(done.GPUEndTime - done.GPUStartTime) forToken:token];
+        [s r8Stage:token stage:5 gpuMs:(done.GPUEndTime - done.GPUStartTime) * 1000.0];
         [s completePhaseToken:token outputs:boxes error:nil];
     }];
     [cb commit];
@@ -884,6 +917,7 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
     double latency = 0.0;
     SPFRCSlot retired;
     BOOL closeRetired = NO;
+    NSDictionary *r8Event = nil;
     {
         std::lock_guard<std::mutex> lock(_mtx);
         size_t idx = SIZE_MAX;
@@ -892,7 +926,21 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
         }
         if (idx == SIZE_MAX) return;
         SPFRCSlot &s = _slots[idx];
-        latency = (spNowUs() - s.startUs) / 1e6;
+        int64_t finishUs = spNowUs();
+        latency = (finishUs - s.startUs) / 1e6;
+        if (self.diagnosticHandler) r8Event = @{
+            @"id": @(token), @"frameA": @(s.r8FrameA), @"frameB": @(s.r8FrameB),
+            @"generation": @(s.r8Generation), @"clockEpoch": @(s.r8ClockEpoch),
+            @"slotID": @(s.r9SlotID), @"submissionMode": s.sequential ? @"sequential" : @"random",
+            @"continuityReason": (@[@"matched",@"disabled_or_legacy",@"no_history",@"buffer_mismatch",@"frame_id_mismatch",@"generation_mismatch",@"clock_mismatch",@"pts_mismatch"])[s.r9ContinuityReason],
+            @"ptsAValue": @(s.ptsA.value), @"ptsAScale": @(s.ptsA.timescale),
+            @"ptsBValue": @(s.ptsB.value), @"ptsBScale": @(s.ptsB.timescale),
+            @"submitUs": @(s.startUs), @"inputCompleteUs": @(s.r8InputDoneUs),
+            @"processQueueUs": @(s.r8ProcessQueueUs), @"vtStartUs": @(s.frcStartUs),
+            @"vtCallbackUs": @(s.r8VTDoneUs), @"outputStartUs": @(s.r8OutputStartUs),
+            @"outputCompleteUs": @(s.r8OutputDoneUs), @"finishUs": @(finishUs),
+            @"inputGPUms": @(s.r8InputGPUms), @"outputGPUms": @(s.r8OutputGPUms),
+            @"timingScope": @"uptime microseconds; GPU times are GPU intervals; VT is submit-to-callback wall time, not GPU execution time" };
         completion = s.phasesCompletion;
         sourceA = s.sourceA;
         sourceB = s.sourceB;
@@ -930,6 +978,7 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
     if (closeRetired) [self closeSlot:retired];
     if (sourceA) CVPixelBufferRelease(sourceA);
     if (sourceB) CVPixelBufferRelease(sourceB);
+    if (r8Event && self.diagnosticHandler) self.diagnosticHandler(r8Event);
     if (completion) completion(token, error ? nil : outputs, latency, error);
 }
 

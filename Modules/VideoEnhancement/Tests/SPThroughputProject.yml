@@ -35,6 +35,7 @@ targets:
       - SPThroughputProbe.mm
       - ../SPFRCEngine.mm
       - ../SPFrameBudgetMetal.mm
+      - ../../../Apps/Mac/Capture/SPLowLatencyEngine.mm
       - ../../../Apps/Mac/Capture/SPRifeEngine.swift
       - ../../../Apps/Mac/Capture/SPRifeContinuity.swift
     dependencies:
@@ -47,3 +48,4 @@ targets:
       - sdk: VideoToolbox.framework
       - sdk: IOSurface.framework
       - sdk: CoreGraphics.framework
+      - sdk: ImageIO.framework

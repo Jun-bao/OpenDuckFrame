@@ -1,4 +1,5 @@
 import AppKit
+@preconcurrency import ApplicationServices
 import CoreVideo
 import Darwin
 @preconcurrency import ScreenCaptureKit
@@ -179,6 +180,163 @@ enum FPSPresentation {
     }
 }
 
+enum R7ContentChangeEvidence {
+    static func isFresh(now: UInt64, host: UInt64, numer: UInt32, denom: UInt32,
+                        generation: UInt64, config: UInt64, epoch: UInt64,
+                        evidenceGeneration: UInt64, evidenceConfig: UInt64, evidenceEpoch: UInt64,
+                        snapshotStale: Bool) -> Bool {
+        guard !snapshotStale, host > 0, now >= host, denom > 0, epoch > 0,
+              generation == evidenceGeneration, config == evidenceConfig, epoch == evidenceEpoch else { return false }
+        let ageSeconds = Double(now - host) * Double(numer) / Double(denom) / 1_000_000_000
+        return ageSeconds <= 1.5
+    }
+}
+
+enum FooterMetrics {
+    static func lines(target: String, output: String, generation: String, budget: String,
+                      stalled: String, overdue: String, supplemental: [String]) -> (primary: String, secondary: String) {
+        let primary = [target, output, generation].filter { !$0.isEmpty }.joined(separator: " · ")
+        let secondary = ([budget, stalled, overdue] + supplemental).filter { !$0.isEmpty }.joined(separator: " · ")
+        return (primary, secondary)
+    }
+}
+
+struct R7PresentationHealth {
+    private(set) var stallSeconds = 0
+    private(set) var recoveryAttempted = false
+    private var generation: UInt64?
+    private var config: UInt64?
+    private var lastAccepted: UInt64?
+    private var lastPresented: UInt64?
+
+    mutating func reset() { self = R7PresentationHealth() }
+
+    mutating func observe(generation: UInt64, config: UInt64, running: Bool, visible: Bool,
+                          accepted: UInt64, presented: UInt64, changingContent: Bool) -> (firstStall: Bool, rearm: Bool) {
+        guard running else { reset(); return (false, false) }
+        if self.generation != generation || self.config != config ||
+            (lastAccepted != nil && accepted < lastAccepted!) || (lastPresented != nil && presented < lastPresented!) {
+            reset()
+            self.generation = generation
+            self.config = config
+        }
+        guard let previousAccepted = lastAccepted, let previousPresented = lastPresented else {
+            lastAccepted = accepted; lastPresented = presented
+            return (false, false)
+        }
+        if presented > previousPresented { recoveryAttempted = false }
+        if visible && accepted > previousAccepted && presented == previousPresented {
+            stallSeconds += 1
+        } else { stallSeconds = 0 }
+        let firstStall = stallSeconds == 3
+        let rearm = stallSeconds >= 3 && changingContent && !recoveryAttempted
+        if rearm { recoveryAttempted = true }
+        lastAccepted = accepted; lastPresented = presented
+        return (firstStall, rearm)
+    }
+}
+
+// Explicit diagnostic only. AX is queried on a worker, never in the tap callback.
+enum P1AXInvestigation {
+    static func rectMatches(_ a: CGRect, _ b: CGRect) -> Bool {
+        [a.minX-b.minX, a.minY-b.minY, a.width-b.width, a.height-b.height].allSatisfy { $0.isFinite && abs($0) <= 2 }
+    }
+    static func uniqueGeometry(total: Int, readable: Int, matches: Int, listSucceeded: Bool) -> Bool {
+        listSucceeded && total <= 8 && total == readable && matches == 1
+    }
+    private static func attribute(_ element: AXUIElement, _ name: String) -> (AXError, CFTypeRef?) {
+        var value: CFTypeRef?; let code = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+        return (code, value)
+    }
+    private static func rect(_ element: AXUIElement) -> CGRect? {
+        let (_, pv) = attribute(element, kAXPositionAttribute as String)
+        let (_, sv) = attribute(element, kAXSizeAttribute as String)
+        guard let pv, let sv, CFGetTypeID(pv) == AXValueGetTypeID(), CFGetTypeID(sv) == AXValueGetTypeID() else { return nil }
+        var p = CGPoint.zero; var s = CGSize.zero
+        guard AXValueGetValue(unsafeDowncast(pv, to: AXValue.self), .cgPoint, &p), AXValueGetValue(unsafeDowncast(sv, to: AXValue.self), .cgSize, &s),
+              p.x.isFinite, p.y.isFinite, s.width.isFinite, s.height.isFinite, s.width > 0, s.height > 0 else { return nil }
+        return CGRect(origin: p, size: s)
+    }
+    static func inspect(pid: pid_t, targetBounds: CGRect, source: CGRect) -> Data {
+        let app = AXUIElementCreateApplication(pid), system = AXUIElementCreateSystemWide()
+        _ = AXUIElementSetMessagingTimeout(app, 0.2) // system-wide timeout would alter this process globally
+        let (listCode, listValue) = attribute(app, kAXWindowsAttribute as String)
+        let windows = listValue as? [AXUIElement]
+        let bounded = windows != nil && windows!.count <= 8
+        var matches: [AXUIElement] = []; var readable = 0
+        if bounded, let windows {
+            for window in windows {
+                _ = AXUIElementSetMessagingTimeout(window, 0.2)
+                if let bounds = rect(window) { readable += 1; if rectMatches(bounds, targetBounds) { matches.append(window) } }
+            }
+        }
+        let unique = uniqueGeometry(total: windows?.count ?? 0, readable: readable, matches: matches.count, listSucceeded: listCode == .success && bounded)
+        let selected = unique ? matches.first : nil
+        let positions: [(String, CGFloat, CGFloat)] = [("upperLeft",0.02,0.02),("center",0.5,0.5),("right",0.75,0.5)]
+        var points: [[String: Any]] = []
+        for (name, x, y) in positions {
+            let pt = CGPoint(x: source.minX + source.width*x, y: source.minY + source.height*y)
+            var hit: AXUIElement?
+            let code = AXUIElementCopyElementAtPosition(system, Float(pt.x), Float(pt.y), &hit)
+            var row: [String: Any] = ["point": name, "position": [pt.x,pt.y], "status": code.rawValue, "association": "unknown"]
+            if let hit, code == .success {
+                _ = AXUIElementSetMessagingTimeout(hit, 0.2)
+                var hitPID: pid_t = 0; let pidStatus = AXUIElementGetPid(hit, &hitPID)
+                row["pidStatus"] = pidStatus.rawValue
+                if pidStatus == .success { row["pid"] = hitPID }
+                let (roleStatus, role) = attribute(hit, kAXRoleAttribute as String)
+                row["roleStatus"] = roleStatus.rawValue
+                if let role = role as? String { row["role"] = role }
+                let (windowStatus, value) = attribute(hit, kAXWindowAttribute as String)
+                row["windowStatus"] = windowStatus.rawValue
+                let window: AXUIElement? = (role as? String) == (kAXWindowRole as String) ? hit :
+                    value.flatMap { CFGetTypeID($0) == AXUIElementGetTypeID() ? unsafeDowncast($0, to: AXUIElement.self) : nil }
+                if let window {
+                    _ = AXUIElementSetMessagingTimeout(window, 0.2)
+                    let (roleStatus, windowRole) = attribute(window, kAXRoleAttribute as String)
+                    row["windowRoleStatus"] = roleStatus.rawValue
+                    if let role = windowRole as? String { row["windowRole"] = role }
+                    if let frame = rect(window) { row["windowBounds"] = [frame.minX,frame.minY,frame.width,frame.height] }
+                    if let selected, pidStatus == .success {
+                        row["association"] = hitPID == pid && CFEqual(window, selected) ? "unique_geometry_matched_ax_window" : "other_or_different_window"
+                    }
+                }
+            }
+            points.append(row)
+        }
+        let result: [String: Any] = ["scope":"AX z-order observation only; not a mouse-delivery receipt", "windowListStatus":listCode.rawValue,
+            "windowCount":windows?.count ?? 0, "windowListBounded":bounded, "windowBoundsReadable":readable, "matchingWindowCount":matches.count,
+            "uniqueGeometryAssociation":selected != nil, "associationScope":"geometry and AX identity only; CGWindowID linkage is not independently verified", "points":points]
+        return (try? JSONSerialization.data(withJSONObject: result)) ?? Data()
+    }
+}
+
+enum P1FocusPolicy {
+    enum Decision { case ready, wait, cancel }
+    static func decide(targetReady: Bool, acquired: Bool, ownFront: Bool, now: TimeInterval, deadline: TimeInterval) -> Decision {
+        if targetReady { return .ready }
+        if !acquired && ownFront && now.isFinite && now < deadline { return .wait }
+        return .cancel
+    }
+}
+
+// A single applied request may wait briefly for a transient obstruction.
+struct P1ObstructionWait {
+    private var started: TimeInterval?
+    private var generation: UInt64 = 0
+    private var config: UInt64 = 0
+    mutating func reset() { started = nil; generation = 0; config = 0 }
+    mutating func observe(blocked: Bool, now: TimeInterval, generation: UInt64, config: UInt64) -> Bool {
+        guard now.isFinite, generation > 0, config > 0 else { reset(); return false }
+        if let began = started {
+            guard self.generation == generation, self.config == config, now >= began, now - began < 5 else { reset(); return false }
+        }
+        if !blocked { reset(); return true }
+        if started == nil { started = now; self.generation = generation; self.config = config }
+        return true
+    }
+}
+
 enum TargetOverlayPolicy {
     struct WindowMetadata {
         let id: CGWindowID
@@ -240,6 +398,74 @@ enum TargetOverlayPolicy {
         if top.id != id { return WindowDecision(target: currentTarget, competing: top, reason: "other_window_frontmost") }
         return WindowDecision(target: currentTarget, competing: nil, reason: "matched")
     }
+    // The ordered list is only a sampled observation, never a delivery receipt.
+    // Treat an incomplete preceding window as unknown rather than assuming clear.
+    // Until the matching surface and tap exist, the visible preparation
+    // panel absorbs pointer input and keeps its stop button available.
+    static func interactionCanPassThrough(available: Bool, routerActive: Bool) -> Bool {
+        available && routerActive
+    }
+    static func interactionOwnedPassThrough(output: CGWindowID?, controls: CGWindowID?, huds: [CGWindowID]) -> Set<CGWindowID> {
+        Set(([output, controls].compactMap { $0 } + huds).filter { $0 != 0 })
+    }
+    struct InteractionGuardResult {
+        let clear: Bool
+        let reason: String
+        let missing: [String]
+        let blocker: [String: Any]
+        let targetFound: String
+        var diagnostic: [String: Any] {
+            ["clear": clear, "reason": reason, "missing": missing, "blocker": blocker, "targetFound": targetFound]
+        }
+    }
+    static func interactionGuard(_ windows: [[String: Any]]?, id: CGWindowID, owner: pid_t,
+                                 source: CGRect, passthrough: Set<CGWindowID>) -> InteractionGuardResult {
+        func result(_ clear: Bool, _ reason: String, _ missing: [String] = [], _ blocker: [String: Any] = [:], _ found: String = "unknown") -> InteractionGuardResult {
+            InteractionGuardResult(clear: clear, reason: reason, missing: missing, blocker: blocker, targetFound: found)
+        }
+        guard let windows else { return result(false, "window_list_unavailable") }
+        guard source.minX.isFinite, source.minY.isFinite, source.width.isFinite, source.height.isFinite,
+              source.width > 0, source.height > 0 else { return result(false, "source_bounds_invalid") }
+        let found = windows.contains { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == id }
+            ? "yes" : (windows.contains { ($0[kCGWindowNumber as String] as? NSNumber) == nil } ? "unknown" : "no")
+        for item in windows {
+            let windowID = (item[kCGWindowNumber as String] as? NSNumber)?.uint32Value
+            if let windowID, passthrough.contains(windowID), windowID != id { continue }
+            let pid = (item[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+            let layer = (item[kCGWindowLayer as String] as? NSNumber)?.intValue
+            let alpha = (item[kCGWindowAlpha as String] as? NSNumber)?.doubleValue
+            let on = (item[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue
+            let bounds = (item[kCGWindowBounds as String] as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) }
+            let validBounds = bounds.map { $0.minX.isFinite && $0.minY.isFinite && $0.width.isFinite && $0.height.isFinite && $0.width > 0 && $0.height > 0 } ?? false
+            let validAlpha = alpha?.isFinite ?? false
+            var missing: [String] = []
+            if windowID == nil { missing.append("windowID") }; if pid == nil { missing.append("pid") }
+            if layer == nil { missing.append("layer") }; if !validAlpha { missing.append("alpha") }
+            if on == nil { missing.append("onscreen") }; if !validBounds { missing.append("bounds") }
+            let blocker: [String: Any] = ["windowID": windowID.map { $0 as Any } ?? NSNull(),
+                "pid": pid.map { $0 as Any } ?? NSNull(), "layer": layer.map { $0 as Any } ?? NSNull(),
+                "alpha": validAlpha ? alpha! : NSNull(),
+                "bounds": validBounds ? [bounds!.minX, bounds!.minY, bounds!.width, bounds!.height] : NSNull()]
+            if windowID == id {
+                guard missing.isEmpty, let target = normalizeWindow(item), target.owner == owner, target.onscreen, target.alpha.map({ $0 > 0.01 }) == true else {
+                    return result(false, "target_invalid", missing, blocker, found)
+                }
+                return result(true, "clear", [], [:], found)
+            }
+            // A finite positive bounding rectangle proves disjointness; unrelated
+            // identity or opacity fields cannot change that geometric fact.
+            if validBounds, let bounds, !bounds.intersects(source) { continue }
+            guard missing.isEmpty else { return result(false, "preceding_metadata_incomplete", missing, blocker, found) }
+            // Opacity alone does not prove that an overlapping window is
+            // unable to receive events; require it to be offscreen or disjoint.
+            if on == true { return result(false, "overlapping_window", [], blocker, found) }
+        }
+        return result(false, "target_not_found", [], [:], found)
+    }
+    static func interactionUnobstructed(_ windows: [[String: Any]]?, id: CGWindowID, owner: pid_t,
+                                        source: CGRect, passthrough: Set<CGWindowID>) -> Bool {
+        interactionGuard(windows, id: id, owner: owner, source: source, passthrough: passthrough).clear
+    }
     static func shouldCancel(exists: Bool, onscreen: Bool, wasOnscreen: Bool) -> Bool {
         !exists || (wasOnscreen && !onscreen)
     }
@@ -254,11 +480,17 @@ enum TargetOverlayPolicy {
                           config: UInt64, currentConfig: UInt64, targetReady: Bool) -> Bool {
         token != 0 && token == currentToken && generation == currentGeneration && config == currentConfig && targetReady
     }
+    static func windowInputAligned(viewMode: String) -> Bool { viewMode != "compare" }
     static func outputFrame(target: NSRect, fullscreen: Bool, display: NSRect?) -> NSRect? {
         fullscreen ? display : target
     }
     static func followsTarget(fullscreen: Bool, viewerFollowOverride: Bool) -> Bool {
         !fullscreen || viewerFollowOverride
+    }
+    static func usesFullscreen(windowTarget: Bool, explicitViewer: Bool, interactiveAvailable: Bool,
+                               diagnosticFullscreen: Bool, legacyFullscreen: Bool, viewerFollowOverride: Bool) -> Bool {
+        diagnosticFullscreen || (windowTarget && (explicitViewer || interactiveAvailable)) ||
+            (!windowTarget && !followsTarget(fullscreen: legacyFullscreen, viewerFollowOverride: viewerFollowOverride))
     }
     static func screenIndex(target: NSRect, screens: [NSRect]) -> Int? {
         guard !target.isEmpty else { return nil }
@@ -322,6 +554,9 @@ struct EnhancementProfile: Codable, Equatable {
     var outputHeight = 1080
     var outputDisplayID: UInt32 = 0
     var outputFullscreen = false
+    // Legacy window output stays source-aligned; saved interaction is never
+    // armed until the user explicitly applies it in the current session.
+    var windowOutputMode = "follow"
     var soundMode = "sourceApplication"
     var viewMode = "enhanced"
     var appearance = "system"
@@ -346,6 +581,7 @@ enum EnhancementProfileStore {
         guard var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         if object["rifeStreamEnabled"] == nil { object["rifeStreamEnabled"] = false }
         if object["captureLimit"] == nil { object["captureLimit"] = "auto" }
+        if !["follow", "viewer", "absolute", "relative"].contains(object["windowOutputMode"] as? String ?? "") { object["windowOutputMode"] = "follow" }
         if object["configName"] == nil { object["configName"] = fallbackName }
         if object["scaleQualityID"] == nil { object["scaleQualityID"] = "none" }
         if object["modelID"] == nil {
@@ -601,6 +837,24 @@ private enum WorkbenchDimensionPolicy {
     static func editable(sizeIndex: Int, scaleEnabled: Bool) -> Bool { scaleEnabled && sizeIndex == 4 }
 }
 
+enum P0DiagnosticPolicy {
+    static func controlsEnabled(args: [String], isolated: Bool) -> Bool {
+        isolated && args.contains("--khua-p0-controls")
+    }
+    static func flag(_ name: String, args: [String], isolated: Bool, overrideValue: Bool?) -> Bool {
+        guard isolated else { return false }
+        if controlsEnabled(args: args, isolated: isolated), let overrideValue { return overrideValue }
+        return args.contains(name)
+    }
+}
+
+enum WorkbenchTitle {
+    static func text(_ base: String, candidate: String) -> String {
+        let label = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        return base + (label.isEmpty ? "" : " · " + label)
+    }
+}
+
 final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate, NSTextFieldDelegate {
     /// Capture callbacks call only the processor's queueing entry points.
     private final class CaptureProcessorSink: @unchecked Sendable {
@@ -626,8 +880,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private var viewerActive = false
     private var viewerFollowOverride = false
     private var viewerReturnPID: pid_t?
-    private var viewerControls: NSView?
+    private var viewerControls: NSStackView?
     private var viewerControlsPanel: NSPanel?
+    private weak var viewerStopButton: NSButton?
     private var targetHUD: NSPanel?
     private var targetCountdownHUD: NSPanel?
     private let targetFPS = NSTextField(labelWithString: "")
@@ -657,7 +912,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private var ownCaptureApplications: [SCRunningApplication] = []
 
     private let statusLabel = NSTextField(labelWithString: "")
-    private let statsLabel = NSTextField(wrappingLabelWithString: "")
+    private let statsLabel = NSTextField(labelWithString: "")
+    private let budgetLabel = NSTextField(labelWithString: "")
     private let planLabel = NSTextField(wrappingLabelWithString: "")
     private let sizeChainLabel = NSTextField(wrappingLabelWithString: "")
     private let sourceLabel = NSTextField(labelWithString: "")
@@ -690,6 +946,25 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private var dimensionEditOriginal: [ObjectIdentifier: String] = [:]
     private let displayPopup = NSPopUpButton()
     private let fullscreenCheck = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+    private let windowOutputPopup = NSPopUpButton()
+    private let interactionStateLabel = NSTextField(wrappingLabelWithString: "")
+    private let inputMonitoringButton = NSButton()
+    private let accessibilityButton = NSButton()
+    private let eventAccessButton = NSButton()
+    private var interactionArmed = false
+    private var interactionFailure = ""
+    private var interactionSourceUnobstructed = false
+    private var interactionObstructionWait = P1ObstructionWait()
+    private var interactionRequestGeneration: UInt64 = 0
+    private var interactionRequestConfig: UInt64 = 0
+    private var interactionFocusAcquired = false
+    private var interactionFocusDeadline: TimeInterval = 0
+    private var interactionGuardFirst: [String: Any]?
+    private var interactionGuardLast: [String: Any]?
+    private var interactionAXBusy = false
+    private var interactionAXLastRequest: TimeInterval = 0
+    private var interactionGeometryWaitAt: TimeInterval = 0
+    private var inputRouter: LiveInputRouter?
     private let fpsSwitch = NSSwitch()
     private let previewFPS = NSTextField(labelWithString: "")
     private let outputFPS = NSTextField(labelWithString: "")
@@ -705,6 +980,28 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private var liveLogTimer: Timer?
     private var visibilityTimer: Timer?
     static var liveLogPath: String?
+    private var r7Health = R7PresentationHealth()
+    private var r7Visibility = ""
+    private var r7LastHealthAt: TimeInterval = 0
+    private var r7Diagnostics: Bool { PixelDiagnosticsPolicy.enabled(CommandLine.arguments) }
+    private var p0ControlsEnabled: Bool { P0DiagnosticPolicy.controlsEnabled(args: CommandLine.arguments, isolated: r7Diagnostics) }
+    private var p0OpaqueOverride: Bool?
+    private var p0ActivateOverride: Bool?
+    private var p0OpaqueButton: NSButton?
+    private var p0ActivateButton: NSButton?
+    private var p0CaptureButton: NSButton?
+    private var p0MainOpaqueButton: NSButton?
+    private var p0MainActivateButton: NSButton?
+    private var p0MainCaptureButton: NSButton?
+    private var p0MainActionInProgress = false
+    private var geometryObservedWindow: CGWindowID = 0
+    private var geometryObservedGeneration: UInt64 = 0
+    private var geometryObservedBounds: CGRect = .null
+    private var geometryBoundsChangedHost: UInt64 = 0
+    private func r7Flag(_ flag: String) -> Bool {
+        let overrideValue = flag == "--khua-r7-opaque" ? p0OpaqueOverride : (flag == "--khua-r7-activate" ? p0ActivateOverride : nil)
+        return P0DiagnosticPolicy.flag(flag, args: CommandLine.arguments, isolated: r7Diagnostics, overrideValue: overrideValue)
+    }
     private let shareStack = NSStackView()
     private let diagnosticLabel = NSTextField(labelWithString: "")
     private let sourceStripLabel = NSTextField(labelWithString: "")
@@ -763,7 +1060,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                               backing: .buffered, defer: false)
         let candidate = (Bundle.main.object(forInfoDictionaryKey: "SPCandidateLabel") as? String ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        window.title = EnhancementText.t("Quality Workbench", "画质工作台") + (candidate.isEmpty ? "" : " · " + candidate)
+        window.title = WorkbenchTitle.text(EnhancementText.t("Quality Workbench", "画质工作台"), candidate: candidate)
         window.minSize = NSSize(width: 1100, height: 760)
         super.init(window: window)
         profile.configID = EnhancementProfileStore.resolvedID(profile)
@@ -989,6 +1286,17 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         sideStack.addArrangedSubview(navButtons[0])
         sideStack.addArrangedSubview(navButtons[1])
         sideStack.addArrangedSubview(navButtons[2])
+        if p0ControlsEnabled {
+            let opaque = NSButton(title: "", target: self, action: #selector(toggleP0OpaqueFromMain))
+            let focus = NSButton(title: "", target: self, action: #selector(toggleP0ActivationFromMain))
+            let cap = NSButton(title: "", target: self, action: #selector(toggleP0CaptureCapFromMain))
+            opaque.identifier = NSUserInterfaceItemIdentifier("p0.main.opaque")
+            focus.identifier = NSUserInterfaceItemIdentifier("p0.main.focus")
+            cap.identifier = NSUserInterfaceItemIdentifier("p0.main.capture")
+            for item in [opaque, focus, cap] { item.bezelStyle = .rounded; sideStack.addArrangedSubview(item) }
+            p0MainOpaqueButton = opaque; p0MainActivateButton = focus; p0MainCaptureButton = cap
+            refreshP0ControlTitles()
+        }
         sideStack.addArrangedSubview(heading(EnhancementText.t("Configs", "配置")))
         configRows.orientation = .vertical
         configRows.alignment = .leading
@@ -1445,8 +1753,28 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         customRateRow = customRate
         frames.addArrangedSubview(customRate)
         frames.addArrangedSubview(multiplierControl)
+        let interaction = column()
+        interaction.addArrangedSubview(heading(EnhancementText.t("Window output", "窗口输出")))
+        windowOutputPopup.addItems(withTitles: [EnhancementText.t("Follow source", "跟随来源"),
+            EnhancementText.t("Fullscreen viewer", "全屏观看"), EnhancementText.t("Fullscreen interaction · pointer", "全屏交互 · 指针"),
+            EnhancementText.t("Fullscreen interaction · relative", "全屏交互 · 相对输入")])
+        windowOutputPopup.target = self
+        windowOutputPopup.action = #selector(interactionModeChanged)
+        interaction.addArrangedSubview(windowOutputPopup)
+        interactionStateLabel.maximumNumberOfLines = 4
+        interactionStateLabel.textColor = .secondaryLabelColor
+        interaction.addArrangedSubview(interactionStateLabel)
+        for (button, title, action) in [
+            (inputMonitoringButton, EnhancementText.t("Input Monitoring…", "输入监听设置…"), #selector(requestInputMonitoring)),
+            (accessibilityButton, EnhancementText.t("Accessibility…", "辅助功能设置…"), #selector(requestAccessibility)),
+            (eventAccessButton, EnhancementText.t("Request event access…", "请求事件访问…"), #selector(requestEventAccess))
+        ] {
+            button.title = title; button.target = self; button.action = action
+            button.isHidden = true
+            interaction.addArrangedSubview(button)
+        }
         phaseLabel.stringValue = ""
-        for column in [scale, frames] {
+        for column in [scale, frames, interaction] {
             for item in column.arrangedSubviews {
                 item.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
             }
@@ -1458,11 +1786,14 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         stack.spacing = 12
         let scaleCard = card(scale)
         let framesCard = card(frames)
+        let interactionCard = card(interaction)
         stack.addArrangedSubview(scaleCard)
         stack.addArrangedSubview(framesCard)
+        stack.addArrangedSubview(interactionCard)
         NSLayoutConstraint.activate([
             scaleCard.widthAnchor.constraint(equalTo: stack.widthAnchor),
             framesCard.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            interactionCard.widthAnchor.constraint(equalTo: stack.widthAnchor),
         ])
         return stack
     }
@@ -1491,16 +1822,20 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let statusColumn = NSStackView()
         statusColumn.orientation = .vertical
         statusColumn.alignment = .leading
-        statusColumn.spacing = 2
+        statusColumn.spacing = 1
+        statusColumn.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         statusColumn.addArrangedSubview(statusLabel)
-        statusColumn.addArrangedSubview(planLabel)
-        sizeChainLabel.maximumNumberOfLines = 2
-        sizeChainLabel.textColor = .secondaryLabelColor
-        sizeChainLabel.preferredMaxLayoutWidth = 520
-        statusColumn.addArrangedSubview(sizeChainLabel)
-        statsLabel.font = .systemFont(ofSize: 11)
-        statsLabel.textColor = .secondaryLabelColor
-        statusColumn.addArrangedSubview(statsLabel)
+        for label in [statsLabel, budgetLabel] {
+            label.font = .systemFont(ofSize: 11)
+            label.textColor = .secondaryLabelColor
+            label.lineBreakMode = .byTruncatingTail
+            label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            statusColumn.addArrangedSubview(label)
+        }
+        for label in [statusLabel, statsLabel, budgetLabel] {
+            label.widthAnchor.constraint(lessThanOrEqualTo: statusColumn.widthAnchor).isActive = true
+        }
+        buttons.setContentCompressionResistancePriority(.required, for: .horizontal)
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
@@ -1513,6 +1848,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         buttons.addArrangedSubview(stop)
         row.addArrangedSubview(buttons)
         stack.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         return stack
     }
 
@@ -1698,11 +2034,13 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     @objc private func sourceKindChanged() {
         cancelCountdown()
+        inputRouter?.stop(reason:"source_changed"); interactionArmed = false
         readControls()
         updateAppleSRCapability()
         refreshSourceBar()
         persist()
         refreshPlanLabel()
+        refreshInteractionStatus()
     }
 
     private func applyPresetDefaults(_ id: String) {
@@ -2233,7 +2571,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private func refreshActions() {
         let player = selectedFilePlayer()
         let enhancing = profile.sourceKind == "file" ? ((player?.workbenchMotionPlusRequested ?? false) || (player?.workbenchFileLanczosActive ?? false)) :
-            (capture.running && (processor.resolvedPlan.interpolationActive || processor.resolvedPlan.scaleActive))
+            (capture.running && (processor.resolvedPlan.interpolationActive || processor.resolvedPlan.scaleActive || (applied.sourceKind == "window" && applied.windowOutputMode != "follow")))
         startButton?.isHidden = false
         startButton?.isEnabled = !filePreparing
         startButton?.title = filePreparing ? EnhancementText.t("Preparing…", "准备中…") : (countdown.active ? "\(countdown.remaining)" : (enhancing ? EnhancementText.t("Apply Changes", "应用更改") : EnhancementText.t("Start Enhancement", "开始增强")))
@@ -2246,7 +2584,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         stack.alignment = .centerY
         stack.spacing = 6
         let label = NSTextField(labelWithString: title)
-        label.widthAnchor.constraint(equalToConstant: 58).isActive = true
+        label.widthAnchor.constraint(equalToConstant: 82).isActive = true
         stack.addArrangedSubview(label)
         control.setContentHuggingPriority(.defaultLow, for: .horizontal)
         control.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -2368,6 +2706,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                     let lag = player.workbenchFileLanczosActive && player.workbenchVideoDelayMs >= 0
                         ? String(format: EnhancementText.t("Video delay ≈ %.0f ms", "视频延后约 %.0f 毫秒"), player.workbenchVideoDelayMs) : ""
                     self.statsLabel.stringValue = [rate, coverage, lag].filter { !$0.isEmpty }.joined(separator: " · ")
+                    self.budgetLabel.stringValue = ""
                     let warning = player.workbenchMotionPlusStatus
                     if !self.fileApplyError.isEmpty {
                         self.statusLabel.stringValue = self.fileApplyError
@@ -2410,7 +2749,21 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 "ackEngine": engine, "ackModel": model, "ackReason": reason, "ackMatched": matched]
             guard matched else { self.recordPlanEvent("ack", extra: event); return }
             if state == 2, let pending = self.pendingApply {
+                self.inputRouter?.stop(reason:"configuration_changed")
+                if self.isInteractiveMode(pending.windowOutputMode) && self.viewerActive {
+                    self.viewerActive = false; self.viewerReturnPID = nil
+                    (self.outputWindow as? TargetPanel)?.viewerKeyboard = false
+                    self.outputWindow?.orderOut(nil); self.viewerControlsPanel?.orderOut(nil)
+                }
                 self.applied = pending
+                self.interactionArmed = self.isInteractiveMode(pending.windowOutputMode) && pending.sourceKind == "window"
+                self.interactionObstructionWait.reset()
+                self.interactionRequestGeneration = self.capture.currentGeneration
+                self.interactionRequestConfig = self.processor.resolvedPlan.configVersion
+                self.interactionFocusAcquired = false
+                self.interactionFocusDeadline = ProcessInfo.processInfo.systemUptime + 5
+                self.interactionFailure = ""
+                self.interactionGeometryWaitAt = 0
                 self.cadenceRefreshHz = -1
                 self.syncRawCadenceEnvironment()
                 self.viewerFollowOverride = false
@@ -2448,7 +2801,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             guard TargetOverlayPolicy.canReveal(token: token, currentToken: self.outputWarmupToken,
                     generation: generation, currentGeneration: self.capture.currentGeneration,
                     config: config, currentConfig: self.processor.resolvedPlan.configVersion, targetReady: targetReady) else { return }
+            self.recordPlanEvent("output_surface_ready", extra: ["generation": generation, "config": config, "token": token])
             panel.alphaValue = 1
+            self.recordPlanEvent("reveal_alpha_1")
             self.outputPreview.refreshVisibilitySnapshot()
             self.outputWarmupStartedAt = 0
             self.lastStatsReceipt = 0
@@ -2459,11 +2814,16 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             DispatchQueue.main.async {
                 guard let self else { return }
                 guard generation == self.capture.currentGeneration else { return }
+                self.inputRouter?.stop(reason:"source_changed")
+                self.interactionArmed = false
                 if self.countdown.active && generation != self.countdownSourceGeneration { self.cancelCountdown() }
                 if let pending = self.pendingSourceGeneration, generation != pending {
                     self.recordPlanEvent("source_supersedes_request")
                     self.liveApply.cancel(); self.pendingApply = nil; self.pendingSourceGeneration = nil
                 }
+                self.r7Health.reset()
+                self.r7LastHealthAt = 0
+                self.r7Visibility = ""
                 self.targetWasOnscreen = false
                 self.viewerActive = false
                 self.viewerFollowOverride = false
@@ -2517,6 +2877,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         let sink = CaptureProcessorSink(processor)
         capture.onNote = { code in sink.processor.noteCaptureStatus(code) }
+        capture.onGeometry = { geometry, generation in sink.processor.observeCaptureGeometry(geometry, generation: generation) }
         capture.onRawFrame = { ptsNum, ptsDen, host, width, height, generation in
             sink.processor.noteRawCapture(ptsNum: ptsNum, ptsDen: ptsDen, host: host,
                                           width: width, height: height, generation: generation)
@@ -2599,6 +2960,11 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func updateStatsText(_ stats: [String: Any]) {
+        let healthNow = ProcessInfo.processInfo.systemUptime
+        if healthNow - r7LastHealthAt >= 1 {
+            r7LastHealthAt = healthNow
+            observeR7Health()
+        }
         if let width = stats["sourceWidth"] as? Int, let height = stats["sourceHeight"] as? Int, width > 0 {
             let fps = stats["callbackFPS"] as? Double ?? 0
             let label = EnhancementText.t("Capture", "采集回调")
@@ -2623,9 +2989,26 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             ? EnhancementText.t("Target ≈%.0f", "目标 ≈%.0f") : EnhancementText.t("Target %.0f", "目标 %.0f"), targetFPS) : ""
         let coverage = attempted > 0 ? "\(EnhancementText.t("Synthesized", "合成")) \(presented)/\(attempted)" : ""
         let budget = budgetSkipped > 0 ? "\(EnhancementText.t("Display budget skipped", "显示上限跳过")) \(budgetSkipped)" : ""
+        let generatedFPS = stats["r9GeneratedFPS"] as? Double ?? -1
+        let onTimeFPS = stats["r9OnTimeSyntheticFPS"] as? Double ?? -1
+        let generationRates = processor.resolvedPlan.interpolationActive && generatedFPS >= 0 && onTimeFPS >= 0
+            ? String(format: EnhancementText.t("Generated %.1f/s · on-time %.1f/s", "生成 %.1f/秒 · 按期合成 %.1f/秒"), generatedFPS, onTimeFPS) : ""
+        let requiredBudget = stats["r9RequiredBudgetMs"] as? Double ?? 0
+        let allowedBudget = stats["r9AllowedBudgetMs"] as? Double ?? 0
+        let budgetLimited = (stats["r9BudgetLimited"] as? Bool) == true
+            ? String(format: EnhancementText.t("FRC budget limited (needs %.0f ms, allows %.0f ms)", "插帧预算不足（需要 %.0f ms，可用 %.0f ms）"), requiredBudget, allowedBudget) : ""
+        let outputStalled = r7Health.stallSeconds >= 3
+            ? EnhancementText.t("Capture continues; output has not presented", "采集持续，输出尚未呈现") : ""
+        let modelOverdue = (stats["r7OldestJobAgeMs"] as? Double ?? -1) > 1000
+            ? EnhancementText.t("Enhancement job delayed", "增强任务超时") : ""
         let holds = ((stats["epochStaticHoldPhases"] as? Int) ?? 0) > 0
             ? EnhancementText.t("Identical frames held", "静止画面保持原图") : ""
-        statsLabel.stringValue = capture.running ? [targetText, rate, coverage, budget, holds].filter { !$0.isEmpty }.joined(separator: " · ") + hint : ""
+        let lines = FooterMetrics.lines(target: targetText, output: rate, generation: generationRates,
+            budget: budgetLimited, stalled: outputStalled, overdue: modelOverdue,
+            supplemental: [coverage, budget, holds, sizeChainLabel.stringValue, hint.trimmingCharacters(in: .whitespaces)])
+        statsLabel.stringValue = capture.running ? lines.primary : ""
+        budgetLabel.stringValue = capture.running ? lines.secondary : ""
+        budgetLabel.textColor = budgetLimited.isEmpty ? .secondaryLabelColor : .systemOrange
     }
 
     @objc private func captureCapChanged() {
@@ -2653,6 +3036,52 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
     }
 
+    private func observeR7Health() {
+        let captureStats = capture.diagnostics()
+        let stats = processor.stats
+        let accepted = (captureStats["accepted"] as? NSNumber)?.uint64Value ?? 0
+        let presented = (stats["outputPresentedValidTime"] as? NSNumber)?.uint64Value ?? 0
+        let visible = outputWindow?.isVisible == true && outputWindow?.alphaValue == 1 && targetFrontmost
+        let state = "\(visible):\(targetDecisionReason):\(NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0)"
+        if state != r7Visibility {
+            r7Visibility = state
+            recordPlanEvent("visibility_changed")
+        }
+        let generation = capture.currentGeneration
+        let config = processor.resolvedPlan.configVersion
+        // Cached stats can briefly belong to a retired source or plan.
+        guard (stats["sourceGeneration"] as? NSNumber)?.uint64Value == generation,
+              (stats["configVersion"] as? NSNumber)?.uint64Value == config else {
+            r7Health.reset()
+            return
+        }
+        let evidence = stats["r7ContentChange"] as? [String: Any] ?? [:]
+        var timebase = mach_timebase_info_data_t()
+        mach_timebase_info(&timebase)
+        let contentFresh = R7ContentChangeEvidence.isFresh(now: mach_absolute_time(),
+            host: (evidence["host"] as? NSNumber)?.uint64Value ?? 0, numer: timebase.numer, denom: timebase.denom,
+            generation: generation, config: config, epoch: (stats["measurementEpoch"] as? NSNumber)?.uint64Value ?? 0,
+            evidenceGeneration: (evidence["generation"] as? NSNumber)?.uint64Value ?? 0,
+            evidenceConfig: (evidence["configVersion"] as? NSNumber)?.uint64Value ?? 0,
+            evidenceEpoch: (evidence["measurementEpoch"] as? NSNumber)?.uint64Value ?? 0,
+            snapshotStale: (stats["snapshotStale"] as? Bool) == true)
+        let result = r7Health.observe(generation: generation, config: config,
+            running: capture.running && !capture.paused, visible: visible,
+            accepted: accepted, presented: presented, changingContent: contentFresh)
+        if result.firstStall {
+            recordPlanEvent("capture_advancing_present_stalled", extra: ["observationSeconds": r7Health.stallSeconds])
+        }
+        if result.rearm {
+            // Re-arm only this presenter; preserve capture and in-flight work.
+            outputWarmupToken &+= 1
+            outputMinimumCaptureHost = Int64(mach_absolute_time())
+            outputWindow?.orderOut(nil)
+            outputPreview.refreshVisibilitySnapshot()
+            recordPlanEvent("presenter_rearm")
+            updateTargetPanels()
+        }
+    }
+
     private func recordPlanEvent(_ event: String, extra: [String: Any] = [:]) {
         guard let path = Self.liveLogPath else { return }
         writeLiveLog(to: path, event: event, extra: extra)
@@ -2661,6 +3090,15 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private func writeLiveLog(to path: String, event: String? = nil, extra: [String: Any] = [:]) {
         var line: [String: Any] = [
             "t": Date().timeIntervalSince1970,
+            "monotonicSeconds": ProcessInfo.processInfo.systemUptime,
+            "machAbsolute": mach_absolute_time(),
+            "r8ProcessID": ProcessInfo.processInfo.processIdentifier,
+            "r7Passthrough": r7Flag("--khua-r7-passthrough"),
+            "r7Opaque": r7Flag("--khua-r7-opaque"),
+            "r7Activate": r7Flag("--khua-r7-activate"),
+            "r7FullscreenGeometry": r7Flag("--khua-r7-fullscreen-geometry"),
+            "p0ControlsEnabled": p0ControlsEnabled,
+            "p0RequestedCaptureCap": capture.captureCapFPS,
             "realWindowCapture": capture.running,
             "capturePaused": capture.paused,
             "sourceKind": activeSourceKind.isEmpty ? profile.sourceKind : activeSourceKind,
@@ -2669,6 +3107,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             "sourceBundle": activeSourceBundle,
             "capture": capture.diagnostics(),
             "processor": processor.stats,
+            "sharedGeometry": outputPreview.sharedGeometrySnapshot(),
             "presentationLimited": processor.resolvedPlan.presentationLimited,
             "countdownActive": countdown.active,
             "countdownRemaining": countdown.remaining,
@@ -2683,7 +3122,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             "appliedEngine": applied.interpolationEngineID,
             "appliedModel": applied.modelID,
             "targetOnscreen": targetOnscreen,
-            "targetFrontmostMatch": targetFrontmost,
+            "targetFrontmostMatch": targetDecisionReason == "matched",
+            "outputTargetReady": targetFrontmost,
+            "diagnosticOwnActivated": viewerActive && r7Flag("--khua-r7-activate"),
             "targetOverlayFrame": [targetFrame.origin.x, targetFrame.origin.y, targetFrame.width, targetFrame.height],
             "targetContentRectVerified": targetContentRectVerified,
             "outputPanelVisible": outputWindow?.isVisible ?? false,
@@ -2693,6 +3134,19 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             "outputLayerIsOpaque": outputPreview.layer?.isOpaque ?? false,
             "outputFollowsWindow": outputFollowsWindow,
             "outputFullscreenApplied": applied.outputFullscreen,
+            "requestedWindowOutputMode": profile.windowOutputMode,
+            "appliedWindowOutputMode": applied.windowOutputMode,
+            "inputRoute": inputRouter?.diagnostics() ?? ["active": false, "reason": "not_started"],
+            "inputListenPermission": isInteractiveMode(profile.windowOutputMode) ? LiveInputRouter.Permission.preflight().listen : false,
+            "inputPostPermission": isInteractiveMode(profile.windowOutputMode) ? LiveInputRouter.Permission.preflight().post : false,
+            "inputAccessibilityTrusted": isInteractiveMode(profile.windowOutputMode) ? LiveInputRouter.Permission.preflight().accessibility : false,
+            "effectiveMode": (outputWindow?.isVisible != true) ? "hidden" :
+                (r7Flag("--khua-r7-fullscreen-geometry") && activeSourceKind == "window" ? "diagnostic_fullscreen_input_blocked" :
+                 (outputFollowsWindow ? "source_aligned_interactive" : (isInteractiveMode(applied.windowOutputMode) ?
+                    (inputRouter?.ready == true ? "fullscreen_interaction_\(applied.windowOutputMode)" : "fullscreen_interaction_preparing") : "fullscreen_viewer_input_blocked"))),
+            "effectiveViewMode": profile.viewMode,
+            "outputPanelIsKey": outputWindow?.isKeyWindow ?? false,
+            "frontProcessActualPID": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0,
             "hudPanelVisible": targetHUD?.isVisible ?? false,
             "countdownPanelVisible": targetCountdownHUD?.isVisible ?? false,
             "outputPanelClickThrough": outputWindow?.ignoresMouseEvents ?? true,
@@ -2717,6 +3171,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         case let .display(id): line["targetDisplayID"] = id
         case nil: break
         }
+        if r7Diagnostics {
+            line["interactionGuardFirst"] = interactionGuardFirst ?? NSNull()
+            line["interactionGuardLast"] = interactionGuardLast ?? NSNull()
+        }
         line.merge(targetDecision) { _, new in new }
         line["targetMatchReason"] = targetDecisionReason
         line["outputHiddenReason"] = outputHiddenReason
@@ -2731,12 +3189,13 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         try? handle.write(contentsOf: data)
     }
 
-    @objc private func chooseWindow() { cancelCountdown(); profile.sourceKind = "window"; capture.presentPicker(windows: true); persist() }
-    @objc private func chooseDisplay() { cancelCountdown(); profile.sourceKind = "display"; capture.presentPicker(windows: false); persist() }
+    @objc private func chooseWindow() { cancelCountdown(); inputRouter?.stop(reason:"source_changed"); interactionArmed = false; profile.sourceKind = "window"; capture.presentPicker(windows: true); persist() }
+    @objc private func chooseDisplay() { cancelCountdown(); inputRouter?.stop(reason:"source_changed"); interactionArmed = false; profile.sourceKind = "display"; capture.presentPicker(windows: false); persist() }
     @objc private func reselect() { if profile.sourceKind == "display" { chooseDisplay() } else { chooseWindow() } }
 
     @objc func chooseFile() {
         cancelCountdown()
+        inputRouter?.stop(reason:"source_changed"); interactionArmed = false
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.movie, .video, .mpeg4Movie, .quickTimeMovie]
         panel.canChooseFiles = true
@@ -2925,6 +3384,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     @objc private func apply() { start() }
 
     @objc private func stop() {
+        recordPlanEvent("stop")
+        inputRouter?.stop(reason:"stopped")
+        interactionArmed = false
+        r7Health.reset()
+        r7LastHealthAt = 0
+        r7Visibility = ""
         cancelCountdown()
         if profile.sourceKind == "file" {
             applyingFileSettings = true
@@ -2934,6 +3399,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             applyingFileSettings = false
             fileApplied = nil
             statsLabel.stringValue = ""
+            budgetLabel.stringValue = ""
             statusLabel.stringValue = EnhancementText.t("Stopped", "已停止")
             statusLabel.textColor = .labelColor
             refreshActions()
@@ -2960,12 +3426,16 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         statusLabel.stringValue = EnhancementText.t("Stopped", "已停止")
         statusLabel.textColor = .labelColor
         statsLabel.stringValue = ""
+        budgetLabel.stringValue = ""
         refreshActions()
         refreshPlanLabel()
+        refreshInteractionStatus()
     }
 
     @objc private func pause() {
         cancelCountdown()
+        inputRouter?.stop(reason:"paused")
+        interactionArmed = false
         if profile.sourceKind == "file", let player = selectedFilePlayer() {
             player.workbenchTogglePlayback()
             pauseButton?.title = player.workbenchIsPlaying ? EnhancementText.t("Pause", "暂停") : EnhancementText.t("Resume", "继续")
@@ -2994,6 +3464,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         statusLabel.textColor = .labelColor
         updateTargetPanels()
         updateFPSOverlay()
+        refreshInteractionStatus()
         recordPlanEvent(capture.paused ? "pause" : "resume")
     }
 
@@ -3001,6 +3472,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     @objc private func viewModeChanged() {
         cancelCountdown()
+        inputRouter?.stop(reason:"view_changed")
+        interactionArmed = false
         fileApplyError = ""
         readControls()
         if profile.sourceKind == "file" {
@@ -3041,6 +3514,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     @objc private func controlChanged() {
         cancelCountdown()
+        inputRouter?.stop(reason:"configuration_changed"); interactionArmed = false
         fileApplyError = ""
         if rateMode.selectedSegment == 1 && multiplierControl.selectedSegment < 0 {
             multiplierControl.selectedSegment = 0
@@ -3080,10 +3554,14 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private func applyModeVisibility() {
         fullscreenCheck.title = profile.sourceKind == "file"
             ? EnhancementText.t("Fullscreen on output display", "在输出显示器全屏")
-            : EnhancementText.t("Fullscreen viewer (Esc to return to interaction)", "全屏预览（Esc 返回交互）")
-        fullscreenCheck.toolTip = profile.sourceKind == "file" ? nil : EnhancementText.t(
-            "Fullscreen pauses source input. Use the on-screen button or Esc to return.",
-            "全屏暂停来源输入；可用画面内按钮或 Esc 返回交互。")
+            : (profile.sourceKind == "window"
+               ? EnhancementText.t("Window mode is selected at right", "窗口输出模式在右侧选择")
+               : EnhancementText.t("Fullscreen viewer (Esc to return to interaction)", "全屏预览（Esc 返回交互）"))
+        fullscreenCheck.isEnabled = profile.sourceKind != "window"
+        fullscreenCheck.state = profile.sourceKind == "window" ? (profile.windowOutputMode == "follow" ? .off : .on) : (profile.outputFullscreen ? .on : .off)
+        fullscreenCheck.toolTip = profile.sourceKind == "window" ? EnhancementText.t(
+            "Choose follow, viewer, or a fullscreen interaction mode in Window output.",
+            "在窗口输出中选择跟随、观看或全屏交互。") : nil
         rifeStreamCheck.isHidden = profile.sourceKind == "file" || profile.interpolationEngineID != "rife.metal"
         let editable = WorkbenchDimensionPolicy.editable(sizeIndex: sizePopup.indexOfSelectedItem, scaleEnabled: scaleSwitch.state == .on)
         for (field, value) in [(widthField, profile.outputWidth), (heightField, profile.outputHeight)] {
@@ -3142,7 +3620,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 button.title = translate(button.title)
             } else if let field = view as? NSTextField, !field.isEditable,
                       field !== sourceLabel, field !== sourceStripLabel, field !== sourceMetaLabel,
-                      field !== diagnosticLabel, field !== planLabel, field !== statsLabel,
+                      field !== diagnosticLabel, field !== planLabel, field !== statsLabel, field !== budgetLabel,
                       field !== fileLimitLabel, field !== statusLabel {
                 field.stringValue = field.identifier?.rawValue == "brand-quality"
                     ? (EnhancementText.chinese ? "画质" : "Quality") : translate(field.stringValue)
@@ -3150,7 +3628,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             for child in view.subviews { visit(child) }
         }
         if let root = window?.contentView { visit(root) }
-        window?.title = EnhancementText.t("Quality Workbench", "画质工作台")
+        let candidate = (Bundle.main.object(forInfoDictionaryKey: "SPCandidateLabel") as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        window?.title = WorkbenchTitle.text(EnhancementText.t("Quality Workbench", "画质工作台"), candidate: candidate)
         outputWindow?.title = EnhancementText.t("Enhanced output", "增强输出")
         if let first = displayPopup.item(at: 0) { first.title = EnhancementText.t("Main display", "主显示器") }
         statusLabel.stringValue = EnhancementText.runtime(translate(statusLabel.stringValue))
@@ -3161,6 +3640,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         refreshActions()
         if !lastStats.isEmpty { updateStatsText(lastStats) }
         refreshPlanLabel()
+        refreshInteractionStatus()
     }
 
     @objc private func motionChanged() {
@@ -3397,7 +3877,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func cadenceScreen(for output: EnhancementProfile) -> NSScreen? {
-        if TargetOverlayPolicy.followsTarget(fullscreen: output.outputFullscreen, viewerFollowOverride: viewerFollowOverride) && capture.target != nil && !targetFrame.isEmpty {
+        let windowTarget: Bool
+        if case .window = capture.target { windowTarget = true } else { windowTarget = false }
+        if (windowTarget || TargetOverlayPolicy.followsTarget(fullscreen: output.outputFullscreen, viewerFollowOverride: viewerFollowOverride)) && capture.target != nil && !targetFrame.isEmpty {
             let screens = NSScreen.screens
             if let index = TargetOverlayPolicy.screenIndex(target: targetFrame, screens: screens.map(\.frame)) { return screens[index] }
         }
@@ -3418,6 +3900,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     @objc private func displayParametersChanged() {
+        inputRouter?.stop(reason:"display_changed"); interactionArmed = false
+        outputPreview.invalidateSharedGeometry()
         cadenceRefreshHz = -1
         syncRawCadenceEnvironment()
     }
@@ -3491,6 +3975,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         sizeChainLabel.stringValue = profile.sourceKind != "file" && capture.running && processor.resolvedPlan.committed
             ? LiveSizeChain.text(lastStats, generation: capture.currentGeneration, config: processor.resolvedPlan.configVersion) : ""
         planLabel.stringValue = [live, pending, limited ? EnhancementText.t("Display is \(screenHz) Hz", "显示器 \(screenHz) Hz，不能完整呈现该帧率") : "", profile.sourceKind == "file" ? fileStatus() : ""].filter { !$0.isEmpty }.joined(separator: " · ")
+        statusLabel.toolTip = [planLabel.stringValue, sizeChainLabel.stringValue].filter { !$0.isEmpty }.joined(separator: " · ")
+        if statusLabel.stringValue.isEmpty { statusLabel.stringValue = live }
         fileLimitLabel.stringValue = profile.sourceKind == "file" ? fileStatus() : ""
     }
 
@@ -3542,11 +4028,13 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         widthField.stringValue = "\(profile.outputWidth)"
         heightField.stringValue = "\(profile.outputHeight)"
-        fullscreenCheck.state = profile.outputFullscreen ? .on : .off
+        fullscreenCheck.state = profile.sourceKind == "window" ? .on : (profile.outputFullscreen ? .on : .off)
+        windowOutputPopup.selectItem(at: ["follow":0,"viewer":1,"absolute":2,"relative":3][profile.windowOutputMode] ?? 0)
         viewMode.selectedSegment = ["enhanced": 0, "original": 1, "compare": 2][profile.viewMode] ?? 0
         appearanceControl.selectedSegment = ["system": 0, "light": 1, "dark": 2][profile.appearance] ?? 0
         captureCapPopup.selectItem(at: ["auto": 0, "30": 1, "60": 2][profile.captureLimit] ?? 0)
         capture.captureCapFPS = Int(profile.captureLimit) ?? 0
+        refreshP0ControlTitles()
         if case .multiplier = profile.rate, multiplierControl.selectedSegment < 0 {
             multiplierControl.selectedSegment = 0
         }
@@ -3556,6 +4044,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         rebuildConfigRows()
         applyModeVisibility()
         refreshPlanLabel()
+        refreshInteractionStatus()
     }
 
     private func reloadQualityItems() {
@@ -3654,7 +4143,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             profile.outputWidth = WorkbenchDimensionPolicy.value(widthField.stringValue) ?? (profile.outputWidth >= 2 ? profile.outputWidth : 1920)
             profile.outputHeight = WorkbenchDimensionPolicy.value(heightField.stringValue) ?? (profile.outputHeight >= 2 ? profile.outputHeight : 1080)
         }
-        profile.outputFullscreen = fullscreenCheck.state == .on
+        if profile.sourceKind != "window" { profile.outputFullscreen = fullscreenCheck.state == .on }
+        profile.windowOutputMode = ["follow", "viewer", "absolute", "relative"][max(0,min(3,windowOutputPopup.indexOfSelectedItem))]
         profile.viewMode = ["enhanced", "original", "compare"][max(0, viewMode.selectedSegment)]
         profile.appearance = ["system", "light", "dark"][max(0, appearanceControl.selectedSegment)]
         profile.captureLimit = ["auto", "30", "60"][max(0, min(2, captureCapPopup.indexOfSelectedItem))]
@@ -3689,6 +4179,215 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         return NSScreen.screens.first {
             ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id
         }
+    }
+
+    private func isInteractiveMode(_ mode: String) -> Bool { mode == "absolute" || mode == "relative" }
+
+    @objc private func interactionModeChanged() {
+        cancelCountdown()
+        inputRouter?.stop(reason: "mode_changed")
+        interactionArmed = false; interactionFailure = ""
+        readControls(); persist(); applyModeVisibility(); refreshPlanLabel(); updateTargetPanels(); refreshInteractionStatus()
+    }
+
+    // Requests happen only in response to these explicit button actions.
+    @objc private func requestInputMonitoring() {
+        if !CGRequestListenEventAccess(), let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") {
+            NSWorkspace.shared.open(url)
+        }
+        refreshInteractionStatus()
+    }
+    @objc private func requestAccessibility() {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        if !AXIsProcessTrustedWithOptions(options), let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+        refreshInteractionStatus()
+    }
+    @objc private func requestEventAccess() {
+        if !CGRequestPostEventAccess(), let url = URL(string: "x-apple.systempreferences:com.apple.preference.security") {
+            NSWorkspace.shared.open(url)
+        }
+        refreshInteractionStatus()
+    }
+
+    private func refreshInteractionStatus() {
+        let requested = profile.windowOutputMode
+        let permission = LiveInputRouter.Permission.preflight()
+        let showPermissions = profile.sourceKind == "window" && isInteractiveMode(requested)
+        inputMonitoringButton.isHidden = !showPermissions || permission.listen
+        accessibilityButton.isHidden = !showPermissions || permission.accessibility
+        eventAccessButton.isHidden = !showPermissions || requested != "absolute" || permission.post
+        let releaseWarning = (inputRouter?.cleanupUnconfirmed ?? 0) > 0 ? EnhancementText.t("\nButton release not confirmed; check the source.", "\n按键释放未确认，请检查来源。") : ""
+        guard profile.sourceKind == "window" else {
+            interactionStateLabel.stringValue = EnhancementText.t("Window interaction is available only for window sources.", "全屏交互仅适用于窗口来源。") + releaseWarning
+            return
+        }
+        guard isInteractiveMode(requested) else {
+            interactionStateLabel.stringValue = (requested == "viewer" ? EnhancementText.t("Viewer blocks input.", "观看模式不转发输入。") : EnhancementText.t("Source-aligned output keeps direct input.", "按来源位置增强，可直接操作。")) + releaseWarning
+            return
+        }
+        let requestedText = requested == "relative" ? EnhancementText.t("relative", "相对输入") : EnhancementText.t("pointer", "指针")
+        let activeText = inputRouter?.ready == true ? EnhancementText.t("route active; verify source response", "路由运行中，请检查来源响应") : EnhancementText.t("not active", "未生效")
+        let listen = permission.listen ? EnhancementText.t("granted", "已授权") : EnhancementText.t("missing", "未授权")
+        let post = requested == "relative" ? EnhancementText.t("not needed", "不需要") : (permission.post ? EnhancementText.t("granted", "已授权") : EnhancementText.t("missing", "未授权"))
+        let accessibility = permission.accessibility ? EnhancementText.t("granted", "已授权") : EnhancementText.t("missing", "未授权")
+        let issueText: String
+        switch interactionFailure {
+        case "input_monitoring_missing", "listen_permission_missing": issueText = EnhancementText.t("input monitoring required", "需要输入监听权限")
+        case "event_modification_missing", "post_permission_missing": issueText = EnhancementText.t("event posting required for release", "需要事件发送权限以释放按键")
+        case "accessibility_missing": issueText = EnhancementText.t("accessibility permission required", "需要辅助功能权限")
+        case "comparison_unsupported": issueText = EnhancementText.t("comparison unavailable", "对比画面不支持交互")
+        case "geometry_unavailable": issueText = EnhancementText.t("waiting for verified geometry", "等待有效画面位置")
+        case "target_unavailable", "target_changed": issueText = EnhancementText.t("source is no longer active", "来源窗口已失焦或变化")
+        case "tap_create_failed", "tap_enable_failed", "tap_disabled": issueText = EnhancementText.t("input route unavailable", "输入路由不可用")
+        case "apply_to_start": issueText = EnhancementText.t("apply to start", "应用设置后开始")
+        case "release_mouse_buttons": issueText = EnhancementText.t("release mouse buttons to prepare", "松开鼠标按键以准备交互")
+        case "bootstrap_unavailable": issueText = EnhancementText.t("input preparation unavailable", "输入准备不可用")
+        case "waiting_source_focus": issueText = EnhancementText.t("switch to the source window", "请切回来源窗口")
+        case "source_obstructed_waiting": issueText = EnhancementText.t("waiting for obstruction to clear", "等待遮挡消失")
+        case "source_obstructed": issueText = EnhancementText.t("source is covered or window state unknown", "来源被遮挡或窗口状态未知")
+        case "source_outside_displays": issueText = EnhancementText.t("mapped point is outside active displays", "映射位置不在活动显示器内")
+        case "geometry_invalidated": issueText = EnhancementText.t("source position changed", "来源位置已变化")
+        default: issueText = ""
+        }
+        let issue = issueText.isEmpty ? "" : " · \(issueText)"
+        interactionStateLabel.stringValue = EnhancementText.t("Requested: \(requestedText) · \(activeText)\(issue)\nMonitoring: \(listen) · Posting: \(post) · Accessibility: \(accessibility)\nExit: Ctrl+Option+Esc", "请求：\(requestedText) · \(activeText)\(issue)\n监听：\(listen) · 发送：\(post) · 辅助功能：\(accessibility)\n退出：Control+Option+Esc") + releaseWarning
+    }
+
+    private func isVerifiedInputTarget(_ context: LiveInputRouter.Context, requireGeometry: Bool) -> Bool {
+        guard capture.running, !capture.paused, capture.currentGeneration == context.generation,
+              case let .window(id, owner) = capture.target, id == context.windowID, owner == context.sourcePID,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == owner, targetFrontmost, targetDecisionReason == "matched", interactionSourceUnobstructed else { return false }
+        if !requireGeometry { return true }
+        let geometry = processor.inputGeometrySnapshot()
+        return (geometry["valid"] as? Bool) == true && (geometry["version"] as? NSNumber)?.uint64Value == context.version &&
+            (geometry["windowID"] as? NSNumber)?.uint32Value == id && (geometry["pid"] as? NSNumber)?.int32Value == owner &&
+            (geometry["generation"] as? NSNumber)?.uint64Value == context.generation &&
+            (geometry["config"] as? NSNumber)?.uint64Value == context.config &&
+            (geometry["measurementEpoch"] as? NSNumber)?.uint64Value == context.epoch
+    }
+
+    private func isVerifiedBootstrapTarget(_ context: LiveInputRouter.Context) -> Bool {
+        guard interactionArmed, capture.running, !capture.paused, capture.currentGeneration == context.generation,
+              processor.resolvedPlan.configVersion == context.config, interactionRequestGeneration == context.generation,
+              interactionRequestConfig == context.config, targetFrontmost, targetDecisionReason == "matched",
+              interactionSourceUnobstructed, case let .window(id, owner) = capture.target,
+              id == context.windowID, owner == context.sourcePID,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == owner else { return false }
+        return true
+    }
+
+    private func setInteractionControlsPassthrough(_ enabled: Bool) {
+        viewerControlsPanel?.ignoresMouseEvents = enabled
+        viewerStopButton?.isHidden = enabled
+        p0OpaqueButton?.isHidden = enabled
+        p0ActivateButton?.isHidden = enabled
+        p0CaptureButton?.isHidden = enabled
+    }
+
+    private func interactionDisplayMappings() -> [P1DisplayMapping] {
+        NSScreen.screens.compactMap { screen in
+            guard let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value,
+                  CGDisplayIsActive(id) != 0 else { return nil }
+            let bounds = CGDisplayBounds(id), frame = screen.frame
+            guard bounds.minX.isFinite, bounds.minY.isFinite, bounds.width > 0, bounds.height > 0,
+                  frame.minX.isFinite, frame.minY.isFinite, frame.width > 0, frame.height > 0 else { return nil }
+            return P1DisplayMapping(quartz: bounds, appKit: frame)
+        }
+    }
+    private func interactionDisplays() -> [CGRect] { interactionDisplayMappings().map(\.quartz) }
+
+    private func investigateSelectedAX(id: CGWindowID, owner: pid_t, source: CGRect, targetBounds: CGRect) {
+        guard r7Diagnostics, CommandLine.arguments.contains("--khua-p1-ax-diagnostics"), AXIsProcessTrusted(),
+              outputWindow?.isVisible != true, !source.isEmpty, !targetBounds.isEmpty,
+              !interactionAXBusy, ProcessInfo.processInfo.systemUptime - interactionAXLastRequest >= 2 else { return }
+        let generation = capture.currentGeneration, config = processor.resolvedPlan.configVersion
+        let requestAt = ProcessInfo.processInfo.systemUptime, visibilityToken = outputWarmupToken, requestSerial = liveApply.serial
+        interactionAXBusy = true; interactionAXLastRequest = requestAt
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let data = P1AXInvestigation.inspect(pid: owner, targetBounds: targetBounds, source: source)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.interactionAXBusy = false
+                guard self.capture.running, !self.capture.paused, self.capture.currentGeneration == generation,
+                      self.processor.resolvedPlan.configVersion == config, self.liveApply.serial == requestSerial,
+                      self.isInteractiveMode(self.profile.windowOutputMode), case let .window(currentID, currentOwner) = self.capture.target,
+                      currentID == id, currentOwner == owner, NSWorkspace.shared.frontmostApplication?.processIdentifier == owner,
+                      self.outputWindow?.isVisible != true, self.outputWarmupToken == visibilityToken,
+                      self.capture.latestScreenRect() == source,
+                      var result = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+                result["generation"] = generation; result["config"] = config; result["targetWindowID"] = id
+                result["targetPID"] = owner; result["requestMonotonic"] = requestAt
+                result["resultMonotonic"] = ProcessInfo.processInfo.systemUptime
+                result["requestedTargetBounds"] = [targetBounds.minX,targetBounds.minY,targetBounds.width,targetBounds.height]
+                self.recordPlanEvent("interaction_ax_observation", extra: ["interactionAX": result])
+            }
+        }
+    }
+
+    private func ensureInputRouter() -> LiveInputRouter {
+        if let inputRouter { return inputRouter }
+        let router = LiveInputRouter(mapper: { [weak self] point, version, clamp in
+            guard let result = self?.processor.mapQuartzOutputPoint(point, geometryVersion: version, clamp: clamp),
+                  let x = result["x"]?.doubleValue, let y = result["y"]?.doubleValue else { return nil }
+            return CGPoint(x:x,y:y)
+        }, verifyTarget: { [weak self] in self?.isVerifiedInputTarget($0, requireGeometry: true) ?? false },
+        verifyBootstrap: { [weak self] in self?.isVerifiedBootstrapTarget($0) ?? false },
+        safeReleaseTarget: { [weak self] context in
+            guard let self, self.isVerifiedInputTarget(context, requireGeometry: true), let target = self.capture.target else { return false }
+            return self.targetWindowState(target).front
+        }, stopped: { [weak self] reason in
+            guard let self else { return }
+            self.interactionArmed = false; self.interactionFailure = reason
+            if reason == "emergency_exit" { self.stop() }
+            else { self.updateTargetPanels(); self.refreshInteractionStatus() }
+        })
+        inputRouter = router
+        return router
+    }
+
+    private func reconcileInputRouter(target: CaptureTarget, interactive: Bool) {
+        guard interactive, interactionArmed, case let .window(id, owner) = target else {
+            if inputRouter?.active == true { inputRouter?.stop(reason:"not_interactive") }
+            refreshInteractionStatus(); return
+        }
+        let permission = LiveInputRouter.Permission.preflight()
+        guard permission.permits(relative: applied.windowOutputMode == "relative") else {
+            if inputRouter?.active == true { inputRouter?.stop(reason:"permission_missing") }
+            interactionFailure = !permission.listen ? "input_monitoring_missing" : (!permission.accessibility ? "accessibility_missing" : "event_modification_missing")
+            refreshInteractionStatus(); return
+        }
+        let geometry = processor.inputGeometrySnapshot()
+        guard (geometry["valid"] as? Bool) == true, let version = (geometry["version"] as? NSNumber)?.uint64Value, version > 0,
+              (geometry["windowID"] as? NSNumber)?.uint32Value == id, (geometry["pid"] as? NSNumber)?.int32Value == owner,
+              (geometry["generation"] as? NSNumber)?.uint64Value == capture.currentGeneration,
+              let config = (geometry["config"] as? NSNumber)?.uint64Value, config == processor.resolvedPlan.configVersion,
+              let epoch = (geometry["measurementEpoch"] as? NSNumber)?.uint64Value, epoch > 0 else {
+            if inputRouter?.ready == true {
+                inputRouter?.stop(reason:"geometry_unavailable"); interactionArmed = false
+            } else if interactionGeometryWaitAt == 0 { interactionGeometryWaitAt = ProcessInfo.processInfo.systemUptime }
+            else if ProcessInfo.processInfo.systemUptime - interactionGeometryWaitAt > 3 { interactionArmed = false }
+            if !interactionArmed { inputRouter?.stop(reason:"geometry_unavailable"); outputWindow?.orderOut(nil); viewerControlsPanel?.orderOut(nil); outputPreview.refreshVisibilitySnapshot() }
+            interactionFailure = "geometry_unavailable"; refreshInteractionStatus(); return
+        }
+        let context = LiveInputRouter.Context(sourcePID: owner, windowID: id, generation: capture.currentGeneration,
+            config: config, epoch: epoch, version: version, relative: applied.windowOutputMode == "relative", exclusions: [], sourceDisplays: interactionDisplayMappings())
+        let router = ensureInputRouter()
+        if router.start(context) { interactionFailure = ""; interactionGeometryWaitAt = 0 }
+        else if router.reason == "bootstrap_buttons_pending" {
+            if interactionGeometryWaitAt == 0 { interactionGeometryWaitAt = ProcessInfo.processInfo.systemUptime }
+            interactionFailure = "release_mouse_buttons"
+            if ProcessInfo.processInfo.systemUptime - interactionGeometryWaitAt >= 3 {
+                router.stop(reason:"bootstrap_buttons_timeout"); interactionArmed = false
+                outputWindow?.orderOut(nil); viewerControlsPanel?.orderOut(nil); outputPreview.refreshVisibilitySnapshot()
+            }
+        } else {
+            interactionFailure = router.reason; interactionArmed = false
+            router.stop(reason: router.reason)
+            outputWindow?.orderOut(nil); viewerControlsPanel?.orderOut(nil); outputPreview.refreshVisibilitySnapshot()
+        }
+        refreshInteractionStatus()
     }
 
     private func selectedScreen() -> NSScreen? {
@@ -3739,9 +4438,18 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         controls.layer?.cornerRadius = 8
         let label = NSTextField(labelWithString: EnhancementText.t("Fullscreen viewer · input paused", "全屏预览 · 输入已暂停"))
         label.textColor = .white
-        let back = NSButton(title: EnhancementText.t("Return to interaction", "返回交互"), target: self, action: #selector(exitFullscreenViewer))
+        let back = NSButton(title: EnhancementText.t("Stop enhancement", "停止增强"), target: self, action: #selector(stop))
         back.bezelStyle = .rounded
+        viewerStopButton = back
         controls.addArrangedSubview(label)
+        if p0ControlsEnabled {
+            let opaque = NSButton(title: "", target: self, action: #selector(toggleP0Opaque))
+            let focus = NSButton(title: "", target: self, action: #selector(toggleP0Activation))
+            let cap = NSButton(title: "", target: self, action: #selector(toggleP0CaptureCap))
+            for item in [opaque, focus, cap] { item.bezelStyle = .rounded; controls.addArrangedSubview(item) }
+            p0OpaqueButton = opaque; p0ActivateButton = focus; p0CaptureButton = cap
+            refreshP0ControlTitles()
+        }
         controls.addArrangedSubview(back)
         let controlsPanel = overlayPanel()
         controlsPanel.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 2)
@@ -3755,6 +4463,57 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         outputWindow = panel
     }
 
+    private func refreshP0ControlTitles() {
+        guard p0ControlsEnabled else { return }
+        let opaque = r7Flag("--khua-r7-opaque") ? EnhancementText.t("Overlay: opaque", "遮罩：不透明") : EnhancementText.t("Overlay: clear", "遮罩：透明")
+        let focus = r7Flag("--khua-r7-activate") ? EnhancementText.t("Focus: output", "焦点：输出") : EnhancementText.t("Focus: source", "焦点：来源")
+        let cap = capture.captureCapFPS == 60 ? "60" : (capture.captureCapFPS == 30 ? "30" : "Auto")
+        let captureTitle = EnhancementText.t("Capture: \(cap)", "采集：\(cap)")
+        for item in [p0OpaqueButton, p0MainOpaqueButton] { item?.title = opaque }
+        for item in [p0ActivateButton, p0MainActivateButton] { item?.title = focus }
+        for item in [p0CaptureButton, p0MainCaptureButton] { item?.title = captureTitle }
+    }
+
+    @objc private func toggleP0OpaqueFromMain() { withP0MainAction { toggleP0Opaque() } }
+    @objc private func toggleP0ActivationFromMain() { withP0MainAction { toggleP0Activation() } }
+    @objc private func toggleP0CaptureCapFromMain() { withP0MainAction { toggleP0CaptureCap() } }
+
+    private func withP0MainAction(_ action: () -> Void) {
+        guard p0ControlsEnabled else { return }
+        p0MainActionInProgress = true
+        defer { p0MainActionInProgress = false }
+        action()
+    }
+
+    @objc private func toggleP0Opaque() {
+        guard p0ControlsEnabled else { return }
+        p0OpaqueOverride = !r7Flag("--khua-r7-opaque")
+        refreshP0ControlTitles()
+        updateTargetPanels()
+        recordPlanEvent("p0_opaque_changed", extra: ["p0ControlSurface": p0MainActionInProgress ? "main" : "overlay"])
+    }
+
+    @objc private func toggleP0Activation() {
+        guard p0ControlsEnabled else { return }
+        let enable = !r7Flag("--khua-r7-activate")
+        p0ActivateOverride = enable
+        if !enable && viewerActive { exitFullscreenViewer() }
+        refreshP0ControlTitles()
+        updateTargetPanels()
+        recordPlanEvent("p0_activation_changed", extra: ["p0ControlSurface": p0MainActionInProgress ? "main" : "overlay"])
+    }
+
+    @objc private func toggleP0CaptureCap() {
+        guard p0ControlsEnabled else { return }
+        // The stream must restart to apply minimumFrameInterval. Reuse the
+        // already-authorized SCContentFilter; no new picker is presented.
+        if viewerActive { exitFullscreenViewer() }
+        captureCapPopup.selectItem(at: capture.captureCapFPS == 60 ? 0 : 2)
+        captureCapChanged()
+        refreshP0ControlTitles()
+        recordPlanEvent("p0_capture_cap_changed", extra: ["p0ControlSurface": p0MainActionInProgress ? "main" : "overlay"])
+    }
+
     @objc private func exitFullscreenViewer() {
         guard viewerActive else { return }
         viewerActive = false
@@ -3762,7 +4521,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         viewerControlsPanel?.orderOut(nil)
         if let panel = outputWindow as? TargetPanel { panel.viewerKeyboard = false; panel.ignoresMouseEvents = true }
         outputWindow?.orderOut(nil)
-        if let pid = viewerReturnPID, let app = NSRunningApplication(processIdentifier: pid) { app.activate(options: []) }
+        if !p0MainActionInProgress, let pid = viewerReturnPID, let app = NSRunningApplication(processIdentifier: pid) { app.activate(options: []) }
         viewerReturnPID = nil
         DispatchQueue.main.async { [weak self] in self?.updateTargetPanels() }
     }
@@ -3820,6 +4579,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         var front: Bool
         var frame: NSRect
         var contentRectVerified: Bool
+        var verifiedScreenRect: CGRect? = nil
+        var screenRectHost: UInt64 = 0
+        var observedWindowBounds: CGRect = .null
     }
 
     private func targetWindowState(_ target: CaptureTarget) -> TargetWindowState {
@@ -3864,10 +4626,11 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             }
             guard chosen.owner == owner else { return .init(exists: false, onscreen: false, front: false, frame: .zero, contentRectVerified: false) }
             let rect = chosen.bounds
-            let captured = capture.latestScreenRect()
-            let content = captured.flatMap { value in rect.insetBy(dx: -4, dy: -4).contains(value) ? value : nil }
+            let captured = capture.latestScreenRectSnapshot()
+            let content = captured.flatMap { value in rect.insetBy(dx: -4, dy: -4).contains(value.rect) ? value.rect : nil }
             return .init(exists: true, onscreen: chosen.onscreen, front: decision.matches,
-                         frame: native(content ?? rect), contentRectVerified: content != nil)
+                         frame: native(content ?? rect), contentRectVerified: content != nil, verifiedScreenRect: content,
+                         screenRectHost: captured?.host ?? 0, observedWindowBounds: rect)
         case let .display(id):
             guard CGDisplayIsActive(id) != 0 else { targetDecisionReason = "display_unavailable"; return .init(exists: false, onscreen: false, front: false, frame: .zero, contentRectVerified: false) }
             let rect = CGDisplayBounds(id)
@@ -3881,6 +4644,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private func updateTargetPanels() {
         guard profile.sourceKind != "file", let target = capture.target else {
+            if inputRouter?.active == true || interactionArmed {
+                inputRouter?.stop(reason:"source_closed"); interactionArmed = false; interactionObstructionWait.reset()
+            }
+            outputPreview.observeVerifiedWindowGeometry(nil)
             viewerActive = false
             viewerReturnPID = nil
             (outputWindow as? TargetPanel)?.viewerKeyboard = false
@@ -3907,7 +4674,28 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         if targetDecisionReason == "target_identity_changed_in_ordered_list" || (targetDecisionReason != "target_metadata_incomplete" && targetDecisionReason != "window_list_unavailable" && TargetOverlayPolicy.shouldCancel(exists: state.exists, onscreen: state.onscreen, wasOnscreen: targetWasOnscreen)) {
             cancelCountdown()
         }
+        if interactionArmed && (interactionRequestGeneration != capture.currentGeneration ||
+                                interactionRequestConfig != processor.resolvedPlan.configVersion) {
+            inputRouter?.stop(reason: "identity_changed"); interactionArmed = false; interactionObstructionWait.reset(); interactionFailure = "target_unavailable"
+        }
+        if interactionArmed && capture.running && !capture.paused && state.exists && state.onscreen && !state.frame.isEmpty {
+            switch P1FocusPolicy.decide(targetReady: targetReady, acquired: interactionFocusAcquired,
+                ownFront: NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier,
+                now: ProcessInfo.processInfo.systemUptime, deadline: interactionFocusDeadline) {
+            case .wait:
+                outputPreview.observeVerifiedWindowGeometry(nil)
+                outputWindow?.orderOut(nil); viewerControlsPanel?.orderOut(nil); outputPreview.refreshVisibilitySnapshot()
+                interactionFailure = "waiting_source_focus"; outputHiddenReason = "waiting_source_focus"; refreshInteractionStatus(); return
+            case .ready: interactionFocusAcquired = true
+            case .cancel:
+                inputRouter?.stop(reason:"target_unavailable"); interactionArmed = false; interactionObstructionWait.reset(); interactionFailure = "target_unavailable"
+            }
+        }
         guard capture.running && !capture.paused && targetReady && !state.frame.isEmpty else {
+            if inputRouter?.active == true || interactionArmed {
+                inputRouter?.stop(reason:"target_unavailable"); interactionArmed = false; interactionObstructionWait.reset(); interactionFailure = "target_unavailable"
+            }
+            outputPreview.observeVerifiedWindowGeometry(nil)
             viewerActive = false
             viewerControlsPanel?.orderOut(nil)
             (outputWindow as? TargetPanel)?.viewerKeyboard = false
@@ -3918,11 +4706,116 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             outputPreview.refreshVisibilitySnapshot()
             return
         }
-        let planActive = processor.resolvedPlan.committed && (processor.resolvedPlan.interpolationActive || processor.resolvedPlan.scaleActive)
-        let fullscreen = !TargetOverlayPolicy.followsTarget(fullscreen: applied.outputFullscreen, viewerFollowOverride: viewerFollowOverride)
+        let planActive = processor.resolvedPlan.committed && (processor.resolvedPlan.interpolationActive || processor.resolvedPlan.scaleActive || r7Flag("--khua-r7-passthrough") || (profile.sourceKind == "window" && applied.windowOutputMode != "follow"))
+        let windowTarget: Bool
+        if case .window = target { windowTarget = true } else { windowTarget = false }
+        // Fullscreen geometry for a window is a non-interactive diagnostic only.
+        let diagnosticFullscreen = windowTarget && r7Flag("--khua-r7-fullscreen-geometry")
+        let requestedInteractive = windowTarget && isInteractiveMode(applied.windowOutputMode)
+        let permission = requestedInteractive ? LiveInputRouter.Permission.preflight() : nil
+        let interactionAvailable = requestedInteractive && interactionArmed && permission?.permits(relative: applied.windowOutputMode == "relative") == true && profile.viewMode != "compare"
+        if requestedInteractive && !interactionAvailable {
+            if inputRouter?.active == true { inputRouter?.stop(reason:"interaction_restricted") }
+            if !interactionArmed { if interactionFailure.isEmpty { interactionFailure = "apply_to_start" } }
+            else if permission?.listen != true { interactionFailure = "input_monitoring_missing" }
+            else if permission?.accessibility != true { interactionFailure = "accessibility_missing" }
+            else if applied.windowOutputMode == "absolute" && permission?.post != true { interactionFailure = "event_modification_missing" }
+            else { interactionFailure = "comparison_unsupported" }
+            if interactionArmed { interactionArmed = false }
+            outputWindow?.orderOut(nil); viewerControlsPanel?.orderOut(nil); outputPreview.refreshVisibilitySnapshot()
+            outputHiddenReason = "interaction_restricted"; refreshInteractionStatus(); return
+        }
+        if interactionAvailable { setInteractionControlsPassthrough(inputRouter?.ready == true) }
+        if interactionAvailable, case let .window(id, owner) = target, let source = state.verifiedScreenRect,
+           outputWindow != nil {
+            // Exclude only panels this controller will make pass-through after
+            // the router starts. Their actual input state is untouched here.
+            func windowID(_ window: NSWindow?) -> CGWindowID? {
+                guard let window, window.windowNumber > 0 else { return nil }
+                return CGWindowID(window.windowNumber)
+            }
+            let huds = [targetHUD, targetCountdownHUD].compactMap { $0 }
+                .filter { $0.ignoresMouseEvents }.compactMap { windowID($0) }
+            let passthrough = TargetOverlayPolicy.interactionOwnedPassThrough(
+                output: windowID(outputWindow), controls: windowID(viewerControlsPanel), huds: huds)
+            let ordered = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+            let displays = interactionDisplays()
+            let guardResult = TargetOverlayPolicy.interactionGuard(ordered, id: id, owner: owner, source: source, passthrough: passthrough)
+            let pointValidatedAbsolute = applied.windowOutputMode == "absolute"
+            interactionSourceUnobstructed = !displays.isEmpty && (pointValidatedAbsolute || guardResult.clear)
+            if r7Diagnostics {
+                var detail = guardResult.diagnostic
+                detail["enforcement"] = pointValidatedAbsolute ? "per_event_exact_window" : "full_source_guard"
+                if displays.isEmpty { detail["clear"] = false; detail["reason"] = "active_displays_unavailable" }
+                detail["activeDisplaysQuartz"] = displays.map { [$0.minX, $0.minY, $0.width, $0.height] }
+                detail["knownOwnedWindowIDs"] = excludedIDs()
+                detail["passthroughWindowIDs"] = passthrough.sorted()
+                detail["targetWindowID"] = id; detail["targetPID"] = owner
+                detail["generation"] = capture.currentGeneration; detail["config"] = processor.resolvedPlan.configVersion
+                if interactionGuardFirst == nil && !interactionSourceUnobstructed { interactionGuardFirst = detail }
+                if interactionGuardLast.map({ !NSDictionary(dictionary: $0).isEqual(to: detail) }) ?? true {
+                    interactionGuardLast = detail
+                    recordPlanEvent("interaction_guard_changed")
+                }
+            }
+            if pointValidatedAbsolute && !guardResult.clear && outputWindow?.isVisible != true {
+                investigateSelectedAX(id: id, owner: owner, source: source, targetBounds: state.observedWindowBounds)
+            }
+            if !interactionSourceUnobstructed {
+                inputRouter?.stop(reason: "source_obstructed")
+                let mayWait = interactionObstructionWait.observe(blocked: true, now: ProcessInfo.processInfo.systemUptime,
+                    generation: capture.currentGeneration, config: processor.resolvedPlan.configVersion)
+                interactionArmed = mayWait; interactionFailure = mayWait ? "source_obstructed_waiting" : "source_obstructed"
+                interactionGeometryWaitAt = 0
+                if outputWindow?.isVisible == true { outputWarmupToken &+= 1 }
+                outputPreview.invalidateSharedGeometry()
+                outputWindow?.orderOut(nil); viewerControlsPanel?.orderOut(nil); outputPreview.refreshVisibilitySnapshot()
+                investigateSelectedAX(id: id, owner: owner, source: source, targetBounds: state.observedWindowBounds)
+                outputHiddenReason = mayWait ? "source_obstructed_waiting" : "source_obstructed"; refreshInteractionStatus(); return
+            }
+            guard interactionObstructionWait.observe(blocked: false, now: ProcessInfo.processInfo.systemUptime,
+                generation: capture.currentGeneration, config: processor.resolvedPlan.configVersion) else {
+                inputRouter?.stop(reason: "obstruction_timeout"); interactionArmed = false; interactionFailure = "source_obstructed"
+                outputPreview.invalidateSharedGeometry(); outputWindow?.orderOut(nil); viewerControlsPanel?.orderOut(nil)
+                outputPreview.refreshVisibilitySnapshot(); outputHiddenReason = "source_obstructed"; refreshInteractionStatus(); return
+            }
+            if interactionFailure == "source_obstructed_waiting" { interactionFailure = "" }
+        } else {
+            interactionSourceUnobstructed = false
+            setInteractionControlsPassthrough(false)
+        }
+        if interactionAvailable && applied.windowOutputMode == "absolute", case let .window(id, owner) = target,
+           inputRouter?.active != true {
+            let router = ensureInputRouter()
+            let outputID = outputScreen(for: applied.outputDisplayID).flatMap {
+                ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+            }
+            let outputBounds = outputID.map(CGDisplayBounds) ?? .null
+            let preparing = LiveInputRouter.Context(sourcePID: owner, windowID: id, generation: capture.currentGeneration,
+                config: processor.resolvedPlan.configVersion, epoch: 0, version: 0, relative: false,
+                exclusions: [], sourceDisplays: interactionDisplayMappings())
+            if !router.startBootstrap(preparing, controlWindowID: viewerControlsPanel?.windowNumber ?? 0, outputQuartz: outputBounds) {
+                if router.reason == "bootstrap_buttons_down" {
+                    if interactionGeometryWaitAt == 0 { interactionGeometryWaitAt = ProcessInfo.processInfo.systemUptime }
+                    if ProcessInfo.processInfo.systemUptime - interactionGeometryWaitAt >= 3 { interactionArmed = false }
+                    interactionFailure = "release_mouse_buttons"
+                } else { interactionArmed = false; interactionFailure = router.reason }
+                outputWindow?.orderOut(nil); viewerControlsPanel?.orderOut(nil); outputPreview.refreshVisibilitySnapshot()
+                outputHiddenReason = "bootstrap_unavailable"; refreshInteractionStatus(); return
+            }
+        }
+        let explicitViewer = windowTarget && applied.windowOutputMode == "viewer"
+        let fullscreen = TargetOverlayPolicy.usesFullscreen(windowTarget: windowTarget, explicitViewer: explicitViewer,
+            interactiveAvailable: interactionAvailable, diagnosticFullscreen: diagnosticFullscreen,
+            legacyFullscreen: applied.outputFullscreen, viewerFollowOverride: viewerFollowOverride)
         let screenFrame = fullscreen ? outputScreen(for: applied.outputDisplayID)?.frame : nil
         let outputFrame = TargetOverlayPolicy.outputFrame(target: state.frame, fullscreen: fullscreen, display: screenFrame)
-        outputHiddenReason = !planActive ? "no_plan" : (!state.contentRectVerified ? "content_rect_unverified" : (outputFrame == nil ? "output_display_unavailable" : (outputWindow == nil ? "output_not_created" : "none")))
+        let alignedInput = !windowTarget || diagnosticFullscreen || explicitViewer || TargetOverlayPolicy.windowInputAligned(viewMode: profile.viewMode)
+        outputHiddenReason = !alignedInput ? "compare_not_input_aligned" : (!planActive ? "no_plan" : (!state.contentRectVerified ? "content_rect_unverified" : (outputFrame == nil ? "output_display_unavailable" : (outputWindow == nil ? "output_not_created" : "none"))))
+        if !alignedInput {
+            statusLabel.stringValue = EnhancementText.t("Comparison cannot align with source input; output hidden. Choose enhanced or original.", "对比画面无法与来源操作位置对齐，输出已隐藏；请选择增强或原始画面。")
+            statusLabel.textColor = .systemOrange
+        }
         if planActive && (!state.contentRectVerified || outputFrame == nil) && !targetGeometryWarned {
             targetGeometryWarned = true
             statusLabel.stringValue = outputFrame == nil
@@ -3931,30 +4824,39 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             statusLabel.textColor = .systemOrange
         } else if state.contentRectVerified && outputFrame != nil { targetGeometryWarned = false }
         var hudFrame = state.frame
-        if planActive && state.contentRectVerified, let frame = outputFrame, let panel = outputWindow {
+        if planActive && alignedInput && state.contentRectVerified, let frame = outputFrame, let panel = outputWindow {
             let followsWindow: Bool
             if case .window = target { followsWindow = !fullscreen }
             else { followsWindow = false }
             outputFollowsWindow = followsWindow
-            panel.isOpaque = !followsWindow
-            panel.backgroundColor = followsWindow ? .clear : .black
-            outputPreview.layer?.isOpaque = !followsWindow
+            let opaque = interactionAvailable ? false : (windowTarget ? r7Flag("--khua-r7-opaque") : true)
+            panel.isOpaque = opaque
+            panel.backgroundColor = opaque ? .black : .clear
+            outputPreview.layer?.isOpaque = opaque
             outputPreview.setFollowTargetContent(followsWindow)
             // A scaled fullscreen picture is not aligned with the source.
             // Absorb pointer input instead of misdirecting it underneath; the
             // aligned follow-window mode retains normal click-through.
-            panel.ignoresMouseEvents = !fullscreen
-            let enteringViewer = fullscreen && !viewerActive
+            panel.ignoresMouseEvents = !fullscreen || (interactionAvailable && inputRouter?.ready == true)
+            let diagnosticActivate = windowTarget && !interactionAvailable && r7Flag("--khua-r7-activate")
+            if interactionAvailable {
+                viewerActive = false; viewerReturnPID = nil
+                (panel as? TargetPanel)?.viewerKeyboard = false
+            }
+            let enteringViewer = ((!windowTarget && fullscreen) || diagnosticActivate || explicitViewer) && !viewerActive
             if enteringViewer {
                 viewerReturnPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
                 viewerActive = true
                 (panel as? TargetPanel)?.viewerKeyboard = true
-            } else if !fullscreen && viewerActive {
+            } else if !fullscreen && !diagnosticActivate && viewerActive {
                 viewerActive = false
                 viewerReturnPID = nil
                 (panel as? TargetPanel)?.viewerKeyboard = false
             }
-            if fullscreen, let controlsPanel = viewerControlsPanel, let controls = viewerControls {
+            if (fullscreen || windowTarget), let controlsPanel = viewerControlsPanel, let controls = viewerControls {
+                if let label = controls.arrangedSubviews.first as? NSTextField {
+                    label.stringValue = interactionAvailable ? (inputRouter?.ready == true ? EnhancementText.t("Interaction · Ctrl+Option+Esc exits", "全屏交互 · Control+Option+Esc 退出") : EnhancementText.t("Preparing · Ctrl+Option+Esc exits", "正在准备交互 · Control+Option+Esc 退出")) : (diagnosticFullscreen ? EnhancementText.t("Diagnostic fullscreen · input blocked", "诊断全屏 · 输入已阻止") : (explicitViewer ? EnhancementText.t("Fullscreen viewer · input paused", "全屏观看 · 输入已暂停") : (windowTarget ? EnhancementText.t("Aligned to source · interactive", "按来源位置增强 · 可直接操作") : EnhancementText.t("Fullscreen viewer · input paused", "全屏预览 · 输入已暂停"))))
+                }
                 let fit = controls.fittingSize
                 let width = min(frame.width - 24, max(220, fit.width))
                 let height = max(40, fit.height)
@@ -3962,7 +4864,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 if !controlsPanel.isVisible { controlsPanel.orderFrontRegardless() }
             } else { viewerControlsPanel?.orderOut(nil) }
             hudFrame = frame
-            if panel.frame != frame { panel.setFrame(frame, display: true) }
+            if panel.frame != frame { outputPreview.observeVerifiedWindowGeometry(nil); panel.setFrame(frame, display: true) }
             if !panel.isVisible {
                 outputWarmupToken &+= 1
                 panel.alphaValue = 0.001
@@ -3970,6 +4872,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 outputWarmupWarningShown = false
                 processor.awaitOutputSurface(withToken: outputWarmupToken, minimumCaptureHost: outputMinimumCaptureHost)
                 panel.orderFrontRegardless()
+                recordPlanEvent("output_enter")
             }
             if enteringViewer {
                 NSApp.activate(ignoringOtherApps: true)
@@ -3984,6 +4887,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 }
             }
         } else {
+            outputPreview.observeVerifiedWindowGeometry(nil)
             if viewerActive { exitFullscreenViewer() }
             if outputWindow?.isVisible == true { outputWarmupToken &+= 1 }
             outputWindow?.orderOut(nil)
@@ -4011,6 +4915,46 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             if !requestedFPSVisible || !requestedCountdownVisible { hudHiddenReason = "panel_not_visible" }
         } else { targetHUD?.orderOut(nil); targetCountdownHUD?.orderOut(nil); hudHiddenReason = "hud_disabled" }
         outputPreview.refreshVisibilitySnapshot()
+        observeOutputGeometry(target: target, state: state, planActive: planActive, alignedInput: alignedInput)
+        reconcileInputRouter(target: target, interactive: interactionAvailable)
+        if interactionAvailable, let panel = outputWindow {
+            let active = TargetOverlayPolicy.interactionCanPassThrough(available: interactionAvailable, routerActive: inputRouter?.ready == true)
+            panel.ignoresMouseEvents = active
+            setInteractionControlsPassthrough(active)
+            if active, let label = viewerControls?.arrangedSubviews.first as? NSTextField {
+                label.stringValue = EnhancementText.t("Interaction · Ctrl+Option+Esc exits", "全屏交互 · Control+Option+Esc 退出")
+            }
+        }
+    }
+
+    private func observeOutputGeometry(target: CaptureTarget, state: TargetWindowState, planActive: Bool, alignedInput: Bool) {
+        if case let .window(id, _) = target, !state.observedWindowBounds.isNull,
+           (geometryObservedWindow != id || geometryObservedGeneration != capture.currentGeneration || geometryObservedBounds != state.observedWindowBounds) {
+            outputPreview.invalidateSharedGeometry()
+            geometryObservedWindow = id; geometryObservedGeneration = capture.currentGeneration
+            geometryObservedBounds = state.observedWindowBounds; geometryBoundsChangedHost = mach_absolute_time()
+        }
+        guard case let .window(id, owner) = target, let source = state.verifiedScreenRect,
+              state.contentRectVerified, state.screenRectHost > geometryBoundsChangedHost,
+              targetFrontmost, planActive, alignedInput, profile.viewMode != "compare",
+              let panel = outputWindow, panel.isVisible, panel.alphaValue >= 0.99,
+              outputPreview.drawableVisibleSnapshot, outputPreview.exposedSnapshot,
+              let screen = panel.screen,
+              let displayID = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value,
+              displayID != 0, lastStatsReceipt > 0, ProcessInfo.processInfo.systemUptime - lastStatsReceipt < 1.5,
+              (lastStats["snapshotStale"] as? Bool) != true,
+              (lastStats["sourceGeneration"] as? NSNumber)?.uint64Value == capture.currentGeneration,
+              (lastStats["configVersion"] as? NSNumber)?.uint64Value == processor.resolvedPlan.configVersion,
+              let epoch = (lastStats["measurementEpoch"] as? NSNumber)?.uint64Value, epoch > 0 else {
+            outputPreview.observeVerifiedWindowGeometry(nil); return
+        }
+        func rect(_ r: CGRect) -> [CGFloat] { [r.minX, r.minY, r.width, r.height] }
+        outputPreview.observeVerifiedWindowGeometry(["generation": capture.currentGeneration, "windowID": id, "pid": owner,
+            "config": processor.resolvedPlan.configVersion, "epoch": epoch, "displayID": displayID,
+            "screenRect": rect(source), "windowBounds": rect(state.observedWindowBounds),
+            "panelFrame": rect(panel.frame), "displayFrame": rect(screen.frame),
+            "displayBoundsQuartz": rect(CGDisplayBounds(displayID)),
+            "backingScale": panel.backingScaleFactor, "verified": true])
     }
 
     private func excludedIDs() -> [Int] {

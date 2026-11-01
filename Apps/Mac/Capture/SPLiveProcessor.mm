@@ -12,10 +12,12 @@
 #import "SPRateSchedule.hpp"
 #import "SPFPSMeter.hpp"
 #import "SPPresentationBudget.hpp"
+#import "SPFRCBudgetPolicy.hpp"
 #import "SPLiveHeldPolicy.hpp"
 #import "SPPresentationOrder.hpp"
 #import "SPPresentationGeometry.hpp"
 #import "SPOutputGeometry.hpp"
+#import "SPSharedGeometry.hpp"
 #import "SPLivePixelProbeCV.h"
 
 #import <CoreMedia/CoreMedia.h>
@@ -34,6 +36,7 @@
 #include <mutex>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 extern "C" int spRunRateScheduleTests(void);
@@ -50,6 +53,104 @@ static int64_t SPHostToNs(int64_t host) {
 }
 
 static const uint64_t SPQueueByteBudget = 160ull << 20;
+static std::atomic<uint64_t> SPR8NextJobID{1};
+static BOOL SPR8Enabled(void) {
+    NSArray<NSString *> *a = NSProcessInfo.processInfo.arguments;
+    NSUInteger p = [a indexOfObject:@"--khua-isolated-profile"], l = [a indexOfObject:@"--khua-live-log"];
+    return [a containsObject:@"--khua-r8-quality-diagnostics"] && [a containsObject:@"--khua-pixel-diagnostics"] &&
+        p != NSNotFound && p + 1 < a.count && [a[p + 1] hasPrefix:@"/"] &&
+        l != NSNotFound && l + 1 < a.count && [a[l + 1] hasPrefix:@"/"];
+}
+static BOOL SPR8FixtureEnabled(void) {
+    return SPR8Enabled() && [NSProcessInfo.processInfo.arguments containsObject:@"--khua-r8-fixture-diagnostics"];
+}
+static int SPR8DecodeFixture(CVPixelBufferRef buffer) {
+    if (!buffer) return -1;
+    OSType format = CVPixelBufferGetPixelFormatType(buffer);
+    bool planar = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+    if (!planar && format != kCVPixelFormatType_32BGRA) return -1;
+    if (CVPixelBufferLockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return -1;
+    size_t width=CVPixelBufferGetWidth(buffer), height=CVPixelBufferGetHeight(buffer);
+    auto *base=(uint8_t *)(planar ? CVPixelBufferGetBaseAddressOfPlane(buffer,0) : CVPixelBufferGetBaseAddress(buffer));
+    size_t stride=planar ? CVPixelBufferGetBytesPerRowOfPlane(buffer,0) : CVPixelBufferGetBytesPerRow(buffer);
+    int result=-1; const bool marker[8]={true,true,false,true,false,false,true,true};
+    if (base && width>=128 && height>=80) for (int row=0; row<=70 && result<0; ++row) {
+        size_t y=std::min(height-1,(size_t)(height*(0.02+row*0.004))); bool bits[64]={}; bool valid=true;
+        for (int c=0;c<64;++c) {
+            size_t x=std::min(width-1,(size_t)(width*(0.08+0.84*(c+0.5)/64)));
+            auto *p=base+y*stride+x*(planar?1:4);
+            int level=planar?p[0]:(p[0]+p[1]+p[2])/3;
+            if (level>175) bits[c]=true; else if (level<80) bits[c]=false; else { valid=false; break; }
+        }
+        if (!valid) continue;
+        for (int i=0;i<8;++i) if (bits[i]!=marker[i] || bits[56+i]!=marker[7-i]) { valid=false; break; }
+        uint32_t frame=0;
+        if (valid) for (int i=0;i<24;++i) {
+            if (bits[8+i]==bits[32+i]) { valid=false; break; }
+            frame=(frame<<1)|(bits[8+i]?1:0);
+        }
+        if (valid) result=(int)frame;
+    }
+    CVPixelBufferUnlockBaseAddress(buffer,kCVPixelBufferLock_ReadOnly);
+    return result;
+}
+
+// Full-buffer coordinates, only used for the explicitly selected fixture.
+// Two of three orange-chroma votes are required at each sampled x.
+static NSDictionary *SPR8FixtureMotion(CVPixelBufferRef buffer) {
+    uint64_t started=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    size_t width=buffer ? CVPixelBufferGetWidth(buffer) : 0, height=buffer ? CVPixelBufferGetHeight(buffer) : 0;
+    auto make = ^NSDictionary *(BOOL valid, double centroid, int first, int last, int active, NSString *reason) {
+        return @{ @"valid": @(valid), @"centroidX": @(centroid), @"centroidNorm": @(valid ? centroid/(double)width : -1),
+            @"firstX": @(first), @"lastX": @(last), @"activeColumns": @(active), @"bufferWidth": @(width),
+            @"sampleDurationNs": @(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)-started), @"reason": reason,
+            @"rows": @[@0.41,@0.43,@0.45], @"coordinateSpace": @"full_pixel_buffer", @"metric": @"orange_chroma_weighted_centroid" };
+    };
+    if (!buffer) return make(NO,-1,-1,-1,0,@"unsupported");
+    OSType format=CVPixelBufferGetPixelFormatType(buffer);
+    bool planar=format==kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || format==kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+    if ((!planar && format!=kCVPixelFormatType_32BGRA) || width<128 || height<80) return make(NO,-1,-1,-1,0,@"unsupported");
+    if (CVPixelBufferLockBaseAddress(buffer,kCVPixelBufferLock_ReadOnly)!=kCVReturnSuccess) return make(NO,-1,-1,-1,0,@"lock_failed");
+    auto *base=(uint8_t *)(planar ? CVPixelBufferGetBaseAddressOfPlane(buffer,0) : CVPixelBufferGetBaseAddress(buffer));
+    auto *uv=(uint8_t *)(planar ? CVPixelBufferGetBaseAddressOfPlane(buffer,1) : nullptr);
+    size_t stride=planar ? CVPixelBufferGetBytesPerRowOfPlane(buffer,0) : CVPixelBufferGetBytesPerRow(buffer);
+    size_t uvStride=planar ? CVPixelBufferGetBytesPerRowOfPlane(buffer,1) : 0;
+    if (!base || (planar && !uv)) {
+        CVPixelBufferUnlockBaseAddress(buffer,kCVPixelBufferLock_ReadOnly);
+        return make(NO,-1,-1,-1,0,base ? @"missing_chroma" : @"missing_base");
+    }
+    size_t ys[3]={(size_t)(height*0.41),(size_t)(height*0.43),(size_t)(height*0.45)};
+    double sum=0, weighted=0; int first=(int)width,last=-1,active=0;
+    for (size_t x=0;x<width;++x) {
+        int votes=0,strength=0;
+        for (size_t y : ys) {
+            int score=0;
+            if (planar) {
+                size_t offset=(y/2)*uvStride+(x/2)*2;
+                if (base[y*stride+x]>35) score=std::max(0,std::min((int)uv[offset+1]-128,128-(int)uv[offset]));
+            } else {
+                auto *p=base+y*stride+x*4; int b=p[0],g=p[1],r=p[2];
+                if (r>50) score=std::max(0,std::min(r-g,g-b));
+            }
+            if (score>=8) { ++votes; strength+=score; }
+        }
+        if (votes>=2) { first=std::min(first,(int)x);last=(int)x;++active;sum+=strength;weighted+=(double)strength*x; }
+    }
+    CVPixelBufferUnlockBaseAddress(buffer,kCVPixelBufferLock_ReadOnly);
+    int span=last>=first ? last-first+1 : 0;
+    bool valid=span>=std::max(8,(int)(width/100)) && span<=(int)(width/4) && active*100>=span*65 && sum>0;
+    return make(valid,valid?weighted/sum:-1,valid?first:-1,valid?last:-1,active,valid?@"ok":@"no_coherent_orange_stripe");
+}
+
+static int SPR8Option(NSString *flag, int fallback, NSArray<NSNumber *> *allowed) {
+    if (!SPR8Enabled()) return fallback;
+    NSArray<NSString *> *a = NSProcessInfo.processInfo.arguments;
+    NSUInteger i = [a indexOfObject:flag];
+    if (i == NSNotFound || i + 1 >= a.count) return fallback;
+    NSString *value = a[i + 1];
+    for (NSNumber *n in allowed) if ([value isEqualToString:n.stringValue]) return n.intValue;
+    return fallback;
+}
 static const double SPInteractiveCapSec = 0.090;
 static const double SPQualityCapSec = 0.250;
 
@@ -63,6 +164,16 @@ static double SPPercentileMs(std::vector<int64_t> samples) {
     std::sort(samples.begin(), samples.end());
     size_t index = (samples.size() - 1) * 95 / 100;
     return (double)samples[index] / 1e6;
+}
+
+// R7 diagnostics are enabled only with both isolated profile and log paths.
+static BOOL SPR7Passthrough(void) {
+    NSArray<NSString *> *args = NSProcessInfo.processInfo.arguments;
+    NSUInteger p = [args indexOfObject:@"--khua-isolated-profile"];
+    NSUInteger l = [args indexOfObject:@"--khua-live-log"];
+    return [args containsObject:@"--khua-r7-passthrough"] && [args containsObject:@"--khua-pixel-diagnostics"] &&
+        p != NSNotFound && p + 1 < args.count && [args[p + 1] hasPrefix:@"/"] &&
+        l != NSNotFound && l + 1 < args.count && [args[l + 1] hasPrefix:@"/"];
 }
 
 static void SPWaitUntilHost(int64_t deadline) {
@@ -510,6 +621,40 @@ static CVPixelBufferRef SPQualityNV12(BOOL full,int shift,BOOL glyph=NO) {
 @implementation SPProbeDrawable
 @end
 
+static BOOL SPGeometryRectValue(id value, sp::GeometryRect &out) {
+    if (![value isKindOfClass:NSArray.class] || [value count] != 4) return NO;
+    NSArray *a = value;
+    for (id x in a) if (![x isKindOfClass:NSNumber.class]) return NO;
+    out = {[a[0] doubleValue], [a[1] doubleValue], [a[2] doubleValue], [a[3] doubleValue]};
+    return std::isfinite(out.x) && std::isfinite(out.y) && std::isfinite(out.width) && std::isfinite(out.height);
+}
+static BOOL SPSourceGeometryValue(NSDictionary *d, sp::GeometrySource &s) {
+    if (![d isKindOfClass:NSDictionary.class] ||
+        !SPGeometryRectValue(d[@"screenRect"], s.screenRect) || !SPGeometryRectValue(d[@"contentRect"], s.contentRect)) return NO;
+    for (NSString *key in @[@"generation",@"windowID",@"pid",@"bufferWidth",@"bufferHeight",@"scaleFactor",@"contentScale"])
+        if (![d[key] isKindOfClass:NSNumber.class]) return NO;
+    s.generation=[d[@"generation"] unsignedLongLongValue]; s.windowID=[d[@"windowID"] unsignedLongLongValue];
+    s.pid=[d[@"pid"] unsignedLongLongValue]; s.bufferWidth=[d[@"bufferWidth"] intValue]; s.bufferHeight=[d[@"bufferHeight"] intValue];
+    s.scaleFactor=[d[@"scaleFactor"] doubleValue]; s.contentScale=[d[@"contentScale"] doubleValue];
+    return YES;
+}
+static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
+    if (![d isKindOfClass:NSDictionary.class] || !SPGeometryRectValue(d[@"screenRect"], t.screenRect) ||
+        !SPGeometryRectValue(d[@"windowBounds"], t.windowBounds) || !SPGeometryRectValue(d[@"panelFrame"], t.panelFrame) || !SPGeometryRectValue(d[@"displayFrame"], t.displayFrame) ||
+        !SPGeometryRectValue(d[@"displayBoundsQuartz"], t.displayBoundsQuartz)) return NO;
+    for (NSString *key in @[@"generation",@"windowID",@"pid",@"config",@"epoch",@"displayID",@"backingScale",@"verified"])
+        if (![d[key] isKindOfClass:NSNumber.class]) return NO;
+    t.generation=[d[@"generation"] unsignedLongLongValue]; t.windowID=[d[@"windowID"] unsignedLongLongValue];
+    t.pid=[d[@"pid"] unsignedLongLongValue]; t.config=[d[@"config"] unsignedLongLongValue];
+    t.epoch=[d[@"epoch"] unsignedLongLongValue]; t.displayID=[d[@"displayID"] unsignedLongLongValue];
+    t.backingScale=[d[@"backingScale"] doubleValue]; t.verified=[d[@"verified"] boolValue];
+    return YES;
+}
+
+@interface SPLivePreviewView ()
+- (void)observeSourceGeometry:(NSDictionary *)value generation:(uint64_t)generation;
+@end
+
 @implementation SPLivePreviewView {
     CAMetalLayer *_metalLayer;
     CALayer *_sourceCover;
@@ -526,10 +671,14 @@ static CVPixelBufferRef SPQualityNV12(BOOL full,int shift,BOOL glyph=NO) {
     std::atomic<bool> _drawableVisible;
     std::atomic<bool> _exposed;
     std::atomic<bool> _followTargetContent;
+    std::atomic<uint32_t> _diagnosticDisplayID;
     std::atomic<uint64_t> _diagnosticConfig;
     std::atomic<uint64_t> _diagnosticEpoch;
     std::atomic<uint64_t> _surfaceToken;
     std::atomic<int> _inflightDraws;
+    std::mutex _geometryMutex;
+    sp::SharedGeometryAuthority _sharedGeometry;
+    int64_t _geometryVerifiedHost;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -541,10 +690,12 @@ static CVPixelBufferRef SPQualityNV12(BOOL full,int shift,BOOL glyph=NO) {
     _drawableVisible.store(false);
     _exposed.store(false);
     _followTargetContent.store(false);
+    _diagnosticDisplayID.store(0);
     _diagnosticConfig.store(0);
     _diagnosticEpoch.store(0);
     _surfaceToken.store(0);
     _inflightDraws.store(0);
+    _geometryVerifiedHost = 0;
     self.wantsLayer = YES;
     _device = MTLCreateSystemDefaultDevice();
     _metalLayer = [CAMetalLayer layer];
@@ -583,11 +734,15 @@ static CVPixelBufferRef SPQualityNV12(BOOL full,int shift,BOOL glyph=NO) {
 
 - (void)layout {
     [super layout];
+    CGSize oldSize = _metalLayer.drawableSize;
     _metalLayer.contentsScale = self.window.backingScaleFactor ?: NSScreen.mainScreen.backingScaleFactor ?: 2;
     _metalLayer.frame = self.bounds;
     _sourceCover.frame = self.bounds;
     _metalLayer.drawableSize = CGSizeMake(MAX(1, self.bounds.size.width * _metalLayer.contentsScale),
                                           MAX(1, self.bounds.size.height * _metalLayer.contentsScale));
+    if (!CGSizeEqualToSize(oldSize, _metalLayer.drawableSize)) {
+        std::lock_guard<std::mutex> lock(_geometryMutex); _sharedGeometry.observeTarget({}, false);
+    }
     [self refreshVisibilitySnapshot];
 }
 
@@ -599,6 +754,11 @@ static CVPixelBufferRef SPQualityNV12(BOOL full,int shift,BOOL glyph=NO) {
     _windowVisible.store(visible);
     _drawableVisible.store(drawable);
     _exposed.store(visible && window.alphaValue >= 0.99);
+    _diagnosticDisplayID.store([window.screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue]);
+    if (!drawable || window.alphaValue < 0.99) {
+        std::lock_guard<std::mutex> lock(_geometryMutex);
+        _sharedGeometry.observeTarget({}, false);
+    }
 }
 
 - (BOOL)windowVisibleSnapshot { return _windowVisible.load(); }
@@ -616,6 +776,7 @@ static CVPixelBufferRef SPQualityNV12(BOOL full,int shift,BOOL glyph=NO) {
         if (generation > _highestGeneration) _highestGeneration = generation;
         old = _generation.exchange(generation);
     }
+    if (generation != old) { std::lock_guard<std::mutex> lock(_geometryMutex); _sharedGeometry.invalidate(); }
     if (!generation || generation == old) return;
     void (^cover)(void) = ^{ [self applySourceCoverForGeneration:generation]; };
     if (NSThread.isMainThread) cover(); else dispatch_async(dispatch_get_main_queue(), cover);
@@ -641,12 +802,121 @@ static CVPixelBufferRef SPQualityNV12(BOOL full,int shift,BOOL glyph=NO) {
 - (BOOL)sourceCoverVisibleForTesting { return !_sourceCover.hidden; }
 
 - (void)setDiagnosticsConfig:(uint64_t)config epoch:(uint64_t)epoch {
-    _diagnosticConfig = config;
-    _diagnosticEpoch = epoch;
+    uint64_t oldConfig = _diagnosticConfig.exchange(config), oldEpoch = _diagnosticEpoch.exchange(epoch);
+    if (oldConfig != config || oldEpoch != epoch) {
+        std::lock_guard<std::mutex> lock(_geometryMutex); _sharedGeometry.invalidate();
+    }
+}
+
+- (void)observeSourceGeometry:(NSDictionary *)value generation:(uint64_t)generation {
+    sp::GeometrySource source{};
+    BOOL valid=SPSourceGeometryValue(value, source) && source.generation==generation;
+    std::lock_guard<std::mutex> lock(_geometryMutex);
+    if (_generation.load()!=generation || !generation) return;
+    _sharedGeometry.observeSource(source, valid);
+}
+
+- (void)observeVerifiedWindowGeometry:(NSDictionary *)value {
+    NSAssert(NSThread.isMainThread, @"target verification must use the main thread");
+    sp::GeometryTarget target{};
+    BOOL valid=SPTargetGeometryValue(value, target) && target.verified && target.generation==_generation.load() &&
+        target.config==_diagnosticConfig.load() && target.epoch==_diagnosticEpoch.load();
+    std::lock_guard<std::mutex> lock(_geometryMutex);
+    valid = valid && target.generation==_generation.load() && target.config==_diagnosticConfig.load() && target.epoch==_diagnosticEpoch.load();
+    if (_geometryVerifiedHost > 0 && SPHostToNs(SPHostNow()-_geometryVerifiedHost)>350000000LL)
+        _sharedGeometry.observeTarget({}, false); // expiry cannot resurrect an old presented ticket
+    _sharedGeometry.observeTarget(target, valid);
+    _geometryVerifiedHost = valid ? SPHostNow() : 0;
+}
+
+- (void)invalidateSharedGeometry {
+    std::lock_guard<std::mutex> lock(_geometryMutex);
+    _sharedGeometry.invalidate(); _geometryVerifiedHost=0;
+}
+
+- (NSDictionary *)sharedGeometrySnapshot {
+    std::lock_guard<std::mutex> lock(_geometryMutex);
+    auto g = _sharedGeometry.active();
+    if (!g.valid || g.generation!=_generation.load() || g.config!=_diagnosticConfig.load() || g.epoch!=_diagnosticEpoch.load() ||
+        g.displayID!=_diagnosticDisplayID.load() || _geometryVerifiedHost<=0 || SPHostToNs(SPHostNow()-_geometryVerifiedHost)>350000000LL)
+        return @{ @"valid": @NO, @"version": [NSNull null], @"routingPermitted": @NO };
+    auto rect=[](sp::GeometryRect r) -> NSArray * { return @[@(r.x),@(r.y),@(r.width),@(r.height)]; };
+    return @{ @"valid": @YES, @"version": @(g.version), @"generation": @(g.generation), @"config": @(g.config),
+        @"routingPermitted": @NO, @"scope": @"verified metadata and presented geometry; real input compatibility not established",
+        @"measurementEpoch": @(g.epoch), @"windowID": @(g.windowID), @"pid": @(g.pid), @"displayID": @(g.displayID),
+        @"presentedFrameID": @(g.frameID), @"captureHost": @(g.captureHost), @"verifiedHost": @(_geometryVerifiedHost),
+        @"screenRectQuartz": rect(g.sourceScreenRect), @"contentRectSurfacePoints": rect(g.sourceContentRect),
+        @"windowBoundsQuartz": rect(g.sourceWindowBounds),
+        @"sourceBufferPixels": @[@(g.sourceBufferWidth),@(g.sourceBufferHeight)], @"scaleFactor": @(g.scaleFactor),
+        @"contentScale": @(g.contentScale), @"panelFrameAppKitPoints": rect(g.panelFrame), @"displayFrameAppKitPoints": rect(g.displayFrame),
+        @"displayBoundsQuartz": rect(g.displayBoundsQuartz),
+        @"drawablePixels": @[@(g.drawableWidth),@(g.drawableHeight)], @"outputImageRectPixels": rect(g.render.image),
+        @"sourceCropQuartz": rect(g.input.sourceCrop) };
+}
+
+- (NSDictionary<NSString *, NSNumber *> *)mapOutputPixel:(NSPoint)point geometryVersion:(uint64_t)version {
+    std::lock_guard<std::mutex> lock(_geometryMutex);
+    auto g = _sharedGeometry.active(); sp::GeometryPoint result{};
+    if (!g.valid || g.generation!=_generation.load() || g.config!=_diagnosticConfig.load() || g.epoch!=_diagnosticEpoch.load() ||
+        g.displayID!=_diagnosticDisplayID.load() || _geometryVerifiedHost<=0 || SPHostToNs(SPHostNow()-_geometryVerifiedHost)>350000000LL ||
+        !sp::outputToSource(g.input,version,{point.x,point.y},result)) return nil;
+    return @{ @"x": @(result.x), @"y": @(result.y), @"version": @(version) };
+}
+
+- (NSDictionary<NSString *, NSNumber *> *)mapQuartzOutputPoint:(CGPoint)point geometryVersion:(uint64_t)version clamp:(BOOL)clamp {
+    std::lock_guard<std::mutex> lock(_geometryMutex);
+    auto g = _sharedGeometry.active(); sp::GeometryPoint result{};
+    if (!g.valid || g.generation!=_generation.load() || g.config!=_diagnosticConfig.load() || g.epoch!=_diagnosticEpoch.load() ||
+        g.displayID!=_diagnosticDisplayID.load() || _geometryVerifiedHost<=0 || SPHostToNs(SPHostNow()-_geometryVerifiedHost)>350000000LL ||
+        !sp::mapQuartzOutputToSource(g,version,{point.x,point.y},clamp,result)) return nil;
+    return @{ @"x": @(result.x), @"y": @(result.y), @"version": @(version) };
+}
+
++ (NSDictionary<NSString *, id> *)runSharedGeometryBridgeContract {
+    __block SPLivePreviewView *view=nil;
+    void (^makeView)(void) = ^{ view=[[SPLivePreviewView alloc] initWithFrame:NSMakeRect(0,0,640,480)]; };
+    if (NSThread.isMainThread) makeView(); else dispatch_sync(dispatch_get_main_queue(), makeView);
+    [view setGeneration:3]; [view setDiagnosticsConfig:4 epoch:5]; view->_diagnosticDisplayID.store(8);
+    NSDictionary *source=@{ @"generation":@3, @"windowID":@101, @"pid":@77, @"bufferWidth":@1280, @"bufferHeight":@960,
+        @"screenRect":@[@100,@200,@640,@480], @"contentRect":@[@0,@0,@640,@480], @"scaleFactor":@2, @"contentScale":@1 };
+    NSDictionary *target=@{ @"generation":@3, @"windowID":@101, @"pid":@77, @"config":@4, @"epoch":@5, @"displayID":@8,
+        @"screenRect":@[@100,@200,@640,@480], @"windowBounds":@[@100,@168,@640,@512],
+        @"panelFrame":@[@(-640),@0,@640,@480], @"displayFrame":@[@(-1920),@0,@1920,@1080],
+        @"displayBoundsQuartz":@[@(-1920),@0,@1920,@1080], @"backingScale":@2, @"verified":@YES };
+    [view observeSourceGeometry:source generation:3];
+    void (^verify)(void) = ^{ [view observeVerifiedWindowGeometry:target]; };
+    if (NSThread.isMainThread) verify(); else dispatch_sync(dispatch_get_main_queue(), verify);
+    sp::GeometrySource frame{}; BOOL parsed=SPSourceGeometryValue(source,frame);
+    sp::SharedGeometry pending{};
+    { std::lock_guard<std::mutex> lock(view->_geometryMutex);
+      pending=view->_sharedGeometry.candidate(frame,3,4,5,8,1280,960,1280,960,false); }
+    BOOL pendingInvisible=![[view sharedGeometrySnapshot][@"valid"] boolValue];
+    { std::lock_guard<std::mutex> lock(view->_geometryMutex); (void)view->_sharedGeometry.activate(pending.version,25,100); }
+    NSDictionary *first=[view sharedGeometrySnapshot]; NSDictionary *mapped=[view mapOutputPixel:NSMakePoint(640,480) geometryVersion:pending.version];
+    BOOL valid=parsed && pending.valid && [first[@"valid"] boolValue] && [first[@"presentedFrameID"] unsignedLongLongValue]==25 &&
+        fabs([mapped[@"x"] doubleValue]-420)<.001 && fabs([mapped[@"y"] doubleValue]-440)<.001;
+    [view observeSourceGeometry:nil generation:2];
+    BOOL staleIgnored=[[view sharedGeometrySnapshot][@"valid"] boolValue];
+    { std::lock_guard<std::mutex> lock(view->_geometryMutex); view->_geometryVerifiedHost=1; }
+    BOOL expired=![[view sharedGeometrySnapshot][@"valid"] boolValue];
+    if (NSThread.isMainThread) verify(); else dispatch_sync(dispatch_get_main_queue(), verify);
+    expired=expired && ![[view sharedGeometrySnapshot][@"valid"] boolValue] && ![view mapOutputPixel:NSMakePoint(640,480) geometryVersion:pending.version];
+    { std::lock_guard<std::mutex> lock(view->_geometryMutex);
+      pending=view->_sharedGeometry.candidate(frame,3,4,5,8,1280,960,1280,960,false);
+      expired=expired && pending.valid && view->_sharedGeometry.activate(pending.version,26,101); }
+    NSMutableDictionary *moved=[source mutableCopy]; moved[@"screenRect"]=@[@110,@200,@640,@480];
+    [view observeSourceGeometry:moved generation:3];
+    BOOL invalidated=![[view sharedGeometrySnapshot][@"valid"] boolValue] && ![view mapOutputPixel:NSMakePoint(640,480) geometryVersion:pending.version];
+    BOOL ok=valid && pendingInvisible && staleIgnored && expired && invalidated;
+    return @{ @"ok":@(ok), @"candidateNotActiveBeforePresentation":@(pendingInvisible), @"matchingMap":@(valid),
+        @"staleGenerationIgnored":@(staleIgnored), @"expiredCannotResurrect":@(expired), @"moveRevokesVersion":@(invalidated),
+        @"scope":@"actual view metadata/authority bridge and inverse transform; no real window, SCK, drawable or GUI input" };
 }
 
 - (void)setSurfaceToken:(uint64_t)token { _surfaceToken.store(token); }
-- (void)setFollowTargetContent:(BOOL)follow { _followTargetContent.store(follow); }
+- (void)setFollowTargetContent:(BOOL)follow {
+    if (_followTargetContent.exchange(follow) != follow) [self invalidateSharedGeometry];
+}
 
 - (CVMetalTextureRef)createTexture:(CVPixelBufferRef)buffer {
     if (!buffer || !_cache) return NULL;
@@ -658,9 +928,12 @@ static CVPixelBufferRef SPQualityNV12(BOOL full,int shift,BOOL glyph=NO) {
     return ref;
 }
 
-- (void)writeQuad:(float *)v viewportWidth:(float)pw height:(float)ph frameWidth:(float)fw frameHeight:(float)fh fill:(BOOL)fill {
-    const auto quad = sp::outputQuad(pw, ph, fw, fh, fill);
-    float hw = quad.halfWidth, hh = quad.halfHeight;
+- (void)writeQuad:(float *)v viewportWidth:(float)pw height:(float)ph frameWidth:(float)fw frameHeight:(float)fh fill:(BOOL)fill
+        geometry:(const sp::OutputGeometry *)shared {
+    const auto geometry = shared && shared->valid ? *shared : sp::outputGeometry({0,0,pw,ph},{0,0,fw,fh},fill,1);
+    const auto fallback = sp::outputQuad(pw, ph, fw, fh, fill);
+    float hw = geometry.valid ? (float)(geometry.image.width / pw) : fallback.halfWidth;
+    float hh = geometry.valid ? (float)(geometry.image.height / ph) : fallback.halfHeight;
     float xyuv[16] = {
         -hw, -hh, 0, 1,
          hw, -hh, 1, 1,
@@ -677,8 +950,15 @@ static CVPixelBufferRef SPQualityNV12(BOOL full,int shift,BOOL glyph=NO) {
              buffer:(id<MTLCommandBuffer>)command
            drawable:(id<CAMetalDrawable>)drawable
                fill:(BOOL)fill {
+    [self drawTexture:texture frameWidth:fw frameHeight:fh viewport:viewport buffer:command drawable:drawable fill:fill geometry:nullptr];
+}
+
+- (void)drawTexture:(id<MTLTexture>)texture
+         frameWidth:(float)fw frameHeight:(float)fh viewport:(MTLViewport)viewport
+             buffer:(id<MTLCommandBuffer>)command drawable:(id<CAMetalDrawable>)drawable
+               fill:(BOOL)fill geometry:(const sp::OutputGeometry *)geometry {
     float quad[16];
-    [self writeQuad:quad viewportWidth:(float)viewport.width height:(float)viewport.height frameWidth:fw frameHeight:fh fill:fill];
+    [self writeQuad:quad viewportWidth:(float)viewport.width height:(float)viewport.height frameWidth:fw frameHeight:fh fill:fill geometry:geometry];
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
     pass.colorAttachments[0].texture = drawable.texture;
     pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
@@ -749,6 +1029,7 @@ static CVPixelBufferRef SPQualityNV12(BOOL full,int shift,BOOL glyph=NO) {
               synthetic:(BOOL)synthetic
                 frameID:(uint64_t)frameID
                  counts:(BOOL)counts
+         captureGeometry:(NSDictionary *)captureGeometry
                  reason:(NSString **)reason {
     if (generation != _generation) { if (reason) *reason = @"generation"; return NO; }
     if (!_pipeline) { if (reason) *reason = @"pipeline"; return NO; }
@@ -759,6 +1040,7 @@ static CVPixelBufferRef SPQualityNV12(BOOL full,int shift,BOOL glyph=NO) {
     BOOL occluded = windowVisible && !_drawableVisible.load();
     BOOL exposed = _exposed.load();
     BOOL fillTarget = _followTargetContent.load() && mode != SPLiveViewCompare;
+    uint32_t diagnosticDisplayID = _diagnosticDisplayID.load();
     if (!counts && (!windowVisible || occluded)) return YES;
     int pending = _inflightDraws.load();
     if (pending >= 3) { if (reason) *reason = @"inflight"; return NO; }
@@ -845,6 +1127,21 @@ static CVPixelBufferRef SPQualityNV12(BOOL full,int shift,BOOL glyph=NO) {
         CGSize size = CGSizeMake(drawable.texture.width, drawable.texture.height);
         float fw = (float)CVPixelBufferGetWidth(primary);
         float fh = (float)CVPixelBufferGetHeight(primary);
+        sp::SharedGeometry geometryCandidate{};
+        sp::GeometrySource sourceGeometry{};
+        if (counts && mode != SPLiveViewCompare && SPSourceGeometryValue(captureGeometry, sourceGeometry)) {
+            std::lock_guard<std::mutex> lock(self->_geometryMutex);
+            geometryCandidate=self->_sharedGeometry.candidate(sourceGeometry, seen, seenConfig, seenEpoch, diagnosticDisplayID,
+                (int)size.width, (int)size.height, (int)fw, (int)fh, fillTarget);
+        }
+        // If this drawable cannot be tied to the current verified geometry,
+        // no earlier mapping may remain active while it is being presented.
+        if (counts && !geometryCandidate.valid) [self invalidateSharedGeometry];
+        id imageRectPixels = [NSNull null];
+        if (SPR8FixtureEnabled() && mode != SPLiveViewCompare) {
+            auto geometry = sp::outputGeometry({0,0,size.width,size.height},{0,0,fw,fh},fillTarget,1);
+            if (geometry.valid) imageRectPixels = @[@(geometry.image.x), @(geometry.image.y), @(geometry.image.width), @(geometry.image.height)];
+        }
         if (mode == SPLiveViewCompare && b) {
             MTLViewport left = {0, 0, size.width * 0.5, size.height, 0, 1};
             MTLViewport right = {size.width * 0.5, 0, size.width * 0.5, size.height, 0, 1};
@@ -854,7 +1151,8 @@ static CVPixelBufferRef SPQualityNV12(BOOL full,int shift,BOOL glyph=NO) {
                      viewport:right buffer:command drawable:drawable fill:NO];
         } else {
             MTLViewport full = {0, 0, size.width, size.height, 0, 1};
-            [self drawTexture:a frameWidth:fw frameHeight:fh viewport:full buffer:command drawable:drawable fill:fillTarget];
+            [self drawTexture:a frameWidth:fw frameHeight:fh viewport:full buffer:command drawable:drawable fill:fillTarget
+                      geometry:geometryCandidate.valid ? &geometryCandidate.render : nullptr];
         }
         [command addCompletedHandler:^(id<MTLCommandBuffer> done) {
             if (done.status != MTLCommandBufferStatusCompleted) reportFailure(@"gpu");
@@ -883,6 +1181,14 @@ static CVPixelBufferRef SPQualityNV12(BOOL full,int shift,BOOL glyph=NO) {
         [drawable addPresentedHandler:^(id<MTLDrawable> presentedDrawable) {
             long long gpuHost = note->gpuHost.load();
             releaseNote();
+            BOOL geometryActivated = NO;
+            if (geometryCandidate.valid && counts && windowVisible && exposed && !occluded && presentedDrawable.presentedTime > 0 &&
+                seen==self->_generation.load() && seenConfig==self->_diagnosticConfig.load() && seenEpoch==self->_diagnosticEpoch.load()) {
+                std::lock_guard<std::mutex> lock(self->_geometryMutex);
+                if (seen==self->_generation.load() && seenConfig==self->_diagnosticConfig.load() && seenEpoch==self->_diagnosticEpoch.load() &&
+                    self->_geometryVerifiedHost>0 && SPHostToNs(SPHostNow()-self->_geometryVerifiedHost)<=350000000LL)
+                    geometryActivated=self->_sharedGeometry.activate(geometryCandidate.version,frameID,captureHost);
+            }
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self revealSourceGeneration:seen];
             });
@@ -910,6 +1216,9 @@ static CVPixelBufferRef SPQualityNV12(BOOL full,int shift,BOOL glyph=NO) {
                 @"height": @(height),
                 @"drawableWidth": @((int)size.width),
                 @"drawableHeight": @((int)size.height),
+                @"outputImageRectPixels": imageRectPixels,
+                @"outputDisplayID": diagnosticDisplayID ? @(diagnosticDisplayID) : (id)[NSNull null],
+                @"geometryVersion": geometryActivated ? @(geometryCandidate.version) : (id)[NSNull null],
                 @"enhancedCenter": @(-1),
                 @"originalCenter": @(-1),
             });
@@ -944,6 +1253,9 @@ struct SPLiveInbound {
 };
 
 struct SPLiveJob {
+    uint64_t diagnosticID = 0;
+    uint64_t measurementEpoch = 0;
+    int64_t callbackHost = 0;
     uint64_t configVersion = 0;
     uint64_t generation = 0;
     int64_t captureHost = 0;
@@ -982,6 +1294,7 @@ static void SPReleaseSRJob(SPSRJob *job) {
 
 struct SPPlaySlot {
     sp::SPRational pts{};
+    uint64_t jobID = 0, clockEpoch = 0, measurementEpoch = 0;
     int64_t targetHost = 0;
     int64_t readyHost = 0;
     BOOL synthetic = NO;
@@ -998,11 +1311,13 @@ struct SPPlaySlot {
 
 struct SPPendingPhase {
     sp::SPRational pts{};
+    uint64_t jobID = 0, configVersion = 0, clockEpoch = 0, measurementEpoch = 0;
     int64_t targetHost = 0;
     uint64_t generation = 0;
 };
 
 struct SPFrameMark {
+    uint64_t jobID = 0, clockEpoch = 0;
     int64_t readyHost = 0;
     int64_t targetHost = 0;
     BOOL hasCenter = NO;
@@ -1077,6 +1392,12 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     NSMutableArray *_testPendingTrace;
     NSMutableArray *_testTimingTrace;
     std::unordered_map<uint64_t, SPFrameMark> _marks;
+    // Bounded diagnostic metadata only; jobs retain their existing owners.
+    std::unordered_map<uint64_t, std::pair<int64_t, uint64_t>> _r7JobHosts;
+    uint64_t _r7JobCompleted, _r7JobUntracked;
+    NSDictionary *_r7LastJobSubmitted, *_r7LastJobCompleted;
+    NSMutableArray<NSDictionary *> *_r7JobTimeline;
+    NSMutableArray<NSDictionary *> *_r8OutputTimeline;
     dispatch_source_t _clock;
     BOOL _haveAnchor;
     sp::SPRational _anchorPts;
@@ -1090,6 +1411,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     BOOL _delayClamped;
     BOOL _delayTimeClamped, _delayByteClamped;
     NSUInteger _peakSlots;
+    uint64_t _r8ReportedSlotBytesPeak, _r8SlotReferencePeak, _r8BudgetEvictions;
     BOOL _haveLastPts;
     sp::SPRational _lastPresentedPts;
     CVPixelBufferRef _lastEnhanced;
@@ -1150,8 +1472,18 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     uint64_t _capturePressureGeneration;
     uint64_t _capturePressureEvents;
     int64_t _lastProcessedHost, _lastDrawablePresentedHost;
+    int64_t _r7ContentChangedHost;
+    uint64_t _r7ContentChangedGeneration, _r7ContentChangedConfig, _r7ContentChangedEpoch;
+    uint64_t _r7LumaGeneration, _r7LumaConfig, _r7LumaEpoch;
     uint64_t _syntheticOK, _syntheticFail, _presentedSource, _presentedSynthetic;
     uint64_t _scheduledSynthetic, _submitted;
+    sp::FRCBudgetGate _r9FRCBudgetGate;
+    double _r9RequiredBudgetMs, _r9AllowedBudgetMs;
+    uint64_t _r9BudgetRejectedPhases, _r9BackendFullPhases, _r9BudgetProbeJobs;
+    uint64_t _r9OnTimeSynthetic, _r9LatePhysicalSynthetic, _r9TimingUnknownSynthetic;
+    uint64_t _r9RateSyntheticBaseline, _r9RateOnTimeBaseline;
+    int64_t _r9RateHost;
+    double _r9GeneratedFPS, _r9OnTimeSyntheticFPS;
     uint64_t _nativeBudgetSkippedPhases;
     BOOL _nativeBudgetActive;
     BOOL _nativeBGRADirectActive;
@@ -1163,6 +1495,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     uint64_t _deadlineDrops, _sceneSkips, _queueDrops, _presentedCallbacks, _renderDrops;
     uint64_t _engineUnavailableDrops, _inflightLimitDrops, _engineSubmissionRejectedDrops, _rifePoolPressureDrops;
     NSMutableDictionary *_presentationFailuresLifetime, *_presentationFailuresEpoch;
+    NSMutableDictionary<NSNumber *, NSDictionary *> *_geometryInputs;
+    NSMutableArray<NSNumber *> *_geometryInputOrder;
     NSMutableDictionary *_firstPresentationFailureLifetime, *_firstPresentationFailureEpoch, *_ignoredPresentedCallbacks;
     uint64_t _staticHoldPhases, _epochStaticHoldPhases;
     uint64_t _lateReadyDrops, _staleReadyDrops, _dueMergeDrops, _pendingExpiredDrops, _slotEvictionDrops;
@@ -1248,6 +1582,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     _firstPresentationFailureLifetime = [NSMutableDictionary dictionary];
     _firstPresentationFailureEpoch = [NSMutableDictionary dictionary];
     _ignoredPresentedCallbacks = [NSMutableDictionary dictionary];
+    _geometryInputs = [NSMutableDictionary dictionary];
+    _geometryInputOrder = [NSMutableArray array];
     _resolved = [[SPLiveResolvedPlan alloc] init];
     _sourceGeneration = 1;
     _configVersion = 1;
@@ -1330,6 +1666,25 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     }
 }
 
+- (void)recordR7JobEvent:(NSString *)kind detail:(NSDictionary *)detail {
+    if (!_pixelDiagnosticsEnabled) return;
+    if (!_r7JobTimeline) _r7JobTimeline = [NSMutableArray array];
+    NSMutableDictionary *event = [detail mutableCopy];
+    event[@"kind"] = kind;
+    event[@"host"] = @(SPHostNow());
+    [_r7JobTimeline addObject:event];
+    NSUInteger limit = SPR8Enabled() ? 256 : 64;
+    if (_r7JobTimeline.count > limit) [_r7JobTimeline removeObjectAtIndex:0];
+}
+
+- (double)r7OldestJobAgeMs {
+    int64_t oldest = 0;
+    for (const auto &entry : _r7JobHosts) {
+        if (entry.second.second == _configVersion && (!oldest || entry.second.first < oldest)) oldest = entry.second.first;
+    }
+    return oldest ? (double)SPHostToNs(SPHostNow() - oldest) / 1e6 : -1;
+}
+
 - (NSDictionary *)pixelDiagnosticsSnapshot {
     if (!_pixelDiagnosticsEnabled) return @{ @"enabled": @NO };
     return @{ @"enabled": @YES, @"intervalMs": @1000,
@@ -1391,6 +1746,23 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"pumpArrivalRate": @(_fpsMeter.inputArrivalRate((int64_t)(CACurrentMediaTime()*1e9))),
         @"staticHoldPhases": @(_staticHoldPhases), @"epochStaticHoldPhases": @(_epochStaticHoldPhases),
         @"submitted": @(_submitted),
+        @"r9BudgetLimited": @(_r9FRCBudgetGate.limited()),
+        @"r9RequiredBudgetMs": @(_r9RequiredBudgetMs), @"r9AllowedBudgetMs": @(_r9AllowedBudgetMs),
+        @"r9BudgetRejectedPhases": @(_r9BudgetRejectedPhases), @"r9BudgetProbeJobs": @(_r9BudgetProbeJobs),
+        @"r9BackendFullPhases": @(_r9BackendFullPhases),
+        @"r9BackendBusy": @(_engine ? _engine.busyCount : 0), @"r9BackendSessions": @(_engine ? _engine.sessionCount : 0),
+        @"r9GeneratedFPS": @(_r9GeneratedFPS), @"r9OnTimeSyntheticFPS": @(_r9OnTimeSyntheticFPS),
+        @"r9OnTimePhysicalSynthetic": @(_r9OnTimeSynthetic), @"r9LatePhysicalSynthetic": @(_r9LatePhysicalSynthetic),
+        @"r9TimingUnknownSynthetic": @(_r9TimingUnknownSynthetic),
+        @"r9OnTimeDefinition": @"visible, scored non-held synthetic drawable, presentedTime no later than frozen target plus 2ms; callback-order estimate, not subjective visual proof",
+        @"r7JobsTracked": @(_r7JobHosts.size()),
+        @"r7JobsUntracked": @(_r7JobUntracked),
+        @"r7JobsCompleted": @(_r7JobCompleted),
+        @"r7OldestJobAgeMs": @([self r7OldestJobAgeMs]),
+        @"r7LastJobSubmitted": _r7LastJobSubmitted ?: @{},
+        @"r7LastJobCompleted": _r7LastJobCompleted ?: @{},
+        @"r7JobTimeline": [_r7JobTimeline copy] ?: @[],
+        @"r8OutputTimeline": [_r8OutputTimeline copy] ?: @[],
         @"presentedSource": @(_presentedSource),
         @"presentedSynthetic": @(_presentedSynthetic),
         @"presented": @(_presentedSource + _presentedSynthetic),
@@ -1450,6 +1822,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"stopped": @(_stopped),
         @"sourceGeneration": @(_sourceGeneration),
         @"measurementEpoch": @(_measurementEpoch),
+        @"clockEpoch": @(_clockEpoch),
         @"epochSamples": @(_epochSamples),
         @"epochP95ms": @(p95),
         @"epochMonotonic": @(_epochMonotonic),
@@ -1508,7 +1881,22 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"measuredScheduled": @(_measuredScheduled),
         @"centerSampleMs": @((double)_centerSampleNs / 1e6),
         @"centerSamples": @(_centerSamples),
-        @"queueByteBudget": @(SPQueueByteBudget),
+        @"queueByteBudget": @([self r8QueueByteBudget]),
+        @"r8QualityDiagnostic": @(SPR8Enabled()),
+        @"r8ExperimentActive": @([self r8CanExperiment]),
+        @"r8AdmissionLimit": @([self r8AdmissionLimit]),
+        @"r8SessionsRequested": @(SPR8Option(@"--khua-r8-sessions", 2, @[@1,@2,@3,@4])),
+        @"r8SessionsActual": @(_engine ? _engine.sessionCount : 0),
+        @"r8QueueBudgetScope": @"playout slot nominal bytes only; excludes capture pool, VT/Metal surfaces and model allocations",
+        @"r8SlotCapByBytes": @([self slotCapByBytes]),
+        @"r8PeakSlots": @(_peakSlots),
+        @"r8TransientReserveFrames": @([self r8CanExperiment] ? 1 : 0),
+        @"r8SlotReferencesCurrent": @(_slots.size() * 2),
+        @"r8SlotReferencesPeak": @(_r8SlotReferencePeak),
+        @"r8BudgetEvictions": @(_r8BudgetEvictions),
+        @"r8ReportedSlotBytesCurrent": @([self r8ReportedSlotBytes]),
+        @"r8ReportedSlotBytesPeak": @(_r8ReportedSlotBytesPeak),
+        @"r8ReportedSlotBytesScope": @"deduplicated CVPixelBufferGetDataSize for queued slot buffers, not resident or total GPU/VT process memory",
         @"sourceWidth": @(_width),
         @"sourceHeight": @(_height),
         @"lowLatencyPreScale": @([self requestUsesLowPrescale:_request width:_width height:_height]),
@@ -1519,6 +1907,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"lowLatencyProcessingHeight": @(_lowLatency ? _lowLatency.height : 0),
         @"lowLatencyProcessingOrder": [self requestUsesLowPrescale:_request width:_width height:_height] ? @"lanczos-before-low-latency" : @"interpolation-before-scale",
         @"estimatedContentFPS": @((double)_windowChanged / seconds),
+        @"r7ContentChange": @{ @"host": @(_r7ContentChangedHost),
+            @"generation": @(_r7ContentChangedGeneration), @"configVersion": @(_r7ContentChangedConfig),
+            @"measurementEpoch": @(_r7ContentChangedEpoch),
+            @"note": @"sampled luma change; capture mach host, not proof of full-frame identity" },
         @"callbackFPS": @((double)_windowCallbacks / seconds),
         @"overlayInputEstimateFPS": @(_fpsMeter.inputRate((int64_t)(CACurrentMediaTime() * 1e9))),
         @"overlayPresentedFPS": @(_fpsMeter.outputRate((int64_t)(CACurrentMediaTime() * 1e9))),
@@ -1532,6 +1924,15 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     int64_t now = SPHostNow();
     if (SPHostToNs(now - _lastStatsHost) < 200000000LL) return;
     _lastStatsHost = now;
+    int64_t elapsedNs = _r9RateHost > 0 ? SPHostToNs(now - _r9RateHost) : 0;
+    if (elapsedNs >= 1000000000LL) {
+        if (elapsedNs <= 3000000000LL && _syntheticOK >= _r9RateSyntheticBaseline && _r9OnTimeSynthetic >= _r9RateOnTimeBaseline) {
+            double seconds = (double)elapsedNs / 1e9;
+            _r9GeneratedFPS = (_syntheticOK - _r9RateSyntheticBaseline) / seconds;
+            _r9OnTimeSyntheticFPS = (_r9OnTimeSynthetic - _r9RateOnTimeBaseline) / seconds;
+        } else { _r9GeneratedFPS = -1; _r9OnTimeSyntheticFPS = -1; }
+        _r9RateHost = now; _r9RateSyntheticBaseline = _syntheticOK; _r9RateOnTimeBaseline = _r9OnTimeSynthetic;
+    }
     NSDictionary *stats = [self currentStats];
     void (^handler)(NSDictionary *) = self.statsHandler;
     if (!handler) return;
@@ -1641,7 +2042,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 }
 
 - (BOOL)requestUsesLatestPresentation:(SPLivePlanRequest *)request {
-    return [self requestUsesLatestScale:request] || (request.interpolationEnabled &&
+    return SPR7Passthrough() || !request.interpolationEnabled || [self requestUsesLatestScale:request] || (request.interpolationEnabled &&
         ([request.engineID isEqualToString:@"distildrba.coreml"] ||
          ([request.engineID isEqualToString:@"apple.lowlatency"] && _lowPrescaleSlowMode)));
 }
@@ -1797,6 +2198,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     _rifeSlowMode = NO;
     _lowPrescaleSlowMode = NO;
     [self resetAsyncScaleOnQueue];
+    [self.outputPreview invalidateSharedGeometry];
     _configVersion += 1;
     _inflightEpoch = _configVersion;
     _inflight = 0;
@@ -1931,6 +2333,25 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             [self publishPlanState:0 reason:reason];
             return;
         }
+        if (SPR7Passthrough()) {
+            self->_request = copy;
+            [self.outputPreview invalidateSharedGeometry];
+            self->_configVersion += 1;
+            self->_inflightEpoch = self->_configVersion;
+            [self clearPendingRife];
+            [self clearPlaySlots];
+            [self resetSchedulerOnQueue];
+            [self refreshResolvedOnQueue];
+            self->_resolved.committed = YES;
+            self->_resolved.interpolationActive = NO;
+            self->_resolved.scaleActive = NO;
+            self->_resolved.configVersion = self->_configVersion;
+            self->_sessionReady = YES;
+            [self beginMeasurementEpoch];
+            [self publishStatus:@"诊断直通：增强计算已旁路" failed:NO];
+            [self publishPlanState:2 reason:@"诊断直通：增强计算已旁路"];
+            return;
+        }
         BOOL needsEngine = copy.interpolationEnabled || copy.scaleEnabled;
         if ([self requestUsesAsyncEngine:copy] || [self requestUsesAsyncScale:copy]) {
             [self startAsyncEngine:copy];
@@ -1941,8 +2362,18 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             [self applyObservedCaptureEnvironment];
             self->_resolved.committed = !needsEngine;
             self->_sessionReady = !needsEngine;
+            if (!needsEngine) {
+                [self.outputPreview invalidateSharedGeometry];
+                self->_configVersion += 1; self->_inflightEpoch = self->_configVersion;
+                [self clearPendingRife]; [self clearPlaySlots]; [self resetSchedulerOnQueue];
+            }
             [self recomputeInteractiveDelay];
             [self refreshResolvedOnQueue];
+            if (!needsEngine) {
+                self->_resolved.committed = YES; self->_resolved.configVersion = self->_configVersion;
+                [self beginMeasurementEpoch];
+                [self publishPlanState:2 reason:@"预览原画面"];
+            }
             [self publishStatus:needsEngine ? @"计划已记下，等到来源画面后准备引擎" : @"预览原画面" failed:NO];
             return;
         }
@@ -2002,6 +2433,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         self->_animeSR = nil;
         self->_cuganSR = nil;
         [self resetAsyncScaleOnQueue];
+        [self.outputPreview invalidateSharedGeometry];
         self->_configVersion += 1;
         self->_inflightEpoch = self->_configVersion;
         self->_inflight = 0;
@@ -2024,7 +2456,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 
 - (void)setViewMode:(SPLiveViewMode)mode {
     dispatch_async(_q, ^{
-        if (self->_request.viewMode != mode) { self->_fpsMeter.resetOutput(); self->_fpsObservationEpoch += 1; }
+        if (self->_request.viewMode != mode) { self->_fpsMeter.resetOutput(); self->_fpsObservationEpoch += 1; [self.outputPreview invalidateSharedGeometry]; }
         self->_request.viewMode = mode;
         if (!self->_lastEnhanced && !self->_lastOriginal) return;
         [self showPair:self->_lastEnhanced original:self->_lastOriginal pts:self->_lastRedrawPts
@@ -2047,6 +2479,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     [self clearPlaySlots];
     self->_pending.clear();
     self->_marks.clear();
+    [self->_geometryInputs removeAllObjects];
+    [self->_geometryInputOrder removeAllObjects];
     self->_haveAnchor = NO;
     self->_haveLastPts = NO;
     self->_havePreviousSourcePts = NO;
@@ -2199,6 +2633,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 - (void)stop {
     void (^stopOnQueue)(void) = ^{
         self->_stopped = YES;
+        self->_r9FRCBudgetGate.reset();
+        self->_r9RequiredBudgetMs = 0; self->_r9AllowedBudgetMs = 0;
+        self->_r9GeneratedFPS = -1; self->_r9OnTimeSyntheticFPS = -1; self->_r9RateHost = 0;
+        [self.outputPreview invalidateSharedGeometry];
         self->_configVersion += 1;
         self->_inflightEpoch = self->_configVersion;
         self->_sessionReady = NO;
@@ -2393,6 +2831,15 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     });
 }
 
+- (void)observeCaptureGeometry:(NSDictionary *)geometry generation:(uint64_t)generation {
+    [self.outputPreview observeSourceGeometry:geometry generation:generation];
+}
+
+- (NSDictionary *)inputGeometrySnapshot { return [self.outputPreview sharedGeometrySnapshot] ?: @{ @"valid": @NO }; }
+- (NSDictionary<NSString *, NSNumber *> *)mapQuartzOutputPoint:(CGPoint)point geometryVersion:(uint64_t)version clamp:(BOOL)clamp {
+    return [self.outputPreview mapQuartzOutputPoint:point geometryVersion:version clamp:clamp];
+}
+
 - (void)noteRawCapturePTSNum:(int64_t)ptsNum ptsDen:(int64_t)ptsDen host:(int64_t)host
                        width:(int)width height:(int)height generation:(uint64_t)generation {
     __int128 ptsNs = ptsDen > 0 ? (__int128)ptsNum * 1000000000 / ptsDen : 0;
@@ -2541,6 +2988,11 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     NSString *key = [NSString stringWithFormat:@"%@.%@", endpoint, reason ?: @"unknown"];
     NSDictionary *sample = @{ @"reason": reason ?: @"unknown", @"endpoint": endpoint, @"frameID": @(frame),
         @"generation": @(generation), @"configVersion": @(config), @"measurementEpoch": @(epoch), @"observedHost": @(SPHostNow()) };
+    auto mark = _marks.find(frame);
+    if (mark != _marks.end() && mark->second.jobID) [self recordR7JobEvent:@"presentationFailure" detail:@{
+        @"id": @(mark->second.jobID), @"frameID": @(frame), @"reason": reason ?: @"unknown",
+        @"endpoint": endpoint ?: @"unknown", @"generation": @(generation), @"config": @(config),
+        @"clockEpoch": @(mark->second.clockEpoch), @"measurementEpoch": @(epoch) }];
     _presentationFailuresLifetime[key] = @([_presentationFailuresLifetime[key] unsignedLongLongValue] + 1);
     if (!_firstPresentationFailureLifetime[endpoint]) _firstPresentationFailureLifetime[endpoint] = sample;
     if (generation == _sourceGeneration && config == _configVersion && epoch == _measurementEpoch) {
@@ -2589,7 +3041,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
                 [info[@"surfaceToken"] unsignedLongLongValue] == strong->_outputSurfaceToken &&
                 [info[@"measurementEpoch"] unsignedLongLongValue] == strong->_measurementEpoch &&
                 generation == strong->_sourceGeneration && config == strong->_configVersion &&
-                strong->_resolved.committed && (strong->_resolved.interpolationActive || strong->_resolved.scaleActive)) {
+                strong->_resolved.committed) {
                 uint64_t token = strong->_outputSurfaceToken;
                 strong->_outputSurfaceToken = 0;
                 [strong.outputPreview setSurfaceToken:0];
@@ -2678,6 +3130,20 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 }
 
 - (void)notePresented:(NSDictionary *)info {
+    if (SPR8FixtureEnabled() && [info[@"endpoint"] isEqual:@"output"]) {
+        if (!_r8OutputTimeline) _r8OutputTimeline = [NSMutableArray array];
+        [_r8OutputTimeline addObject:@{ @"kind": @"presented", @"frameID": info[@"frameID"] ?: @0,
+            @"generation": info[@"generation"] ?: @0, @"configVersion": info[@"configVersion"] ?: @0,
+            @"measurementEpoch": info[@"measurementEpoch"] ?: @0,
+            @"presentedTime": info[@"presentedTime"] ?: @0, @"counts": info[@"counts"] ?: @NO,
+            @"windowVisible": info[@"windowVisible"] ?: @NO, @"exposed": info[@"exposed"] ?: @NO,
+            @"occluded": info[@"occluded"] ?: @NO, @"synthetic": info[@"synthetic"] ?: @NO,
+            @"callbackHost": info[@"presentedHost"] ?: @0, @"handlerMediaTime": info[@"handlerMediaTime"] ?: @0,
+            @"drawablePixels": @[info[@"drawableWidth"] ?: @0, info[@"drawableHeight"] ?: @0],
+            @"outputImageRectPixels": info[@"outputImageRectPixels"] ?: [NSNull null],
+            @"outputDisplayID": info[@"outputDisplayID"] ?: [NSNull null], @"geometryVersion": info[@"geometryVersion"] ?: [NSNull null] }];
+        if (_r8OutputTimeline.count > 512) [_r8OutputTimeline removeObjectAtIndex:0];
+    }
     uint64_t configVersion = [info[@"configVersion"] unsignedLongLongValue];
     uint64_t epoch = [info[@"measurementEpoch"] unsignedLongLongValue];
     NSString *ignored = ![info[@"counts"] boolValue] ? @"redrawOrUnscored" :
@@ -2745,7 +3211,23 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         _fpsMeter.presented((int64_t)ptsNs, (int64_t)(presentTime * 1e9), meterFrameID, held, originalSynthetic,
                             visible);
         if (visible && !held && !originalSynthetic && (!_physicalHavePts || sp::spCmp(pts, _physicalLastPts) > 0)) {
-            if ([info[@"synthetic"] boolValue]) _epochPhysicalSynthetic++; else _epochPhysicalSource++;
+            if ([info[@"synthetic"] boolValue]) {
+                _epochPhysicalSynthetic++;
+                if (meterMark == _marks.end() || meterMark->second.targetHost <= 0) _r9TimingUnknownSynthetic++;
+                else {
+                    int64_t actualNs = (int64_t)(presentTime * 1e9);
+                    int64_t targetNs = SPHostToNs(meterMark->second.targetHost);
+                    bool onTime = actualNs <= targetNs + 2000000LL;
+                    if (onTime) _r9OnTimeSynthetic++;
+                    else _r9LatePhysicalSynthetic++;
+                    if (meterMark->second.jobID) [self recordR7JobEvent:@"physicalSynthetic" detail:@{
+                        @"id": @(meterMark->second.jobID), @"frameID": @(meterFrameID),
+                        @"generation": @(_sourceGeneration), @"config": @(_configVersion),
+                        @"clockEpoch": @(meterMark->second.clockEpoch), @"measurementEpoch": @(_measurementEpoch),
+                        @"targetHost": @(meterMark->second.targetHost), @"presentedTime": @(presentTime),
+                        @"onTimePlus2ms": @(onTime) }];
+                }
+            } else _epochPhysicalSource++;
             _physicalLastPts=pts; _physicalHavePts=YES;
         }
     }
@@ -2840,6 +3322,14 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     [self publishStats];
 }
 
+- (void)recordR9SlotDrop:(const SPPlaySlot &)slot reason:(NSString *)reason {
+    if (!slot.synthetic || !slot.jobID) return;
+    [self recordR7JobEvent:reason detail:@{ @"id": @(slot.jobID), @"frameID": @(slot.frameID),
+        @"ptsNum": @(slot.pts.num), @"ptsDen": @(slot.pts.den), @"generation": @(slot.sourceGeneration),
+        @"config": @(slot.configVersion), @"clockEpoch": @(slot.clockEpoch),
+        @"measurementEpoch": @(slot.measurementEpoch), @"targetHost": @(slot.targetHost) }];
+}
+
 - (void)clearPlaySlots {
     for (auto &slot : _slots) SPReleaseSlot(slot);
     _slots.clear();
@@ -2897,13 +3387,36 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     return source * multiplier;
 }
 
+- (uint64_t)r8ReportedSlotBytes {
+    if (!SPR8Enabled()) return 0;
+    std::unordered_set<CVPixelBufferRef> unique;
+    uint64_t bytes=0;
+    for (const auto &slot : _slots) for (CVPixelBufferRef buffer : {slot.enhanced, slot.original}) {
+        if (buffer && unique.insert(buffer).second) bytes += CVPixelBufferGetDataSize(buffer);
+    }
+    return bytes;
+}
+- (BOOL)r8CanExperiment {
+    return SPR8Enabled() && _request.interpolationEnabled && _request.quality == SPFRCQualityHigh && !_request.scaleEnabled &&
+        [_request.engineID isEqualToString:@"apple.frc"] && _width > 0 && _height > 0 &&
+        _width <= 3840 && _height <= 2160;
+}
+- (uint64_t)r8QueueByteBudget {
+    return [self r8CanExperiment] ? ((uint64_t)SPR8Option(@"--khua-r8-budget-mib", 160, @[@160,@320,@480]) << 20) : SPQueueByteBudget;
+}
+- (int)r8AdmissionLimit {
+    return [self r8CanExperiment] ? SPR8Option(@"--khua-r8-inflight", 2, @[@1,@2,@3,@4]) : 2;
+}
 - (NSUInteger)slotCapByBytes {
     int w = _resolved.outputWidth > 0 ? _resolved.outputWidth : (_width > 0 ? _width : 1920);
     int h = _resolved.outputHeight > 0 ? _resolved.outputHeight : (_height > 0 ? _height : 1080);
     uint64_t planes = _request.viewMode == SPLiveViewCompare ? 2ull : 1ull;
     uint64_t bytes = (uint64_t)w * (uint64_t)h * 4ull * planes;
     if (bytes < 1) bytes = 1;
-    NSUInteger cap = (NSUInteger)(SPQueueByteBudget / bytes);
+    NSUInteger cap = (NSUInteger)([self r8QueueByteBudget] / bytes);
+    // The existing insert-then-evict path transiently has one extra slot.
+    // Diagnostic budgets reserve it while preserving the regular path.
+    if ([self r8CanExperiment] && cap > 3) cap -= 1;
     if (cap < 3) cap = 3;
     if (cap > 32) cap = 32;
     return cap;
@@ -2933,6 +3446,11 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 }
 
 - (void)beginMeasurementEpoch {
+    _r9FRCBudgetGate.reset();
+    _r9RequiredBudgetMs = 0; _r9AllowedBudgetMs = 0;
+    _r9OnTimeSynthetic = 0; _r9LatePhysicalSynthetic = 0; _r9TimingUnknownSynthetic = 0;
+    _r9GeneratedFPS = -1; _r9OnTimeSyntheticFPS = -1; _r9RateHost = SPHostNow();
+    _r9RateSyntheticBaseline = _syntheticOK; _r9RateOnTimeBaseline = 0;
     _processedSequence = 0;
     _lastProcessedHost = 0;
     _lastDrawablePresentedHost = 0;
@@ -2977,6 +3495,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     _frcEwmaSec = 0.025;
     _scaleEwmaSec = 0.004;
     _measurementEpoch += 1;
+    [self.outputPreview setDiagnosticsConfig:_configVersion epoch:_measurementEpoch];
     _presentationOrder.reset(_sourceGeneration, _configVersion, _measurementEpoch);
     _presentationGeometry.reset();
     [self recomputeInteractiveDelay];
@@ -3015,7 +3534,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     ++_clockEpoch;
     _fpsMeter.resetOutput();
     _fpsObservationEpoch += 1;
-    for (const auto &pending : _pending) [self noteClockRetiredSyntheticDrop:pending.pts];
+    for (const auto &pending : _pending) {
+        if ([self noteClockRetiredSyntheticDrop:pending.pts] && pending.jobID)
+            [self recordR7JobEvent:@"clockRetiredDrop" detail:@{ @"id": @(pending.jobID), @"ptsNum": @(pending.pts.num), @"ptsDen": @(pending.pts.den), @"generation": @(pending.generation), @"config": @(pending.configVersion), @"clockEpoch": @(pending.clockEpoch), @"measurementEpoch": @(pending.measurementEpoch) }];
+    }
     for (const auto &pending : _rifePending) [self noteClockRetiredSyntheticDrop:pending.pts];
     [self clearPendingRife];
     while (!_srPending.empty()) {
@@ -3024,13 +3546,26 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         if (pending->synthetic) [self noteClockRetiredSyntheticDrop:pending->pts];
         SPReleaseSRJob(pending);
     }
-    for (const auto &slot : _slots) if (slot.synthetic) [self noteClockRetiredSyntheticDrop:slot.pts];
+    for (const auto &slot : _slots) if (slot.synthetic && [self noteClockRetiredSyntheticDrop:slot.pts]) [self recordR9SlotDrop:slot reason:@"clockRetiredDrop"];
     _videoSRDiscontinuity = YES;
     _pending.clear();
     [self clearPlaySlots];
 }
 
 - (void)recomputeInteractiveDelay {
+    // There is no future temporal phase to wait for in source-only output.
+    // Scaling finishes before enqueue; its actual cost is not an extra queue
+    // delay. In-flight work remains owned by its original epoch.
+    if (SPR7Passthrough() || !_request.interpolationEnabled) {
+        _delayHost = 0;
+        _r9RequiredBudgetMs = 0;
+        _r9AllowedBudgetMs = 0;
+        _delayClamped = NO;
+        _delayTimeClamped = NO;
+        _delayByteClamped = NO;
+        _delayClampNoted = NO;
+        return;
+    }
     double interval = 1.0 / 30.0;
     if (_haveInterval && _intervalHost > 0) {
         double seconds = (double)SPHostToNs(_intervalHost) / 1e9;
@@ -3046,7 +3581,15 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         size_t index = (recent.size() - 1) * 80 / 100;
         frc = MAX(frc, (double)recent[index] / 1e9);
     }
-    double process = frc + _scaleEwmaSec;
+    double process = frc + (_request.scaleEnabled ? _scaleEwmaSec : 0);
+    if ([_request.engineID isEqualToString:@"apple.frc"] && _captureToOutputReadyNs.size() >= 8) {
+        // This includes input wait, model, output conversion and scaling up to
+        // enqueue-ready; callback-only model latency is not output readiness.
+        std::vector<int64_t> recent = _captureToOutputReadyNs;
+        if (recent.size() > 32) recent.erase(recent.begin(), recent.end() - 32);
+        std::sort(recent.begin(), recent.end());
+        process = MAX(process, (double)recent[(recent.size() - 1) * 80 / 100] / 1e9);
+    }
     if (process < 0.008) process = 0.008;
     double cap = _request.quality == SPFRCQualityHigh ? SPQualityCapSec : SPInteractiveCapSec;
     double wanted = lead + process + 0.016;
@@ -3065,6 +3608,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     if (fps < 1) fps = 1;
     NSUInteger byBytes = [self slotCapByBytes];
     double queueLimit = (double)(byBytes > 2 ? byBytes - 2 : 1) / fps;
+    _r9RequiredBudgetMs = wanted * 1000.0;
+    _r9AllowedBudgetMs = MIN(cap, queueLimit) * 1000.0;
     if (delay > queueLimit) {
         delay = queueLimit;
         clamped = YES;
@@ -3208,7 +3753,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             [_testPendingTrace addObject:@{ @"kind":@"expired", @"ptsNum":@(it->pts.num), @"ptsDen":@(it->pts.den),
                 @"lateMs":@((double)SPHostToNs(now-it->targetHost)/1e6), @"delayMs":@((double)SPHostToNs(_delayHost)/1e6) }];
         }
-        if ([self noteUniqueSyntheticDrop:it->pts]) _pendingExpiredDrops++;
+        if ([self noteUniqueSyntheticDrop:it->pts]) {
+            _pendingExpiredDrops++;
+            if (it->jobID) [self recordR7JobEvent:@"pendingExpiredDrop" detail:@{ @"id": @(it->jobID), @"ptsNum": @(it->pts.num), @"ptsDen": @(it->pts.den), @"generation": @(it->generation), @"config": @(it->configVersion), @"clockEpoch": @(it->clockEpoch), @"measurementEpoch": @(it->measurementEpoch), @"targetHost": @(it->targetHost) }];
+        }
         it = _pending.erase(it);
     }
     return wait;
@@ -3271,17 +3819,29 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         BOOL accepted = [self.preview presentEnhanced:enhanced original:original mode:_request.viewMode
                                           captureHost:captureHost generation:generation
                                                ptsNum:pts.num ptsDen:pts.den synthetic:synthetic
-                                              frameID:frameID counts:previewCounts reason:&reason];
+                                              frameID:frameID counts:previewCounts captureGeometry:nil reason:&reason];
         if (!accepted && previewCounts) { _renderDrops += 1; [self recordPresentationFailure:reason endpoint:@"preview" generation:generation config:_configVersion epoch:_measurementEpoch frame:frameID]; }
     }
     if (self.outputPreview) {
+        if (SPR8FixtureEnabled() && outputCounts) {
+            if (!_r8OutputTimeline) _r8OutputTimeline = [NSMutableArray array];
+            CVPixelBufferRef primary = _request.viewMode == SPLiveViewOriginal ? (original ?: enhanced) : enhanced;
+            int code = SPR8DecodeFixture(primary);
+            NSDictionary *motion = SPR8FixtureMotion(primary);
+            [_r8OutputTimeline addObject:@{ @"kind": @"submitted", @"frameID": @(frameID),
+                @"generation": @(generation), @"configVersion": @(_configVersion), @"measurementEpoch": @(_measurementEpoch),
+                @"captureHost": @(captureHost), @"submitHost": @(SPHostNow()), @"clockEpoch": @(_clockEpoch),
+                @"geometryVersion": [NSNull null], @"ptsNum": @(pts.num), @"ptsDen": @(pts.den),
+                @"synthetic": @(synthetic), @"decoded": @(code >= 0), @"frameNumber": @(code), @"motion": motion }];
+            if (_r8OutputTimeline.count > 512) [_r8OutputTimeline removeObjectAtIndex:0];
+        }
         if (_pixelDiagnosticsEnabled && !redraw && outputVisible && self.outputPreview.drawableVisibleSnapshot && self.outputPreview.exposedSnapshot)
             [self prepareDiagnosticOutput:enhanced original:original captureHost:captureHost frameID:frameID pts:pts synthetic:synthetic];
         NSString *reason = nil;
         BOOL accepted = [self.outputPreview presentEnhanced:enhanced original:original mode:_request.viewMode
                                                 captureHost:captureHost generation:generation
                                                      ptsNum:pts.num ptsDen:pts.den synthetic:synthetic
-                                                    frameID:frameID counts:outputCounts reason:&reason];
+                                                    frameID:frameID counts:outputCounts captureGeometry:_geometryInputs[@(captureHost)] reason:&reason];
         if (_pixelPendingOutput && [_pixelPendingOutput[@"frameID"] unsignedLongLongValue] == frameID) {
             NSMutableDictionary *submitted = [_pixelPendingOutput mutableCopy];
             submitted[@"submissionState"] = accepted ? @"accepted" : @"rejected";
@@ -3309,7 +3869,9 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             return;
         }
         while (_slots.size() > 1 && _slots[1].targetHost <= now + slop) {
-            if (_slots.front().synthetic && [self noteUniqueSyntheticDrop:_slots.front().pts]) _dueMergeDrops++;
+            if (_slots.front().synthetic && [self noteUniqueSyntheticDrop:_slots.front().pts]) {
+                _dueMergeDrops++; [self recordR9SlotDrop:_slots.front() reason:@"dueMergeDrop"];
+            }
             if (!_slots.front().synthetic) _sourceDueMergeDrops++;
             [self erasePending:_slots.front().pts];
             _marks.erase(_slots.front().frameID);
@@ -3329,8 +3891,9 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             continue;
         }
         if (_haveLastPts && sp::spCmp(slot.pts, _lastPresentedPts) <= 0) {
-            if (slot.synthetic) [self noteUniqueSyntheticDrop:slot.pts];
-            else _sourceStaleDrops++;
+            if (slot.synthetic) {
+                if ([self noteUniqueSyntheticDrop:slot.pts]) [self recordR9SlotDrop:slot reason:@"stalePlayoutDrop"];
+            } else _sourceStaleDrops++;
             _marks.erase(slot.frameID);
             SPReleaseSlot(slot);
             continue;
@@ -3359,7 +3922,20 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
                          held:(BOOL)held
                  captureHost:(int64_t)captureHost
                   generation:(uint64_t)generation
-              deadlineHost:(int64_t)deadlineHost {
+                deadlineHost:(int64_t)deadlineHost {
+    [self enqueueReadyEnhanced:enhanced original:original pts:pts synthetic:synthetic held:held
+                  captureHost:captureHost generation:generation deadlineHost:deadlineHost jobID:0];
+}
+
+- (void)enqueueReadyEnhanced:(CVPixelBufferRef)enhanced
+                    original:(CVPixelBufferRef)original
+                         pts:(sp::SPRational)pts
+                   synthetic:(BOOL)synthetic
+                         held:(BOOL)held
+                 captureHost:(int64_t)captureHost
+                  generation:(uint64_t)generation
+                deadlineHost:(int64_t)deadlineHost
+                       jobID:(uint64_t)jobID {
     if (!enhanced || generation != _sourceGeneration) {
         if (enhanced) CVPixelBufferRelease(enhanced);
         if (original) CVPixelBufferRelease(original);
@@ -3372,7 +3948,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         if (!_testKeepLowRealtime && _delayClamped) _lowPrescaleSlowMode = YES;
     }
     if (_haveLastPts && sp::spCmp(pts, _lastPresentedPts) <= 0) {
-        if (synthetic && [self noteUniqueSyntheticDrop:pts]) _staleReadyDrops++;
+        if (synthetic && [self noteUniqueSyntheticDrop:pts]) {
+            _staleReadyDrops++;
+            if (jobID) [self recordR7JobEvent:@"staleReadyDrop" detail:@{ @"id": @(jobID), @"ptsNum": @(pts.num), @"ptsDen": @(pts.den), @"generation": @(generation), @"config": @(_configVersion), @"clockEpoch": @(_clockEpoch), @"measurementEpoch": @(_measurementEpoch) }];
+        }
         if (!synthetic) _sourceStaleDrops++;
         [self erasePending:pts];
         CVPixelBufferRelease(enhanced);
@@ -3381,6 +3960,9 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     }
     SPPlaySlot slot;
     slot.pts = pts;
+    slot.jobID = jobID;
+    slot.clockEpoch = _clockEpoch;
+    slot.measurementEpoch = _measurementEpoch;
     slot.targetHost = [self requestUsesLatestPresentation:_request] ? SPHostNow() : (deadlineHost > 0 ? deadlineHost : [self targetHostForPTS:pts]);
     slot.synthetic = synthetic;
     slot.enhanced = enhanced;
@@ -3390,9 +3972,15 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     slot.sourceGeneration = generation;
     slot.configVersion = _configVersion;
     slot.captureHost = captureHost;
+    if (synthetic && !slot.jobID) for (const auto &pending : _pending) {
+        if (pending.generation == generation && sp::spCmp(pending.pts, pts) == 0) { slot.jobID = pending.jobID; break; }
+    }
     [self erasePending:pts];
     if (synthetic && ![self requestUsesLatestPresentation:_request] && slot.targetHost + SPRationalToHost(sp::spMake(2, 1000)) < slot.readyHost) {
-        if ([self noteUniqueSyntheticDrop:pts]) _lateReadyDrops++;
+        if ([self noteUniqueSyntheticDrop:pts]) {
+            _lateReadyDrops++;
+            if (slot.jobID) [self recordR7JobEvent:@"lateReadyDrop" detail:@{ @"id": @(slot.jobID), @"ptsNum": @(pts.num), @"ptsDen": @(pts.den), @"generation": @(generation), @"config": @(_configVersion), @"clockEpoch": @(_clockEpoch), @"measurementEpoch": @(_measurementEpoch), @"targetHost": @(slot.targetHost), @"readyHost": @(slot.readyHost) }];
+        }
         SPReleaseSlot(slot);
         return;
     }
@@ -3409,6 +3997,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     });
     _slots.insert(at, slot);
     SPFrameMark mark;
+    mark.jobID = slot.jobID;
+    mark.clockEpoch = slot.clockEpoch;
     mark.readyHost = slot.readyHost;
     mark.targetHost = slot.targetHost;
     mark.hasCenter = slot.hasCenter;
@@ -3417,12 +4007,27 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     mark.held = held;
     mark.fpsEpoch = _fpsObservationEpoch;
     _marks[slot.frameID] = mark;
+    if (SPR8FixtureEnabled()) {
+        if (!_r8OutputTimeline) _r8OutputTimeline = [NSMutableArray array];
+        [_r8OutputTimeline addObject:@{ @"kind": @"enqueued", @"frameID": @(slot.frameID), @"jobID": @(slot.jobID),
+            @"generation": @(generation), @"configVersion": @(_configVersion), @"measurementEpoch": @(_measurementEpoch),
+            @"clockEpoch": @(_clockEpoch), @"geometryVersion": [NSNull null], @"captureHost": @(captureHost),
+            @"readyHost": @(slot.readyHost), @"targetHost": @(slot.targetHost), @"ptsNum": @(pts.num), @"ptsDen": @(pts.den), @"synthetic": @(synthetic) }];
+        if (_r8OutputTimeline.count > 512) [_r8OutputTimeline removeObjectAtIndex:0];
+    }
     if (_slots.size() > _peakSlots) _peakSlots = _slots.size();
+    if (SPR8Enabled()) {
+        _r8SlotReferencePeak = MAX(_r8SlotReferencePeak, (uint64_t)_slots.size() * 2);
+        _r8ReportedSlotBytesPeak = MAX(_r8ReportedSlotBytesPeak, [self r8ReportedSlotBytes]);
+    }
     NSUInteger cap = [self slotCap];
-    while (_slots.size() > cap) {
+    while (_slots.size() > cap || ([self r8CanExperiment] && [self r8ReportedSlotBytes] > [self r8QueueByteBudget])) {
+        if ([self r8CanExperiment] && [self r8ReportedSlotBytes] > [self r8QueueByteBudget]) _r8BudgetEvictions++;
         auto victim = std::find_if(_slots.begin(), _slots.end(), [](const SPPlaySlot &item) { return item.synthetic; });
         if (victim == _slots.end()) victim = _slots.begin();
-        if (victim->synthetic && [self noteUniqueSyntheticDrop:victim->pts]) _slotEvictionDrops++;
+        if (victim->synthetic && [self noteUniqueSyntheticDrop:victim->pts]) {
+            _slotEvictionDrops++; [self recordR9SlotDrop:*victim reason:@"slotEvictionDrop"];
+        }
         if (!victim->synthetic) _sourceSlotEvictionDrops++;
         _marks.erase(victim->frameID);
         SPReleaseSlot(*victim);
@@ -3452,16 +4057,18 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     // RGBA-half output and converted BGRA. Include all three in the budget.
     uint64_t outputBudget = (uint64_t)MAX(_resolved.outputWidth, 1) * (uint64_t)MAX(_resolved.outputHeight, 1) * (_videoSR ? 20 : (_cuganSR ? 16 : 8));
     uint64_t cost = inputBytes + originalBytes + outputBudget;
-    if ([self requestUsesLatestScale:_request] && ((_srBusy && sp::spCmp(pts,_srActivePTS)<=0) ||
+    BOOL latestScale = !_request.interpolationEnabled || [self requestUsesLatestScale:_request];
+    if (latestScale && ((_srBusy && sp::spCmp(pts,_srActivePTS)<=0) ||
         (!_srPending.empty() && sp::spCmp(pts,_srPending.front()->pts)<=0))) {
         CVPixelBufferRelease(input);if(original)CVPixelBufferRelease(original);
         if(synthetic){[self erasePending:pts];[self noteUniqueSyntheticDrop:pts];}
         _queueDrops+=1;_epochQueueDrops+=1;return;
     }
-    if ([self requestUsesLatestScale:_request] && !_srPending.empty()) {
+    if (latestScale && !_srPending.empty()) {
         SPSRJob *replaced = _srPending.front(); _srPending.pop_front();
         _srPendingBytes = _srPendingBytes >= replaced->bytes ? _srPendingBytes - replaced->bytes : 0;
         if (replaced->synthetic) { [self erasePending:replaced->pts]; [self noteUniqueSyntheticDrop:replaced->pts]; }
+        if (_videoSR) _videoSRDiscontinuity = YES;
         SPReleaseSRJob(replaced);
         _queueDrops += 1; _epochQueueDrops += 1;
     }
@@ -3626,6 +4233,26 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     [self enqueueReadyEnhanced:enhanced original:original pts:pts synthetic:NO held:held captureHost:host generation:generation deadlineHost:nativeDirect ? SPHostNow() : 0];
 }
 
+// Shared by live FRC admission and its deterministic production-queue contract.
+- (BOOL)r9AdmitFRCPhases:(NSUInteger)count backendAvailable:(BOOL)available nowNs:(int64_t)nowNs {
+    bool measured = _frcNs.size() >= 8 || _captureToOutputReadyNs.size() >= 8;
+    auto decision = _r9FRCBudgetGate.decide(_r9RequiredBudgetMs, _r9AllowedBudgetMs, measured, available, nowNs);
+    if (decision == sp::FRCBudgetGate::Decision::backendBusy) {
+        _queueDrops += count; _epochQueueDrops += count; _r9BackendFullPhases += count; return NO;
+    }
+    if (decision == sp::FRCBudgetGate::Decision::budgetLimited) {
+        _queueDrops += count; _epochQueueDrops += count; _r9BudgetRejectedPhases += count; return NO;
+    }
+    if (decision == sp::FRCBudgetGate::Decision::probe) _r9BudgetProbeJobs++;
+    return YES;
+}
+
+- (void)r9RecordUsableLatency:(double)latency {
+    SPPushSample(_frcNs, (int64_t)(latency * 1e9));
+    _frcEwmaSec = _frcEwmaSec <= 0 ? latency : (0.5 * _frcEwmaSec + 0.5 * latency);
+    [self recomputeInteractiveDelay];
+}
+
 - (void)submitEventGroup:(const std::vector<sp::SPScheduleOutput> &)events generation:(uint64_t)generation {
     [self submitEventGroup:events generation:generation frozenDeadline:0];
 }
@@ -3673,7 +4300,13 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             return;
         }
     }
-    if (events.empty() || _inflight >= ((wantDistil || slowPair) ? 1 : 2) || !haveEngine) {
+    int admission = (!wantLow && !wantRife && !wantDistil) ? [self r8AdmissionLimit] : ((wantDistil || slowPair) ? 1 : 2);
+    BOOL appleFRC = !wantLow && !wantRife && !wantDistil && _engine != nil;
+    if (!events.empty() && appleFRC && _engine.busyCount >= _engine.sessionCount) {
+        (void)[self r9AdmitFRCPhases:events.size() backendAvailable:NO nowNs:SPHostToNs(SPHostNow())];
+        return;
+    }
+    if (events.empty() || _inflight >= admission || !haveEngine) {
         if (!events.empty()) {
             _queueDrops += events.size();
             _epochQueueDrops += events.size();
@@ -3682,6 +4315,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         }
         return;
     }
+    if (appleFRC && ![self r9AdmitFRCPhases:events.size()
+                        backendAvailable:(_engine.busyCount < _engine.sessionCount) nowNs:SPHostToNs(SPHostNow())]) return;
     NSMutableArray<NSNumber *> *phases = [NSMutableArray array];
     for (const auto &event : events) {
         float value = 0;
@@ -3746,6 +4381,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         if (!a || !b) { _syntheticFail += 1; [self publishStatus:@"低延迟前置缩放失败" failed:YES]; return; }
     }
     SPLiveJob *job = new SPLiveJob();
+    job->diagnosticID = SPR8NextJobID.fetch_add(1);
+    job->measurementEpoch = _measurementEpoch;
     job->configVersion = _configVersion;
     job->generation = generation;
     job->clockEpoch = _clockEpoch;
@@ -3762,7 +4399,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     job->inflightEpoch = _inflightEpoch;
     if (auto aHeld = _held.find(job->frameA); aHeld != _held.end()) aHeld->second.pins += 1;
     if (auto bHeld = _held.find(job->frameB); bHeld != _held.end()) bHeld->second.pins += 1;
-    uint64_t token = (uint64_t)(uintptr_t)job;
+    uint64_t token = job->diagnosticID;
     _inflight += 1;
     _havePair = YES;
     _lastPairB = events.front().frameB;
@@ -3771,7 +4408,9 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         // Each box already owns its buffer. Copy the array for the queue
         // handoff instead of adding a second owner for every output.
         NSArray<SPOwnedPixelBuffer *> *kept = [outputs copy] ?: @[];
+        const int64_t callbackHost = SPHostNow();
         dispatch_async(selfRef->_q, ^{
+            job->callbackHost = callbackHost;
             @autoreleasepool { [selfRef finishJob:job token:doneToken outputs:kept latency:latency error:error]; }
         });
     };
@@ -3829,13 +4468,27 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         _queueDrops += (uint64_t)MAX(1, job->count);
         _epochQueueDrops += (uint64_t)MAX(1, job->count);
         _engineSubmissionRejectedDrops += (uint64_t)MAX(1, job->count);
+        [self recordR7JobEvent:@"rejected" detail:@{ @"id": @(token), @"frameA": @(job->frameA), @"frameB": @(job->frameB), @"generation": @(generation), @"config": @(_configVersion) }];
         delete job;
     } else {
         _submitted += 1;
+        int64_t submittedHost = SPHostNow();
+        if (_r7JobHosts.size() < 32) _r7JobHosts[token] = {submittedHost, _configVersion};
+        else _r7JobUntracked++;
+        _r7LastJobSubmitted = @{ @"id": @(token), @"host": @(submittedHost),
+            @"frameA": @(job->frameA), @"frameB": @(job->frameB),
+            @"captureHost": @(job->captureHost), @"generation": @(generation), @"config": @(_configVersion),
+            @"clockEpoch": @(job->clockEpoch), @"measurementEpoch": @(job->measurementEpoch), @"deadlineHost": @(job->targetHost[0]),
+            @"deadlineSlackMs": @(job->targetHost[0] ? (double)SPHostToNs(job->targetHost[0] - submittedHost) / 1e6 : 0) };
+        [self recordR7JobEvent:@"submitted" detail:_r7LastJobSubmitted];
         for (int phaseIndex = 0; phaseIndex < job->count; ++phaseIndex) {
             const auto &event = events[(size_t)phaseIndex];
             SPPendingPhase phase;
             phase.pts = event.pts;
+            phase.jobID = job->diagnosticID;
+            phase.configVersion = job->configVersion;
+            phase.clockEpoch = job->clockEpoch;
+            phase.measurementEpoch = job->measurementEpoch;
             phase.targetHost = job->targetHost[phaseIndex];
             phase.generation = generation;
             if (_testCapturePlayout && _testPendingTrace.count < 24) {
@@ -3866,6 +4519,19 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
           outputs:(NSArray<SPOwnedPixelBuffer *> *)outputs
           latency:(double)latency
             error:(NSError *)error {
+    int64_t completedHost = SPHostNow();
+    _r7JobHosts.erase(job->diagnosticID);
+    _r7JobCompleted++;
+    _r7LastJobCompleted = @{ @"id": @(job->diagnosticID), @"host": @(completedHost),
+        @"frameA": @(job->frameA), @"frameB": @(job->frameB), @"captureHost": @(job->captureHost),
+        @"generation": @(job->generation), @"config": @(job->configVersion), @"outputs": @(outputs.count),
+        @"error": @(error != nil), @"deadlineHost": @(job->targetHost[0]),
+        @"deadlineSlackMs": @(job->targetHost[0] ? (double)SPHostToNs(job->targetHost[0] - completedHost) / 1e6 : 0),
+        @"clockEpoch": @(job->clockEpoch), @"measurementEpoch": @(job->measurementEpoch),
+        @"callbackHost": @(job->callbackHost),
+        @"callbackDeliveryMs": @(job->callbackHost ? (double)SPHostToNs(completedHost - job->callbackHost) / 1e6 : -1),
+        @"captureToReadyMs": @(job->captureHost ? (double)SPHostToNs(completedHost - job->captureHost) / 1e6 : -1) };
+    [self recordR7JobEvent:@"completed" detail:_r7LastJobCompleted];
     (void)token;
     BOOL releasedCapacity = job->inflightEpoch == _inflightEpoch && _inflight > 0;
     if (releasedCapacity) _inflight -= 1;
@@ -3881,12 +4547,12 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         [self trimHeld]; delete job;
         return;
     }
-    if (job->captureHost > 0 && SPHostNow() > job->captureHost)
+    // An errored FRC callback is not a sample of time to a usable output.
+    BOOL validTimingSample = !_engine || (!error && outputs.count > 0);
+    if (validTimingSample && job->captureHost > 0 && SPHostNow() > job->captureHost)
         SPPushSample(_captureToModelReadyNs, SPHostToNs(SPHostNow() - job->captureHost));
-    if (latency > 0) {
-        SPPushSample(_frcNs, (int64_t)(latency * 1e9));
-        _frcEwmaSec = _frcEwmaSec <= 0 ? latency : (0.5 * _frcEwmaSec + 0.5 * latency);
-        [self recomputeInteractiveDelay];
+    if (validTimingSample && latency > 0) {
+        [self r9RecordUsableLatency:latency];
         if (!_testKeepLowRealtime && _lowLatency && _delayClamped && [self requestUsesLowPrescale:_request width:_width height:_height]) _lowPrescaleSlowMode = YES;
     }
     // Delay recomputation can itself retire the clock mapping.
@@ -3991,7 +4657,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             if (a>=0 && b>=0) { if (abs(a-b)<=2) _testBaselineMatches++; else _testBaselineMismatches++; }
         }
         [self enqueueReadyEnhanced:scaled original:original pts:pts synthetic:YES held:NO
-                      captureHost:job->captureHost generation:job->generation deadlineHost:phaseDeadline];
+                      captureHost:job->captureHost generation:job->generation deadlineHost:phaseDeadline jobID:job->diagnosticID];
     }
     if (!_rifePending.empty() && _rifePendingGeneration == _sourceGeneration && (_rife || _lowLatency) && !_stopped) {
         auto pending = _rifePending;
@@ -4101,12 +4767,21 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
                                                       error:&local];
         SPFRCQuality quality = _request.quality == SPFRCQualityHigh ? SPFRCQualityHigh : SPFRCQualityNormal;
         const BOOL continuousFRC = [[[NSProcessInfo processInfo] environment][@"CHUANFLOW_FRC_CONTINUOUS"] isEqualToString:@"1"];
-        _engine = _metal ? [[SPFRCEngine alloc] initWithMetal:_metal sessions:continuousFRC ? 1 : 2 outputCapacity:8 quality:quality error:&local] : nil;
+        int sessions = [self r8CanExperiment] ? SPR8Option(@"--khua-r8-sessions", continuousFRC ? 1 : 2, @[@1,@2,@3,@4]) : (continuousFRC ? 1 : 2);
+        _engine = _metal ? [[SPFRCEngine alloc] initWithMetal:_metal sessions:sessions outputCapacity:8 quality:quality error:&local] : nil;
         if (!_engine) {
             if (error) *error = local ?: SPLiveError(32, @"插帧会话创建失败");
             _resolved.interpolationActive = NO;
             _resolved.unavailableReason = local.localizedDescription ?: @"插帧会话创建失败";
             return NO;
+        }
+        if (SPR8Enabled()) {
+            __weak SPLiveProcessor *weakProcessor = self;
+            _engine.diagnosticHandler = ^(NSDictionary<NSString *, id> *event) {
+                SPLiveProcessor *processor = weakProcessor;
+                if (!processor) return;
+                dispatch_async(processor->_q, ^{ [processor recordR7JobEvent:@"frcStages" detail:event]; });
+            };
         }
         _resolved.interpolationActive = YES;
         _resolved.unavailableReason = @"";
@@ -4204,6 +4879,26 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         batch.swap(_inbound);
         _pumpQueued = NO;
     }
+    if (SPR7Passthrough() || !_request.interpolationEnabled) {
+        // Coalesce only already-buffered frames of the current source. Pick
+        // the greatest valid PTS rather than blindly trusting callback order.
+        size_t newest = batch.size();
+        for (size_t i=0; i<batch.size(); ++i) {
+            if (batch[i].generation != _sourceGeneration || batch[i].ptsDen <= 0) continue;
+            if (newest == batch.size() || sp::spCmp(sp::spMake(batch[i].ptsNum,batch[i].ptsDen),
+                                                     sp::spMake(batch[newest].ptsNum,batch[newest].ptsDen)) > 0) newest = i;
+        }
+        if (newest != batch.size()) {
+            std::deque<SPLiveInbound> kept;
+            for (size_t i=0; i<batch.size(); ++i) {
+                if (i != newest && batch[i].generation == _sourceGeneration) {
+                    CVPixelBufferRelease(batch[i].buffer); _queueDrops++; _epochQueueDrops++;
+                    if (_videoSR) _videoSRDiscontinuity = YES;
+                } else kept.push_back(batch[i]);
+            }
+            batch.swap(kept);
+        }
+    }
     for (auto &item : batch) {
         if (item.readyHost > item.host) SPPushSample(_copyEntryNs, SPHostToNs(item.readyHost - item.host));
         if (_stopped) {
@@ -4258,6 +4953,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         if (width != _width || height != _height || rawSizeChanged) {
             _width = width;
             _height = height;
+            [self.outputPreview invalidateSharedGeometry];
             _configVersion += 1;
             _inflightEpoch = _configVersion;
             _inflight = 0;
@@ -4300,6 +4996,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         SPSampleLuma(item.buffer, luma, 64);
         BOOL cut = NO;
         BOOL changed = YES;
+        BOOL comparableLuma = _haveLuma && _r7LumaGeneration == _sourceGeneration &&
+            _r7LumaConfig == _configVersion && _r7LumaEpoch == _measurementEpoch;
         if (_haveLuma) {
             cut = sp::spDetectSceneCut(_previousLuma, luma, 64);
             int64_t mad = 0;
@@ -4314,12 +5012,28 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         _haveLuma = YES;
         if (cut && _videoSR) _videoSRDiscontinuity = YES;
         if (changed) _windowChanged += 1;
+        // Recovery evidence requires two comparable samples in this exact
+        // source/configuration/measurement epoch. Never count the first sample.
+        if (comparableLuma && changed && item.host > 0) {
+            _r7ContentChangedHost = item.host;
+            _r7ContentChangedGeneration = _sourceGeneration;
+            _r7ContentChangedConfig = _configVersion;
+            _r7ContentChangedEpoch = _measurementEpoch;
+        }
+        _r7LumaGeneration = _sourceGeneration;
+        _r7LumaConfig = _configVersion;
+        _r7LumaEpoch = _measurementEpoch;
         _processedSequence += 1;
         _lastProcessedHost = SPHostNow();
         uint64_t identity = _nextIdentity++;
         _held[identity].source = item.buffer;
         _held[identity].host = item.host;
         _held[identity].pts = sp::spMake(item.ptsNum, item.ptsDen);
+        NSDictionary *geometry = CFBridgingRelease(CVBufferCopyAttachment(item.buffer, CFSTR("app.khuaplayer.capture.geometry"), NULL));
+        if ([geometry isKindOfClass:NSDictionary.class] && item.host > 0) {
+            NSNumber *key = @(item.host); _geometryInputs[key] = [geometry copy]; [_geometryInputOrder addObject:key];
+            while (_geometryInputOrder.count > 128) { NSNumber *old = _geometryInputOrder.firstObject; [_geometryInputOrder removeObjectAtIndex:0]; [_geometryInputs removeObjectForKey:old]; }
+        }
         if (_pixelDiagnosticsEnabled)
             [self sampleDiagnosticInput:item.buffer host:item.host identity:identity ptsNum:item.ptsNum ptsDen:item.ptsDen];
         auto previous = _held.find(_previousSourceIdentity);
@@ -4328,6 +5042,25 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             if (sp::spSub(_held[identity].pts, previous->second.pts, delta) &&
                 sp::spCmp(delta, sp::spMake(0, 1)) > 0 && sp::spCmp(delta, sp::spMake(1, 2)) <= 0)
                 _held[identity].previousIdentity = _previousSourceIdentity;
+        }
+        // Explicit isolated diagnostic: use the production presenter and source
+        // timing, but never construct or submit enhancement jobs.
+        if (SPR7Passthrough()) {
+            _resolved.committed = YES;
+            _resolved.interpolationActive = NO;
+            _resolved.scaleActive = NO;
+            _resolved.configVersion = _configVersion;
+            _sessionReady = YES;
+            _previousSourceIdentity = identity;
+            [self observeSourceIdentity:identity];
+            CVPixelBufferRef original = [self bgraFromSource:item.buffer];
+            if (original) {
+                [self enqueueReadyEnhanced:original original:CVPixelBufferRetain(original)
+                                      pts:sp::spMake(item.ptsNum, item.ptsDen) synthetic:NO held:NO
+                              captureHost:item.host generation:item.generation deadlineHost:0];
+            } else { _sourceConversionDrops++; }
+            [self trimHeld];
+            continue;
         }
         if ((_request.interpolationEnabled || _request.scaleEnabled) && !_sessionReady) {
             [self beginBuildOnQueue];
@@ -4971,6 +5704,161 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"oldClockJobRetiredWithoutTouchingNewPending":@(retired), @"lateFrozenDeadlineRejected":@(lateRejected),
         @"recomputedDeadlineWouldBeFuture":@(recomputedWouldBeFuture), @"fpsWindowResetOnReanchor":@(fpsReset), @"sourceGenerationReset":@(sourceReset),
         @"scope":@"deterministic source clock and actual scheduler/event handler with simulated completion and synthetic buffer; no real inference, capture, window or physical FPS" };
+}
+
+// Exercises actual source-only pump/playout without constructing a model or
+// window. Physical timing and the asynchronous GPU path require native tests.
++ (NSDictionary<NSString *, id> *)runP1SourceOnlyAckContract {
+    SPLiveProcessor *p=[[SPLiveProcessor alloc] init];
+    auto ack=std::make_shared<std::atomic<int>>(0);
+    p.planHandler=^(NSInteger state, NSString *engine, NSString *model, NSString *reason, uint64_t requestID) {
+        (void)engine; (void)model; (void)reason;
+        if (state==2 && requestID==701) ack->fetch_add(1);
+    };
+    SPLivePlanRequest *request=[[SPLivePlanRequest alloc] init]; request.requestID=701;
+    request.interpolationEnabled=NO; request.scaleEnabled=NO; request.engineID=@"apple.frc";
+    [p updateRequest:request];
+    for (int i=0;i<100 && ack->load()==0;++i) usleep(10000);
+    __block BOOL committed=NO, zeroDelay=NO; __block uint64_t config=0;
+    dispatch_sync(p->_q, ^{ committed=p->_resolved.committed && p->_resolved.configVersion==p->_configVersion;
+        zeroDelay=p->_delayHost==0; config=p->_configVersion; });
+    BOOL ok=ack->load()==1 && committed && zeroDelay && config>1;
+    [p stop];
+    return @{ @"ok":@(ok), @"ackExactlyOnce":@(ack->load()==1), @"committed":@(committed), @"zeroTemporalDelay":@(zeroDelay),
+        @"config":@(config), @"scope":@"source-only request before first source frame; no GUI, capture or event tap" };
+}
+
++ (NSDictionary<NSString *, id> *)runP0PassthroughContract {
+    SPLiveProcessor *p = [[SPLiveProcessor alloc] init];
+    CVPixelBufferRef frame = SPCreateBuffer(320,192,kCVPixelFormatType_32BGRA);
+    if (!frame) return @{ @"ok": @NO, @"error": @"frame allocation" };
+    __block BOOL zero=NO, newest=NO, staleSource=NO, orderedInterpolation=NO, disabledScaleIgnored=NO;
+    dispatch_sync(p->_q, ^{
+        p->_stopped=NO; p->_request.interpolationEnabled=NO; p->_request.scaleEnabled=NO;
+        p->_width=320; p->_height=192; p->_sourceWidth=320; p->_sourceHeight=192;
+        p->_sessionReady=YES; p->_testCapturePlayout=YES; p->_frcEwmaSec=0.9; p->_scaleEwmaSec=0.8;
+        for (int i=0; i<10; ++i) { SPPushSample(p->_frcNs,900000000); SPPushSample(p->_captureToOutputReadyNs,900000000); }
+        p->_delayHost=SPRationalToHost(sp::spMake(1,2)); [p recomputeInteractiveDelay];
+        zero=p->_delayHost==0 && [p requestUsesLatestPresentation:p->_request];
+        for (int n : {3,1,2}) {
+            SPLiveInbound item; item.buffer=CVPixelBufferRetain(frame); item.ptsNum=n; item.ptsDen=60;
+            item.host=SPHostNow(); item.readyHost=item.host; item.generation=p->_sourceGeneration;
+            p->_inbound.push_back(item);
+        }
+        SPLiveInbound old; old.buffer=CVPixelBufferRetain(frame); old.ptsNum=9; old.ptsDen=60;
+        old.host=SPHostNow(); old.readyHost=old.host; old.generation=p->_sourceGeneration-1; p->_inbound.push_back(old);
+        [p pump];
+        newest=p->_testPlayout.size()==1 && sp::spCmp(p->_testPlayout.back().first,sp::spMake(3,60))==0 && p->_processedSequence==1;
+        staleSource=p->_generationDrops==1;
+        p->_request.interpolationEnabled=YES; p->_request.engineID=@"apple.frc";
+        p->_frcNs.clear(); p->_captureToOutputReadyNs.clear(); p->_frcEwmaSec=0.020;
+        p->_scaleEwmaSec=0.8; [p recomputeInteractiveDelay]; double noScale=p->_r9RequiredBudgetMs;
+        p->_scaleEwmaSec=0.001; [p recomputeInteractiveDelay];
+        disabledScaleIgnored=fabs(noScale-p->_r9RequiredBudgetMs)<0.001;
+        orderedInterpolation=![p requestUsesLatestPresentation:p->_request] && p->_r9RequiredBudgetMs>0;
+    });
+    [p stop]; CVPixelBufferRelease(frame);
+    BOOL ok=zero && newest && staleSource && orderedInterpolation && disabledScaleIgnored;
+    return @{ @"ok":@(ok), @"zeroTemporalWait":@(zero), @"newestBufferedSource":@(newest),
+        @"oldGenerationDropped":@(staleSource), @"interpolationRetainsDeadlines":@(orderedInterpolation),
+        @"disabledScaleExcluded":@(disabledScaleIgnored),
+        @"scope":@"actual CPU processor queue, no GUI or physical presentation; async scale and old callback isolation require separate regression" };
+}
+
+// Exercises production processor queue methods with CPU-owned synthetic
+// buffers and controlled timestamps; it does not instantiate a VT/GPU model.
++ (NSDictionary<NSString *, id> *)runR9FRCBudgetContract {
+    SPLiveProcessor *p = [[SPLiveProcessor alloc] init];
+    CVPixelBufferRef frame = SPCreateBuffer(320,192,kCVPixelFormatType_32BGRA);
+    if (!frame) return @{ @"ok": @NO, @"error": @"frame allocation" };
+    __block BOOL limited=NO, sourceContinues=NO, backendSeparate=NO, recovered=NO, staleIgnored=NO, terminalExclusive=NO, reset=NO, sourceReset=NO, stopReset=NO;
+    __block uint64_t rejected=0, probes=0, sourceCount=0;
+    dispatch_sync(p->_q, ^{
+        p->_stopped=NO; p->_request.interpolationEnabled=YES; p->_request.engineID=@"apple.frc";
+        p->_request.quality=SPFRCQualityHigh; p->_request.rateKind=SPLiveRateMultiplier; p->_request.multiplier=2;
+        p->_request.scaleEnabled=NO; p->_width=2560; p->_height=1410;
+        p->_resolved.outputWidth=2560; p->_resolved.outputHeight=1410;
+        p->_haveInterval=YES; p->_intervalHost=SPRationalToHost(sp::spMake(1,60)); p->_testCapturePlayout=YES;
+        [p beginMeasurementEpoch];
+        for (int i=0;i<32;i++) { SPPushSample(p->_captureToOutputReadyNs,100000000); [p r9RecordUsableLatency:0.100]; }
+        limited=p->_r9RequiredBudgetMs > p->_r9AllowedBudgetMs;
+        int64_t base=SPHostToNs(SPHostNow());
+        uint64_t oldBackend=p->_r9BackendFullPhases, oldReject=p->_r9BudgetRejectedPhases;
+        BOOL deniedBusy=![p r9AdmitFRCPhases:1 backendAvailable:NO nowNs:base];
+        backendSeparate=deniedBusy && p->_r9BackendFullPhases==oldBackend+1 && p->_r9BudgetRejectedPhases==oldReject;
+        for (int i=0;i<120;i++) {
+            (void)[p r9AdmitFRCPhases:1 backendAvailable:YES nowNs:base+(int64_t)i*1000000000LL/60];
+            uint64_t id=(uint64_t)(1000+i); auto pts=sp::spMake(i+1,60);
+            p->_held[id].source=CVPixelBufferRetain(frame); p->_held[id].pts=pts;
+            p->_held[id].host=SPHostNow()-SPRationalToHost(sp::spMake(1,2));
+            p->_haveAnchor=YES; p->_anchorPts=pts; p->_anchorHost=p->_held[id].host;
+            p->_delayHost=0; p->_havePreviousSourcePts=NO;
+            [p enqueueSourceIdentity:id pts:pts host:p->_held[id].host generation:p->_sourceGeneration force:YES];
+            [p trimHeld];
+        }
+        rejected=p->_r9BudgetRejectedPhases; probes=p->_r9BudgetProbeJobs; sourceCount=p->_testPlayout.size();
+        limited=limited && p->_r9FRCBudgetGate.limited() && rejected>100 && probes>=1 && probes<=2;
+        sourceContinues=sourceCount==120;
+        for (const auto &output:p->_testPlayout) if (output.second) sourceContinues=NO;
+        // Fast feedback only arrives on accepted re-probes, exercising the real
+        // sample window and recomputation rather than assigning a desired result.
+        for (int i=0;i<40 && p->_r9FRCBudgetGate.limited();i++) {
+            int64_t when=base+3000000000LL+(int64_t)i*2100000000LL;
+            if ([p r9AdmitFRCPhases:1 backendAvailable:YES nowNs:when]) {
+                SPPushSample(p->_captureToOutputReadyNs,15000000);
+                [p r9RecordUsableLatency:0.015];
+            }
+        }
+        (void)[p r9AdmitFRCPhases:1 backendAvailable:YES nowNs:base+100000000000LL];
+        recovered=!p->_r9FRCBudgetGate.limited() && p->_r9RequiredBudgetMs<=p->_r9AllowedBudgetMs;
+        size_t before=p->_frcNs.size(), beforeReady=p->_captureToOutputReadyNs.size();
+        uint64_t beforeSynth=p->_syntheticOK, beforeOnTime=p->_r9OnTimeSynthetic;
+        p->_r9GeneratedFPS=12.5; p->_r9OnTimeSyntheticFPS=3.5;
+        double requiredBefore=p->_r9RequiredBudgetMs, allowedBefore=p->_r9AllowedBudgetMs;
+        BOOL gateBefore=p->_r9FRCBudgetGate.limited();
+        for (int reason=0;reason<3;reason++) {
+            SPLiveJob *job=new SPLiveJob(); job->generation=p->_sourceGeneration; job->configVersion=p->_configVersion;
+            job->clockEpoch=p->_clockEpoch; job->inflightEpoch=p->_inflightEpoch; job->count=1;
+            if(reason==0) job->generation++;
+            if(reason==1) job->configVersion++;
+            if(reason==2) job->clockEpoch++;
+            SPOwnedPixelBuffer *box=[[SPOwnedPixelBuffer alloc] initWithBufferNoCopy:CVPixelBufferRetain(frame)];
+            [p finishJob:job token:0 outputs:@[box] latency:9.0 error:nil];
+        }
+        staleIgnored=p->_frcNs.size()==before && p->_captureToOutputReadyNs.size()==beforeReady &&
+            p->_syntheticOK==beforeSynth && p->_r9OnTimeSynthetic==beforeOnTime && p->_r9FRCBudgetGate.limited()==gateBefore &&
+            p->_r9GeneratedFPS==12.5 && p->_r9OnTimeSyntheticFPS==3.5 && p->_r9RequiredBudgetMs==requiredBefore && p->_r9AllowedBudgetMs==allowedBefore;
+        [p clearPlaySlots]; p->_haveLastPts=NO; p->_pending.clear(); p->_claimedDrops.clear(); p->_pixelDiagnosticsEnabled=YES;
+        uint64_t beforeExpired=p->_pendingExpiredDrops, beforeLate=p->_lateReadyDrops;
+        int64_t now=SPHostNow(); SPPendingPhase pending; pending.pts=sp::spMake(7000,120); pending.jobID=42;
+        pending.generation=p->_sourceGeneration; pending.configVersion=p->_configVersion; pending.clockEpoch=p->_clockEpoch;
+        pending.measurementEpoch=p->_measurementEpoch; pending.targetHost=now-SPRationalToHost(sp::spMake(5,100));
+        p->_pending.push_back(pending); int64_t earliest=0;
+        (void)[p waitForPendingBefore:sp::spMake(7001,120) now:now earliest:&earliest];
+        [p enqueueReadyEnhanced:CVPixelBufferRetain(frame) original:NULL pts:pending.pts synthetic:YES held:NO
+                   captureHost:0 generation:p->_sourceGeneration deadlineHost:pending.targetHost jobID:42];
+        [p enqueueReadyEnhanced:CVPixelBufferRetain(frame) original:NULL pts:sp::spMake(7002,120) synthetic:YES held:NO
+                   captureHost:0 generation:p->_sourceGeneration deadlineHost:pending.targetHost jobID:43];
+        int expiredEvents=0, duplicateLate=0, otherLate=0;
+        for (NSDictionary *event in p->_r7JobTimeline) {
+            if ([event[@"id"] unsignedLongLongValue]==42 && [event[@"kind"] isEqual:@"pendingExpiredDrop"]) expiredEvents++;
+            if ([event[@"id"] unsignedLongLongValue]==42 && [event[@"kind"] isEqual:@"lateReadyDrop"]) duplicateLate++;
+            if ([event[@"id"] unsignedLongLongValue]==43 && [event[@"kind"] isEqual:@"lateReadyDrop"]) otherLate++;
+        }
+        terminalExclusive=p->_pendingExpiredDrops==beforeExpired+1 && p->_lateReadyDrops==beforeLate+1 && expiredEvents==1 && duplicateLate==0 && otherLate==1;
+        [p beginMeasurementEpoch]; reset=!p->_r9FRCBudgetGate.limited() && p->_r9GeneratedFPS<0 && p->_r9OnTimeSyntheticFPS<0;
+    });
+    [p adoptSourceGeneration:2];
+    dispatch_sync(p->_q, ^{ sourceReset=p->_sourceGeneration==2 && !p->_r9FRCBudgetGate.limited() && p->_r9GeneratedFPS<0; });
+    [p stop];
+    dispatch_sync(p->_q, ^{ stopReset=p->_stopped && !p->_r9FRCBudgetGate.limited() && p->_r9GeneratedFPS<0 && p->_r9OnTimeSyntheticFPS<0; });
+    CVPixelBufferRelease(frame);
+    BOOL ok=limited && sourceContinues && backendSeparate && recovered && staleIgnored && terminalExclusive && reset && sourceReset && stopReset;
+    return @{ @"ok": @(ok), @"budgetLimited": @(limited), @"sourceContinues": @(sourceContinues),
+        @"backendFullSeparate": @(backendSeparate), @"recoveredFromFeedback": @(recovered),
+        @"oldCallbacksIgnored": @(staleIgnored), @"phaseTerminalsExclusive": @(terminalExclusive),
+        @"epochReset": @(reset), @"sourceReset": @(sourceReset), @"stopReset": @(stopReset), @"rejectedPhases": @(rejected), @"probeJobs": @(probes), @"sourceFrames": @(sourceCount),
+        @"scope": @"production queue and policy with controlled CPU buffer/timing; no FRC inference, SCK, drawable or GUI" };
 }
 
  + (NSDictionary<NSString *, id> *)runPresentationBudgetContract {
