@@ -138,6 +138,25 @@ enum AppLanguage { static var current: String? { nil }; static func effectiveLan
   precondition(TargetOverlayPolicy.evaluateWindow([targetWindow],orderedOnscreen:[otherBrowserWindow],id:101,owner:77,frontPID:77).reason=="target_not_in_ordered_list")
   precondition(TargetOverlayPolicy.evaluateWindow([targetWindow],orderedOnscreen:[cgWindow(101,88,0,1200,800)],id:101,owner:77,frontPID:77).reason=="target_identity_changed_in_ordered_list")
   precondition(decision([cgWindow(101,77,0,1200,800,true,0)]).reason=="target_transparent")
+  // Fullscreen source bars and real competitors in actual front-to-back order.
+  func positioned(_ id:Int, _ x:Double, _ y:Double, _ w:Double, _ h:Double) -> [String:Any] {
+   var window=cgWindow(id,77,0,w,h); window[kCGWindowBounds as String] = ["X":x,"Y":y,"Width":w,"Height":h]
+   window[kCGWindowName as String] = "window-\(id)"; return window
+  }
+  let full=positioned(101,0,0,2560,1440)
+  let upper=positioned(41844,0,-81,2560,81), toolbar=positioned(47424,0,0,2560,115)
+  precondition(decision([upper,full]).matches)
+  precondition(decision([toolbar,full]).matches)
+  let bothBars=decision([upper,toolbar,full])
+  precondition(bothBars.matches && bothBars.ignored.map(\.id)==[41844,47424] && bothBars.ignored.map(\.name)==["window-41844","window-47424"])
+  precondition(decision([upper,toolbar]).ignored.isEmpty)
+  precondition(decision([positioned(41844,1884,-81,2560,81),positioned(101,1884,0,2560,1440)]).matches)
+  let beneath=decision([upper,positioned(500,20,100,600,400),full])
+  precondition(beneath.reason=="other_window_frontmost" && beneath.competing?.id==500)
+  for item in [positioned(501,0,0,600,400),positioned(502,0,0,2560,375),positioned(503,0,0,1200,100),
+               positioned(504,0,1340,2560,100),positioned(505,20,0,2560,100)] {
+   precondition(decision([item,full]).reason=="other_window_frontmost")
+  }
   // Preparation, failure/revoke, and geometry-loss never click through.
   precondition(!TargetOverlayPolicy.interactionCanPassThrough(available:true,routerActive:false))
   precondition(TargetOverlayPolicy.interactionCanPassThrough(available:true,routerActive:true))

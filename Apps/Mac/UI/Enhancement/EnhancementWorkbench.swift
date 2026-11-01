@@ -345,11 +345,13 @@ enum TargetOverlayPolicy {
         let onscreen: Bool
         let alpha: Double?
         let bounds: CGRect
+        let name: String?
     }
     struct WindowDecision {
         let target: WindowMetadata?
         let competing: WindowMetadata?
         let reason: String
+        var ignored: [WindowMetadata] = []
         var matches: Bool { reason == "matched" }
     }
     static func normalizeWindow(_ item: [String: Any]) -> WindowMetadata? {
@@ -364,7 +366,7 @@ enum TargetOverlayPolicy {
         guard alpha?.isFinite ?? true else { return nil }
         return WindowMetadata(id: id, owner: owner, layer: layer,
                               onscreen: (item[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue ?? false,
-                              alpha: alpha, bounds: bounds)
+                              alpha: alpha, bounds: bounds, name: item[kCGWindowName as String] as? String)
     }
     static func evaluateWindow(_ allWindows: [[String: Any]], orderedOnscreen: [[String: Any]]?, id: CGWindowID, owner: pid_t, frontPID: pid_t?) -> WindowDecision {
         guard let rawTarget = allWindows.first(where: { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == id }) else {
@@ -377,26 +379,41 @@ enum TargetOverlayPolicy {
         // Only the on-screen CG list has a documented front-to-back order.
         // The chosen window remains eligible at its actual level; competing
         // windows must be visible, nontransparent ordinary windows.
-        let top = orderedOnscreen?.lazy.compactMap(normalizeWindow).first { window in
-            guard window.owner == owner, window.onscreen, window.alpha.map({ $0 > 0.01 }) ?? true else { return false }
-            return window.id == id || (window.layer == 0 && window.bounds.width >= 80 && window.bounds.height >= 80)
+        // Only the target in this same ordered snapshot can justify a bar exemption.
+        let snapshotTarget = orderedOnscreen?.first(where: { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == id }).flatMap(normalizeWindow)
+        let barTarget = snapshotTarget.flatMap { value in
+            value.owner == owner && value.onscreen && (value.alpha.map { $0 > 0.01 } ?? true) ? value : nil
+        }
+        var top: WindowMetadata?
+        var ignored: [WindowMetadata] = []
+        for window in orderedOnscreen?.compactMap(normalizeWindow) ?? [] {
+            guard window.owner == owner, window.onscreen, window.alpha.map({ $0 > 0.01 }) ?? true else { continue }
+            if window.id == id { top = window; break }
+            guard window.layer == 0, window.bounds.width >= 80, window.bounds.height >= 80 else { continue }
+            if let target = barTarget, window.bounds.height <= 160,
+               abs(window.bounds.minX - target.bounds.minX) <= 2,
+               window.bounds.width >= target.bounds.width - 4,
+               window.bounds.minY <= target.bounds.minY + 2 {
+                ignored.append(window); continue
+            }
+            top = window; break
         }
         let competing = top.flatMap { $0.id == id ? nil : $0 }
-        guard target.onscreen else { return WindowDecision(target: target, competing: competing, reason: "target_offscreen") }
-        guard target.alpha.map({ $0 > 0.01 }) ?? true else { return WindowDecision(target: target, competing: competing, reason: "target_transparent") }
-        guard let orderedOnscreen else { return WindowDecision(target: target, competing: nil, reason: "onscreen_window_list_unavailable") }
+        guard target.onscreen else { return WindowDecision(target: target, competing: competing, reason: "target_offscreen", ignored: ignored) }
+        guard target.alpha.map({ $0 > 0.01 }) ?? true else { return WindowDecision(target: target, competing: competing, reason: "target_transparent", ignored: ignored) }
+        guard let orderedOnscreen else { return WindowDecision(target: target, competing: nil, reason: "onscreen_window_list_unavailable", ignored: ignored) }
         guard let rawOnscreen = orderedOnscreen.first(where: { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == id }) else {
-            return WindowDecision(target: target, competing: competing, reason: "target_not_in_ordered_list")
+            return WindowDecision(target: target, competing: competing, reason: "target_not_in_ordered_list", ignored: ignored)
         }
         guard let currentTarget = normalizeWindow(rawOnscreen), currentTarget.owner == owner, currentTarget.onscreen else {
-            return WindowDecision(target: target, competing: competing, reason: "target_identity_changed_in_ordered_list")
+            return WindowDecision(target: target, competing: competing, reason: "target_identity_changed_in_ordered_list", ignored: ignored)
         }
-        guard currentTarget.alpha.map({ $0 > 0.01 }) ?? true else { return WindowDecision(target: currentTarget, competing: competing, reason: "target_transparent") }
-        guard let frontPID else { return WindowDecision(target: currentTarget, competing: competing, reason: "front_process_unknown") }
-        guard frontPID == owner else { return WindowDecision(target: currentTarget, competing: competing, reason: "other_app_frontmost") }
-        guard let top else { return WindowDecision(target: currentTarget, competing: nil, reason: "no_visible_candidate") }
-        if top.id != id { return WindowDecision(target: currentTarget, competing: top, reason: "other_window_frontmost") }
-        return WindowDecision(target: currentTarget, competing: nil, reason: "matched")
+        guard currentTarget.alpha.map({ $0 > 0.01 }) ?? true else { return WindowDecision(target: currentTarget, competing: competing, reason: "target_transparent", ignored: ignored) }
+        guard let frontPID else { return WindowDecision(target: currentTarget, competing: competing, reason: "front_process_unknown", ignored: ignored) }
+        guard frontPID == owner else { return WindowDecision(target: currentTarget, competing: competing, reason: "other_app_frontmost", ignored: ignored) }
+        guard let top else { return WindowDecision(target: currentTarget, competing: nil, reason: "no_visible_candidate", ignored: ignored) }
+        if top.id != id { return WindowDecision(target: currentTarget, competing: top, reason: "other_window_frontmost", ignored: ignored) }
+        return WindowDecision(target: currentTarget, competing: nil, reason: "matched", ignored: ignored)
     }
     // The ordered list is only a sampled observation, never a delivery receipt.
     // Treat an incomplete preceding window as unknown rather than assuming clear.
@@ -3121,6 +3138,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             "pendingRequestID": liveApply.pending ?? 0,
             "appliedEngine": applied.interpolationEngineID,
             "appliedModel": applied.modelID,
+            "targetIgnoredWindows": targetDecision["targetIgnoredWindows"] ?? [],
             "targetOnscreen": targetOnscreen,
             "targetFrontmostMatch": targetDecisionReason == "matched",
             "outputTargetReady": targetFrontmost,
@@ -3128,6 +3146,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             "targetOverlayFrame": [targetFrame.origin.x, targetFrame.origin.y, targetFrame.width, targetFrame.height],
             "targetContentRectVerified": targetContentRectVerified,
             "outputPanelVisible": outputWindow?.isVisible ?? false,
+            "outputPanelOnActiveSpace": outputWindow?.isOnActiveSpace ?? false,
+            "hudPanelOnActiveSpace": targetHUD?.isOnActiveSpace ?? false,
             "outputPanelAlpha": outputWindow?.alphaValue ?? 0,
             "outputMinimumCaptureHost": outputMinimumCaptureHost,
             "outputPanelIsOpaque": outputWindow?.isOpaque ?? false,
@@ -4618,6 +4638,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         case let .window(id, owner):
             let ordered = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]]
             let decision = TargetOverlayPolicy.evaluateWindow(raw, orderedOnscreen: ordered, id: id, owner: owner, frontPID: frontPID)
+            targetDecision["targetIgnoredWindows"] = decision.ignored.map { item -> [String: Any] in
+                ["id": item.id, "bounds": [item.bounds.minX, item.bounds.minY, item.bounds.width, item.bounds.height],
+                 "layer": item.layer, "alpha": item.alpha as Any? ?? NSNull(), "name": item.name as Any? ?? NSNull()]
+            }
             targetDecisionReason = decision.reason
             if let target = decision.target { record(target, prefix: "targetCG") }
             if let competing = decision.competing { record(competing, prefix: "competingCG") }

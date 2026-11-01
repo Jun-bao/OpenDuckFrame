@@ -49,7 +49,7 @@ import Foundation
                 canObserve: true, outputObservable: true, chinese: true)
         }
         let current = text()
-        precondition(current.contains("输入/采集≈ 120.1") && current.contains("目标≈ 240.2 (X2)"))
+        precondition(current.contains("内容≈ 120.1") && current.contains("目标≈ 240.2 (X2)"))
         precondition(current.contains("呈现 119.9 FPS") && current.contains("屏幕 120 Hz") && current.contains("原生直通"))
         for stale in [text(stats, 11), text(stats, 10, 8), text(stats, 10, 7, 14),
                       text(stats, 10, 7, 13, false), text(stats, 10, 7, 13, true, true)] {
