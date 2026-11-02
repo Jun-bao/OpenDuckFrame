@@ -343,7 +343,10 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     private var pauseValue = false
     var paused: Bool {
         get { pauseLock.lock(); defer { pauseLock.unlock() }; return pauseValue }
-        set { pauseLock.lock(); pauseValue = newValue; pauseLock.unlock() }
+        set {
+            pauseLock.lock(); pauseValue = newValue; pauseLock.unlock()
+            if newValue { geometryLock.lock(); frameGeometryValue = nil; geometryLock.unlock() }
+        }
     }
     private(set) var running = false
     private(set) var currentGeneration: UInt64 = 0
@@ -362,6 +365,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     private var screenRectValue: CGRect?
     private var screenRectHost: UInt64 = 0
     private var geometryTarget: CaptureTarget?
+    private var frameGeometryValue: [String: Any]?
     private var pickerArmed = false
     private var issuedGeneration: UInt64 = 0
     private var completeCount = 0
@@ -487,6 +491,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         screenRectGeneration = generation
         screenRectValue = nil
         screenRectHost = 0
+        frameGeometryValue = nil
         geometryTarget = target
         geometryLock.unlock()
         completeCount = 0
@@ -539,6 +544,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     private func stopStream() {
         let current = stream
         streamBinding.retire()
+        geometryLock.lock(); frameGeometryValue = nil; geometryLock.unlock()
         stream = nil
         running = false
         current?.stopCapture { [weak self] error in
@@ -615,6 +621,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
                             self.startStream(filter: current, width: width, height: height, biplanar: false, generation: generation)
                         } else {
                             self.running = false
+                            self.geometryLock.lock(); self.frameGeometryValue = nil; self.geometryLock.unlock()
                             self.onDiagnostic?("start failed: \(error.localizedDescription)")
                             self.onStatus?("捕获没有开始：\(error.localizedDescription)", true)
                         }
@@ -629,6 +636,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
                 onDiagnostic?("addStreamOutput failed: \(error.localizedDescription); retry BGRA")
                 startStream(filter: filter, width: width, height: height, biplanar: false, generation: generation)
             } else {
+                geometryLock.lock(); frameGeometryValue = nil; geometryLock.unlock()
                 onDiagnostic?("addStreamOutput failed: \(error.localizedDescription)")
                 onStatus?("捕获没有开始：\(error.localizedDescription)", true)
             }
@@ -649,7 +657,12 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         if let generation = streamBinding.snapshot(stream) {
-            _ = streamBinding.withCurrent(stream, generation: generation) { onGeometry?(nil, generation) }
+            _ = streamBinding.withCurrent(stream, generation: generation) {
+                geometryLock.lock()
+                if screenRectGeneration == generation { frameGeometryValue = nil }
+                geometryLock.unlock()
+                onGeometry?(nil, generation)
+            }
         }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -707,7 +720,12 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             return
         }
         if status == .blank || status == .suspended || status == .stopped {
-            _ = streamBinding.withCurrent(stream, generation: generation) { onGeometry?(nil, generation) }
+            _ = streamBinding.withCurrent(stream, generation: generation) {
+                geometryLock.lock()
+                if screenRectGeneration == generation { frameGeometryValue = nil }
+                geometryLock.unlock()
+                onGeometry?(nil, generation)
+            }
             if status == .blank { blankCount += 1 }
             if status == .suspended { suspendedCount += 1 }
             if status == .stopped { stoppedCount += 1 }
@@ -719,6 +737,11 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         lastCompleteHost = mach_absolute_time()
         onNote?(0)
         guard !paused, let image = sampleBuffer.imageBuffer else {
+            _ = streamBinding.withCurrent(stream, generation: generation) {
+                geometryLock.lock()
+                if screenRectGeneration == generation { frameGeometryValue = nil }
+                geometryLock.unlock()
+            }
             if paused {
                 pausedDrops += 1
                 if pausedDrops <= 3 || pausedDrops % 60 == 0 {
@@ -729,7 +752,14 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         }
         let captureHost = lastReceivedHost
         let frameGeometry = geometryMetadata(sampleBuffer, width: CVPixelBufferGetWidth(image), height: CVPixelBufferGetHeight(image), generation: generation)
-        guard streamBinding.withCurrent(stream, generation: generation, { onGeometry?(frameGeometry, generation) }) else { retiredDrops += 1; return }
+        guard streamBinding.withCurrent(stream, generation: generation, {
+            geometryLock.lock()
+            if screenRectGeneration == generation {
+                frameGeometryValue = !paused && CMSampleBufferIsValid(sampleBuffer) && CMSampleBufferDataIsReady(sampleBuffer) ? frameGeometry : nil
+            }
+            geometryLock.unlock()
+            onGeometry?(frameGeometry, generation)
+        }) else { retiredDrops += 1; return }
         // Geometry remains current even for a duplicate, but duplicate pixels do
         // not become native-cadence evidence or enter the processor queue.
         if contentFrameGate.evaluate(buffer: image, generation: generation, hostNs: contentHostNs(captureHost)) == .duplicate { return }
@@ -832,8 +862,15 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             mach_timebase_info(&info)
             hostSpan = Double(lastHost - firstHost) * Double(info.numer) / Double(info.denom) / 1_000_000_000
         }
+        geometryLock.lock()
+        let geometry = screenRectGeneration == currentGeneration ? frameGeometryValue : nil
+        geometryLock.unlock()
         var report: [String: Any] = [
             "generation": currentGeneration,
+            "lastContentRect": geometry?["contentRect"] ?? NSNull(),
+            "lastScreenRect": geometry?["screenRect"] ?? NSNull(),
+            "lastScaleFactor": geometry?["scaleFactor"] ?? NSNull(),
+            "lastContentScale": geometry?["contentScale"] ?? NSNull(),
             "running": running,
             "paused": paused,
             "captureCapFPS": captureCapFPS,
