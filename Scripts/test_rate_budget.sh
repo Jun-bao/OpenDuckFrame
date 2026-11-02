@@ -46,6 +46,22 @@ import Foundation
         stats.removeValue(forKey: "rateRequestedMultiplier"); stats.removeValue(forKey: "rateEffectiveMultiplier")
         check(render().contains("120.0 (X2)"), "legacy snapshots remain supported")
         print("PASS HUD: requested target, effective multiplier, x1, stale state, English and native passthrough")
+        stats["rateRequestedMultiplier"] = 2; stats["rateEffectiveMultiplier"] = 1
+        stats["rateBudgetPassthrough"] = true; stats["rateBudgetLimit"] = "display"
+        check(render().contains("120.0 (X2)") && render().contains("原生直通") &&
+              !render().contains("算力受限") && !render().contains("→X"), "display x1 uses native label")
+        check(render(false).contains("Native passthrough") && !render(false).contains("Limited by compute"), "display x1 English")
+        stats["rateRequestedMultiplier"] = 3; stats["rateEffectiveMultiplier"] = 2
+        stats["rateBudgetPassthrough"] = false; stats["estimatedRequestedFPS"] = 180.0
+        check(render().contains("180.0 (X3→X2)") && render().contains(" · 屏幕上限") &&
+              !render().contains("算力受限"), "display x2 keeps effective multiplier and display label")
+        check(render(false).contains(" · Limited by display"), "display x2 English")
+        for stale in [render(now: 11), render(running: false), render(paused: true), render(generation: 8), render(config: 14)] {
+            check(!stale.contains("屏幕上限") && !stale.contains("原生直通") && !stale.contains("→X"), "stale display label clears")
+        }
+        stats["rateBudgetLimit"] = "compute"
+        check(render().contains(" · 算力受限") && !render().contains("屏幕上限"), "explicit compute remains unchanged")
+        print("PASS HUD: display passthrough, display cap, stale display state and English")
     }
 }
 SWIFT

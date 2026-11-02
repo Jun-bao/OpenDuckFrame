@@ -27,14 +27,17 @@ enum LiveFPSOverlay {
         let multiplier = fresh && (stats["rateKind"] as? String) == "multiplier"
             ? (stats["rateRequestedMultiplier"] as? Int ?? stats["rateMultiplier"] as? Int ?? 0) : 0
         let effective = fresh ? (stats["rateEffectiveMultiplier"] as? Int ?? multiplier) : 0
-        let native = fresh && committed && interpolation && (stats["nativeBudgetActive"] as? Bool) == true
+        let displayLimited = fresh && (stats["rateBudgetLimit"] as? String) == "display"
+        let native = fresh && committed && interpolation &&
+            ((stats["nativeBudgetActive"] as? Bool) == true || (displayLimited && effective == 1))
         let limited = target != nil && !native && multiplier > 1 && effective >= 1 && effective < multiplier
         let suffix = target != nil && multiplier > 1
             ? (limited ? " (X\(multiplier)→X\(effective))" : " (X\(multiplier))") : ""
         let display = fresh ? (stats["displayRefreshHz"] as? Double ?? 0) : 0
         let screen = display.isFinite && display > 0 ? String(format: "%.0f", display) : "—"
         let passthrough = native ? (chinese ? " · 原生直通" : " · Native passthrough")
-            : (limited ? (chinese ? " · 算力受限" : " · Limited by compute") : "")
+            : (limited ? (displayLimited ? (chinese ? " · 屏幕上限" : " · Limited by display")
+                                        : (chinese ? " · 算力受限" : " · Limited by compute")) : "")
         let approximate = !fresh || (stats["requestedFPSIsEstimated"] as? Bool) == true
         let targetLabel = chinese ? (approximate ? "目标≈" : "目标") : (approximate ? "Target≈" : "Target")
         return (chinese ? "内容≈" : "Content≈") + " \(value(input)) · " + targetLabel + " \(value(target))\(suffix) FPS\n" +

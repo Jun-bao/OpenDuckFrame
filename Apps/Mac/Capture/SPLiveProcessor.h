@@ -184,6 +184,8 @@ typedef NS_ENUM(NSInteger, SPLiveViewMode) {
 - (uint64_t)ownedContractRedrawIdentity;
 - (void)ownedContractCompleteIdentity:(uint64_t)identity stale:(BOOL)stale;
 - (void)ownedContractQueueCurrentThenStalePressure;
+/// Deterministic probe completion/cancellation with synthetic source leases; no model is run.
+- (NSDictionary<NSString *, id> *)ownedContractRateBudgetProbeCancellation:(NSString *)scenario;
 /// Blocks until queued GPU work for this probe finishes. Not for the main thread of a live session.
 + (NSDictionary<NSString *, id> *)runProbe;
 /// Generation ownership and absolute-PTS scheduling. Does not start a capture stream.

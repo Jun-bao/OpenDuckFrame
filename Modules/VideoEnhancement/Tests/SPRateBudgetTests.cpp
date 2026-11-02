@@ -277,6 +277,107 @@ static void a8_replay() {
     expect(b.snapshot().phaseCostMs == 26, "a8 replay must replace the initial estimate with new samples");
     expect(b.snapshot().downgrades == 0, "a8 recovery must not create a self-induced downgrade");
 }
+static void display_cap_without_cost() {
+    RateBudget b; b.reset(2);
+    for (int tick = 0; tick <= 10; ++tick) {
+        auto s = b.update({tick / 10.0, 114, 2, 0, 0, 0, 0, 120});
+        expect(s.effectiveMultiplier == (tick < 10 ? 2 : 1), "114fps must reach x1 after exactly one second without samples or warmup");
+        if (tick == 5) b.markRateApplied(0.5);
+    }
+    auto s = b.snapshot();
+    expect(s.displayCap == 1 && s.limit == sp::RateBudgetLimit::Display, "114fps bypass must be limited by display");
+    expect(s.displayCapChanges == 1 && s.downgrades == 0 && s.upgrades == 0, "display bypass must not increment compute counters");
+    expect(s.phaseCostMs == 0, "display bypass must not invent a phase cost");
+}
+static void display_cap_boundaries() {
+    for (double fps : {60.0, 61.0, 62.0}) {
+        RateBudget b; b.reset(2);
+        for (int tick = 0; tick <= 20; ++tick) b.update({tick / 10.0, fps, 2, 0, 0, 0, 0, 120});
+        int expected = fps < 62 ? 2 : 1;
+        expect(b.snapshot().effectiveMultiplier == expected, "60 and 61 fps fit x2, but 62 fps exceeds the 1.02 display allowance");
+        expect(b.snapshot().displayCap == expected, "display cap must use the specified floor");
+        expect(b.snapshot().limit == (expected == 2 ? sp::RateBudgetLimit::None : sp::RateBudgetLimit::Display), "boundary reason must match the applied rate");
+    }
+    RateBudget b; b.reset(3);
+    for (int tick = 0; tick <= 10; ++tick) b.update({tick / 10.0, 60, 3, 0, 0, 0, 0, 120});
+    expect(b.snapshot().effectiveMultiplier == 2 && b.snapshot().displayCap == 2 &&
+           b.snapshot().limit == sp::RateBudgetLimit::Display, "60fps x3 must stop at display-limited x2");
+    for (double hz : {0.0, 1.0, -1.0, std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()}) {
+        b.reset(2);
+        for (int tick = 0; tick <= 20; ++tick) b.update({tick / 10.0, 114, 2, 0, 0, 0, 0, hz});
+        expect(b.snapshot().effectiveMultiplier == 2 && b.snapshot().displayCap == 2 &&
+               b.snapshot().limit == sp::RateBudgetLimit::None, "unknown or invalid refresh must not impose a display cap");
+    }
+}
+static void display_recovers_without_cooldown() {
+    for (double initialCost : {0.0, 68.0}) {
+        RateBudget b; b.reset(2);
+        for (int tick = 0; tick <= 10; ++tick) b.update({tick / 10.0, 114, 2, initialCost, 0, 0, 0, 120});
+        expect(b.snapshot().effectiveMultiplier == 1, "display recovery setup must reach x1");
+        for (int tick = 20; tick <= 30; ++tick) {
+            auto s = b.update({tick / 10.0, 24, 2, 0, 0, 0, 0, 120});
+            expect(s.effectiveMultiplier == (tick < 30 ? 1 : 2), "display recovery must persist for one second, including with unknown P");
+        }
+        expect(b.snapshot().limit == sp::RateBudgetLimit::None && b.snapshot().displayCapChanges == 2 &&
+               b.snapshot().upgrades == 0, "display recovery must have its own counter and clear the limit");
+        // A real overload after this recovery must not classify it as a failed
+        // compute upgrade and block the next probe-based recovery for 30s.
+        for (int tick = 31; tick <= 81; ++tick) b.update({tick / 10.0, 24, 2, 68, 100, 100, 16, 120});
+        expect(b.snapshot().effectiveMultiplier == 1 && b.snapshot().limit == sp::RateBudgetLimit::Compute,
+               "fresh overload after display recovery must still downgrade by compute");
+        expect(b.recordProbePhaseCost(26), "compute-limited x1 must accept a fresh recovery probe");
+        for (int tick = 82; tick <= 113; ++tick) b.update({tick / 10.0, 24, 2, 0, 0, 0, 0, 120});
+        expect(b.snapshot().effectiveMultiplier == 2 && b.snapshot().upgrades == 1,
+               "display recovery must not create a failed-upgrade cooldown");
+    }
+}
+static void display_flicker_debounce() {
+    RateBudget b; b.reset(2);
+    for (int tick = 0; tick <= 100; ++tick) {
+        double fps = (tick / 6) % 2 ? 60.5 : 62.5;
+        b.update({tick / 10.0, fps, 2, 0, 0, 0, 0, 120});
+        expect(b.snapshot().effectiveMultiplier == 2 && b.snapshot().displayCapChanges == 0,
+               "sub-second 60.5/62.5fps changes must not trigger a display downgrade");
+    }
+    b.reset(2);
+    for (int tick = 0; tick <= 10; ++tick) b.update({tick / 10.0, 114, 2, 0, 0, 0, 0, 120});
+    for (int tick = 20; tick <= 120; ++tick) {
+        double fps = ((tick - 20) / 6) % 2 ? 62.5 : 60.5;
+        b.update({tick / 10.0, fps, 2, 0, 0, 0, 0, 120});
+        expect(b.snapshot().effectiveMultiplier == 1 && b.snapshot().displayCapChanges == 1,
+               "sub-second cap changes must also debounce display recovery");
+    }
+    b.reset(2);
+    b.update({0, 114, 2, 0, 0, 0, 0, 120});
+    b.update({0.6, 114, 2, 0, 0, 0, 0, 120});
+    b.update({0.9, 0, 2, 0, 0, 0, 0, 120});
+    b.update({1.0, 114, 2, 0, 0, 0, 0, 120});
+    b.update({1.9, 114, 2, 0, 0, 0, 0, 120});
+    expect(b.snapshot().effectiveMultiplier == 2, "unknown content FPS must interrupt display persistence");
+    b.update({2.0, 114, 2, 0, 0, 0, 0, 120});
+    expect(b.snapshot().effectiveMultiplier == 1, "display persistence must restart after unknown FPS");
+}
+static void display_preserves_compute_policy() {
+    RateBudget b; b.reset(2);
+    for (int tick = 0; tick <= 51; ++tick) {
+        b.update({tick / 10.0, 24, 2, 68, 100, 100, 16, 120});
+        if (tick < 50) expect(b.snapshot().effectiveMultiplier == 2, "display support must not shorten compute warmup or persistence");
+    }
+    auto s = b.snapshot();
+    expect(s.effectiveMultiplier == 1 && s.displayCap == 2 && s.limit == sp::RateBudgetLimit::Compute &&
+           s.downgrades == 1 && s.displayCapChanges == 0, "24fps real overload must remain a compute downgrade");
+    // At 60fps the display permits only x2 even if the GPU could sustain x3.
+    b.reset(3);
+    for (int tick = 0; tick <= 100; ++tick) {
+        b.update({tick / 10.0, 60, 3, 2, 100, 0, 16, 120});
+        if (tick >= 10) expect(b.snapshot().effectiveMultiplier <= 2, "compute recovery cannot briefly cross the display cap");
+    }
+    expect(b.snapshot().effectiveMultiplier == 2 && b.snapshot().limit == sp::RateBudgetLimit::Display &&
+           b.snapshot().upgrades == 0, "compute upgrades must never exceed the display cap");
+    expect(std::string(sp::rateBudgetLimitName(sp::RateBudgetLimit::None)) == "none" &&
+           std::string(sp::rateBudgetLimitName(sp::RateBudgetLimit::Display)) == "display" &&
+           std::string(sp::rateBudgetLimitName(sp::RateBudgetLimit::Compute)) == "compute", "limit names must match the log contract");
+}
 int main(int argc, char **argv) {
     const std::vector<std::pair<std::string, std::function<void()>>> cases = {
         {"24x3", x3_at_24}, {"60x2", x2_at_60}, {"30x2", x2_at_30},
@@ -287,7 +388,10 @@ int main(int argc, char **argv) {
         {"idle_never_rejected", idle_never_rejected}, {"busy_late_rejected", busy_late_rejected},
         {"stale_samples_no_downgrade", stale_samples_no_downgrade}, {"warmup_no_downgrade", warmup_no_downgrade},
         {"a8_replay", a8_replay}, {"real_overload_downgrades", real_overload_downgrades},
-        {"probe_recovers", probe_recovers}, {"probe_no_false_upgrade", probe_no_false_upgrade}
+        {"probe_recovers", probe_recovers}, {"probe_no_false_upgrade", probe_no_false_upgrade},
+        {"display_cap_without_cost", display_cap_without_cost}, {"display_cap_boundaries", display_cap_boundaries},
+        {"display_recovers_without_cooldown", display_recovers_without_cooldown},
+        {"display_flicker_debounce", display_flicker_debounce}, {"display_preserves_compute_policy", display_preserves_compute_policy}
     };
     int executed = 0, failed = 0;
     for (const auto &test : cases) {

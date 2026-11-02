@@ -20,11 +20,24 @@ struct RateBudgetInput {
     double medianTaskMs = 0;
     uint64_t plannedPhases = 0, droppedPhases = 0;
     uint64_t freshSamples = 0;
+    double refreshHz = 0;
 };
+enum class RateBudgetLimit { None, Display, Compute };
+inline const char *rateBudgetLimitName(RateBudgetLimit limit) {
+    switch (limit) {
+        case RateBudgetLimit::Display: return "display";
+        case RateBudgetLimit::Compute: return "compute";
+        case RateBudgetLimit::None: return "none";
+    }
+    return "none";
+}
 struct RateBudgetSnapshot {
     int requestedMultiplier = 1, effectiveMultiplier = 1;
     double phaseCostMs = 0;
     uint64_t downgrades = 0, upgrades = 0;
+    int displayCap = 1;
+    uint64_t displayCapChanges = 0;
+    RateBudgetLimit limit = RateBudgetLimit::None;
 };
 
 // The caller supplies a current-multiplier task median and rolling phase
@@ -34,16 +47,28 @@ class RateBudget {
     struct Cooldown { double fps, until; };
     RateBudgetSnapshot state_;
     double lastNow_ = -1, downSince_ = -1, upSince_ = -1;
+    double displayDownSince_ = -1, displayUpSince_ = -1;
+    bool displayRecovery_ = false;
     double warmupAt_ = -1;
     double upgradeAt_ = -1;
     int upgradeFrom_ = 1;
     std::vector<Cooldown> cooldowns_;
-    void clearTimers() { downSince_ = upSince_ = -1; }
+    void clearComputeTimers() { downSince_ = upSince_ = -1; }
+    void clearTimers() {
+        clearComputeTimers();
+        displayDownSince_ = displayUpSince_ = -1;
+    }
+    void updateLimit() {
+        state_.limit = state_.effectiveMultiplier == state_.requestedMultiplier ? RateBudgetLimit::None
+            : state_.effectiveMultiplier == state_.displayCap ? RateBudgetLimit::Display : RateBudgetLimit::Compute;
+    }
 public:
     void reset(int requestedMultiplier = 1) {
         state_ = {};
         state_.requestedMultiplier = state_.effectiveMultiplier = std::clamp(requestedMultiplier, 1, 4);
+        state_.displayCap = state_.requestedMultiplier;
         lastNow_ = upgradeAt_ = warmupAt_ = -1;
+        displayRecovery_ = false;
         upgradeFrom_ = 1;
         cooldowns_.clear();
         clearTimers();
@@ -84,15 +109,57 @@ public:
         if (!std::isfinite(interval)) { clearTimers(); return state_; }
         if (warmupAt_ < 0) warmupAt_ = now;
         const int effective = state_.effectiveMultiplier;
-        if (effective > 1) {
-            if (!std::isfinite(input.medianTaskMs) || input.medianTaskMs <= 0) {
-                clearTimers();
-                return state_;
-            }
+        const bool validTaskCost = std::isfinite(input.medianTaskMs) && input.medianTaskMs > 0;
+        if (effective > 1 && validTaskCost)
             state_.phaseCostMs = input.medianTaskMs / (effective - 1);
+
+        // Keep the origin of a display-limited rate while the current cap
+        // moves upward. The public limit describes the current cap, so it
+        // cannot itself retain that origin through the recovery debounce.
+        if (state_.limit == RateBudgetLimit::Display) displayRecovery_ = true;
+        state_.displayCap = requested;
+        if (std::isfinite(input.refreshHz) && input.refreshHz > 1)
+            state_.displayCap = static_cast<int>(std::clamp(
+                std::floor(input.refreshHz * 1.02 / input.contentFPS), 1.0, static_cast<double>(requested)));
+        const int upper = std::min(requested, state_.displayCap);
+        updateLimit();
+        if (state_.limit == RateBudgetLimit::Display) displayRecovery_ = true;
+        if (effective > upper) {
+            displayUpSince_ = -1;
+            clearComputeTimers();
+            if (displayDownSince_ < 0) displayDownSince_ = now;
+            if (now - displayDownSince_ >= 1.0) {
+                state_.effectiveMultiplier = upper;
+                ++state_.displayCapChanges;
+                displayRecovery_ = true;
+                upgradeAt_ = -1;
+                markRateApplied(now);
+                clearTimers();
+                updateLimit();
+            }
+            return state_;
         }
+        displayDownSince_ = -1;
+        if (effective < upper && displayRecovery_) {
+            clearComputeTimers();
+            if (displayUpSince_ < 0) displayUpSince_ = now;
+            if (now - displayUpSince_ >= 1.0) {
+                state_.effectiveMultiplier = upper;
+                ++state_.displayCapChanges;
+                displayRecovery_ = upper < requested;
+                // This is a display-cap recovery, not a compute upgrade;
+                // a later overload must not turn it into a failed upgrade.
+                upgradeAt_ = -1;
+                markRateApplied(now);
+                clearTimers();
+                updateLimit();
+            }
+            return state_;
+        }
+        displayUpSince_ = -1;
+        if (effective > 1 && !validTaskCost) { clearComputeTimers(); return state_; }
         const double phaseCost = state_.phaseCostMs;
-        if (!std::isfinite(phaseCost) || phaseCost <= 0) { clearTimers(); return state_; }
+        if (!std::isfinite(phaseCost) || phaseCost <= 0) { clearComputeTimers(); return state_; }
         cooldowns_.erase(std::remove_if(cooldowns_.begin(), cooldowns_.end(),
             [now](const Cooldown &item) { return now >= item.until; }), cooldowns_.end());
 
@@ -105,16 +172,18 @@ public:
             if (downSince_ < 0) downSince_ = now;
             if (now - downSince_ >= 2.0) {
                 int next = 1;
-                for (int m = 2; m <= requested; ++m)
+                for (int m = 2; m <= upper; ++m)
                     if ((m - 1) * phaseCost <= 0.90 * interval) next = m;
                 if (next < effective) {
                     if (upgradeAt_ >= 0 && now - upgradeAt_ <= 10.0 && next <= upgradeFrom_)
                         cooldowns_.push_back({input.contentFPS, now + 30.0});
                     state_.effectiveMultiplier = next;
+                    displayRecovery_ = false;
                     ++state_.downgrades;
                     upgradeAt_ = -1;
                     markRateApplied(now);
                     clearTimers();
+                    updateLimit();
                     return state_;
                 }
             }
@@ -122,7 +191,7 @@ public:
 
         const bool cooling = std::any_of(cooldowns_.begin(), cooldowns_.end(),
             [&](const Cooldown &item) { return std::abs(input.contentFPS - item.fps) <= 2.0; });
-        const bool canUpgrade = effective < requested && !cooling &&
+        const bool canUpgrade = effective < upper && !cooling &&
             effective * phaseCost <= 0.85 * interval;
         if (canUpgrade) {
             if (upSince_ < 0) upSince_ = now;
@@ -130,9 +199,11 @@ public:
                 upgradeAt_ = now;
                 upgradeFrom_ = effective;
                 ++state_.effectiveMultiplier;
+                displayRecovery_ = false;
                 ++state_.upgrades;
                 markRateApplied(now);
                 clearTimers();
+                updateLimit();
             }
         } else upSince_ = -1;
         return state_;

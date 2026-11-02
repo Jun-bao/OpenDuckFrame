@@ -1785,7 +1785,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 - (BOOL)rateBudgetProbeEligible {
     double fps = _fpsMeter.inputRate((int64_t)(CACurrentMediaTime() * 1e9));
     return [self rateBudgetEnabled] && _rateBudgetPassthrough && _effectiveMultiplier == 1 &&
-        _rateBudget.snapshot().effectiveMultiplier == 1 && _rife && _sessionReady && !_stopped &&
+        _rateBudget.snapshot().effectiveMultiplier == 1 &&
+        _rateBudget.snapshot().limit == sp::RateBudgetLimit::Compute && _rife && _sessionReady && !_stopped &&
         !_nativeBudgetActive && ![self nativeBudgetForSnapshot:[self nativeCadenceSnapshot]] &&
         std::isfinite(fps) && fps > 0;
 }
@@ -1939,8 +1940,11 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         return;
     }
     if ([self nativeBudgetForSnapshot:[self nativeCadenceSnapshot]]) {
-        [self suspendRateBudgetOnQueue];
-        return;
+        // Native bypass still suspends compute evidence, but the display cap
+        // must observe continuous content cadence across native-gate changes.
+        [self cancelRateBudgetProbe];
+        _rateBudgetCompletedHosts.clear();
+        [self clearRateBudgetWindow];
     }
     int64_t now = SPHostNow();
     // A one-second rolling phase window feeds the independent 2/3-second
@@ -1956,14 +1960,18 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     auto budget = _rateBudget.snapshot();
     if (budget.effectiveMultiplier == _effectiveMultiplier) {
         budget = _rateBudget.update({CACurrentMediaTime(), fps, (int)_request.multiplier,
-                                    median, planned, dropped, fresh});
+                                    median, planned, dropped, fresh, _request.displayRefreshHz});
         if (budget.effectiveMultiplier != _effectiveMultiplier) {
             _rateBudgetLastDecision = @{ @"host": @(now), @"from": @(_effectiveMultiplier),
                 @"to": @(budget.effectiveMultiplier), @"medianMs": @(median),
                 @"planned": @(planned), @"dropped": @(dropped), @"freshSamples": @(fresh),
-                @"contentFPS": @(fps), @"phaseCostMs": @(budget.phaseCostMs) };
+                @"contentFPS": @(fps), @"phaseCostMs": @(budget.phaseCostMs),
+                @"refreshHz": @(_request.displayRefreshHz), @"displayCap": @(budget.displayCap),
+                @"limit": [NSString stringWithUTF8String:sp::rateBudgetLimitName(budget.limit)] };
         }
     }
+    if (budget.limit != sp::RateBudgetLimit::Compute && _rateBudgetProbeActive)
+        [self cancelRateBudgetProbe];
     if (budget.effectiveMultiplier == _effectiveMultiplier) return;
     // Reuse the loaded engine. Let its bounded serial queue drain before
     // changing ownership epochs; admission rejects new jobs during this gap.
@@ -1987,7 +1995,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     // Keep the budget's remembered phase cost, counters, and retry cooldown.
     [self beginMeasurementEpoch];
     _rateBudget.markRateApplied(CACurrentMediaTime());
-    if (_rateBudgetPassthrough)
+    if (_rateBudgetPassthrough && budget.limit == sp::RateBudgetLimit::Compute)
         _rateBudgetProbeNextHost = SPHostNow() + SPRationalToHost(sp::spMake(10, 1));
     [self recordR7JobEvent:@"rateBudgetChanged" detail:@{
         @"requested": @(_request.multiplier), @"previous": @(previous), @"effective": @(_effectiveMultiplier),
@@ -2074,6 +2082,9 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"rateRequestedMultiplier": @(_request.rateKind == SPLiveRateMultiplier ? _request.multiplier : 0),
         @"rateEffectiveMultiplier": @(_request.rateKind == SPLiveRateMultiplier ? ([self rateBudgetEnabled] ? _effectiveMultiplier : _request.multiplier) : 0),
         @"rateBudgetPassthrough": @(_rateBudgetPassthrough),
+        @"rateBudgetLimit": [NSString stringWithUTF8String:sp::rateBudgetLimitName(_rateBudget.snapshot().limit)],
+        @"rateBudgetDisplayCap": @(_rateBudget.snapshot().displayCap),
+        @"rateBudgetDisplayCapChanges": @(_rateBudget.snapshot().displayCapChanges),
         @"rateBudgetRejectedPhases": @(_rifeBudgetRejectedPhases),
         @"rifeBudgetRejectedPhases": @(_rifeBudgetRejectedPhases),
         @"rateBudgetSkippedPhases": @(_rateBudgetSkippedPhases),
@@ -3049,6 +3060,165 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             @"playoutSource": @(source), @"playoutSynthetic": @(synthetic), @"redrawHeld": @(_lastEnhanced != nullptr),
             @"nativeBudgetActive": @([self nativeBudgetForSnapshot:[self nativeCadenceSnapshot]]), @"delayMs": @((double)SPHostToNs(_delayHost)/1e6),
             @"peakSlots": @(_peakSlots), @"slotCap": @([self slotCap]), @"sampleHost": @(SPHostNow()) };
+}
+
+// Deterministic cancellation evidence, using the same serial queue, real
+// finish/cancel/release functions and CVPixelBuffer leases as live probes.
+// This hook is called only by the isolated contract executable.
+- (NSDictionary<NSString *, id> *)ownedContractRateBudgetProbeCancellation:(NSString *)scenario {
+    if (![@[@"current", @"config", @"generation", @"clock", @"stopped", @"queued"] containsObject:scenario])
+        return @{ @"setup": @NO, @"error": @"unknown probe contract scenario" };
+    __block NSDictionary *result;
+    dispatch_sync(_q, ^{
+        // Each test owns a fresh processor. Refuse to disturb a live session.
+        if (!self->_held.empty() || self->_inflight || self->_rateBudgetProbeInFlightToken ||
+            !self->_rateBudgetProbePending.empty()) {
+            result = @{ @"setup": @NO, @"error": @"probe contract requires an idle fresh processor" };
+            return;
+        }
+        self->_request.interpolationEnabled = YES;
+        self->_request.engineID = @"rife.metal";
+        self->_request.rateKind = SPLiveRateMultiplier;
+        self->_request.multiplier = 2;
+        self->_request.displayRefreshHz = 120;
+        self->_sourceGeneration = 21;
+        self->_configVersion = 31;
+        self->_clockEpoch = 41;
+        self->_measurementEpoch = 51;
+        self->_inflightEpoch = 61;
+        self->_rife = [[SPRifeBridge alloc] init]; // Unprepared: no model or GPU work.
+        self->_sessionReady = YES;
+        self->_stopped = NO;
+        self->_nativeBudgetActive = NO;
+        self->_rateBudget.reset(2);
+        for (int tick = 0; tick <= 51; ++tick)
+            self->_rateBudget.update({tick / 10.0, 60, 2, 40, 100, 100, 16});
+        self->_effectiveMultiplier = self->_rateBudget.snapshot().effectiveMultiplier;
+        self->_rateBudgetPassthrough = self->_effectiveMultiplier == 1;
+        self->_rateBudgetProbeMedianMs = 40;
+        self->_fpsMeter.reset();
+        int64_t nowNs = (int64_t)(CACurrentMediaTime() * 1e9);
+        self->_fpsMeter.input(0, nowNs - 17000000);
+        self->_fpsMeter.input(16666667, nowNs - 1);
+
+        // The release callback is a lifetime observation, not a retain-count
+        // guess. A shared counter remains valid even in an intentionally broken
+        // mutation run where a retained source outlives the test hook.
+        auto releases = std::make_shared<std::atomic<int>>(0);
+        int buffersCreated = 0;
+        auto buffer = [&]() -> CVPixelBufferRef {
+            void *bytes = calloc(1, 64);
+            if (!bytes) return nullptr;
+            auto counter = new std::shared_ptr<std::atomic<int>>(releases);
+            CVPixelBufferRef value = nullptr;
+            CVReturn status = CVPixelBufferCreateWithBytes(kCFAllocatorDefault, 4, 4,
+                kCVPixelFormatType_32BGRA, bytes, 16,
+                [](void *context, const void *address) {
+                    auto counter = static_cast<std::shared_ptr<std::atomic<int>> *>(context);
+                    (*counter)->fetch_add(1);
+                    delete counter;
+                    free(const_cast<void *>(address));
+                }, counter, nullptr, &value);
+            if (status != kCVReturnSuccess) { delete counter; free(bytes); return nullptr; }
+            ++buffersCreated;
+            return value;
+        };
+        for (uint64_t identity : {uint64_t(101), uint64_t(102)}) {
+            SPLiveHeld held;
+            held.source = buffer();
+            held.pins = 1;
+            self->_held.emplace(identity, held);
+        }
+        if (!self->_held[101].source || !self->_held[102].source) {
+            for (auto &entry : self->_held) if (entry.second.source) CVPixelBufferRelease(entry.second.source);
+            self->_held.clear();
+            result = @{ @"setup": @NO, @"error": @"source buffer allocation" };
+            return;
+        }
+        self->_rateBudgetProbeRound = 71;
+        self->_rateBudgetProbeActive = YES;
+        self->_rateBudgetProbeCollected = 4;
+        // Make this the last measured group. Without the invalidation guard,
+        // its 6 ms result changes the median from 40 to 5 ms and fails the test.
+        self->_rateBudgetProbeTaskCosts = {4, 5};
+        self->_rateBudgetProbePhaseCosts = {4, 5};
+        SPLiveJob *job = new SPLiveJob();
+        job->diagnosticID = 81;
+        job->generation = self->_sourceGeneration;
+        job->configVersion = self->_configVersion;
+        job->clockEpoch = self->_clockEpoch;
+        job->measurementEpoch = self->_measurementEpoch;
+        job->inflightEpoch = self->_inflightEpoch;
+        job->probeRound = self->_rateBudgetProbeRound;
+        job->probeIndex = 3;
+        job->count = 1;
+        job->frameA = 101;
+        job->frameB = 102;
+        job->probeSourceA = CVPixelBufferRetain(self->_held[101].source);
+        job->probeSourceB = CVPixelBufferRetain(self->_held[102].source);
+        const int inflightBaseline = self->_inflight;
+        const double phaseCostBefore = self->_rateBudget.snapshot().phaseCostMs;
+        const double probeMedianBefore = self->_rateBudgetProbeMedianMs;
+        BOOL setup = [self rateBudgetProbeEligible] && phaseCostBefore == 40;
+        int pinsBefore = 0;
+        for (const auto &entry : self->_held) pinsBefore += entry.second.pins;
+        BOOL oldHeldRemoved = NO;
+
+        if ([scenario isEqualToString:@"queued"]) {
+            self->_rateBudgetProbePending.push_back(job);
+            [self cancelRateBudgetProbe];
+        } else {
+            self->_rateBudgetProbeInFlightToken = job->diagnosticID;
+            self->_rateBudgetProbeInFlightEpoch = self->_inflightEpoch;
+            ++self->_inflight;
+            if ([scenario isEqualToString:@"config"]) ++self->_configVersion;
+            if ([scenario isEqualToString:@"clock"]) ++self->_clockEpoch;
+            if ([scenario isEqualToString:@"stopped"]) self->_stopped = YES;
+            if ([scenario isEqualToString:@"generation"]) {
+                ++self->_sourceGeneration;
+                // A real source replacement destroys the old held map. The
+                // submitted job alone now retains its old-generation sources.
+                // Reuse the identities with new buffers to test isolation.
+                for (auto &entry : self->_held) CVPixelBufferRelease(entry.second.source);
+                self->_held.clear();
+                oldHeldRemoved = YES;
+                for (uint64_t identity : {uint64_t(101), uint64_t(102)}) {
+                    SPLiveHeld held;
+                    held.source = buffer();
+                    held.pins = 1;
+                    self->_held.emplace(identity, held);
+                }
+                setup = setup && self->_held[101].source && self->_held[102].source;
+            }
+            // Only count/latency metadata matters here; no output is sampled or
+            // presented. Source ownership above is backed by real pixel buffers.
+            NSArray<SPOwnedPixelBuffer *> *outputs = (id)@[[NSObject new]];
+            [self finishRateBudgetProbe:job outputs:outputs latency:0.006 error:nil];
+        }
+        int pinsAfter = 0;
+        for (const auto &entry : self->_held) pinsAfter += entry.second.pins;
+        int releasedAfterCallback = releases->load();
+        int inflightAfter = self->_inflight;
+        uint64_t tokenAfter = self->_rateBudgetProbeInFlightToken;
+        BOOL activeAfter = self->_rateBudgetProbeActive;
+        size_t pendingAfter = self->_rateBudgetProbePending.size();
+        double phaseCostAfter = self->_rateBudget.snapshot().phaseCostMs;
+        double probeMedianAfter = self->_rateBudgetProbeMedianMs;
+        for (auto &entry : self->_held) if (entry.second.source) CVPixelBufferRelease(entry.second.source);
+        self->_held.clear();
+        result = @{ @"setup": @(setup), @"scenario": scenario,
+            @"inflightBaseline": @(inflightBaseline), @"inflightAfter": @(inflightAfter),
+            @"tokenAfter": @(tokenAfter), @"activeAfter": @(activeAfter), @"pendingAfter": @(pendingAfter),
+            @"pinsBefore": @(pinsBefore), @"pinsAfter": @(pinsAfter), @"oldHeldRemoved": @(oldHeldRemoved),
+            @"phaseCostBefore": @(phaseCostBefore), @"phaseCostAfter": @(phaseCostAfter),
+            @"probeMedianBefore": @(probeMedianBefore), @"probeMedianAfter": @(probeMedianAfter),
+            @"releasedAfterCallback": @(releasedAfterCallback), @"releasedAfterCleanup": @(releases->load()),
+            @"buffersCreated": @(buffersCreated) };
+        self->_rife = nil;
+        self->_sessionReady = NO;
+        self->_request.interpolationEnabled = NO;
+    });
+    return result;
 }
 
 - (NSDictionary *)ownedContractFence {
