@@ -40,6 +40,11 @@
 #include <unordered_set>
 #include <vector>
 
+// Private live-budget bridge entry point; the public adapter API is unchanged.
+@interface SPRifeBridge (SPRateBudgetProbe)
+- (void)resetLiveCacheForRateBudgetProbe;
+@end
+
 extern "C" int spRunRateScheduleTests(void);
 
 static const void *SPLiveQueueKey = &SPLiveQueueKey;
@@ -1268,6 +1273,10 @@ struct SPLiveJob {
     uint64_t frameA = 0;
     uint64_t frameB = 0;
     uint64_t inflightEpoch = 0;
+    uint64_t probeRound = 0;
+    int probeIndex = -1;
+    CVPixelBufferRef probeSourceA = nullptr, probeSourceB = nullptr;
+    CMTime probePreviousPTS = kCMTimeInvalid, probeCurrentPTS = kCMTimeInvalid;
 };
 
 struct SPSRJob {
@@ -1497,6 +1506,16 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     uint64_t _rifeBudgetRejectedPhases, _rateBudgetSkippedPhases;
     std::deque<SPRateBudgetWindowSample> _rateBudgetWindow;
     std::vector<sp::SPRational> _rateBudgetDropPTS;
+    std::deque<int64_t> _rateBudgetCompletedHosts;
+    NSDictionary *_rateBudgetLastDecision;
+    BOOL _rateBudgetProbeActive;
+    uint64_t _rateBudgetProbeRound, _rateBudgetProbeJobs, _rateBudgetProbeLastFrameB;
+    uint64_t _rateBudgetProbeInFlightToken, _rateBudgetProbeInFlightEpoch;
+    int _rateBudgetProbeCollected;
+    int64_t _rateBudgetProbeNextHost;
+    double _rateBudgetProbeMedianMs;
+    std::deque<SPLiveJob *> _rateBudgetProbePending;
+    std::vector<double> _rateBudgetProbeTaskCosts, _rateBudgetProbePhaseCosts;
     uint64_t _nativeBudgetSkippedPhases;
     BOOL _nativeBudgetActive;
     BOOL _nativeBGRADirectActive;
@@ -1684,6 +1703,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 }
 
 - (void)resetRateBudgetOnQueue {
+    [self cancelRateBudgetProbe];
     int requested = _request.rateKind == SPLiveRateMultiplier ? (int)_request.multiplier : 1;
     _rateBudget.reset(requested);
     _effectiveMultiplier = _rateBudget.snapshot().effectiveMultiplier;
@@ -1691,6 +1711,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     _rifeBudgetRejectedPhases = 0;
     _rateBudgetSkippedPhases = 0;
     _rifeBusySinceHost = 0;
+    _rateBudgetCompletedHosts.clear();
+    _rateBudgetLastDecision = @{};
+    _rateBudgetProbeJobs = 0;
+    _rateBudgetProbeMedianMs = -1;
     [self clearRateBudgetWindow];
 }
 
@@ -1716,14 +1740,204 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     return (recent[(count - 1) / 2] / 2.0 + recent[count / 2] / 2.0) / 1e6;
 }
 
+- (uint64_t)rateBudgetFreshSampleCount {
+    int64_t now = SPHostNow();
+    while (!_rateBudgetCompletedHosts.empty() &&
+           SPHostToNs(now - _rateBudgetCompletedHosts.front()) > 2000000000LL)
+        _rateBudgetCompletedHosts.pop_front();
+    return (uint64_t)_rateBudgetCompletedHosts.size();
+}
+
+- (void)releaseRateBudgetProbeJob:(SPLiveJob *)job {
+    // A retained buffer and generation identify the original lease even if
+    // a request reset has replaced the current held-frame map.
+    if (job->generation == _sourceGeneration) {
+        for (int side = 0; side < 2; ++side) {
+            uint64_t identity = side == 0 ? job->frameA : job->frameB;
+            CVPixelBufferRef source = side == 0 ? job->probeSourceA : job->probeSourceB;
+            auto found = _held.find(identity);
+            if (found != _held.end() && found->second.source == source && found->second.pins > 0)
+                found->second.pins -= 1;
+        }
+    }
+    if (job->probeSourceA) CVPixelBufferRelease(job->probeSourceA);
+    if (job->probeSourceB) CVPixelBufferRelease(job->probeSourceB);
+    delete job;
+}
+
+- (void)cancelRateBudgetProbe {
+    ++_rateBudgetProbeRound;
+    _rateBudgetProbeActive = NO;
+    _rateBudgetProbeCollected = 0;
+    _rateBudgetProbeLastFrameB = 0;
+    _rateBudgetProbeNextHost = 0;
+    _rateBudgetProbeTaskCosts.clear();
+    _rateBudgetProbePhaseCosts.clear();
+    while (!_rateBudgetProbePending.empty()) {
+        SPLiveJob *job = _rateBudgetProbePending.front();
+        _rateBudgetProbePending.pop_front();
+        [self releaseRateBudgetProbeJob:job];
+    }
+    // The submitted job owns its slot and leases until its own callback.
+    // Do not clear _rateBudgetProbeInFlightToken here.
+}
+
+- (BOOL)rateBudgetProbeEligible {
+    double fps = _fpsMeter.inputRate((int64_t)(CACurrentMediaTime() * 1e9));
+    return [self rateBudgetEnabled] && _rateBudgetPassthrough && _effectiveMultiplier == 1 &&
+        _rateBudget.snapshot().effectiveMultiplier == 1 && _rife && _sessionReady && !_stopped &&
+        !_nativeBudgetActive && ![self nativeBudgetForSnapshot:[self nativeCadenceSnapshot]] &&
+        std::isfinite(fps) && fps > 0;
+}
+
+- (void)finishRateBudgetProbe:(SPLiveJob *)job outputs:(NSArray<SPOwnedPixelBuffer *> *)outputs
+                     latency:(double)latency error:(NSError *)error {
+    BOOL ownsSlot = job->diagnosticID == _rateBudgetProbeInFlightToken;
+    if (ownsSlot) {
+        _rateBudgetProbeInFlightToken = 0;
+        if (job->inflightEpoch == _inflightEpoch && _inflight > 0) {
+            --_inflight;
+            _rifeBusySinceHost = _inflight > 0 ? SPHostNow() : 0;
+        }
+    }
+    BOOL current = ownsSlot && _rateBudgetProbeActive && job->probeRound == _rateBudgetProbeRound &&
+        job->generation == _sourceGeneration && job->configVersion == _configVersion &&
+        job->clockEpoch == _clockEpoch && job->measurementEpoch == _measurementEpoch &&
+        [self rateBudgetProbeEligible];
+    if (current) {
+        if (error || outputs.count != (NSUInteger)job->count || !std::isfinite(latency) || latency <= 0) {
+            [self cancelRateBudgetProbe];
+        } else {
+            if (job->probeIndex > 0) {
+                _rateBudgetProbeTaskCosts.push_back(latency * 1000.0);
+                _rateBudgetProbePhaseCosts.push_back(latency * 1000.0 / job->count);
+            }
+            if (job->probeIndex == 3) {
+                if (_rateBudgetProbeTaskCosts.size() == 3 && _rateBudgetProbePhaseCosts.size() == 3) {
+                    auto tasks = _rateBudgetProbeTaskCosts, phases = _rateBudgetProbePhaseCosts;
+                    std::sort(tasks.begin(), tasks.end());
+                    std::sort(phases.begin(), phases.end());
+                    if (_rateBudget.recordProbePhaseCost(phases[1]))
+                        _rateBudgetProbeMedianMs = tasks[1];
+                }
+                _rateBudgetProbeActive = NO;
+            }
+        }
+    } else if (_rateBudgetProbeActive && job->probeRound == _rateBudgetProbeRound) {
+        [self cancelRateBudgetProbe];
+    }
+    [self releaseRateBudgetProbeJob:job];
+    // Output owners leave this callback without entering playback, drop
+    // accounting, or ordinary submission/synthetic counters.
+    [self submitNextRateBudgetProbe];
+    [self trimHeld];
+}
+
+- (void)submitNextRateBudgetProbe {
+    if (!_rateBudgetProbeActive || _rateBudgetProbeInFlightToken || _inflight > 0 ||
+        _rateBudgetProbePending.empty()) return;
+    if (![self rateBudgetProbeEligible]) { [self cancelRateBudgetProbe]; return; }
+    SPLiveJob *job = _rateBudgetProbePending.front();
+    _rateBudgetProbePending.pop_front();
+    if (job->probeRound != _rateBudgetProbeRound || job->generation != _sourceGeneration ||
+        job->configVersion != _configVersion || job->clockEpoch != _clockEpoch ||
+        job->measurementEpoch != _measurementEpoch) {
+        [self releaseRateBudgetProbeJob:job]; [self cancelRateBudgetProbe]; return;
+    }
+    NSMutableArray<NSNumber *> *phases = [NSMutableArray array];
+    for (int i = 0; i < job->count; ++i) {
+        float value = 0;
+        if (!sp::spPhaseFitsFloat(job->phase[i], value)) {
+            [self releaseRateBudgetProbeJob:job]; [self cancelRateBudgetProbe]; return;
+        }
+        [phases addObject:@(value)];
+    }
+    job->inflightEpoch = _inflightEpoch;
+    _rateBudgetProbeInFlightEpoch = _inflightEpoch;
+    _rateBudgetProbeInFlightToken = job->diagnosticID;
+    ++_inflight;
+    _rifeBusySinceHost = SPHostNow();
+    SPLiveProcessor *selfRef = self;
+    BOOL submitted = [_rife submitLivePrevious:job->probeSourceA current:job->probeSourceB
+        previousID:job->frameA currentID:job->frameB
+        previousPTS:job->probePreviousPTS currentPTS:job->probeCurrentPTS
+        generation:job->generation clockEpoch:job->clockEpoch timesteps:phases token:job->diagnosticID
+        completion:^(uint64_t token, NSArray<SPOwnedPixelBuffer *> *outputs, double latency, NSError *error) {
+            NSArray<SPOwnedPixelBuffer *> *kept = [outputs copy] ?: @[];
+            dispatch_async(selfRef->_q, ^{
+                @autoreleasepool { [selfRef finishRateBudgetProbe:job outputs:kept latency:latency error:error]; }
+            });
+        }];
+    if (submitted) {
+        ++_rateBudgetProbeJobs;
+    } else {
+        _rateBudgetProbeInFlightToken = 0;
+        --_inflight;
+        _rifeBusySinceHost = 0;
+        [self releaseRateBudgetProbeJob:job];
+        [self cancelRateBudgetProbe];
+    }
+}
+
+- (BOOL)collectRateBudgetProbeGroup:(const std::vector<sp::SPScheduleOutput> &)group
+                         generation:(uint64_t)generation {
+    if (![self rateBudgetProbeEligible] || generation != _sourceGeneration || group.empty() || group.size() > 3)
+        return NO;
+    int64_t now = SPHostNow();
+    if (!_rateBudgetProbeNextHost)
+        _rateBudgetProbeNextHost = now + SPRationalToHost(sp::spMake(10, 1));
+    if (!_rateBudgetProbeActive) {
+        if (now < _rateBudgetProbeNextHost || _rateBudgetProbeInFlightToken || _inflight > 0) return NO;
+        ++_rateBudgetProbeRound;
+        _rateBudgetProbeActive = YES;
+        _rateBudgetProbeCollected = 0;
+        _rateBudgetProbeLastFrameB = 0;
+        _rateBudgetProbeTaskCosts.clear();
+        _rateBudgetProbePhaseCosts.clear();
+        _rateBudgetProbeNextHost = now + SPRationalToHost(sp::spMake(10, 1));
+        [_rife resetLiveCacheForRateBudgetProbe];
+    }
+    if (_rateBudgetProbeCollected >= 4) return NO;
+    auto a = _held.find(group.front().frameA), b = _held.find(group.front().frameB);
+    if (a == _held.end() || b == _held.end() || !a->second.source || !b->second.source ||
+        a->second.pts.den <= 0 || a->second.pts.den > INT32_MAX ||
+        b->second.pts.den <= 0 || b->second.pts.den > INT32_MAX ||
+        (_rateBudgetProbeCollected > 0 && group.front().frameA != _rateBudgetProbeLastFrameB)) {
+        [self cancelRateBudgetProbe];
+        return NO;
+    }
+    SPLiveJob *job = new SPLiveJob();
+    job->diagnosticID = SPR8NextJobID.fetch_add(1);
+    job->generation = generation; job->configVersion = _configVersion;
+    job->clockEpoch = _clockEpoch; job->measurementEpoch = _measurementEpoch;
+    job->probeRound = _rateBudgetProbeRound; job->probeIndex = _rateBudgetProbeCollected++;
+    job->frameA = group.front().frameA; job->frameB = group.front().frameB;
+    job->count = (int)group.size();
+    for (int i = 0; i < job->count; ++i) job->phase[i] = group[(size_t)i].phase;
+    job->probeSourceA = CVPixelBufferRetain(a->second.source);
+    job->probeSourceB = CVPixelBufferRetain(b->second.source);
+    job->probePreviousPTS = CMTimeMake(a->second.pts.num, (int32_t)a->second.pts.den);
+    job->probeCurrentPTS = CMTimeMake(b->second.pts.num, (int32_t)b->second.pts.den);
+    ++a->second.pins; ++b->second.pins;
+    _rateBudgetProbeLastFrameB = job->frameB;
+    _rateBudgetProbePending.push_back(job);
+    [self submitNextRateBudgetProbe];
+    return YES;
+}
+
 - (void)suspendRateBudgetOnQueue {
+    [self cancelRateBudgetProbe];
+    _rateBudgetCompletedHosts.clear();
     if (![self rateBudgetEnabled]) return;
     (void)_rateBudget.update({CACurrentMediaTime(), 0, (int)_request.multiplier, 0, 0, 0});
     [self clearRateBudgetWindow];
 }
 
 - (void)updateRateBudgetOnQueue {
-    if (![self rateBudgetEnabled] || !_rife || !_sessionReady || _stopped) return;
+    if (![self rateBudgetEnabled] || !_rife || !_sessionReady || _stopped) {
+        [self cancelRateBudgetProbe];
+        return;
+    }
     if ([self nativeBudgetForSnapshot:[self nativeCadenceSnapshot]]) {
         [self suspendRateBudgetOnQueue];
         return;
@@ -1736,15 +1950,24 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     uint64_t planned = 0, dropped = 0;
     for (const auto &sample : _rateBudgetWindow) { planned += sample.planned; dropped += sample.dropped; }
     double median = [self rateBudgetMedianTaskMs];
+    double fps = _fpsMeter.inputRate((int64_t)(CACurrentMediaTime() * 1e9));
+    uint64_t fresh = [self rateBudgetFreshSampleCount];
+    if (!std::isfinite(fps) || fps <= 0) [self cancelRateBudgetProbe];
     auto budget = _rateBudget.snapshot();
     if (budget.effectiveMultiplier == _effectiveMultiplier) {
-        double fps = _fpsMeter.inputRate((int64_t)(CACurrentMediaTime() * 1e9));
-        budget = _rateBudget.update({CACurrentMediaTime(), fps, (int)_request.multiplier, median, planned, dropped});
+        budget = _rateBudget.update({CACurrentMediaTime(), fps, (int)_request.multiplier,
+                                    median, planned, dropped, fresh});
+        if (budget.effectiveMultiplier != _effectiveMultiplier) {
+            _rateBudgetLastDecision = @{ @"host": @(now), @"from": @(_effectiveMultiplier),
+                @"to": @(budget.effectiveMultiplier), @"medianMs": @(median),
+                @"planned": @(planned), @"dropped": @(dropped), @"freshSamples": @(fresh),
+                @"contentFPS": @(fps), @"phaseCostMs": @(budget.phaseCostMs) };
+        }
     }
     if (budget.effectiveMultiplier == _effectiveMultiplier) return;
     // Reuse the loaded engine. Let its bounded serial queue drain before
     // changing ownership epochs; admission rejects new jobs during this gap.
-    if (_inflight > 0) return;
+    if (_inflight > 0 || _rateBudgetProbeInFlightToken) return;
     int previous = _effectiveMultiplier;
     _effectiveMultiplier = budget.effectiveMultiplier;
     _rateBudgetPassthrough = _effectiveMultiplier == 1;
@@ -1763,6 +1986,9 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     // Clears service samples so X3 task costs cannot be interpreted as X2.
     // Keep the budget's remembered phase cost, counters, and retry cooldown.
     [self beginMeasurementEpoch];
+    _rateBudget.markRateApplied(CACurrentMediaTime());
+    if (_rateBudgetPassthrough)
+        _rateBudgetProbeNextHost = SPHostNow() + SPRationalToHost(sp::spMake(10, 1));
     [self recordR7JobEvent:@"rateBudgetChanged" detail:@{
         @"requested": @(_request.multiplier), @"previous": @(previous), @"effective": @(_effectiveMultiplier),
         @"config": @(_configVersion), @"medianTaskMs": @(median),
@@ -1825,6 +2051,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     _nativeBudgetActive = [self nativeBudgetForSnapshot:raw];
     if (!_nativeBudgetActive) _nativeBGRADirectActive = NO;
     NSDictionary *copiedCadence = [self copiedCadenceStats];
+    NSDictionary *rifeDiagnostics = _rife ? [_rife streamDiagnostics] : @{};
     double requestedFPS = -1;
     if (_resolved.committed && _resolved.interpolationActive && _request.interpolationEnabled && _request.rateKind == SPLiveRateFixedFPS && _request.fpsDenominator > 0)
         requestedFPS = (double)_request.fpsNumerator / (double)_request.fpsDenominator;
@@ -1853,6 +2080,13 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"rateBudgetDowngrades": @(_rateBudget.snapshot().downgrades),
         @"rateBudgetUpgrades": @(_rateBudget.snapshot().upgrades),
         @"rateBudgetPhaseCostMs": @(_rateBudget.snapshot().phaseCostMs),
+        @"rateBudgetLastDecision": _rateBudgetLastDecision ?: @{},
+        @"rateBudgetFreshSamples": @([self rateBudgetFreshSampleCount]),
+        @"rateBudgetProbeJobs": @(_rateBudgetProbeJobs),
+        @"rateBudgetProbeMedianMs": @(_rateBudgetProbeMedianMs),
+        @"rifeRecentJobs": rifeDiagnostics[@"rifeRecentJobs"] ?: @[],
+        @"processThermalState": @([NSProcessInfo processInfo].thermalState),
+        @"processLowPowerMode": @([NSProcessInfo processInfo].lowPowerModeEnabled),
         @"nativeBudgetSkippedPhases": @(_nativeBudgetSkippedPhases),
         @"nativeBudgetActive": @(_nativeBudgetActive),
         @"nativeBGRADirectActive": @(_nativeBGRADirectActive), @"nativeBGRADirectFrames": @(_nativeBGRADirectFrames),
@@ -1992,7 +2226,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"modelID": _resolved.modelID ?: @"",
         @"qualityID": _request.qualityID ?: @"",
         @"rifeStreamEnabled": @(_request.rifeStreamEnabled),
-        @"rifeStreamDiagnostics": _rife ? [_rife streamDiagnostics] : @{},
+        @"rifeStreamDiagnostics": rifeDiagnostics,
         @"scaleEngineID": _resolved.scaleEngineID ?: @"",
         @"scaleQualityID": _resolved.scaleQualityID ?: @"",
         @"sourcePixelFormat": @(_sourcePixelFormat),
@@ -3592,6 +3826,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     _fpsObservationEpoch += 1;
     _latencyNs.clear();
     _frcNs.clear();
+    _rateBudgetCompletedHosts.clear();
+    [self cancelRateBudgetProbe];
     [self clearRateBudgetWindow];
     _scaleNs.clear();
     _transferNs.clear();
@@ -4415,22 +4651,23 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         int64_t deadline = frozenDeadline > 0 ? frozenDeadline : [self targetHostForPTS:events.front().pts];
         BOOL changingRate = [self rateBudgetEnabled] &&
             (_rateBudgetPassthrough || _rateBudget.snapshot().effectiveMultiplier != _effectiveMultiplier);
-        BOOL missesBudget = NO;
-        if (_frcNs.size() >= 8) {
-            size_t count = MIN((size_t)32, _frcNs.size());
+        size_t count = MIN((size_t)32, _frcNs.size());
+        double serviceMs = 0;
+        if (count > 0) {
             std::vector<int64_t> recent(_frcNs.end() - count, _frcNs.end());
             std::sort(recent.begin(), recent.end());
-            double service = recent[(count - 1) * 80 / 100] / 1e9;
-            double elapsed = _rifeBusySinceHost > 0 ? MAX(0.0, SPHostToNs(now - _rifeBusySinceHost) / 1e9) : 0;
-            double remaining = _inflight > 0 ? MAX(0.0, service - elapsed) : 0;
-            double predictedSeconds = remaining + MAX(0, _inflight - 1) * service + service;
-            int64_t predictedReady = now + SPRationalToHost(sp::spMake((int64_t)llround(predictedSeconds * 1e9), 1000000000));
-            missesBudget = predictedReady > deadline;
+            serviceMs = recent[(count - 1) * 80 / 100] / 1e6;
         }
-        if (changingRate || missesBudget || _inflight >= 2) {
+        double elapsedMs = _rifeBusySinceHost > 0 ? MAX(0.0, SPHostToNs(now - _rifeBusySinceHost) / 1e6) : 0;
+        double remainingMs = SPHostToNs(deadline - now) / 1e6;
+        int rifeInflight = _inflight + ((_rateBudgetProbeInFlightToken &&
+            _rateBudgetProbeInFlightEpoch != _inflightEpoch) ? 1 : 0);
+        BOOL admitted = sp::shouldAdmitRife(rifeInflight, count, serviceMs, elapsedMs, remainingMs);
+        BOOL missesBudget = !admitted && rifeInflight < 2;
+        if (changingRate || !admitted) {
             _queueDrops += events.size(); _epochQueueDrops += events.size();
             if (missesBudget) _rifeBudgetRejectedPhases += events.size();
-            else if (_inflight >= 2) { _inflightLimitDrops += events.size(); _rifeDeferredCapacityDrops += events.size(); }
+            else if (rifeInflight >= 2) { _inflightLimitDrops += events.size(); _rifeDeferredCapacityDrops += events.size(); }
             for (const auto &event : events) [self noteRateBudgetDrop:event.pts];
             return;
         }
@@ -4707,6 +4944,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     if (validTimingSample && job->captureHost > 0 && SPHostNow() > job->captureHost)
         SPPushSample(_captureToModelReadyNs, SPHostToNs(SPHostNow() - job->captureHost));
     if (validTimingSample && latency > 0) {
+        if (_rife) _rateBudgetCompletedHosts.push_back(job->callbackHost > 0 ? job->callbackHost : completedHost);
         [self r9RecordUsableLatency:latency];
         if (!_testKeepLowRealtime && _lowLatency && _delayClamped && [self requestUsesLowPrescale:_request width:_width height:_height]) _lowPrescaleSlowMode = YES;
     }
@@ -4859,6 +5097,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     auto raw = [self nativeCadenceSnapshot];
     _nativeBudgetActive = [self nativeBudgetForSnapshot:raw];
     if (!_nativeBudgetActive) _nativeBGRADirectActive=NO;
+    if (_nativeBudgetActive && _rateBudgetProbeActive) [self cancelRateBudgetProbe];
     size_t index = 0;
     while (index < events.size()) {
         const sp::SPScheduleOutput &event = events[index];
@@ -4883,6 +5122,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             group.push_back(events[index]);
             index += 1;
         }
+        if (_rateBudgetPassthrough && !_nativeBudgetActive &&
+            [self collectRateBudgetProbeGroup:group generation:generation]) continue;
         _scheduledSynthetic += group.size();
         _epochScheduled += group.size();
         if (_probeWindowOpen) {

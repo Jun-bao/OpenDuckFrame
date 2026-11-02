@@ -37,6 +37,7 @@ final class SPRifeBridge: NSObject {
     private let diagnosticLock = NSLock()
     private var diagnosticCounts: [String: Int] = [:]
     private var convertSamplesMs: [Double] = [], pushSamplesMs: [Double] = []
+    private var recentJobs: [[String: Any]] = []
     private func count(_ name: String) {
         diagnosticLock.lock(); diagnosticCounts[name, default: 0] += 1; diagnosticLock.unlock()
     }
@@ -135,6 +136,7 @@ final class SPRifeBridge: NSObject {
                 guard active else { completion(token, nil, 0, Self.error(1, "RIFE 结果属于旧会话")); return }
                 var convertNs: UInt64 = 0, pushNs: UInt64 = 0
                 var convertCalls = 0, pushCalls = 0
+                var cacheHit: Bool?
                 func measuredBGRA(_ bridge: SPRifeBridge, _ source: CVPixelBuffer) throws -> CVPixelBuffer {
                     let began = DispatchTime.now().uptimeNanoseconds
                     defer { convertNs += DispatchTime.now().uptimeNanoseconds - began; convertCalls += 1 }
@@ -145,9 +147,13 @@ final class SPRifeBridge: NSObject {
                     defer { pushNs += DispatchTime.now().uptimeNanoseconds - began; pushCalls += 1 }
                     return try operation()
                 }
-                func recordTiming(_ bridge: SPRifeBridge) {
-                    bridge.recordStreamTiming(convertMs: convertCalls > 0 ? Double(convertNs) / 1e6 : nil,
-                                              pushMs: pushCalls > 0 ? Double(pushNs) / 1e6 : nil)
+                func recordTiming(_ bridge: SPRifeBridge) -> Double {
+                    let elapsed = max(0, CFAbsoluteTimeGetCurrent() - started)
+                    bridge.recordStreamTiming(totalMs: elapsed * 1000,
+                                              convertMs: convertCalls > 0 ? Double(convertNs) / 1e6 : nil,
+                                              pushMs: pushCalls > 0 ? Double(pushNs) / 1e6 : nil,
+                                              hit: cacheHit)
+                    return elapsed
                 }
                 do {
                     let width = CVPixelBufferGetWidth(previous), height = CVPixelBufferGetHeight(previous)
@@ -169,6 +175,7 @@ final class SPRifeBridge: NSObject {
                     let currentFormat = CVPixelBufferGetPixelFormatType(current)
                     let hit = previousFormat == currentFormat && self.streamPreviousFormat == previousFormat &&
                         self.streamPrevious === previous && self.streamKey?.matches(previousKey) == true
+                    cacheHit = hit
                     if hit { self.count("hits") } else {
                         self.count("misses")
                         stream.reset(); self.streamPrevious = nil; self.streamKey = nil; self.count("resets")
@@ -197,14 +204,12 @@ final class SPRifeBridge: NSObject {
                         CVBufferPropagateAttachments(previous, buffer); Self.attach709IfMissing(buffer)
                         return SPOwnedPixelBuffer(retaining: buffer)
                     }
-                    completion(token, owned, max(0, CFAbsoluteTimeGetCurrent() - started), nil)
-                    recordTiming(self)
+                    completion(token, owned, recordTiming(self), nil)
                 } catch {
                     self.stream?.reset(); self.streamPrevious = nil; self.streamKey = nil; self.count("resets")
                     let failure = Self.explain(error) as NSError
                     if failure.domain == "app.khuaplayer.rife" && failure.code == 10 {
-                        completion(token, nil, max(0, CFAbsoluteTimeGetCurrent() - started), failure)
-                        recordTiming(self)
+                        completion(token, nil, recordTiming(self), failure)
                         return
                     }
                     // Retry with the same model, quality, resolution and phases.
@@ -225,12 +230,10 @@ final class SPRifeBridge: NSObject {
                             return SPOwnedPixelBuffer(retaining: buffer)
                         }
                         self.count("fallbackSucceeded")
-                        completion(token, owned, max(0, CFAbsoluteTimeGetCurrent() - started), nil)
-                        recordTiming(self)
+                        completion(token, owned, recordTiming(self), nil)
                     } catch {
                         self.count("fallbackFailed")
-                        completion(token, nil, max(0, CFAbsoluteTimeGetCurrent() - started), Self.explain(error))
-                        recordTiming(self)
+                        completion(token, nil, recordTiming(self), Self.explain(error))
                     }
                 }
             }
@@ -262,6 +265,16 @@ final class SPRifeBridge: NSObject {
         return buffer
     }
 
+    @objc func resetLiveCacheForRateBudgetProbe() {
+        // Enqueued before the first probe job on the same serial exec queue.
+        exec.async {
+            self.stream?.reset()
+            self.streamPrevious = nil
+            self.streamKey = nil
+            self.streamPreviousFormat = 0
+        }
+    }
+
     @objc func relieveCapturePressure() {
         state.lock()
         if pressureResetQueued { state.unlock(); return }
@@ -284,7 +297,7 @@ final class SPRifeBridge: NSObject {
 
     // One accumulated sample per live task, including both inputs on a miss.
     // Error fallback conversion is included; stateless interpolate is not push.
-    private func recordStreamTiming(convertMs: Double?, pushMs: Double?) {
+    private func recordStreamTiming(totalMs: Double, convertMs: Double?, pushMs: Double?, hit: Bool?) {
         diagnosticLock.lock()
         defer { diagnosticLock.unlock() }
         if let convertMs {
@@ -295,11 +308,18 @@ final class SPRifeBridge: NSObject {
             pushSamplesMs.append(pushMs)
             if pushSamplesMs.count > 256 { pushSamplesMs.removeFirst(pushSamplesMs.count - 256) }
         }
+        recentJobs.append([
+            "totalMs": totalMs,
+            "convertMs": convertMs.map { $0 as Any } ?? NSNull(),
+            "pushMs": pushMs.map { $0 as Any } ?? NSNull(),
+            "hit": hit.map { $0 as Any } ?? NSNull()
+        ])
+        if recentJobs.count > 32 { recentJobs.removeFirst(recentJobs.count - 32) }
     }
 
     @objc func streamDiagnostics() -> [String: Any] {
         diagnosticLock.lock()
-        let counts = diagnosticCounts, convert = convertSamplesMs, push = pushSamplesMs
+        let counts = diagnosticCounts, convert = convertSamplesMs, push = pushSamplesMs, jobs = recentJobs
         diagnosticLock.unlock()
         func summary(_ values: [Double]) -> (median: Double, p95: Double) {
             guard !values.isEmpty else { return (-1, -1) }
@@ -315,7 +335,8 @@ final class SPRifeBridge: NSObject {
                 "fallbackFailed": counts["fallbackFailed", default: 0], "poolRequests": counts["poolRequests", default: 0],
                 "poolFailures": counts["poolFailures", default: 0],
                 "convertMedianMs": convertTiming.median, "convertP95Ms": convertTiming.p95,
-                "pushMedianMs": pushTiming.median, "pushP95Ms": pushTiming.p95]
+                "pushMedianMs": pushTiming.median, "pushP95Ms": pushTiming.p95,
+                "rifeRecentJobs": jobs]
     }
 
     @objc func invalidate() {
