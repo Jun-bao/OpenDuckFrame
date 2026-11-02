@@ -12,6 +12,7 @@
 #import "SPRateSchedule.hpp"
 #import "SPFPSMeter.hpp"
 #import "SPPresentationBudget.hpp"
+#import "SPRateBudget.hpp"
 #import "SPFRCBudgetPolicy.hpp"
 #import "SPLiveHeldPolicy.hpp"
 #import "SPPresentationOrder.hpp"
@@ -1316,6 +1317,11 @@ struct SPPendingPhase {
     uint64_t generation = 0;
 };
 
+struct SPRateBudgetWindowSample {
+    int64_t host = 0;
+    uint64_t planned = 0, dropped = 0;
+};
+
 struct SPFrameMark {
     uint64_t jobID = 0, clockEpoch = 0;
     int64_t readyHost = 0;
@@ -1484,6 +1490,13 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     uint64_t _r9RateSyntheticBaseline, _r9RateOnTimeBaseline;
     int64_t _r9RateHost;
     double _r9GeneratedFPS, _r9OnTimeSyntheticFPS;
+    sp::RateBudget _rateBudget;
+    int _effectiveMultiplier;
+    BOOL _rateBudgetPassthrough;
+    int64_t _rifeBusySinceHost;
+    uint64_t _rifeBudgetRejectedPhases, _rateBudgetSkippedPhases;
+    std::deque<SPRateBudgetWindowSample> _rateBudgetWindow;
+    std::vector<sp::SPRational> _rateBudgetDropPTS;
     uint64_t _nativeBudgetSkippedPhases;
     BOOL _nativeBudgetActive;
     BOOL _nativeBGRADirectActive;
@@ -1597,6 +1610,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
                                      dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
     dispatch_queue_set_specific(_q, SPLiveQueueKey, (__bridge void *)self, NULL);
     _epochMonotonic = YES;
+    [self resetRateBudgetOnQueue];
     [self beginMeasurementEpoch];
     VTPixelTransferSessionCreate(kCFAllocatorDefault, &_transfer);
     return self;
@@ -1656,6 +1670,103 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         snapshot.active && snapshot.generation == _sourceGeneration &&
         snapshot.width == _sourceWidth && snapshot.height == _sourceHeight &&
         snapshot.captureLimit == _request.captureCapFPS && snapshot.refreshHz == _request.displayRefreshHz;
+}
+
+- (BOOL)rateBudgetEnabled {
+    return !SPR7Passthrough() && _request.interpolationEnabled &&
+        [_request.engineID isEqualToString:@"rife.metal"] &&
+        _request.rateKind == SPLiveRateMultiplier && _request.multiplier >= 2 && _request.multiplier <= 4;
+}
+
+- (void)clearRateBudgetWindow {
+    _rateBudgetWindow.clear();
+    _rateBudgetDropPTS.clear();
+}
+
+- (void)resetRateBudgetOnQueue {
+    int requested = _request.rateKind == SPLiveRateMultiplier ? (int)_request.multiplier : 1;
+    _rateBudget.reset(requested);
+    _effectiveMultiplier = _rateBudget.snapshot().effectiveMultiplier;
+    _rateBudgetPassthrough = NO;
+    _rifeBudgetRejectedPhases = 0;
+    _rateBudgetSkippedPhases = 0;
+    _rifeBusySinceHost = 0;
+    [self clearRateBudgetWindow];
+}
+
+- (void)noteRateBudgetPlanned:(size_t)count {
+    if (![self rateBudgetEnabled] || _rateBudgetPassthrough || _nativeBudgetActive || count == 0) return;
+    _rateBudgetWindow.push_back({SPHostNow(), (uint64_t)count, 0});
+}
+
+- (void)noteRateBudgetDrop:(sp::SPRational)pts {
+    if (![self rateBudgetEnabled] || _rateBudgetPassthrough || _nativeBudgetActive) return;
+    for (const auto &seen : _rateBudgetDropPTS) if (sp::spCmp(seen, pts) == 0) return;
+    _rateBudgetDropPTS.push_back(pts);
+    if (_rateBudgetDropPTS.size() > 8192)
+        _rateBudgetDropPTS.erase(_rateBudgetDropPTS.begin(), _rateBudgetDropPTS.begin() + 2048);
+    _rateBudgetWindow.push_back({SPHostNow(), 0, 1});
+}
+
+- (double)rateBudgetMedianTaskMs {
+    if (_frcNs.empty()) return 0;
+    size_t count = MIN((size_t)16, _frcNs.size());
+    std::vector<int64_t> recent(_frcNs.end() - count, _frcNs.end());
+    std::sort(recent.begin(), recent.end());
+    return (recent[(count - 1) / 2] / 2.0 + recent[count / 2] / 2.0) / 1e6;
+}
+
+- (void)suspendRateBudgetOnQueue {
+    if (![self rateBudgetEnabled]) return;
+    (void)_rateBudget.update({CACurrentMediaTime(), 0, (int)_request.multiplier, 0, 0, 0});
+    [self clearRateBudgetWindow];
+}
+
+- (void)updateRateBudgetOnQueue {
+    if (![self rateBudgetEnabled] || !_rife || !_sessionReady || _stopped) return;
+    if ([self nativeBudgetForSnapshot:[self nativeCadenceSnapshot]]) {
+        [self suspendRateBudgetOnQueue];
+        return;
+    }
+    int64_t now = SPHostNow();
+    // A one-second rolling phase window feeds the independent 2/3-second
+    // persistence rules. Retried phases are counted only once by their PTS.
+    while (!_rateBudgetWindow.empty() && SPHostToNs(now - _rateBudgetWindow.front().host) > 1000000000LL)
+        _rateBudgetWindow.pop_front();
+    uint64_t planned = 0, dropped = 0;
+    for (const auto &sample : _rateBudgetWindow) { planned += sample.planned; dropped += sample.dropped; }
+    double median = [self rateBudgetMedianTaskMs];
+    auto budget = _rateBudget.snapshot();
+    if (budget.effectiveMultiplier == _effectiveMultiplier) {
+        double fps = _fpsMeter.inputRate((int64_t)(CACurrentMediaTime() * 1e9));
+        budget = _rateBudget.update({CACurrentMediaTime(), fps, (int)_request.multiplier, median, planned, dropped});
+    }
+    if (budget.effectiveMultiplier == _effectiveMultiplier) return;
+    // Reuse the loaded engine. Let its bounded serial queue drain before
+    // changing ownership epochs; admission rejects new jobs during this gap.
+    if (_inflight > 0) return;
+    int previous = _effectiveMultiplier;
+    _effectiveMultiplier = budget.effectiveMultiplier;
+    _rateBudgetPassthrough = _effectiveMultiplier == 1;
+    [self.outputPreview invalidateSharedGeometry];
+    _configVersion += 1;
+    _inflightEpoch = _configVersion;
+    _rifeBusySinceHost = 0;
+    [self clearPendingRife];
+    [self clearPlaySlots];
+    _pending.clear();
+    _marks.clear();
+    _havePair = NO;
+    [self clearRateBudgetWindow];
+    [self resetSchedulerOnQueue];
+    [self refreshResolvedOnQueue];
+    // Clears service samples so X3 task costs cannot be interpreted as X2.
+    // Keep the budget's remembered phase cost, counters, and retry cooldown.
+    [self beginMeasurementEpoch];
+    [self recordR7JobEvent:@"rateBudgetChanged" detail:@{
+        @"requested": @(_request.multiplier), @"previous": @(previous), @"effective": @(_effectiveMultiplier),
+        @"config": @(_configVersion), @"medianTaskMs": @(median),
+        @"plannedPhases": @(planned), @"droppedPhases": @(dropped) }];
 }
 
 - (void)applyObservedCaptureEnvironment {
@@ -1733,6 +1844,15 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"syntheticOK": @(_syntheticOK),
         @"syntheticFail": @(_syntheticFail),
         @"scheduledSynthetic": @(_scheduledSynthetic),
+        @"rateRequestedMultiplier": @(_request.rateKind == SPLiveRateMultiplier ? _request.multiplier : 0),
+        @"rateEffectiveMultiplier": @(_request.rateKind == SPLiveRateMultiplier ? ([self rateBudgetEnabled] ? _effectiveMultiplier : _request.multiplier) : 0),
+        @"rateBudgetPassthrough": @(_rateBudgetPassthrough),
+        @"rateBudgetRejectedPhases": @(_rifeBudgetRejectedPhases),
+        @"rifeBudgetRejectedPhases": @(_rifeBudgetRejectedPhases),
+        @"rateBudgetSkippedPhases": @(_rateBudgetSkippedPhases),
+        @"rateBudgetDowngrades": @(_rateBudget.snapshot().downgrades),
+        @"rateBudgetUpgrades": @(_rateBudget.snapshot().upgrades),
+        @"rateBudgetPhaseCostMs": @(_rateBudget.snapshot().phaseCostMs),
         @"nativeBudgetSkippedPhases": @(_nativeBudgetSkippedPhases),
         @"nativeBudgetActive": @(_nativeBudgetActive),
         @"nativeBGRADirectActive": @(_nativeBGRADirectActive), @"nativeBGRADirectFrames": @(_nativeBGRADirectFrames),
@@ -2194,6 +2314,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     [oldAnimeSR invalidate];
     [oldCuganSR invalidate];
     [self applyObservedCaptureEnvironment];
+    [self resetRateBudgetOnQueue];
     [self clearPendingRife];
     _rifeSlowMode = NO;
     _lowPrescaleSlowMode = NO;
@@ -2222,6 +2343,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     _asyncPrepareFailed = NO;
     if (_width < 2 || _height < 2) {
         _request = request;
+        [self resetRateBudgetOnQueue];
         [self applyObservedCaptureEnvironment];
         _sessionReady = NO;
         _resolved.committed = NO;
@@ -2335,6 +2457,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         }
         if (SPR7Passthrough()) {
             self->_request = copy;
+            [self resetRateBudgetOnQueue];
             [self.outputPreview invalidateSharedGeometry];
             self->_configVersion += 1;
             self->_inflightEpoch = self->_configVersion;
@@ -2359,6 +2482,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         }
         if (self->_width < 2) {
             self->_request = copy;
+            [self resetRateBudgetOnQueue];
             [self applyObservedCaptureEnvironment];
             self->_resolved.committed = !needsEngine;
             self->_sessionReady = !needsEngine;
@@ -2421,6 +2545,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         [oldAnimeSR invalidate];
         [oldCuganSR invalidate];
         [self applyObservedCaptureEnvironment];
+        [self resetRateBudgetOnQueue];
         // Pending pairs pin source buffers and belong to the old plan.
         // Cancel only after a successful replacement so rollback keeps them.
         [self clearPendingRife];
@@ -2465,10 +2590,11 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 }
 
 - (void)resetFPSObservations {
-    dispatch_async(_q, ^{ self->_fpsMeter.reset(); self->_fpsObservationEpoch += 1; });
+    dispatch_async(_q, ^{ self->_fpsMeter.reset(); self->_fpsObservationEpoch += 1; [self suspendRateBudgetOnQueue]; });
 }
 
 - (void)discardQueuedStateOnQueue {
+    [self resetRateBudgetOnQueue];
     _fpsMeter.reset();
     _pumpedCaptureMeter.reset();
     _fpsObservationEpoch += 1;
@@ -2563,7 +2689,12 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     }
     if (_request.rateKind == SPLiveRateMultiplier) {
         rate.kind = sp::SPRateKind::Multiplier;
-        rate.multiplier = (int)_request.multiplier;
+        if ([self rateBudgetEnabled] && _rateBudget.snapshot().requestedMultiplier != _request.multiplier)
+            [self resetRateBudgetOnQueue];
+        // X1 uses the existing phase-skip path; never send an invalid X1
+        // request to the scheduler.
+        rate.multiplier = [self rateBudgetEnabled] && _effectiveMultiplier >= 2
+            ? _effectiveMultiplier : (int)_request.multiplier;
         _resolved.targetNumerator = _request.multiplier;
         _resolved.targetDenominator = 1;
     } else {
@@ -3383,7 +3514,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         if (seconds > 0.001) source = 1.0 / seconds;
     }
     if (!_request.interpolationEnabled) return source;
-    int multiplier = _request.multiplier > 0 ? _request.multiplier : 1;
+    int multiplier = [self rateBudgetEnabled] ? _effectiveMultiplier : (_request.multiplier > 0 ? (int)_request.multiplier : 1);
     return source * multiplier;
 }
 
@@ -3461,6 +3592,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     _fpsObservationEpoch += 1;
     _latencyNs.clear();
     _frcNs.clear();
+    [self clearRateBudgetWindow];
     _scaleNs.clear();
     _transferNs.clear();
     _queueNs.clear();
@@ -3502,9 +3634,9 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 }
 
 - (double)informationLeadSeconds:(double)interval {
-    if (!_request.interpolationEnabled || interval <= 0) return 0;
+    if (!_request.interpolationEnabled || _rateBudgetPassthrough || interval <= 0) return 0;
     if (_request.rateKind == SPLiveRateFixedFPS) return interval;
-    int multiplier = (int)_request.multiplier;
+    int multiplier = [self rateBudgetEnabled] ? _effectiveMultiplier : (int)_request.multiplier;
     if (multiplier < 2) multiplier = 2;
     return interval * (double)(multiplier - 1) / (double)multiplier;
 }
@@ -3517,6 +3649,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     if (_claimedDrops.size() > 8192) _claimedDrops.erase(_claimedDrops.begin(), _claimedDrops.begin() + 2048);
     _deadlineDrops += 1;
     _epochDeadline += 1;
+    [self noteRateBudgetDrop:pts];
     return YES;
 }
 
@@ -3556,7 +3689,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     // There is no future temporal phase to wait for in source-only output.
     // Scaling finishes before enqueue; its actual cost is not an extra queue
     // delay. In-flight work remains owned by its original epoch.
-    if (SPR7Passthrough() || !_request.interpolationEnabled) {
+    if (SPR7Passthrough() || !_request.interpolationEnabled || _rateBudgetPassthrough) {
         _delayHost = 0;
         _r9RequiredBudgetMs = 0;
         _r9AllowedBudgetMs = 0;
@@ -4277,17 +4410,30 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     BOOL wantDistil = [_request.engineID isEqualToString:@"distildrba.coreml"];
     BOOL haveEngine = wantLow ? (_lowLatency != nil) : (wantRife ? (_rife != nil) : (wantDistil ? (_distil != nil) : (_engine != nil)));
     BOOL slowPair=wantLow && _lowPrescaleSlowMode;
-    if (wantRife && haveEngine && !events.empty() && _inflight >= 2) {
-        [self expireDeferredRifeAt:SPHostNow()];
+    if (wantRife && haveEngine && !events.empty()) {
+        int64_t now = SPHostNow();
         int64_t deadline = frozenDeadline > 0 ? frozenDeadline : [self targetHostForPTS:events.front().pts];
-        if (events.size()==1 && [self deferRifeEvent:events.front() generation:generation deadline:deadline retryHost:0]) {
+        BOOL changingRate = [self rateBudgetEnabled] &&
+            (_rateBudgetPassthrough || _rateBudget.snapshot().effectiveMultiplier != _effectiveMultiplier);
+        BOOL missesBudget = NO;
+        if (_frcNs.size() >= 8) {
+            size_t count = MIN((size_t)32, _frcNs.size());
+            std::vector<int64_t> recent(_frcNs.end() - count, _frcNs.end());
+            std::sort(recent.begin(), recent.end());
+            double service = recent[(count - 1) * 80 / 100] / 1e9;
+            double elapsed = _rifeBusySinceHost > 0 ? MAX(0.0, SPHostToNs(now - _rifeBusySinceHost) / 1e9) : 0;
+            double remaining = _inflight > 0 ? MAX(0.0, service - elapsed) : 0;
+            double predictedSeconds = remaining + MAX(0, _inflight - 1) * service + service;
+            int64_t predictedReady = now + SPRationalToHost(sp::spMake((int64_t)llround(predictedSeconds * 1e9), 1000000000));
+            missesBudget = predictedReady > deadline;
+        }
+        if (changingRate || missesBudget || _inflight >= 2) {
+            _queueDrops += events.size(); _epochQueueDrops += events.size();
+            if (missesBudget) _rifeBudgetRejectedPhases += events.size();
+            else if (_inflight >= 2) { _inflightLimitDrops += events.size(); _rifeDeferredCapacityDrops += events.size(); }
+            for (const auto &event : events) [self noteRateBudgetDrop:event.pts];
             return;
         }
-        _queueDrops += events.size(); _epochQueueDrops += events.size();
-        if (deadline <= SPHostNow()) {
-            for (const auto &event : events) if ([self noteUniqueSyntheticDrop:event.pts]) { _rifeDeferredExpired++; _pendingExpiredDrops++; }
-        } else { _inflightLimitDrops += events.size(); _rifeDeferredCapacityDrops += events.size(); }
-        return;
     }
     if (!events.empty() && slowPair && _inflight >= 1 && haveEngine) {
         auto a = _held.find(events.front().frameA), b = _held.find(events.front().frameB);
@@ -4400,6 +4546,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     if (auto aHeld = _held.find(job->frameA); aHeld != _held.end()) aHeld->second.pins += 1;
     if (auto bHeld = _held.find(job->frameB); bHeld != _held.end()) bHeld->second.pins += 1;
     uint64_t token = job->diagnosticID;
+    if (wantRife && _inflight == 0) _rifeBusySinceHost = SPHostNow();
     _inflight += 1;
     _havePair = YES;
     _lastPairB = events.front().frameB;
@@ -4463,7 +4610,11 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         }
     }
     if (!submitted) {
-        if (job->inflightEpoch == _inflightEpoch) _inflight = MAX(0, _inflight - 1);
+        if (job->inflightEpoch == _inflightEpoch) {
+            _inflight = MAX(0, _inflight - 1);
+            if (wantRife && _inflight == 0) _rifeBusySinceHost = 0;
+        }
+        if (wantRife) for (int i = 0; i < job->count; ++i) [self noteRateBudgetDrop:job->pts[i]];
         [self unpinJob:job];
         _queueDrops += (uint64_t)MAX(1, job->count);
         _epochQueueDrops += (uint64_t)MAX(1, job->count);
@@ -4534,7 +4685,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     [self recordR7JobEvent:@"completed" detail:_r7LastJobCompleted];
     (void)token;
     BOOL releasedCapacity = job->inflightEpoch == _inflightEpoch && _inflight > 0;
-    if (releasedCapacity) _inflight -= 1;
+    if (releasedCapacity) {
+        _inflight -= 1;
+        if (_rife) _rifeBusySinceHost = _inflight > 0 ? completedHost : 0;
+    }
     [self unpinJob:job];
     if (job->configVersion != _configVersion || job->generation != _sourceGeneration || _stopped) {
         if (releasedCapacity) [self resumeDeferredRife];
@@ -4547,8 +4701,9 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         [self trimHeld]; delete job;
         return;
     }
-    // An errored FRC callback is not a sample of time to a usable output.
-    BOOL validTimingSample = !_engine || (!error && outputs.count > 0);
+    // FRC/RIFE failures can finish before inference (for example pool pressure).
+    // They are not samples of the cost of producing a usable output.
+    BOOL validTimingSample = (!_engine && !_rife) || (!error && outputs.count > 0);
     if (validTimingSample && job->captureHost > 0 && SPHostNow() > job->captureHost)
         SPPushSample(_captureToModelReadyNs, SPHostToNs(SPHostNow() - job->captureHost));
     if (validTimingSample && latency > 0) {
@@ -4589,6 +4744,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             } else {
                 uint64_t dropped=(uint64_t)MAX(1,job->count);
                 _rifePoolPressureDrops+=dropped; _queueDrops+=dropped; _epochQueueDrops+=dropped;
+                for (int i=0;i<job->count;i++) [self noteRateBudgetDrop:job->pts[i]];
                 for (int i=0;i<job->count;i++) {
                     if (job->targetHost[i] > now) _rifePoolUnexpiredDrops++;
                     else if ([self noteUniqueSyntheticDrop:job->pts[i]]) _pendingExpiredDrops++;
@@ -4599,6 +4755,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         [self clearPendingRife];
         for (int i = 0; i < job->count; ++i) [self erasePending:job->pts[i]];
         _syntheticFail += (uint64_t)MAX((NSUInteger)1, outputs.count);
+        if (_rife) for (int i = 0; i < job->count; ++i) [self noteRateBudgetDrop:job->pts[i]];
         _resolved.interpolationActive = NO;
         _resolved.unavailableReason = error.localizedDescription ?: @"插帧失败";
         [self publishStatus:_resolved.unavailableReason failed:YES];
@@ -4637,6 +4794,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         }
         if (!scaled) {
             _syntheticFail += 1;
+            if (_rife) [self noteRateBudgetDrop:pts];
             [self erasePending:pts];
             continue;
         }
@@ -4715,7 +4873,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             auto found = _held.find(event.sourceIdentity);
             int64_t host = found == _held.end() ? 0 : found->second.host;
             [self enqueueSourceIdentity:event.sourceIdentity pts:event.pts host:host generation:generation
-                                   force:_nativeBudgetActive || event.skipReason != sp::SPScheduleSkipReason::None];
+                                   force:_nativeBudgetActive || _rateBudgetPassthrough || event.skipReason != sp::SPScheduleSkipReason::None];
             index += 1;
             continue;
         }
@@ -4738,6 +4896,11 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             _nativeBudgetSkippedPhases += group.size();
             continue;
         }
+        if (_rateBudgetPassthrough) {
+            _rateBudgetSkippedPhases += group.size();
+            continue;
+        }
+        [self noteRateBudgetPlanned:group.size()];
         if (group.size() > 3) _phaseBatchSplits += 1;
         for (size_t batch = 0; batch < group.size(); batch += 3) {
             size_t count = MIN((size_t)3, group.size() - batch);
@@ -4958,6 +5121,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             _inflightEpoch = _configVersion;
             _inflight = 0;
             _sessionReady = NO;
+            [self resetRateBudgetOnQueue];
             _prepareToken += 1;
             _preparing = NO;
             _asyncPrepareFailed = NO;
@@ -5065,6 +5229,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         if ((_request.interpolationEnabled || _request.scaleEnabled) && !_sessionReady) {
             [self beginBuildOnQueue];
         }
+        [self updateRateBudgetOnQueue];
         BOOL engineReady = _engine != nil || _lowLatency != nil || _rife != nil || _distil != nil;
         if (_request.interpolationEnabled && _sessionReady && engineReady) {
             sp::SPScheduleInput input;

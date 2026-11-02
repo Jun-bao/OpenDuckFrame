@@ -36,6 +36,7 @@ final class SPRifeBridge: NSObject {
     private var outputPool: CVPixelBufferPool?
     private let diagnosticLock = NSLock()
     private var diagnosticCounts: [String: Int] = [:]
+    private var convertSamplesMs: [Double] = [], pushSamplesMs: [Double] = []
     private func count(_ name: String) {
         diagnosticLock.lock(); diagnosticCounts[name, default: 0] += 1; diagnosticLock.unlock()
     }
@@ -132,6 +133,22 @@ final class SPRifeBridge: NSObject {
                 defer { if trace { os_signpost(.end, log: log, name: "RIFE stream", signpostID: signpost) } }
                 self.state.lock(); let active = self.epoch == seen; self.state.unlock()
                 guard active else { completion(token, nil, 0, Self.error(1, "RIFE 结果属于旧会话")); return }
+                var convertNs: UInt64 = 0, pushNs: UInt64 = 0
+                var convertCalls = 0, pushCalls = 0
+                func measuredBGRA(_ source: CVPixelBuffer) throws -> CVPixelBuffer {
+                    let began = DispatchTime.now().uptimeNanoseconds
+                    defer { convertNs += DispatchTime.now().uptimeNanoseconds - began; convertCalls += 1 }
+                    return try self.ownedBGRA(source)
+                }
+                func measuredPush<T>(_ operation: () throws -> T) rethrows -> T {
+                    let began = DispatchTime.now().uptimeNanoseconds
+                    defer { pushNs += DispatchTime.now().uptimeNanoseconds - began; pushCalls += 1 }
+                    return try operation()
+                }
+                defer {
+                    self.recordStreamTiming(convertMs: convertCalls > 0 ? Double(convertNs) / 1e6 : nil,
+                                            pushMs: pushCalls > 0 ? Double(pushNs) / 1e6 : nil)
+                }
                 do {
                     let width = CVPixelBufferGetWidth(previous), height = CVPixelBufferGetHeight(previous)
                     guard width == CVPixelBufferGetWidth(current), height == CVPixelBufferGetHeight(current) else {
@@ -155,17 +172,17 @@ final class SPRifeBridge: NSObject {
                     if hit { self.count("hits") } else {
                         self.count("misses")
                         stream.reset(); self.streamPrevious = nil; self.streamKey = nil; self.count("resets")
-                        let left = try self.ownedBGRA(previous)
-                        guard try stream.push(left, timesteps: []).isEmpty else { throw Self.error(2, "RIFE 缓存初始化失败") }
+                        let left = try measuredBGRA(previous)
+                        guard try measuredPush({ try stream.push(left, timesteps: []) }).isEmpty else { throw Self.error(2, "RIFE 缓存初始化失败") }
                     }
-                    let right = try self.ownedBGRA(current)
+                    let right = try measuredBGRA(current)
                     let frames: [CVPixelBuffer]
                     if phases.count == 1 && phases[0] == 0.5 {
                         let output = try self.pooledOutput(width: width, height: height)
-                        guard try stream.push(right, into: output) else { throw Self.error(2, "RIFE 中间帧缺失") }
+                        guard try measuredPush({ try stream.push(right, into: output) }) else { throw Self.error(2, "RIFE 中间帧缺失") }
                         frames = [output]
                     } else {
-                        frames = try stream.push(right, timesteps: phases)
+                        frames = try measuredPush { try stream.push(right, timesteps: phases) }
                     }
                     guard frames.count == phases.count, frames.allSatisfy({ CVPixelBufferGetWidth($0) == width && CVPixelBufferGetHeight($0) == height }) else {
                         throw Self.error(2, "RIFE 输出数量或尺寸不一致")
@@ -193,7 +210,7 @@ final class SPRifeBridge: NSObject {
                     do {
                         self.state.lock(); let active = self.epoch == seen; self.state.unlock()
                         guard active else { throw Self.error(1, "RIFE 结果属于旧会话") }
-                        let left = try self.ownedBGRA(previous), right = try self.ownedBGRA(current)
+                        let left = try measuredBGRA(previous), right = try measuredBGRA(current)
                         let frames = try engine.interpolate(previous: left, current: right, timesteps: phases)
                         guard frames.count == phases.count, frames.allSatisfy({
                             CVPixelBufferGetWidth($0) == CVPixelBufferGetWidth(previous) &&
@@ -261,15 +278,40 @@ final class SPRifeBridge: NSObject {
         exec.sync { contractFailNext = true }
     }
 
+    // One accumulated sample per live task, including both inputs on a miss.
+    // Error fallback conversion is included; stateless interpolate is not push.
+    private func recordStreamTiming(convertMs: Double?, pushMs: Double?) {
+        diagnosticLock.lock()
+        defer { diagnosticLock.unlock() }
+        if let convertMs {
+            convertSamplesMs.append(convertMs)
+            if convertSamplesMs.count > 256 { convertSamplesMs.removeFirst(convertSamplesMs.count - 256) }
+        }
+        if let pushMs {
+            pushSamplesMs.append(pushMs)
+            if pushSamplesMs.count > 256 { pushSamplesMs.removeFirst(pushSamplesMs.count - 256) }
+        }
+    }
+
     @objc func streamDiagnostics() -> [String: Any] {
-        diagnosticLock.lock(); let counts = diagnosticCounts; diagnosticLock.unlock()
+        diagnosticLock.lock()
+        let counts = diagnosticCounts, convert = convertSamplesMs, push = pushSamplesMs
+        diagnosticLock.unlock()
+        func summary(_ values: [Double]) -> (median: Double, p95: Double) {
+            guard !values.isEmpty else { return (-1, -1) }
+            let sorted = values.sorted(), count = values.count
+            return ((sorted[(count - 1) / 2] + sorted[count / 2]) / 2, sorted[(count - 1) * 95 / 100])
+        }
+        let convertTiming = summary(convert), pushTiming = summary(push)
         let environment = ProcessInfo.processInfo.environment["CHUANFLOW_RIFE_STREAM"] == "1"
         return ["requested": liveStreamEnabled, "effective": liveStreamEnabled || environment,
                 "enableSource": liveStreamEnabled ? "request" : (environment ? "environment" : "disabled"),
                 "hits": counts["hits", default: 0], "misses": counts["misses", default: 0],
                 "resets": counts["resets", default: 0], "pressureResets": counts["pressureResets", default: 0], "fallbackSucceeded": counts["fallbackSucceeded", default: 0],
                 "fallbackFailed": counts["fallbackFailed", default: 0], "poolRequests": counts["poolRequests", default: 0],
-                "poolFailures": counts["poolFailures", default: 0]]
+                "poolFailures": counts["poolFailures", default: 0],
+                "convertMedianMs": convertTiming.median, "convertP95Ms": convertTiming.p95,
+                "pushMedianMs": pushTiming.median, "pushP95Ms": pushTiming.p95]
     }
 
     @objc func invalidate() {
