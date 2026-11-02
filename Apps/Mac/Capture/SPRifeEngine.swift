@@ -135,19 +135,19 @@ final class SPRifeBridge: NSObject {
                 guard active else { completion(token, nil, 0, Self.error(1, "RIFE 结果属于旧会话")); return }
                 var convertNs: UInt64 = 0, pushNs: UInt64 = 0
                 var convertCalls = 0, pushCalls = 0
-                func measuredBGRA(_ source: CVPixelBuffer) throws -> CVPixelBuffer {
+                func measuredBGRA(_ bridge: SPRifeBridge, _ source: CVPixelBuffer) throws -> CVPixelBuffer {
                     let began = DispatchTime.now().uptimeNanoseconds
                     defer { convertNs += DispatchTime.now().uptimeNanoseconds - began; convertCalls += 1 }
-                    return try self.ownedBGRA(source)
+                    return try bridge.ownedBGRA(source)
                 }
                 func measuredPush<T>(_ operation: () throws -> T) rethrows -> T {
                     let began = DispatchTime.now().uptimeNanoseconds
                     defer { pushNs += DispatchTime.now().uptimeNanoseconds - began; pushCalls += 1 }
                     return try operation()
                 }
-                defer {
-                    self.recordStreamTiming(convertMs: convertCalls > 0 ? Double(convertNs) / 1e6 : nil,
-                                            pushMs: pushCalls > 0 ? Double(pushNs) / 1e6 : nil)
+                func recordTiming(_ bridge: SPRifeBridge) {
+                    bridge.recordStreamTiming(convertMs: convertCalls > 0 ? Double(convertNs) / 1e6 : nil,
+                                              pushMs: pushCalls > 0 ? Double(pushNs) / 1e6 : nil)
                 }
                 do {
                     let width = CVPixelBufferGetWidth(previous), height = CVPixelBufferGetHeight(previous)
@@ -172,10 +172,10 @@ final class SPRifeBridge: NSObject {
                     if hit { self.count("hits") } else {
                         self.count("misses")
                         stream.reset(); self.streamPrevious = nil; self.streamKey = nil; self.count("resets")
-                        let left = try measuredBGRA(previous)
+                        let left = try measuredBGRA(self, previous)
                         guard try measuredPush({ try stream.push(left, timesteps: []) }).isEmpty else { throw Self.error(2, "RIFE 缓存初始化失败") }
                     }
-                    let right = try measuredBGRA(current)
+                    let right = try measuredBGRA(self, current)
                     let frames: [CVPixelBuffer]
                     if phases.count == 1 && phases[0] == 0.5 {
                         let output = try self.pooledOutput(width: width, height: height)
@@ -198,11 +198,13 @@ final class SPRifeBridge: NSObject {
                         return SPOwnedPixelBuffer(retaining: buffer)
                     }
                     completion(token, owned, max(0, CFAbsoluteTimeGetCurrent() - started), nil)
+                    recordTiming(self)
                 } catch {
                     self.stream?.reset(); self.streamPrevious = nil; self.streamKey = nil; self.count("resets")
                     let failure = Self.explain(error) as NSError
                     if failure.domain == "app.khuaplayer.rife" && failure.code == 10 {
                         completion(token, nil, max(0, CFAbsoluteTimeGetCurrent() - started), failure)
+                        recordTiming(self)
                         return
                     }
                     // Retry with the same model, quality, resolution and phases.
@@ -210,7 +212,7 @@ final class SPRifeBridge: NSObject {
                     do {
                         self.state.lock(); let active = self.epoch == seen; self.state.unlock()
                         guard active else { throw Self.error(1, "RIFE 结果属于旧会话") }
-                        let left = try measuredBGRA(previous), right = try measuredBGRA(current)
+                        let left = try measuredBGRA(self, previous), right = try measuredBGRA(self, current)
                         let frames = try engine.interpolate(previous: left, current: right, timesteps: phases)
                         guard frames.count == phases.count, frames.allSatisfy({
                             CVPixelBufferGetWidth($0) == CVPixelBufferGetWidth(previous) &&
@@ -224,9 +226,11 @@ final class SPRifeBridge: NSObject {
                         }
                         self.count("fallbackSucceeded")
                         completion(token, owned, max(0, CFAbsoluteTimeGetCurrent() - started), nil)
+                        recordTiming(self)
                     } catch {
                         self.count("fallbackFailed")
                         completion(token, nil, max(0, CFAbsoluteTimeGetCurrent() - started), Self.explain(error))
+                        recordTiming(self)
                     }
                 }
             }
