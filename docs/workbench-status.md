@@ -32,7 +32,7 @@
 ## 获取与构建
 
 ```sh
-git clone https://github.com/super-individual-ai/OpenDuckFrame.git
+git clone https://github.com/Jun-bao/OpenDuckFrame.git
 cd OpenDuckFrame
 ./Apps/Mac/Scripts/build.sh Debug
 ```

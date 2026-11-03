@@ -128,9 +128,9 @@
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 OpenDuckFrame contributors</string>
 	<key>ODFFeedbackURL</key>
-	<string>https://github.com/super-individual-ai/OpenDuckFrame/issues</string>
+	<string>https://github.com/Jun-bao/OpenDuckFrame/issues</string>
 	<key>ODFRepositoryURL</key>
-	<string>https://github.com/super-individual-ai/OpenDuckFrame</string>
+	<string>https://github.com/Jun-bao/OpenDuckFrame</string>
 	<key>ODFWebsiteURL</key>
 	<string></string>
 	<key>NSNetworkVolumesUsageDescription</key>

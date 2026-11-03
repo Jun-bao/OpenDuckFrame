@@ -36,7 +36,7 @@ and English. Experimental backends and constraints are described in [the feature
 ## Get started
 
 The source is available now. Build it with the commands below; packaged downloads,
-when published, will be listed under [Releases](https://github.com/super-individual-ai/OpenDuckFrame/releases).
+when published, will be listed under [Releases](https://github.com/Jun-bao/OpenDuckFrame/releases).
 
 1. Open **File → Quality Workbench** (⇧⌘E).
 2. Choose a window, display, or video file. macOS asks for Screen Recording
@@ -67,7 +67,7 @@ and these build tools:
 
 ```sh
 brew install xcodegen meson ninja cmake pkg-config
-git clone https://github.com/super-individual-ai/OpenDuckFrame.git
+git clone https://github.com/Jun-bao/OpenDuckFrame.git
 cd OpenDuckFrame
 ./Apps/Mac/Scripts/build.sh Debug
 open .build/Build/Products/Debug/OpenDuckFrame.app
@@ -107,8 +107,8 @@ Generated projects, apps, dependency builds, private keys, local logs and test m
 
 ## Community and contributing
 
-Use [Issues](https://github.com/super-individual-ai/OpenDuckFrame/issues) for bugs and
-feature requests, and [Discussions](https://github.com/super-individual-ai/OpenDuckFrame/discussions)
+Use [Issues](https://github.com/Jun-bao/OpenDuckFrame/issues) for bugs and
+feature requests, and [Discussions](https://github.com/Jun-bao/OpenDuckFrame/discussions)
 for questions and setup sharing. Include app and macOS versions, Mac model, source
 resolution, engine and observed output rate. Review logs and screenshots for private content before sharing.
 

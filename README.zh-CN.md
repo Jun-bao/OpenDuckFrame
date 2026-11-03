@@ -26,7 +26,7 @@ OpenDuckFrame 是一款原生 Mac 画质增强应用。浏览器视频、游戏�
 ## 开始使用
 
 源码现已提供，可按下面的命令构建。打包版本发布后会出现在
-[Releases](https://github.com/super-individual-ai/OpenDuckFrame/releases)。
+[Releases](https://github.com/Jun-bao/OpenDuckFrame/releases)。
 
 1. 打开 **文件 → 画质工作台**（⇧⌘E）。
 2. 选择窗口、显示器或视频文件。采集窗口或显示器时，按 macOS 提示授予屏幕录制权限。
@@ -54,7 +54,7 @@ OpenDuckFrame 是一款原生 Mac 画质增强应用。浏览器视频、游戏�
 
 ```sh
 brew install xcodegen meson ninja cmake pkg-config
-git clone https://github.com/super-individual-ai/OpenDuckFrame.git
+git clone https://github.com/Jun-bao/OpenDuckFrame.git
 cd OpenDuckFrame
 ./Apps/Mac/Scripts/build.sh Debug
 open .build/Build/Products/Debug/OpenDuckFrame.app
@@ -91,8 +91,8 @@ docs/              上手、功能与项目说明
 
 ## 交流与参与
 
-故障和功能建议请提交 [Issue](https://github.com/super-individual-ai/OpenDuckFrame/issues)，
-使用问题和配置分享可前往 [Discussions](https://github.com/super-individual-ai/OpenDuckFrame/discussions)。
+故障和功能建议请提交 [Issue](https://github.com/Jun-bao/OpenDuckFrame/issues)，
+使用问题和配置分享可前往 [Discussions](https://github.com/Jun-bao/OpenDuckFrame/discussions)。
 反馈时附上应用版本、macOS 版本、Mac 型号、来源分辨率、引擎和实际输出帧率；不要直接上传私人画面或未经检查的诊断日志。
 
 开发约定见 [CONTRIBUTING.md](CONTRIBUTING.md)，安全问题的私下反馈方式见 [SECURITY.md](SECURITY.md)，

@@ -45,7 +45,7 @@ Performance, latency and artifacts vary with motion, resolution and backend.
 
 ## Report a problem
 
-Use the [bug form](https://github.com/super-individual-ai/OpenDuckFrame/issues/new?template=bug_report.yml).
+Use the [bug form](https://github.com/Jun-bao/OpenDuckFrame/issues/new?template=bug_report.yml).
 Include app and macOS versions, Mac model, source type and resolution, engine,
 requested rate, actual output and reproduction steps. Inspect logs and screenshots
 before sharing: window titles and media paths can be personal.
