@@ -4,6 +4,8 @@ All notable public releases will be documented here.
 
 ## 0.1.0 — Unreleased
 
+- Prepare the public source repository with bilingual documentation, getting
+  started and feature guides, contribution templates and automated checks.
 - First OpenDuckFrame release: real-time frame generation and upscaling for a
   selected window, display or video file, with a frame-rate overlay.
 - Detects the real content frame rate, lowers the multiplier automatically when

@@ -9,7 +9,8 @@ Thank you for helping improve OpenDuckFrame.
   downloaded media, benchmarks, or local logs.
 - Preserve the existing `SP` internal symbol prefix unless a change genuinely
   requires an ABI-level rename.
-- Keep public documentation, diagnostics, and new source comments in English.
+- Keep English documentation current and update `README.zh-CN.md` when public
+  behavior changes. Write new source comments and diagnostics clearly in English.
 - Follow the source ownership described in
   [REPOSITORY_LAYOUT.md](REPOSITORY_LAYOUT.md). Product and platform directories
   are not independent packages; do not assume the current media or subtitle
@@ -38,7 +39,7 @@ Use `OpenDuckFrame` for every name: the app bundle, executable, Dock, Finder,
 menus, windows, About panel, localized `app.displayName`, bundle identifiers
 (`app.openduckframe.*`), targets, modules, environment variables (`ODF_*`),
 command-line flags (`--odf-*`), download artifacts and documentation.
-`Scripts/check_public_repo.sh` rejects any other product name.
+Preserve upstream attribution and license text when changing branding.
 
 ### Checks
 
@@ -46,7 +47,9 @@ Use an Apple Silicon Mac with Xcode and the macOS 26.4 SDK or later, then run
 these commands from the repository root:
 
 ```bash
-./Scripts/check_public_repo.sh
+python3 -m venv .build/check-tools
+.build/check-tools/bin/pip install -r Design/AppIcon/requirements.txt
+PATH="$PWD/.build/check-tools/bin:$PATH" ./Scripts/check_public_repo.sh
 ./Apps/Mac/Scripts/build.sh Release
 ./Scripts/verify_app_bundle.sh \
   .build/Build/Products/Release/OpenDuckFrame.app
@@ -60,3 +63,9 @@ these commands from the repository root:
 Describe the media formats and macOS versions exercised in the pull request.
 The public repository intentionally does not ship large media fixtures or the
 maintainers' extended benchmark and reliability suites.
+
+Pushes and pull requests run the repository, icon, localization and secret checks.
+Maintainers can request the full Release and unsigned App Store build from the
+**Build** workflow's manual dispatch by selecting **Build application artifacts**.
+Passing repository checks is distinct from successful application builds and
+native playback, visual or performance acceptance.

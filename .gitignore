@@ -43,6 +43,15 @@ __pycache__/
 .DS_Store
 .claude/
 .wrangler/
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.pem
+*.key
+*.mobileprovision
+*.provisionprofile
 *.log
 /tmp/
 BenchResults/

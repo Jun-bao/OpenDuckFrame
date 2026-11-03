@@ -1,6 +1,7 @@
 # OpenDuckFrame 能力工作台开发快照
 
-本仓库是 OpenDuckFrame 画质工作台的开发快照，许可证和第三方声明见根目录。
+本文保留公开整理前的开发记录与验收缺口，日期对应各次开发，并非当前仓库可见性或发行状态。
+当前使用说明见 [README](../README.zh-CN.md) 和 [功能说明](features.md)，许可证和第三方声明见根目录。
 
 ## 2026-11-03：品牌与采集尺寸更新
 
@@ -36,8 +37,8 @@ cd OpenDuckFrame
 ./Apps/Mac/Scripts/build.sh Debug
 ```
 
-需要组织仓库访问权限及匹配的 Apple 开发工具链。具体构建依赖见根目录 README 的 Build from source；Apple 新增能力还取决于系统与设备支持。
+需要匹配的 Apple 开发工具链。具体构建依赖见根目录 README 的 Build from source；Apple 新增能力还取决于系统与设备支持。
 
 仓库包含源码、第三方源文件/声明、模型资源和测试脚本。构建产物、生成依赖、测试媒体、用户配置、账号凭据和本机原始运行日志不纳入 Git；运行时依赖按现有脚本构建或获取。
 
-为避免本次导入自动触发 macOS CI，仓库 Actions 在首次推送前关闭；工作流文件保留。
+首次私有导入时曾关闭 Actions。公开整理后的检查入口和完整构建触发方式见 [CONTRIBUTING.md](../CONTRIBUTING.md)。

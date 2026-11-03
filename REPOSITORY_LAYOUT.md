@@ -14,7 +14,10 @@ Apps/
     Scripts/build.sh      Mac product build entry point
     Info.plist            Main app metadata
     UI/                   AppKit windows, controls, menus, and product behavior
+    Capture/              ScreenCaptureKit input and live enhancement adapters
     Resources/            Mac localization, icons, and privacy manifest
+      Models/             Bundled RIFE / animation model resources
+      Notices/            Model, runtime and application attribution
     Support/              Swift bridging header
     QuickLook/            Finder preview extension and its configuration
     CaptionsHost/         Mac subtitle tasks, presentation, and download adapters
@@ -34,6 +37,8 @@ Platform/
 Scripts/                  Repository tools, dependency recipes, and release tools
 ThirdParty/               Dependency lock, licenses, and ignored macOS artifacts
 Design/                   Editable app-icon source and static exports
+Website/                  Static product website
+docs/                     Quick start, features and development status
 ```
 
 ## Build and release entry points
@@ -66,8 +71,10 @@ locations and distribution channels are described in [RELEASING.md](RELEASING.md
 
 ## Current compilation boundaries
 
-The `OpenDuckFrame` app compiles `Apps/Mac/UI`, `Apps/Mac/CaptionsHost`, and
-`Modules/Captions`. `OpenDuckFrameMediaCore` still combines `Modules/MediaCore`
+The `OpenDuckFrame` app compiles `Apps/Mac/UI`, most of `Apps/Mac/Capture`,
+`Apps/Mac/CaptionsHost`, and `Modules/Captions`. Selected Apple SR and animation
+adapters from `Capture` compile into the media framework, as listed explicitly
+in `Apps/Mac/project.yml`. `OpenDuckFrameMediaCore` combines `Modules/MediaCore`
 with `Modules/VideoEnhancement` and the implementations under `Platform/macOS`
 in one framework. Quick Look
 uses that same media framework. `OpenDuckFrameCaptionsUI` remains a separate,

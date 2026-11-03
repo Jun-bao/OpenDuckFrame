@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the private product boundary without freezing active source edits."""
+"""Validate the public product source and repository boundary."""
 import json
 import os
 from pathlib import Path
@@ -62,6 +62,15 @@ def main():
             fail(f'missing required product source: {relative}')
     for path in files.values():
         check_file(path)
+    for path in (ROOT / 'Apps/Mac/Capture').rglob('*'):
+        if path.is_file():
+            check_file(path)
+    for relative in ('README.md', 'README.zh-CN.md', 'CONTRIBUTING.md',
+                     'SECURITY.md', 'LICENSE', 'PRIVACY.md', 'TRADEMARK.md',
+                     'THIRD_PARTY_NOTICES.md', 'REPOSITORY_LAYOUT.md',
+                     'docs/quick-start.md', 'docs/features.md'):
+        if not (ROOT / relative).is_file():
+            fail(f'missing public documentation: {relative}')
     catalog = json.loads((ROOT / 'Apps/Mac/Resources/Localizable.xcstrings').read_text())
     names = catalog['strings']['app.displayName']['localizations']
     expected = {language: ('OpenDuckFrame' if language == 'zh-Hans' else 'OpenDuckFrame' if language == 'zh-Hant' else 'OpenDuckFrame') for language in supported_languages()}
@@ -81,7 +90,7 @@ def main():
     for line in ('ODF_DISPLAY_NAME: OpenDuckFrame', 'CFBundleName: OpenDuckFrame', 'CFBundleDisplayName: $(ODF_DISPLAY_NAME)', 'SPProductName: OpenDuckFrame', 'PRODUCT_NAME: OpenDuckFrame', 'EXECUTABLE_NAME: OpenDuckFrame'):
         if not re.search(r'^\s*' + re.escape(line) + r'\s*$', project, re.M):
             fail(f'project metadata missing {line}')
-    print(f'Private product source and boundary checks passed ({len(files)} runtime files).')
+    print(f'Public product source and repository boundary checks passed ({len(files)} managed runtime files plus live capture).')
 
 
 if __name__ == '__main__':

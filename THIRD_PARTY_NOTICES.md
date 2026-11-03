@@ -1,5 +1,32 @@
 # Third-party notices
 
+OpenDuckFrame is derived from [Khua Player](https://github.com/nake13/khuaplayer),
+whose MIT copyright notice is preserved in [LICENSE](LICENSE) and the bundled
+`OpenDuckFrame-MIT.txt` notice.
+
+## Frame generation, models and optional runtimes
+
+| Component | Version / source | License / notice |
+|---|---|---|
+| RIFE Metal | 0.1.8, `cinemore/rife-metal` | Apache-2.0 |
+| Practical-RIFE weights | 4.25 (package resource), 4.26 (app resource) | MIT, hzwer |
+| Anime4K shader | 4.0.1, `bloc97/Anime4K` | MIT |
+| Real-CUGAN weights | Bundled 2× models, bilibili | MIT |
+| Real-CUGAN ncnn adapter | `nihui/realcugan-ncnn-vulkan` | MIT |
+| ncnn | Pinned by the optional runtime recipe | BSD-3-Clause |
+| DistilDRBA | Optional V1 model, `routineLife1/DistilDRBA` | MIT |
+| libplacebo | Optional Anime4K runtime | LGPL-2.1-or-later |
+| Shaderc, glslang, Vulkan headers, MoltenVK | Optional animation runtimes | Upstream Apache / BSD / MIT notices |
+| Little CMS | Optional Anime4K runtime | MIT |
+
+Full license texts, source revisions, conversion details and available checksums
+are included in [`Apps/Mac/Resources/Notices`](Apps/Mac/Resources/Notices).
+The build definition pins RIFE Metal to 0.1.8. Optional runtime recipes pin their
+own source or binary expectations; they are separate from the default media
+dependency lock. No third-party code or weights are relicensed by this project's MIT license.
+
+## Media dependencies
+
 OpenDuckFrame builds the following libraries from the versions and source hashes
 recorded in [`ThirdParty/deps.lock.json`](ThirdParty/deps.lock.json).
 

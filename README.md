@@ -1,146 +1,123 @@
-> **Private workbench development snapshot:** this organization repository includes the enhancement workbench changes. It is not a validated release. See [current status and known limitations](docs/workbench-status.md).
+<p align="center"><img src="Design/AppIcon/AppIcon.appiconset/AppIcon-256.png" alt="OpenDuckFrame" width="128" height="128"></p>
+<h1 align="center">OpenDuckFrame</h1>
+<p align="center"><b>Real-time frame generation and upscaling for your Mac.</b></p>
+<p align="center">Choose a window, a display, or a video. Make it smoother. Make it clearer.</p>
+<p align="center"><b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
+<p align="center">Apple silicon · macOS 14+ · <a href="LICENSE">MIT</a></p>
 
-<img src="Design/AppIcon/AppIcon.appiconset/AppIcon-128.png" width="96" height="96" alt="OpenDuckFrame app icon">
+## About
 
-# OpenDuckFrame — 开源小鸭
+OpenDuckFrame is a native Mac app that enhances the picture you are already watching.
+Select a browser window, game or stream, a display, or a local video file, then
+control frame generation and upscaling from one workbench. Processing happens on
+your Mac, without an account or uploading your picture.
 
-OpenDuckFrame is a macOS app for real-time frame generation and upscaling of any window, display or video file.
+- **Frame generation.** Choose Apple interpolation or RIFE 4.25 / 4.26, select a
+  target frame rate or X2 / X3 / X4, and watch the actual output rate.
+  Availability and achieved performance depend on the engine, source and Mac.
+- **Upscaling, independently.** Use Lanczos or MetalFX, or try the supported
+  Apple and animation-oriented backends. Scaling and frame generation can be
+  configured separately.
+- **A workbench for everyday use.** Save profiles for games, films and animation;
+  compare original and enhanced output; follow the source window or use a
+  fullscreen output display.
+- **A local video player, too.** Open formats including MKV, MP4, MOV and WebM,
+  with subtitles, HDR playback on compatible displays, playback resume, speed
+  control, and Finder Quick Look previews.
+- **On-device subtitles.** Generate, translate and export text subtitles on
+  supported macOS versions. macOS may download its language models first.
+- **Private by design.** No account, ads, or playback analytics. See [PRIVACY.md](PRIVACY.md).
 
-Get smoother motion with frame interpolation, generate and translate subtitles on your Mac,
-and keep watching the playable parts of damaged or unfinished files.
+The player has 17 interface languages; the enhancement workbench supports Chinese
+and English. Experimental backends and constraints are described in [the feature guide](docs/features.md).
 
-Designed from the ground up for fast, responsive, and efficient playback.
+## Get started
 
-This development snapshot has not yet been audited for public distribution.
+The source is available now. Build it with the commands below; packaged downloads,
+when published, will be listed under [Releases](https://github.com/super-individual-ai/OpenDuckFrame/releases).
 
-## More than playback
+1. Open **File → Quality Workbench** (⇧⌘E).
+2. Choose a window, display, or video file. macOS asks for Screen Recording
+   permission when you capture a window or display.
+3. Choose frame generation, upscaling, or both, and press **Start enhancement**.
+4. Use the original / enhanced / comparison controls and FPS display to check the result.
 
-- **Smoother motion with Motion+.** Adaptive frame interpolation makes movement
-  smoother. Hold **C** to compare the original and enhanced video side by side.
-- **Subtitles, made on your Mac.** Generate subtitles from video audio, translate
-  generated or existing text subtitles, and save the results as SRT. Processing
-  stays on your Mac. Requires macOS 26; macOS may download a language model first.
-- **Playback for imperfect files.** OpenDuckFrame attempts to recover playable content
-  from damaged or partially downloaded files, marks problem areas on the
-  timeline, and leaves the original file unchanged. Recovery is best-effort;
-  not every damaged or incomplete file can be played.
-- **More from your display.** Watch HDR video, use tone mapping on SDR displays,
-  or give everyday SDR video extra brightness with Brightness+ on compatible displays.
-- **A timeline drawn from your video.** Particle Star Trail takes its colors
-  from the video itself. Liquid and Classic styles are also available.
-- **Preview right in Finder.** Select a supported video and press **Space** for
-  Quick Look playback, including MKV. Set OpenDuckFrame as the default player by file format.
-
-Motion+ requires macOS 26 and a supported Mac. See [Requirements](#requirements)
-for feature availability.
-
-## Everyday essentials
-
-- **Broad format support:** MKV, MP4, MOV, WebM, AVI, MPEG-TS, FLV, WMV, and common
-  audio formats, with hardware decoding where supported and a bundled fallback.
-- **Subtitles that travel with your video:** embedded and external text subtitles,
-  including subtitle files in the same folder. OpenDuckFrame does not search for or download subtitles.
-- **Natural-sounding speed control:** hold Space for Turbo playback, then release
-  to return to normal speed. Voices keep their pitch.
-- **Native multichannel audio:** 5.1 and 7.1 output on supported audio devices.
-- **A familiar Mac experience:** playback resume, frame stepping, screenshots,
-  multiple playback windows, and an interface available in 17 languages.
-- **Private by design:** no account, ads, or playback analytics. Your media and
-  playback history stay on your Mac. See the [privacy policy](PRIVACY.md).
+See [Quick start](docs/quick-start.md) for permissions and troubleshooting.
 
 ## Requirements
 
-| Feature | Requirements |
+| Capability | Requirements |
 |---|---|
-| Basic playback and Quick Look | Apple silicon Mac running macOS 14 or later |
-| Motion+ frame interpolation | macOS 26 and a Mac supporting system frame-rate conversion |
-| Subtitle generation and translation | macOS 26; language availability depends on macOS, which may download language models on first use |
-| Brightness+ | A compatible display with available extended brightness headroom |
+| App and local playback | Apple silicon Mac, macOS 14 or later |
+| Window / display capture | Screen Recording permission; protected content may not be capturable |
+| Apple frame generation and Apple super resolution | macOS 26+, supported hardware and input formats |
+| RIFE frame generation | Apple silicon; throughput depends on resolution, quality and display rate |
+| Subtitle generation and translation | macOS 26+ and an available system language model |
+| Experimental animation backends | Additional models / runtimes; see [features](docs/features.md) |
 
-Intel Macs are not supported. iPhone and iPad support is planned, but only the
-Mac app is currently available.
+Intel Macs, Windows, iPhone and iPad are not currently supported. A multiplier is
+a requested processing mode, not a guarantee of a particular displayed frame rate.
 
 ## Build from source
 
-Building requires an Apple silicon Mac and Xcode with the macOS 26.4 SDK or later.
-There is no public OpenDuckFrame download yet; build from source to try it.
+Use an Apple silicon Mac with Xcode and the macOS 26.4 SDK or later, Python 3,
+and these build tools:
 
-Install the build tools once:
-
-```bash
+```sh
 brew install xcodegen meson ninja cmake pkg-config
+git clone https://github.com/super-individual-ai/OpenDuckFrame.git
+cd OpenDuckFrame
+./Apps/Mac/Scripts/build.sh Debug
+open .build/Build/Products/Debug/OpenDuckFrame.app
 ```
 
-Build the application:
+For an optimized local build:
 
-```bash
-./Apps/Mac/Scripts/build.sh          # Debug
-./Apps/Mac/Scripts/build.sh Release  # optimized local build
+```sh
+./Apps/Mac/Scripts/build.sh Release
 ```
 
-Run these commands from the repository root. `Scripts/build.sh` remains a
-compatibility entry point with the same arguments and environment settings.
-The Mac project definition is [`Apps/Mac/project.yml`](Apps/Mac/project.yml);
-the build generates `Apps/Mac/OpenDuckFrame.xcodeproj`. Edit the definition, not
-the generated Xcode project.
+The build fetches pinned dependencies, generates the Xcode project, bundles runtime
+libraries and verifies the application. Debug output stays under `.build/`; Release
+also publishes a local `OpenDuckFrame.app` at the repository root. Local builds use
+ad-hoc signing. Developer ID signing, notarization and App Store packaging have
+their own [release workflow](RELEASING.md).
 
-The first build downloads checksum-pinned dependency source archives, builds
-them with the macOS SDK toolchain, generates the Xcode project, packages the
-runtime libraries, signs the app ad hoc, and verifies its Mach-O dependency
-closure. Subsequent builds reuse validated dependency stamps.
+Edit [`Apps/Mac/project.yml`](Apps/Mac/project.yml), not the generated Xcode project.
+Optional experimental runtimes are not built by default; see [the feature guide](docs/features.md#optional-runtimes).
 
-Run the app, optionally opening a local media file through the macOS document
-open event:
+## Repository
 
-```bash
-./Scripts/run.sh
-./Scripts/run.sh /path/to/video.mkv
+```text
+Apps/Mac/          Native UI, live capture, resources, Quick Look and build definition
+Modules/           Media playback, video enhancement and subtitle source
+Platform/macOS/    Mac rendering and audio implementations
+Scripts/           Build, verification, localization and release tools
+ThirdParty/        Dependency lock, selected source and license notices
+Design/            App icon source and deterministic exports
+Website/           Static website source
+docs/              Getting started, features and project documentation
 ```
 
-The generated app is located at
-`.build/Build/Products/<configuration>/OpenDuckFrame.app`. Release builds also deploy
-the verified app to `OpenDuckFrame.app` at the repository root; Debug builds leave that
-copy unchanged. Both locations are ignored by Git. Local Release builds are
-still ad-hoc signed, not distribution-ready artifacts.
+These are source boundaries, not independently released packages. See
+[REPOSITORY_LAYOUT.md](REPOSITORY_LAYOUT.md) for compilation and ownership details.
+Generated projects, apps, dependency builds, private keys, local logs and test media stay outside Git.
 
-## Repository scope
+## Community and contributing
 
-This repository contains the shipping application source and the reproducible
-build and packaging recipes. Large media fixtures, benchmark suites, internal
-experiments, generated Xcode projects, dependency build trees, and caches are
-intentionally excluded.
+Use [Issues](https://github.com/super-individual-ai/OpenDuckFrame/issues) for bugs and
+feature requests, and [Discussions](https://github.com/super-individual-ai/OpenDuckFrame/discussions)
+for questions and setup sharing. Include app and macOS versions, Mac model, source
+resolution, engine and observed output rate. Review logs and screenshots for private content before sharing.
 
-Editable Icon Composer source and the deterministic static AppIcon export live
-in [`Design/AppIcon`](Design/AppIcon).
+[CONTRIBUTING.md](CONTRIBUTING.md) covers development and checks;
+[SECURITY.md](SECURITY.md) explains private vulnerability reporting.
+See [CHANGELOG.md](CHANGELOG.md) for changes.
 
-The directory layout separates the Mac product, reusable-source candidates,
-and platform implementations. See [REPOSITORY_LAYOUT.md](REPOSITORY_LAYOUT.md)
-for ownership and build entry points. iPhone and iPad support is planned;
-only the Mac product currently builds, and no mobile app target is included.
+## License and acknowledgments
 
-## Distribution
-
-Local builds use ad-hoc signing. Developer ID releases and App Store archives
-use separate, fail-closed signing configurations; see
-[RELEASING.md](RELEASING.md). Release identity, version, bundle identifier, and
-Apple Developer Team values must be supplied explicitly by the distributor.
-The primary direct download is a signed, notarized, and stapled DMG with an
-Applications shortcut. Generated apps, DMGs, ZIPs, archives, and symbols stay
-outside Git history and are published through the release host.
-
-Direct-distribution builds contain configuration-gated Sparkle support. Without
-both `ODF_SPARKLE_FEED_URL` and `ODF_SPARKLE_PUBLIC_ED_KEY`, the updater does
-not load, create a menu item, or make a network request. App Store builds omit
-Sparkle and its configuration entirely. Configured direct builds check
-automatically by default and expose an App-menu toggle to disable that behavior.
-
-## Privacy and licensing
-
-The application does not collect or transmit playback data. See
-[PRIVACY.md](PRIVACY.md) for the current behavior.
-
-OpenDuckFrame's own source code is available under the [MIT License](LICENSE).
-Third-party components retain their own licenses; see
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and
-[`ThirdParty/Licenses`](ThirdParty/Licenses). Distributors are responsible for
-satisfying all third-party license obligations.
+OpenDuckFrame's own code is [MIT-licensed](LICENSE). It builds on
+[Khua Player](https://github.com/nake13/khuaplayer) and preserves its copyright notice.
+FFmpeg, RIFE, model weights and other dependencies retain their own licenses;
+see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+See [TRADEMARK.md](TRADEMARK.md) for the project name and icon.
