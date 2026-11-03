@@ -21,7 +21,7 @@ OpenDuckFrame 是一款原生 Mac 画质增强应用。浏览器视频、游戏�
 
 播放器提供 17 种界面语言，画质工作台支持中文和英文。实验后端与具体条件见 [功能说明](docs/features.md)。
 
-<p align="center"><img src="Website/assets/openduckframe-library.webp" alt="OpenDuckFrame v0.1.0 在 Mac 上的技术库实机界面" width="900"></p>
+<p align="center"><img src="Website/assets/openduckframe-library-v2.webp" alt="OpenDuckFrame v0.1.0 在 Mac 上的技术库实机界面" width="900"></p>
 
 ## 开始使用
 
