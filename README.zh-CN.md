@@ -2,7 +2,7 @@
 <h1 align="center">OpenDuckFrame · 开源小鸭</h1>
 <p align="center"><b>让 Mac 上的画面更流畅、更清晰。</b></p>
 <p align="center">选一个窗口、一块屏幕或一个视频，实时补帧与超分。</p>
-<p align="center"><a href="README.md">English</a> · <b>简体中文</b></p>
+<p align="center"><a href="https://openduckframe.cn/">官网与使用指南</a> · <a href="README.md">English</a> · <b>简体中文</b></p>
 <p align="center">Apple 芯片 · macOS 14+ · <a href="LICENSE">MIT 开源</a></p>
 
 ## 简介

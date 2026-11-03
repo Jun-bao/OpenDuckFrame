@@ -1,3 +1,0 @@
-DistilDRBA v1, upstream commit db51bdeb452685cba9aee227c6dba42e67753b55, MIT: https://github.com/routineLife1/DistilDRBA
-v1.pkl SHA256: 3096c7228f2159628184ab9dc78484e29b1c031eb68ff7c17ebb23f72726a96f
-The application uses a locally converted fixed-shape Core ML model for 1280x720 padded to 1280x768 and the 1.5 midpoint. Model conversion recipe and versions are in Scripts/build_distildrba_runtime.sh and Scripts/build_distildrba_model.py.

@@ -2,7 +2,7 @@
 <h1 align="center">OpenDuckFrame</h1>
 <p align="center"><b>Real-time frame generation and upscaling for your Mac.</b></p>
 <p align="center">Choose a window, a display, or a video. Make it smoother. Make it clearer.</p>
-<p align="center"><b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
+<p align="center"><a href="https://openduckframe.cn/en/">Official website</a> · <b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
 <p align="center">Apple silicon · macOS 14+ · <a href="LICENSE">MIT</a></p>
 
 ## About

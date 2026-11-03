@@ -1,6 +1,0 @@
-Anime4K Upscale CNN x2 S, upstream v4.0.1, commit 4029bf701ecaa15f163cdc49cffe5501c1acf410, MIT: https://github.com/bloc97/Anime4K
-The experimental runtime uses libplacebo 7.360.1 (LGPL-2.1-or-later, dynamically linked): https://code.videolan.org/videolan/libplacebo
-Shaderc 2026.4.1 (Apache-2.0): https://github.com/google/shaderc
-Little CMS 2.19.1 (MIT): https://github.com/mm2/Little-CMS
-MoltenVK 1.4.2 (Apache-2.0): https://github.com/KhronosGroup/MoltenVK
-Runtime libraries remain separately replaceable; license texts are alongside this notice. This local candidate uses libraries compiled for macOS 27; earlier systems retain the rest of the workbench.
