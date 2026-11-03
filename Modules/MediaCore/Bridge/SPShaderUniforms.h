@@ -1,4 +1,4 @@
-// KhuaPlayer — CPU mirrors of Metal constant-buffer layouts.
+// OpenDuckFrame — CPU mirrors of Metal constant-buffer layouts.
 //
 // Keep every field assertion in this header in sync with Video.metal. The
 // explicit offsets make an accidental type or field-order change fail at

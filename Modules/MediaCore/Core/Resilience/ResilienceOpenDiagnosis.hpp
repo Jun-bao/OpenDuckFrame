@@ -1,4 +1,4 @@
-// KhuaPlayer - resilient playback: read callback / abort hook and open-failure diagnosis
+// OpenDuckFrame - resilient playback: read callback / abort hook and open-failure diagnosis
 //
 // Split out of the umbrella header by section; function bodies, constants and inline
 // attributes are unchanged. Callers keep including the umbrella; this file only guarantees

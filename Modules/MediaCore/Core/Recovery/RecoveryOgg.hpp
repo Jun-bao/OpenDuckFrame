@@ -1,4 +1,4 @@
-// KhuaPlayer - container recovery: Ogg page CRC / whole-page single-bit fixes
+// OpenDuckFrame - container recovery: Ogg page CRC / whole-page single-bit fixes
 //
 // Split out of the umbrella header by section; function bodies, constants and inline
 // attributes are unchanged. Callers keep including the umbrella; this file only guarantees

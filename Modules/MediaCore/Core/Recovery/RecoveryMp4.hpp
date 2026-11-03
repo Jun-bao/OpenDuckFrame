@@ -1,4 +1,4 @@
-// KhuaPlayer - container recovery: MP4/MOV/fMP4 (box walk, mdat before trailing moov, bad-trak isolation, table counts and entries, fragment chains and re-anchoring, ctts, no-moov extraction, track ownership / sample sizes / tfdt)
+// OpenDuckFrame - container recovery: MP4/MOV/fMP4 (box walk, mdat before trailing moov, bad-trak isolation, table counts and entries, fragment chains and re-anchoring, ctts, no-moov extraction, track ownership / sample sizes / tfdt)
 //
 // Split out of the umbrella header by section; function bodies, constants and inline
 // attributes are unchanged. Callers keep including the umbrella; this file only guarantees

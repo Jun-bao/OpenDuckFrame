@@ -1,4 +1,4 @@
-// KhuaPlayer - resilient playback: video codec parameter-set and header evidence (avcC/hvcC bootstrap, VP8/VP9, MJPEG DHT, MP4 RAP/ctts, ProRes, TS Annex-B chains)
+// OpenDuckFrame - resilient playback: video codec parameter-set and header evidence (avcC/hvcC bootstrap, VP8/VP9, MJPEG DHT, MP4 RAP/ctts, ProRes, TS Annex-B chains)
 //
 // Split out of the umbrella header by section; function bodies, constants and inline
 // attributes are unchanged. Callers keep including the umbrella; this file only guarantees

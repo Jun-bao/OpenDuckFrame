@@ -4,7 +4,7 @@ import Foundation
 /// parsing return value results to the window without blocking MainActor on file I/O.
 enum CaptionSubtitleFiles {
     static let maximumFileBytes = 32 * 1024 * 1024
-    private static let ioQueue = DispatchQueue(label: "dev.khuaplayer.captions.files", qos: .utility)
+    private static let ioQueue = DispatchQueue(label: "dev.openduckframe.captions.files", qos: .utility)
 
     private final class Cancellation: @unchecked Sendable {
         private let lock = NSLock()

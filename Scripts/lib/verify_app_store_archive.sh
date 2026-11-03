@@ -1,5 +1,5 @@
 #!/bin/bash
-# Read-only validation for a distribution-signed Khua App Store archive.
+# Read-only validation for a distribution-signed OpenDuckFrame App Store archive.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
@@ -224,7 +224,7 @@ verify_runtime_boundary() {
     SURequireSignedFeed
     SPUpdateUsageEnabled
     SPUpdateUsageInstallationV1
-    khua_usage
+    odf_usage
   )
   local grep_args=()
 
@@ -273,8 +273,8 @@ if [ "$RUNTIME_BOUNDARY_ONLY" -eq 1 ]; then
   exit 0
 fi
 
-APPEX="$APP/Contents/PlugIns/KhuaPlayerQuickLook.appex"
-FRAMEWORK="$APP/Contents/Frameworks/KhuaPlayerMediaCore.framework"
+APPEX="$APP/Contents/PlugIns/OpenDuckFrameQuickLook.appex"
+FRAMEWORK="$APP/Contents/Frameworks/OpenDuckFrameMediaCore.framework"
 LIBASS="$APP/Contents/Frameworks/libass.9.dylib"
 SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
 MAIN_INFO="$APP/Contents/Info.plist"
@@ -399,7 +399,7 @@ verify_info "Quick Look extension" "$APPEX_INFO" "$BUNDLE_ID.QuickLook"
 assert_equal "main bundle name" "$(plist_value "$MAIN_INFO" CFBundleName)" "OpenDuckFrame"
 assert_equal "main display name" "$(plist_value "$MAIN_INFO" CFBundleDisplayName)" "OpenDuckFrame"
 assert_equal "About product name" "$(plist_value "$MAIN_INFO" SPProductName)" "OpenDuckFrame"
-assert_equal "main executable name" "$(plist_value "$MAIN_INFO" CFBundleExecutable)" "Khua"
+assert_equal "main executable name" "$(plist_value "$MAIN_INFO" CFBundleExecutable)" "OpenDuckFrame"
 assert_equal "Quick Look display name" \
   "$(plist_value "$APPEX_INFO" CFBundleDisplayName)" "OpenDuckFrame Quick Look"
 [ -f "$FRAMEWORK_INFO" ] || die "media framework Info.plist is missing"

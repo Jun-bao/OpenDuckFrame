@@ -305,7 +305,7 @@ int main(int argc,const char **argv) { @autoreleasepool {
             if(e || outputs.count!=1) { poolError=e; break; }
             [held addObject:outputs[0]]; [heldHashes addObject:digest(outputs[0].buffer)];
         }}
-        BOOL exhausted=[poolError.domain isEqualToString:@"app.khuaplayer.rife"] && poolError.code==SPRifeBridgeErrorOutputPoolExhausted;
+        BOOL exhausted=[poolError.domain isEqualToString:@"app.openduckframe.rife"] && poolError.code==SPRifeBridgeErrorOutputPoolExhausted;
         BOOL stable=held.count>0; for(NSUInteger i=0;i<held.count;i++) stable=stable && heldHashes[i].length>0 && [heldHashes[i] isEqualToString:digest(held[i].buffer)];
         NSUInteger heldCount=held.count; [held removeAllObjects];
         NSError *recoveryError=nil; NSArray *recovered=infer(rifeBridge,YES,inputs[1],inputs[2],1,2,3,3,@[@0.5],&recoveryError);

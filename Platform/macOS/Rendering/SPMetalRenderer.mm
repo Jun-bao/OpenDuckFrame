@@ -580,7 +580,7 @@ static_assert(kSPDragFxNearLevel <= kSPDragFxFarLevel);
         dispatch_queue_attr_t submitAttr = dispatch_queue_attr_make_with_qos_class(
             DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
         _submitQueue = dispatch_queue_create(
-            [NSString stringWithFormat:@"dev.khuaplayer.render-submit.c%u", logId].UTF8String,
+            [NSString stringWithFormat:@"dev.openduckframe.render-submit.c%u", logId].UTF8String,
             submitAttr);
         _primaries = 0; _transfer = 0; _range = 0; _bits = 8; _hasHdr = 0;
         _planar = 0;

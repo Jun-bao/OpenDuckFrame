@@ -1,4 +1,4 @@
-// KhuaPlayer - resilient playback: audio frame structure and configuration evidence (FLAC, AC-3/E-AC-3, ADTS, MKV FLAC lacing, Matroska audio CodecPrivate)
+// OpenDuckFrame - resilient playback: audio frame structure and configuration evidence (FLAC, AC-3/E-AC-3, ADTS, MKV FLAC lacing, Matroska audio CodecPrivate)
 //
 // Split out of the umbrella header by section; function bodies, constants and inline
 // attributes are unchanged. Callers keep including the umbrella; this file only guarantees

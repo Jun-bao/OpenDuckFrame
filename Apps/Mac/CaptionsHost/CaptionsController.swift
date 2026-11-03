@@ -707,7 +707,7 @@ final class CaptionsController: NSObject {
     private static func embeddedSample(mediaURL: URL, stream: Int, timelineOriginUs: Int64) async throws -> String? {
         nonisolated(unsafe) let r = SPCaptionSubtitleReader(path: mediaURL.path, subtitleStreamIndex: Int32(stream))
         r.timelineOriginUs = timelineOriginUs
-        let q = DispatchQueue(label: "dev.khuaplayer.captions.sample", qos: .utility)
+        let q = DispatchQueue(label: "dev.openduckframe.captions.sample", qos: .utility)
         let text: String? = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { cont in
                 q.async {

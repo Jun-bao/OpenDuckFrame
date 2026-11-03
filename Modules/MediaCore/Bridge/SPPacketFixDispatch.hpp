@@ -1,4 +1,4 @@
-// KhuaPlayer - unified dispatch for packet-level fixes on the decode thread (input: codec lane + packet bytes; output: fix plans; pure, unit-testable)
+// OpenDuckFrame - unified dispatch for packet-level fixes on the decode thread (input: codec lane + packet bytes; output: fix plans; pure, unit-testable)
 //
 // The ProRes / MJPEG / VP8 / VP9 lanes used to each decide, make the packet writable, patch bytes, count and log inside
 // the decode loop. The decision and the bytes to change now live here; the decode thread applies plans in order, keeps

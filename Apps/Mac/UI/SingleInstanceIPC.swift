@@ -13,7 +13,7 @@ enum SingleInstanceIPC {
     private static let limit = 256 * 1024
 
     private static func path(_ pid: Int32) -> String {
-        "/private/tmp/khua-single-\(getuid())-\(pid).sock"
+        "/private/tmp/odf-single-\(getuid())-\(pid).sock"
     }
 
     private static func address(_ path: String) -> sockaddr_un? {
@@ -78,7 +78,7 @@ enum SingleInstanceIPC {
 
         private init(fd: Int32, path: String, handler: @escaping @MainActor @Sendable (Int32, [URL]) -> Bool) {
             self.fd = fd; socketPath = path; self.handler = handler
-            queue = DispatchQueue(label: "app.khuaplayer.single-instance-ipc")
+            queue = DispatchQueue(label: "app.openduckframe.single-instance-ipc")
             source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
             source.setEventHandler { [weak self] in self?.acceptOne() }
             source.setCancelHandler { Darwin.close(fd); unlink(path) }

@@ -3,7 +3,7 @@
 #include <atomic>
 
 static NSError *SPFileScaleError(NSInteger code, NSString *message) {
-    return [NSError errorWithDomain:@"Khua.FileLanczos" code:code userInfo:@{NSLocalizedDescriptionKey:message}];
+    return [NSError errorWithDomain:@"OpenDuckFrame.FileLanczos" code:code userInfo:@{NSLocalizedDescriptionKey:message}];
 }
 
 @implementation SPFileLanczosScaler {

@@ -1,4 +1,4 @@
-// KhuaPlayer - container recovery: ASF (packet geometry, payload counts, object size copies / fragment offsets) and RealMedia MDPR
+// OpenDuckFrame - container recovery: ASF (packet geometry, payload counts, object size copies / fragment offsets) and RealMedia MDPR
 //
 // Split out of the umbrella header by section; function bodies, constants and inline
 // attributes are unchanged. Callers keep including the umbrella; this file only guarantees

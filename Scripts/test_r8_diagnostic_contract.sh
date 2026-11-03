@@ -10,9 +10,9 @@ helpers=s[s.index('static BOOL SPR8Enabled'):s.index('static const double SPInte
 main=r'''
 int main() {
  @autoreleasepool {
-  const int budget=SPR8Option(@"--khua-r8-budget-mib",160,@[@160,@320,@480]);
-  const int admission=SPR8Option(@"--khua-r8-inflight",2,@[@1,@2,@3,@4]);
-  const int sessions=SPR8Option(@"--khua-r8-sessions",2,@[@1,@2,@3,@4]);
+  const int budget=SPR8Option(@"--odf-r8-budget-mib",160,@[@160,@320,@480]);
+  const int admission=SPR8Option(@"--odf-r8-inflight",2,@[@1,@2,@3,@4]);
+  const int sessions=SPR8Option(@"--odf-r8-sessions",2,@[@1,@2,@3,@4]);
   printf("%d %d %d %d\n",(int)SPR8Enabled(),budget,admission,sessions);
   const uint32_t seq=0x48a621; const bool mark[8]={1,1,0,1,0,0,1,1};
   for (OSType format : {kCVPixelFormatType_32BGRA,kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange}) {
@@ -67,9 +67,9 @@ pathlib.Path(sys.argv[2]).write_text('#import <Foundation/Foundation.h>\n#import
 PY
 xcrun clang++ -std=c++17 -fobjc-arc -fblocks "$OUT/r8-diagnostic-contract.mm" -framework Foundation -framework CoreVideo -o "$OUT/r8-diagnostic-contract"
 exe="$OUT/r8-diagnostic-contract"
-[ "$($exe --khua-r8-budget-mib 480 --khua-r8-inflight 4 --khua-r8-sessions 4)" = "0 160 2 2" ]
-base=(--khua-r8-quality-diagnostics --khua-pixel-diagnostics --khua-isolated-profile /tmp/r8-profile --khua-live-log /tmp/r8-log)
-[ "$($exe "${base[@]}" --khua-r8-budget-mib 320 --khua-r8-inflight 3 --khua-r8-sessions 4)" = "1 320 3 4" ]
-[ "$($exe "${base[@]}" --khua-r8-budget-mib 999 --khua-r8-inflight 20 --khua-r8-sessions 9)" = "1 160 2 2" ]
-[ "$($exe --khua-r8-quality-diagnostics --khua-pixel-diagnostics --khua-isolated-profile relative --khua-live-log /tmp/r8-log --khua-r8-budget-mib 480)" = "0 160 2 2" ]
+[ "$($exe --odf-r8-budget-mib 480 --odf-r8-inflight 4 --odf-r8-sessions 4)" = "0 160 2 2" ]
+base=(--odf-r8-quality-diagnostics --odf-pixel-diagnostics --odf-isolated-profile /tmp/r8-profile --odf-live-log /tmp/r8-log)
+[ "$($exe "${base[@]}" --odf-r8-budget-mib 320 --odf-r8-inflight 3 --odf-r8-sessions 4)" = "1 320 3 4" ]
+[ "$($exe "${base[@]}" --odf-r8-budget-mib 999 --odf-r8-inflight 20 --odf-r8-sessions 9)" = "1 160 2 2" ]
+[ "$($exe --odf-r8-quality-diagnostics --odf-pixel-diagnostics --odf-isolated-profile relative --odf-live-log /tmp/r8-log --odf-r8-budget-mib 480)" = "0 160 2 2" ]
 echo 'R8 option isolation/default/allowlist, C++ decoder and BGRA/NV12 motion counterexamples passed'

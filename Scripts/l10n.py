@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Maintain Khua's English-first String Catalog.
+"""Maintain OpenDuckFrame's English-first String Catalog.
 
 The authoritative locale list is AppLanguage.supported in
 Apps/Mac/UI/Localization.swift. The catalog, language menu, and release gate

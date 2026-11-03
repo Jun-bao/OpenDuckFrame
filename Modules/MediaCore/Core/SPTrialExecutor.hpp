@@ -1,4 +1,4 @@
-// KhuaPlayer - executor, budgets, outcome classes and source identity for private trial decodes (pure C++, unit-testable)
+// OpenDuckFrame - executor, budgets, outcome classes and source identity for private trial decodes (pure C++, unit-testable)
 //
 // Private trial decodes (FLAC configuration candidates, alternate audio tracks, H.264 PPS, AV1 sequence
 // header copies, MP4 ctts) used to open their own contexts and read until satisfied, with no interrupt

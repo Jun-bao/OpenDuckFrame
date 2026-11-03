@@ -8,7 +8,7 @@
 #import <atomic>
 
 static NSError *SPLLError(NSInteger code, NSString *text) {
-    return [NSError errorWithDomain:@"app.khuaplayer.lowlatency" code:code userInfo:@{NSLocalizedDescriptionKey: text}];
+    return [NSError errorWithDomain:@"app.openduckframe.lowlatency" code:code userInfo:@{NSLocalizedDescriptionKey: text}];
 }
 
 static BOOL SPLLSame(int64_t n, int64_t d, int64_t tn, int64_t td) {
@@ -250,7 +250,7 @@ static double SPLLCenter(CVPixelBufferRef buffer) {
 - (instancetype)init {
     if (!(self = [super init])) return nil;
     _epoch.store(0);
-    _queue = dispatch_queue_create("app.khuaplayer.lowlatency",
+    _queue = dispatch_queue_create("app.openduckframe.lowlatency",
                                    dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
     dispatch_queue_set_specific(_queue, (__bridge const void *)self, (__bridge void *)self, NULL);
     _modelID = @"vt.llfi.temporal.1";
@@ -569,9 +569,9 @@ static double SPLLCenter(CVPixelBufferRef buffer) {
 
 + (NSDictionary<NSString *, id> *)measureFixture {
     NSDictionary *env = NSProcessInfo.processInfo.environment;
-    NSString *pathA = env[@"KHUA_PHASE_FIXTURE_A"];
-    NSString *pathB = env[@"KHUA_PHASE_FIXTURE_B"];
-    NSString *pathMid = env[@"KHUA_PHASE_FIXTURE_MID"];
+    NSString *pathA = env[@"ODF_PHASE_FIXTURE_A"];
+    NSString *pathB = env[@"ODF_PHASE_FIXTURE_B"];
+    NSString *pathMid = env[@"ODF_PHASE_FIXTURE_MID"];
     if (!pathA.length || !pathB.length || !pathMid.length) return @{@"provided": @NO};
     CVPixelBufferRef a = SPLLReadFixture(pathA), b = SPLLReadFixture(pathB), gt = SPLLReadFixture(pathMid);
     if (!a || !b || !gt || CVPixelBufferGetWidth(a) != CVPixelBufferGetWidth(b) ||

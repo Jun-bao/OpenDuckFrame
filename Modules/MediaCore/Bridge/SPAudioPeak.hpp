@@ -1,4 +1,4 @@
-// KhuaPlayer — exact, allocation-free peak predicate for the audio RT callback.
+// OpenDuckFrame — exact, allocation-free peak predicate for the audio RT callback.
 #pragma once
 
 #include <cmath>

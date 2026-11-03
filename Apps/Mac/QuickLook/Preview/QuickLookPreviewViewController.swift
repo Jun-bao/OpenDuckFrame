@@ -4,7 +4,7 @@ import os
 
 final class QuickLookPreviewViewController: NSViewController, @preconcurrency QLPreviewingController {
     private static let log = Logger(
-        subsystem: "dev.khuaplayer.quicklook.preview", category: "lifecycle")
+        subsystem: "dev.openduckframe.quicklook.preview", category: "lifecycle")
 
     private let playerView = PreviewPlayerView()
     private let controls = PreviewControlsView()

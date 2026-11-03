@@ -1,4 +1,4 @@
-// KhuaPlayer - container picture orientation (display matrix) as one of the
+// OpenDuckFrame - container picture orientation (display matrix) as one of the
 // eight axis-aligned rotate/mirror transforms. Pure C++, no FFmpeg dependency.
 //
 // Convention, shared with the videoVertex geometry in Shaders/Video.metal:

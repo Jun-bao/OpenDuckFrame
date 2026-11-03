@@ -15,7 +15,7 @@ it after `xcodebuild archive` completes.
 The local `Debug`/`Release` lane is intentionally unsandboxed and uses
 `Scripts/bundle_libs.sh` for ad-hoc packaging only. The `AppStore`
 lane never invokes that bundler: Xcode embeds and signs every component and
-applies `Apps/Mac/KhuaPlayer.entitlements` during the archive build.
+applies `Apps/Mac/OpenDuckFrame.entitlements` during the archive build.
 
 CI also runs `Scripts/smoke_app_store_unsigned.sh`. It archives the exact
 `AppStore` configuration, including the `SP_APP_STORE` compilation condition,
@@ -65,7 +65,7 @@ Keep the main app and Quick Look extension aligned; the existing validators
 check their packaged values. Identify an installed app using its welcome/About
 version and build, not the Finder modification date of the outer app directory.
 
-Record the Khua source commit, version, build, validation results, artifact
+Record the OpenDuckFrame source commit, version, build, validation results, artifact
 checksums, and distribution channel in the release record. This is a maintainer
 workflow, not automatic numbering: the local build script does not allocate
 versions or build numbers, and the app does not currently embed its source
@@ -85,14 +85,12 @@ automation and stress controls are not part of the shipping source.
 `Debug` and `Release` builds include Sparkle. Ordinary local builds remain
 inactive unless both settings below are supplied. The Developer ID archive
 script defaults to `Distribution/sparkle.json`. Its feed URL and public key are
-intentionally empty: the values inherited from Khua Player pointed at the
-upstream `khua.app` feed and signing key, which would let upstream releases
-replace OpenDuckFrame. Fill both only with an OpenDuckFrame feed and a key pair
-we control.
+intentionally empty until the official `openduckframe.app` update feed and its
+EdDSA key pair exist; fill both only with values we control.
 
 ```sh
-KHUA_SPARKLE_FEED_URL=https://example.invalid/updates/appcast.xml \
-KHUA_SPARKLE_PUBLIC_ED_KEY=BASE64_PUBLIC_KEY \
+ODF_SPARKLE_FEED_URL=https://example.invalid/updates/appcast.xml \
+ODF_SPARKLE_PUBLIC_ED_KEY=BASE64_PUBLIC_KEY \
   Apps/Mac/Scripts/build.sh Release
 ```
 
@@ -103,20 +101,9 @@ checks from the App menu. Generate and protect the EdDSA key using the locked
 Sparkle tools in `ThirdParty/sparkle-min/bin`, and keep the private key outside
 the repository.
 
-Starting with 0.6.1 (11), official direct-download builds attach a random local
-installation identifier to existing Sparkle appcast requests for deduplicated
-update-check statistics. There is no new setting, prompt, SDK, or request.
-`SPUpdateUsageEnabled` is distribution metadata injected by `bundle_libs.sh`
-only for the canonical official feed, not a user preference. The same step
-selects `Distribution/PrivacyInfo-Direct.xcprivacy` before signing; unconfigured,
-third-party-feed, and Store builds retain the neutral manifest. See
-[privacy](PRIVACY.md) and [statistics operations](Website/UPDATE_USAGE.md).
-
-See [Cloudflare publishing](Website/DEPLOYMENT.md) for website deployment,
-immutable R2 downloads, release history, signed appcasts, and the final channel
-promotion. The publication tools derive version/build/OS metadata from the
-verified app; the website never hardcodes the latest version. Older unconfigured
-apps require one manual installation of 0.6.0 or later.
+OpenDuckFrame builds never attach installation identifiers or other statistics
+to update checks. `bundle_libs.sh` always ships the neutral privacy manifest.
+The website in `Website/` is a static page with no build step.
 
 The ordinary local lane remains ad-hoc signed and is not a publishable updater
 artifact. Developer ID releases use the separate workflow below, which signs
@@ -133,7 +120,7 @@ app-specific password on a command line or commit an App Store Connect private
 key. This interactive example prompts securely for the password:
 
 ```sh
-xcrun notarytool store-credentials khua-notary \
+xcrun notarytool store-credentials odf-notary \
   --apple-id developer@example.com \
   --team-id ABCDE12345
 ```
@@ -148,10 +135,10 @@ verifies a ZIP round trip before it can succeed:
 Scripts/archive_developer_id.sh \
   --identity "Developer ID Application: Developer Name (ABCDE12345)" \
   --team-id ABCDE12345 \
-  --bundle-id com.example.khuaplayer \
+  --bundle-id com.example.openduckframe \
   --marketing-version 1.0.0 \
   --build-number 1 \
-  --output-dir .build/DeveloperID/Khua-1.0.0-1
+  --output-dir .build/DeveloperID/OpenDuckFrame-1.0.0-1
 ```
 
 First notarize the signed app and staple its ticket. This uses the prepared
@@ -159,9 +146,9 @@ ZIP as an upload container and also produces an optional `OpenDuckFrame.zip` dow
 
 ```sh
 Scripts/notarize_developer_id.sh \
-  --release-dir .build/DeveloperID/Khua-1.0.0-1 \
+  --release-dir .build/DeveloperID/OpenDuckFrame-1.0.0-1 \
   --team-id ABCDE12345 \
-  --keychain-profile khua-notary
+  --keychain-profile odf-notary
 ```
 
 The app needs its own stapled ticket to pass the standalone pre-distribution
@@ -169,7 +156,7 @@ checks, even when a notarized outer DMG passes Gatekeeper. On macOS versions
 that provide the tool, also run `syspolicy_check distribution` on this app.
 Do not re-sign or change the app after its ticket has been stapled.
 
-Create the primary user-facing layout. It contains only `Khua.app` and a real
+Create the primary user-facing layout. It contains only `OpenDuckFrame.app` and a real
 symbolic link to `/Applications`, then becomes a read-only UDZO disk image
 signed with the same Developer ID identity. `OpenDuckFrame-notarization.dmg` is an
 internal immutable submission artifact and must not be published. Packaging
@@ -177,7 +164,7 @@ and mounted-image verification both require a valid ticket on the inner app:
 
 ```sh
 Scripts/create_developer_id_dmg.sh \
-  --release-dir .build/DeveloperID/Khua-1.0.0-1 \
+  --release-dir .build/DeveloperID/OpenDuckFrame-1.0.0-1 \
   --identity "Developer ID Application: Developer Name (ABCDE12345)" \
   --team-id ABCDE12345
 ```
@@ -187,9 +174,9 @@ ticket to a byte-for-byte copy, and publish the versioned final DMG:
 
 ```sh
 Scripts/notarize_developer_id_dmg.sh \
-  --release-dir .build/DeveloperID/Khua-1.0.0-1 \
+  --release-dir .build/DeveloperID/OpenDuckFrame-1.0.0-1 \
   --team-id ABCDE12345 \
-  --keychain-profile khua-notary
+  --keychain-profile odf-notary
 ```
 
 The final stage requires `hdiutil`, `codesign`, `stapler`, and Gatekeeper to
@@ -208,7 +195,7 @@ the corresponding update archive to a signed Sparkle appcast.
 
 Release apps, DMGs, ZIPs, dSYMs, and notarization records remain under
 `.build/` and are intentionally ignored by Git. Publish the final versioned
-`Khua-<version>.dmg` through a release host such as GitHub Releases or object
+`OpenDuckFrame-<version>.dmg` through a release host such as GitHub Releases or object
 storage; do not commit binary artifacts to the source repository.
 
 Always create Store archives with `Scripts/archive_app_store.sh`. A project
@@ -242,10 +229,10 @@ Choose a new archive path. The script refuses to overwrite an existing archive.
 ```sh
 Scripts/archive_app_store.sh \
   --team-id ABCDE12345 \
-  --bundle-id com.example.khuaplayer \
+  --bundle-id com.example.openduckframe \
   --marketing-version 1.0.0 \
   --build-number 1 \
-  --archive-path .build/AppStore/Khua-1.0.0-1.xcarchive \
+  --archive-path .build/AppStore/OpenDuckFrame-1.0.0-1.xcarchive \
   --allow-provisioning-updates
 ```
 
@@ -256,7 +243,7 @@ The archive script runs these stages in order:
 
 1. Builds the pinned FFmpeg/dav1d dependencies.
 2. Builds the pinned subtitle dependencies.
-3. Generates `Apps/Mac/KhuaPlayer.xcodeproj` with XcodeGen.
+3. Generates `Apps/Mac/OpenDuckFrame.xcodeproj` with XcodeGen.
 4. Runs an `AppStore` archive for `generic/platform=macOS`, injecting the team,
    final bundle ID, marketing version, and build number on the command line.
 5. Performs read-only archive validation.
@@ -290,11 +277,11 @@ The export path must not already exist.
 
 ```sh
 Scripts/export_app_store.sh \
-  --archive-path .build/AppStore/Khua-1.0.0-1.xcarchive \
-  --export-path .build/AppStore/Khua-1.0.0-1-export \
+  --archive-path .build/AppStore/OpenDuckFrame-1.0.0-1.xcarchive \
+  --export-path .build/AppStore/OpenDuckFrame-1.0.0-1-export \
   --destination export \
   --team-id ABCDE12345 \
-  --bundle-id com.example.khuaplayer \
+  --bundle-id com.example.openduckframe \
   --marketing-version 1.0.0 \
   --build-number 1 \
   --allow-provisioning-updates
@@ -310,11 +297,11 @@ For an interactive machine signed in to Xcode:
 
 ```sh
 Scripts/export_app_store.sh \
-  --archive-path .build/AppStore/Khua-1.0.0-1.xcarchive \
-  --export-path .build/AppStore/Khua-1.0.0-1-upload \
+  --archive-path .build/AppStore/OpenDuckFrame-1.0.0-1.xcarchive \
+  --export-path .build/AppStore/OpenDuckFrame-1.0.0-1-upload \
   --destination upload \
   --team-id ABCDE12345 \
-  --bundle-id com.example.khuaplayer \
+  --bundle-id com.example.openduckframe \
   --marketing-version 1.0.0 \
   --build-number 1 \
   --allow-provisioning-updates
@@ -324,11 +311,11 @@ For CI, pass all three App Store Connect API credentials together:
 
 ```sh
 Scripts/export_app_store.sh \
-  --archive-path .build/AppStore/Khua-1.0.0-1.xcarchive \
-  --export-path .build/AppStore/Khua-1.0.0-1-upload \
+  --archive-path .build/AppStore/OpenDuckFrame-1.0.0-1.xcarchive \
+  --export-path .build/AppStore/OpenDuckFrame-1.0.0-1-upload \
   --destination upload \
   --team-id ABCDE12345 \
-  --bundle-id com.example.khuaplayer \
+  --bundle-id com.example.openduckframe \
   --marketing-version 1.0.0 \
   --build-number 1 \
   --api-key-path /secure/path/AuthKey_KEYID.p8 \

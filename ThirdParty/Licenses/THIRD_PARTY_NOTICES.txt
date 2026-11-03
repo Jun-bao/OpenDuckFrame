@@ -1,13 +1,13 @@
-Khua third-party notices
+OpenDuckFrame third-party notices
 ===============================
 
-Khua builds the third-party software below from the source archives,
+OpenDuckFrame builds the third-party software below from the source archives,
 versions, and SHA-256 values recorded in ThirdParty/deps.lock.json. Every other
 file in this directory is an unmodified copy of the named file from that locked
 upstream archive (path relative to the archive's top-level directory).
 
 FFmpeg 8.1.2 -- LGPL-2.1-or-later (configured without GPL, version3, or
-nonfree components); statically linked into KhuaPlayerMediaCore
+nonfree components); statically linked into OpenDuckFrameMediaCore
     FFmpeg/LICENSE.md             LICENSE.md
     FFmpeg/COPYING.LGPLv2.1    COPYING.LGPLv2.1
     FFmpeg/COPYING.LGPLv3          COPYING.LGPLv3 (additional upstream text)
@@ -15,12 +15,12 @@ nonfree components); statically linked into KhuaPlayerMediaCore
     ThirdParty/deps.lock.json (Scripts/patches/).
 
 dav1d 1.5.1 -- BSD-2-Clause; Alliance for Open Media Patent License 1.0;
-statically linked into KhuaPlayerMediaCore
+statically linked into OpenDuckFrameMediaCore
     dav1d/COPYING              COPYING
     dav1d/PATENTS              doc/PATENTS
 
 Speex 1.2.1 -- BSD-3-Clause (Xiph.Org); statically linked into
-KhuaPlayerMediaCore
+OpenDuckFrameMediaCore
     Speex/COPYING              COPYING
 
 libass 0.17.5 -- ISC; shipped as Frameworks/libass.9.dylib
@@ -75,4 +75,4 @@ Corresponding source
 
 The exact upstream source archives are identified by URL and SHA-256 in
 ThirdParty/deps.lock.json. The complete build recipes (Scripts/build_*.sh) and
-the downstream FFmpeg patches are part of the Khua source repository.
+the downstream FFmpeg patches are part of the OpenDuckFrame source repository.

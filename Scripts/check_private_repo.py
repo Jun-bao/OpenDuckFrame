@@ -71,14 +71,14 @@ def main():
     for key, entry in catalog['strings'].items():
         for language, record in entry.get('localizations', {}).items():
             value = record.get('stringUnit', {}).get('value', '')
-            if re.search(r'(?i)\bkhua\b(?!\.)', value):
+            if re.search(r'(?i)\bk[h]ua\b(?!\.)', value):
                 fail(f'old user-visible product name in {key} ({language})')
     plist = plistlib.loads((ROOT / 'Apps/Mac/Info.plist').read_bytes())
-    for key, value in {'CFBundleName': 'OpenDuckFrame', 'CFBundleDisplayName': '$(KHUA_DISPLAY_NAME)', 'SPProductName': 'OpenDuckFrame'}.items():
+    for key, value in {'CFBundleName': 'OpenDuckFrame', 'CFBundleDisplayName': '$(ODF_DISPLAY_NAME)', 'SPProductName': 'OpenDuckFrame'}.items():
         if plist.get(key) != value:
             fail(f'product Info.plist {key} does not match the current brand')
     project = (ROOT / 'Apps/Mac/project.yml').read_text()
-    for line in ('KHUA_DISPLAY_NAME: OpenDuckFrame', 'CFBundleName: OpenDuckFrame', 'CFBundleDisplayName: $(KHUA_DISPLAY_NAME)', 'SPProductName: OpenDuckFrame', 'PRODUCT_NAME: OpenDuckFrame', 'EXECUTABLE_NAME: Khua'):
+    for line in ('ODF_DISPLAY_NAME: OpenDuckFrame', 'CFBundleName: OpenDuckFrame', 'CFBundleDisplayName: $(ODF_DISPLAY_NAME)', 'SPProductName: OpenDuckFrame', 'PRODUCT_NAME: OpenDuckFrame', 'EXECUTABLE_NAME: OpenDuckFrame'):
         if not re.search(r'^\s*' + re.escape(line) + r'\s*$', project, re.M):
             fail(f'project metadata missing {line}')
     print(f'Private product source and boundary checks passed ({len(files)} runtime files).')

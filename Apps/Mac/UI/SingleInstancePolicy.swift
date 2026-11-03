@@ -4,7 +4,7 @@ import Foundation
 // finish launching while it is still handing off to the actual primary.
 enum SingleInstancePolicy {
     static func matchesProductMetadata(_ product: String?, _ executable: String?) -> Bool {
-        (product == "OpenDuckFrame" || product == "小川帧流 · ChuanFlow") && executable == "Khua"
+        product == "OpenDuckFrame" && executable == "OpenDuckFrame"
     }
 
     struct Candidate: Equatable {
@@ -29,9 +29,9 @@ enum SingleInstancePolicy {
     }
 
     static func isContract(_ arguments: [String]) -> Bool {
-        let flags: Set<String> = ["--khua-enhancement-selftest", "--khua-session-contract", "--khua-engine-probe",
-            "--khua-sr-pipeline-contract", "--khua-video-sr-pipeline-contract", "--khua-anime4k-pipeline-contract",
-            "--khua-realcugan-pipeline-contract"]
+        let flags: Set<String> = ["--odf-enhancement-selftest", "--odf-session-contract", "--odf-engine-probe",
+            "--odf-sr-pipeline-contract", "--odf-video-sr-pipeline-contract", "--odf-anime4k-pipeline-contract",
+            "--odf-realcugan-pipeline-contract"]
         return arguments.contains { flags.contains($0) }
     }
 }

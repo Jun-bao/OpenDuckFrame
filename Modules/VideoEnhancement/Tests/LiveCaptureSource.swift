@@ -492,7 +492,7 @@ final class WebSource {
         if let index = args.firstIndex(of: "--fps"), index + 1 < args.count, let fps = Int(args[index + 1]), [60, 120].contains(fps) { view.targetFPS = fps }
         let web = args.contains("--web") ? WebSource(frame: frame) : nil
         let window = NSWindow(contentRect: frame, styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-        window.title = web == nil ? "Khua Controlled 1440p Source" : "Khua WebKit 1440p Source"
+        window.title = web == nil ? "OpenDuckFrame Controlled 1440p Source" : "OpenDuckFrame WebKit 1440p Source"
         window.contentView = web?.view ?? view
         window.acceptsMouseMovedEvents = view.logInput
         window.center(); window.makeKeyAndOrderFront(nil)

@@ -429,7 +429,7 @@ final class SPDirectoryMediaIndex {
         -> DispatchQueue {
         if let existing = listingLanes[laneKey] { return existing }
         let queue = DispatchQueue(
-            label: "dev.khuaplayer.directory-index.lane.\(nextListingLaneID)",
+            label: "dev.openduckframe.directory-index.lane.\(nextListingLaneID)",
             qos: .utility)
         nextListingLaneID += 1
         listingLanes[laneKey] = queue

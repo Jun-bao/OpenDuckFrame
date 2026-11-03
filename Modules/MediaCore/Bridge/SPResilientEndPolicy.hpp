@@ -1,4 +1,4 @@
-// KhuaPlayer - pure decision rules for end-of-content and the audio decode failure signal
+// OpenDuckFrame - pure decision rules for end-of-content and the audio decode failure signal
 //
 // Input to verdict only: no state publication, audio device, clock or DisplayLink work. The three call sites keep
 // their side effects on their own threads. The rules are covered by the end-policy unit tests.

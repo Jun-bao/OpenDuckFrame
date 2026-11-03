@@ -5,7 +5,7 @@
 #include <atomic>
 #include <initializer_list>
 
-static NSError *SPFileRifeError(NSInteger code,NSString *message){return [NSError errorWithDomain:@"Khua.FileRife" code:code userInfo:@{NSLocalizedDescriptionKey:message}];}
+static NSError *SPFileRifeError(NSInteger code,NSString *message){return [NSError errorWithDomain:@"OpenDuckFrame.FileRife" code:code userInfo:@{NSLocalizedDescriptionKey:message}];}
 static CVPixelBufferRef SPFileRifeCreate(int w,int h,OSType format){
     NSDictionary *attrs=@{(id)kCVPixelBufferIOSurfacePropertiesKey:@{},(id)kCVPixelBufferMetalCompatibilityKey:@YES};
     CVPixelBufferRef result=NULL;return CVPixelBufferCreate(NULL,w,h,format,(__bridge CFDictionaryRef)attrs,&result)==kCVReturnSuccess?result:NULL;
@@ -23,7 +23,7 @@ static CVPixelBufferRef SPFileRifeCreate(int w,int h,OSType format){
 }
 - (instancetype)initWithModelID:(NSString *)modelID quality:(NSString *)quality {return [self initWithModelID:modelID quality:quality resourceBundle:NSBundle.mainBundle];}
 - (instancetype)initWithModelID:(NSString *)modelID quality:(NSString *)quality resourceBundle:(NSBundle *)bundle {
-    if(!(self=[super init]))return nil;_resourceBundle=bundle;_modelID=[modelID copy];_quality=[quality copy];_queue=dispatch_queue_create("app.khuaplayer.file-rife",DISPATCH_QUEUE_SERIAL);_busy.store(false);return self;
+    if(!(self=[super init]))return nil;_resourceBundle=bundle;_modelID=[modelID copy];_quality=[quality copy];_queue=dispatch_queue_create("app.openduckframe.file-rife",DISPATCH_QUEUE_SERIAL);_busy.store(false);return self;
 }
 - (void)dealloc {[_bridge invalidate];if(_toRGB)CFRelease(_toRGB);if(_toNV12)CFRelease(_toNV12);}
 - (void)invalidate {@synchronized(self){_epoch++;_ready=NO;}[_bridge invalidate];}

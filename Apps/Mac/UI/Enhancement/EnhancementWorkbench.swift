@@ -5,7 +5,7 @@ import Darwin
 @preconcurrency import ScreenCaptureKit
 
 extension Notification.Name {
-    static let khuaMotionPlusChanged = Notification.Name("khua.motionPlusChanged")
+    static let odfMotionPlusChanged = Notification.Name("openduckframe.motionPlusChanged")
 }
 
 /// One place for the workbench type scale, spacing and surfaces.
@@ -19,7 +19,7 @@ private enum WorkbenchStyle {
 }
 
 @MainActor enum EnhancementText {
-    static let languageKey = "KhuaWorkbenchLanguage"
+    static let languageKey = "OpenDuckFrameWorkbenchLanguage"
     static var pairs: [String: (en: String, zh: String)] = [:]
     static var chinese: Bool {
         language(in: .standard)
@@ -182,7 +182,7 @@ struct EnhancementCountdown {
 }
 
 enum FPSPreference {
-    private static let key = "KhuaShowFPS"
+    private static let key = "OpenDuckFrameShowFPS"
     static func enabled(in defaults: UserDefaults) -> Bool { defaults.bool(forKey: key) }
     static func set(_ value: Bool, in defaults: UserDefaults) { defaults.set(value, forKey: key) }
 }
@@ -606,7 +606,7 @@ enum EnhancementProfileStore {
         if let testDirectory { return testDirectory.appendingPathComponent("EnhancementProfile.json") }
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        return base.appendingPathComponent("Khua/EnhancementProfile.json")
+        return base.appendingPathComponent("OpenDuckFrame/EnhancementProfile.json")
     }
 
     static func decode(_ data: Data, fallbackName: String) -> EnhancementProfile? {
@@ -781,7 +781,7 @@ enum EnhancementProfileStore {
                 try original.write(to: newURL, options: .atomic)
                 try moveNamedFile(newURL, to: oldURL)
             } catch let rollback {
-                throw NSError(domain: "Khua.ConfigRename", code: 1, userInfo: [NSLocalizedDescriptionKey: "重命名未完成，回退也失败；请检查 \(newURL.path)：\(rollback.localizedDescription)"])
+                throw NSError(domain: "OpenDuckFrame.ConfigRename", code: 1, userInfo: [NSLocalizedDescriptionKey: "重命名未完成，回退也失败；请检查 \(newURL.path)：\(rollback.localizedDescription)"])
             }
             throw error
         }
@@ -871,7 +871,7 @@ private enum WorkbenchDimensionPolicy {
 
 enum P0DiagnosticPolicy {
     static func controlsEnabled(args: [String], isolated: Bool) -> Bool {
-        isolated && args.contains("--khua-p0-controls")
+        isolated && args.contains("--odf-p0-controls")
     }
     static func flag(_ name: String, args: [String], isolated: Bool, overrideValue: Bool?) -> Bool {
         guard isolated else { return false }
@@ -1031,7 +1031,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private var geometryObservedBounds: CGRect = .null
     private var geometryBoundsChangedHost: UInt64 = 0
     private func r7Flag(_ flag: String) -> Bool {
-        let overrideValue = flag == "--khua-r7-opaque" ? p0OpaqueOverride : (flag == "--khua-r7-activate" ? p0ActivateOverride : nil)
+        let overrideValue = flag == "--odf-r7-opaque" ? p0OpaqueOverride : (flag == "--odf-r7-activate" ? p0ActivateOverride : nil)
         return P0DiagnosticPolicy.flag(flag, args: CommandLine.arguments, isolated: r7Diagnostics, overrideValue: overrideValue)
     }
     private let shareStack = NSStackView()
@@ -2387,7 +2387,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                         try original.write(to: newURL, options: .atomic)
                         try EnhancementProfileStore.moveNamedFile(newURL, to: oldURL)
                     } catch let rollback {
-                        throw NSError(domain: "Khua.ConfigRename", code: 2, userInfo: [NSLocalizedDescriptionKey: "重命名未完成，回退也失败；请检查 \(newURL.path)：\(rollback.localizedDescription)"])
+                        throw NSError(domain: "OpenDuckFrame.ConfigRename", code: 2, userInfo: [NSLocalizedDescriptionKey: "重命名未完成，回退也失败；请检查 \(newURL.path)：\(rollback.localizedDescription)"])
                     }
                     throw error
                 }
@@ -2926,7 +2926,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         capture.onFrame = { buffer, ptsNum, ptsDen, captureHost, readyHost, generation in
             sink.processor.push(buffer, ptsNum: ptsNum, ptsDen: ptsDen, host: captureHost, readyHost: readyHost, generation: generation)
         }
-        NotificationCenter.default.addObserver(self, selector: #selector(motionChanged), name: .khuaMotionPlusChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(motionChanged), name: .odfMotionPlusChanged, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(displayParametersChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(foregroundApplicationChanged), name: NSWorkspace.didActivateApplicationNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(pendingTextChanged(_:)), name: NSControl.textDidChangeNotification, object: nil)
@@ -3137,10 +3137,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             "monotonicSeconds": ProcessInfo.processInfo.systemUptime,
             "machAbsolute": mach_absolute_time(),
             "r8ProcessID": ProcessInfo.processInfo.processIdentifier,
-            "r7Passthrough": r7Flag("--khua-r7-passthrough"),
-            "r7Opaque": r7Flag("--khua-r7-opaque"),
-            "r7Activate": r7Flag("--khua-r7-activate"),
-            "r7FullscreenGeometry": r7Flag("--khua-r7-fullscreen-geometry"),
+            "r7Passthrough": r7Flag("--odf-r7-passthrough"),
+            "r7Opaque": r7Flag("--odf-r7-opaque"),
+            "r7Activate": r7Flag("--odf-r7-activate"),
+            "r7FullscreenGeometry": r7Flag("--odf-r7-fullscreen-geometry"),
             "p0ControlsEnabled": p0ControlsEnabled,
             "p0RequestedCaptureCap": capture.captureCapFPS,
             "realWindowCapture": capture.running,
@@ -3169,7 +3169,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             "targetOnscreen": targetOnscreen,
             "targetFrontmostMatch": targetDecisionReason == "matched",
             "outputTargetReady": targetFrontmost,
-            "diagnosticOwnActivated": viewerActive && r7Flag("--khua-r7-activate"),
+            "diagnosticOwnActivated": viewerActive && r7Flag("--odf-r7-activate"),
             "targetOverlayFrame": [targetFrame.origin.x, targetFrame.origin.y, targetFrame.width, targetFrame.height],
             "targetContentRectVerified": targetContentRectVerified,
             "outputPanelVisible": outputWindow?.isVisible ?? false,
@@ -3188,7 +3188,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             "inputPostPermission": isInteractiveMode(profile.windowOutputMode) ? LiveInputRouter.Permission.preflight().post : false,
             "inputAccessibilityTrusted": isInteractiveMode(profile.windowOutputMode) ? LiveInputRouter.Permission.preflight().accessibility : false,
             "effectiveMode": (outputWindow?.isVisible != true) ? "hidden" :
-                (r7Flag("--khua-r7-fullscreen-geometry") && activeSourceKind == "window" ? "diagnostic_fullscreen_input_blocked" :
+                (r7Flag("--odf-r7-fullscreen-geometry") && activeSourceKind == "window" ? "diagnostic_fullscreen_input_blocked" :
                  (outputFollowsWindow ? "source_aligned_interactive" : (isInteractiveMode(applied.windowOutputMode) ?
                     (inputRouter?.ready == true ? "fullscreen_interaction_\(applied.windowOutputMode)" : "fullscreen_interaction_preparing") : "fullscreen_viewer_input_blocked"))),
             "effectiveViewMode": profile.viewMode,
@@ -4350,7 +4350,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private func interactionDisplays() -> [CGRect] { interactionDisplayMappings().map(\.quartz) }
 
     private func investigateSelectedAX(id: CGWindowID, owner: pid_t, source: CGRect, targetBounds: CGRect) {
-        guard r7Diagnostics, CommandLine.arguments.contains("--khua-p1-ax-diagnostics"), AXIsProcessTrusted(),
+        guard r7Diagnostics, CommandLine.arguments.contains("--odf-p1-ax-diagnostics"), AXIsProcessTrusted(),
               outputWindow?.isVisible != true, !source.isEmpty, !targetBounds.isEmpty,
               !interactionAXBusy, ProcessInfo.processInfo.systemUptime - interactionAXLastRequest >= 2 else { return }
         let generation = capture.currentGeneration, config = processor.resolvedPlan.configVersion
@@ -4516,8 +4516,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private func refreshP0ControlTitles() {
         guard p0ControlsEnabled else { return }
-        let opaque = r7Flag("--khua-r7-opaque") ? EnhancementText.t("Overlay: opaque", "遮罩：不透明") : EnhancementText.t("Overlay: clear", "遮罩：透明")
-        let focus = r7Flag("--khua-r7-activate") ? EnhancementText.t("Focus: output", "焦点：输出") : EnhancementText.t("Focus: source", "焦点：来源")
+        let opaque = r7Flag("--odf-r7-opaque") ? EnhancementText.t("Overlay: opaque", "遮罩：不透明") : EnhancementText.t("Overlay: clear", "遮罩：透明")
+        let focus = r7Flag("--odf-r7-activate") ? EnhancementText.t("Focus: output", "焦点：输出") : EnhancementText.t("Focus: source", "焦点：来源")
         let cap = capture.captureCapFPS == 60 ? "60" : (capture.captureCapFPS == 30 ? "30" : "Auto")
         let captureTitle = EnhancementText.t("Capture: \(cap)", "采集：\(cap)")
         for item in [p0OpaqueButton, p0MainOpaqueButton] { item?.title = opaque }
@@ -4538,7 +4538,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     @objc private func toggleP0Opaque() {
         guard p0ControlsEnabled else { return }
-        p0OpaqueOverride = !r7Flag("--khua-r7-opaque")
+        p0OpaqueOverride = !r7Flag("--odf-r7-opaque")
         refreshP0ControlTitles()
         updateTargetPanels()
         recordPlanEvent("p0_opaque_changed", extra: ["p0ControlSurface": p0MainActionInProgress ? "main" : "overlay"])
@@ -4546,7 +4546,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     @objc private func toggleP0Activation() {
         guard p0ControlsEnabled else { return }
-        let enable = !r7Flag("--khua-r7-activate")
+        let enable = !r7Flag("--odf-r7-activate")
         p0ActivateOverride = enable
         if !enable && viewerActive { exitFullscreenViewer() }
         refreshP0ControlTitles()
@@ -4761,11 +4761,11 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             outputPreview.refreshVisibilitySnapshot()
             return
         }
-        let planActive = processor.resolvedPlan.committed && (processor.resolvedPlan.interpolationActive || processor.resolvedPlan.scaleActive || r7Flag("--khua-r7-passthrough") || (profile.sourceKind == "window" && applied.windowOutputMode != "follow"))
+        let planActive = processor.resolvedPlan.committed && (processor.resolvedPlan.interpolationActive || processor.resolvedPlan.scaleActive || r7Flag("--odf-r7-passthrough") || (profile.sourceKind == "window" && applied.windowOutputMode != "follow"))
         let windowTarget: Bool
         if case .window = target { windowTarget = true } else { windowTarget = false }
         // Fullscreen geometry for a window is a non-interactive diagnostic only.
-        let diagnosticFullscreen = windowTarget && r7Flag("--khua-r7-fullscreen-geometry")
+        let diagnosticFullscreen = windowTarget && r7Flag("--odf-r7-fullscreen-geometry")
         let requestedInteractive = windowTarget && isInteractiveMode(applied.windowOutputMode)
         let permission = requestedInteractive ? LiveInputRouter.Permission.preflight() : nil
         let interactionAvailable = requestedInteractive && interactionArmed && permission?.permits(relative: applied.windowOutputMode == "relative") == true && profile.viewMode != "compare"
@@ -4884,7 +4884,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             if case .window = target { followsWindow = !fullscreen }
             else { followsWindow = false }
             outputFollowsWindow = followsWindow
-            let opaque = interactionAvailable ? false : (windowTarget ? r7Flag("--khua-r7-opaque") : true)
+            let opaque = interactionAvailable ? false : (windowTarget ? r7Flag("--odf-r7-opaque") : true)
             panel.isOpaque = opaque
             panel.backgroundColor = opaque ? .black : .clear
             outputPreview.layer?.isOpaque = opaque
@@ -4893,7 +4893,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             // Absorb pointer input instead of misdirecting it underneath; the
             // aligned follow-window mode retains normal click-through.
             panel.ignoresMouseEvents = !fullscreen || (interactionAvailable && inputRouter?.ready == true)
-            let diagnosticActivate = windowTarget && !interactionAvailable && r7Flag("--khua-r7-activate")
+            let diagnosticActivate = windowTarget && !interactionAvailable && r7Flag("--odf-r7-activate")
             if interactionAvailable {
                 viewerActive = false; viewerReturnPID = nil
                 (panel as? TargetPanel)?.viewerKeyboard = false

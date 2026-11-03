@@ -13,7 +13,7 @@
 #include <vector>
 
 static NSError *SPFRCError(NSInteger code, NSString *message) {
-    return [NSError errorWithDomain:@"dev.khuaplayer.FRCEngine" code:code
+    return [NSError errorWithDomain:@"dev.openduckframe.FRCEngine" code:code
                            userInfo:@{NSLocalizedDescriptionKey: message ?: @""}];
 }
 
@@ -174,7 +174,7 @@ static std::atomic<int> gFRCAvailability{-1};
         return nil;
     }
     _metal = metal;
-    _q = dispatch_queue_create("dev.khuaplayer.frc-engine",
+    _q = dispatch_queue_create("dev.openduckframe.frc-engine",
                                dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
     const uint64_t pixels = (uint64_t)metal.width * metal.height;
     _latencyEwma = pixels >= 6000000ULL ? 0.165 : (pixels >= 1800000ULL ? 0.055 : 0.030);

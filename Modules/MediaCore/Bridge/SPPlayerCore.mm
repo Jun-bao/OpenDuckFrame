@@ -1380,7 +1380,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         _restampNextPtsUs = -1;
         _eofDrainedGen = -1;
         _playbackRate.store(1.0);
-        _openQueue = dispatch_queue_create("dev.khuaplayer.open", DISPATCH_QUEUE_SERIAL);
+        _openQueue = dispatch_queue_create("dev.openduckframe.open", DISPATCH_QUEUE_SERIAL);
         _volume = 1.0;
         _muted = NO;
         _loopA = -1;
@@ -4085,7 +4085,7 @@ static BOOL spThumbsEnabled(void) {
             candidate=[[SPFileMetalFXScaler alloc] initWithDevice:device sourceWidth:(int)CVPixelBufferGetWidth(sample) sourceHeight:(int)CVPixelBufferGetHeight(sample) outputWidth:width outputHeight:height error:&error];
         } else if ([engine isEqualToString:@"anime4k"] || [engine isEqualToString:@"realcugan"]) {
             int sourceWidth=(int)CVPixelBufferGetWidth(sample), sourceHeight=(int)CVPixelBufferGetHeight(sample);
-            if (width!=sourceWidth*2 || height!=sourceHeight*2) error=[NSError errorWithDomain:@"Khua.FileAnimation" code:10 userInfo:@{NSLocalizedDescriptionKey:@"动画超分使用来源尺寸的 2× 输出。"}];
+            if (width!=sourceWidth*2 || height!=sourceHeight*2) error=[NSError errorWithDomain:@"OpenDuckFrame.FileAnimation" code:10 userInfo:@{NSLocalizedDescriptionKey:@"动画超分使用来源尺寸的 2× 输出。"}];
             else candidate=[[SPFileAnimationScaler alloc] initWithSourceWidth:sourceWidth sourceHeight:sourceHeight engine:engine variant:variant resourceBundle:bundle error:&error];
         } else {
             candidate=[[SPFileLanczosScaler alloc] initWithDevice:device width:width height:height error:&error];
@@ -4354,7 +4354,7 @@ static BOOL spThumbsEnabled(void) {
                     pathCopy.lastPathComponent, reason];
 
                 [self->_delegate playerCore:self didFailWithError:
-                    [self makeErrorWithDomain:@"KhuaPlayer" code:-30 description:msg
+                    [self makeErrorWithDomain:@"OpenDuckFrame" code:-30 description:msg
                                         phase:@"subtitle" diagnosis:@"subtitleLoad" terminal:NO]];
             }
         });

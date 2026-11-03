@@ -1,4 +1,4 @@
-// KhuaPlayer - resilient playback basics: bitstream structure checks, MJPEG/VP9 in-packet structure, shared bit helpers
+// OpenDuckFrame - resilient playback basics: bitstream structure checks, MJPEG/VP9 in-packet structure, shared bit helpers
 //
 // Split out of the umbrella header by section; function bodies, constants and inline
 // attributes are unchanged. Callers keep including the umbrella; this file only guarantees

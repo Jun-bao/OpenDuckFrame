@@ -1,4 +1,4 @@
-// KhuaPlayer - resilient playback: damage map (per-track spans with class and confidence, merged main band)
+// OpenDuckFrame - resilient playback: damage map (per-track spans with class and confidence, merged main band)
 //
 // Split out of the umbrella header by section; function bodies, constants and inline
 // attributes are unchanged. Callers keep including the umbrella; this file only guarantees

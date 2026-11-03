@@ -1,5 +1,5 @@
-#ifndef KhuaPlayer_Bridging_Header_h
-#define KhuaPlayer_Bridging_Header_h
+#ifndef OpenDuckFrame_Bridging_Header_h
+#define OpenDuckFrame_Bridging_Header_h
 
 #import "SPPlayerCore.h"
 #import "SPCaptionAudioReader.h"

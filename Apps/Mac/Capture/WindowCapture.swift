@@ -185,7 +185,7 @@ private final class OwnedFrameCopier {
         copyAttachments(from: source, to: destination)
         let elapsed = hostToNs(mach_absolute_time() - started)
         let ticket = PoolTicket { [weak self] in self?.noteReturned() }
-        CVBufferSetAttachment(destination, "app.khuaplayer.capture.poolTicket" as CFString, ticket, .shouldNotPropagate)
+        CVBufferSetAttachment(destination, "app.openduckframe.capture.poolTicket" as CFString, ticket, .shouldNotPropagate)
         lock.lock()
         inUse += 1
         peak = max(peak, inUse)
@@ -361,7 +361,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
 
     private var stream: SCStream?
     private let streamBinding = CaptureStreamBinding()
-    private let queue = DispatchQueue(label: "app.khuaplayer.capture", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "app.openduckframe.capture", qos: .userInitiated)
     private var filter: SCContentFilter?
     private var selectionRevision: UInt64 = 0
     private var streamUsesBiplanar = true
@@ -431,8 +431,8 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             guard let i = args.firstIndex(of: flag), args.indices.contains(i + 1) else { return false }
             return args[i + 1].hasPrefix("/")
         }
-        return args.contains("--khua-r8-fixture-diagnostics") && args.contains("--khua-r8-quality-diagnostics") && args.contains("--khua-pixel-diagnostics") &&
-            absolute("--khua-isolated-profile") && absolute("--khua-live-log")
+        return args.contains("--odf-r8-fixture-diagnostics") && args.contains("--odf-r8-quality-diagnostics") && args.contains("--odf-pixel-diagnostics") &&
+            absolute("--odf-isolated-profile") && absolute("--odf-live-log")
     }
 
     func presentPicker(windows: Bool) {
@@ -455,7 +455,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
 
     func refreshShareable(_ completion: @escaping @MainActor @Sendable (Result<SCShareableContent, Error>) -> Void) {
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
-            let result = ShareableResult(content.map { .success($0) } ?? .failure(error ?? NSError(domain: "app.khuaplayer.capture", code: 1)))
+            let result = ShareableResult(content.map { .success($0) } ?? .failure(error ?? NSError(domain: "app.openduckframe.capture", code: 1)))
             DispatchQueue.main.async { completion(result.value) }
         }
     }
@@ -476,7 +476,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             // include our new panels. Rebuild it with our application excluded.
             let displayID = selected.displayID
             SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { [weak self] content, error in
-                let result = ShareableResult(content.map { .success($0) } ?? .failure(error ?? NSError(domain: "app.khuaplayer.capture", code: 1)))
+                let result = ShareableResult(content.map { .success($0) } ?? .failure(error ?? NSError(domain: "app.openduckframe.capture", code: 1)))
                 DispatchQueue.main.async {
                     guard let self, self.selectionRevision == revision else { return }
                     guard case let .success(content) = result.value, let bundle = Bundle.main.bundleIdentifier,
@@ -931,7 +931,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         lastHost = captureHost
         pixelWidth = CVPixelBufferGetWidth(owned)
         pixelHeight = CVPixelBufferGetHeight(owned)
-        let geometryKey = "app.khuaplayer.capture.geometry" as CFString
+        let geometryKey = "app.openduckframe.capture.geometry" as CFString
         CVBufferRemoveAttachment(owned, geometryKey)
         if let frameGeometry { CVBufferSetAttachment(owned, geometryKey, frameGeometry as CFDictionary, .shouldNotPropagate) }
         let admitted = streamBinding.withCurrent(stream, generation: generation) {

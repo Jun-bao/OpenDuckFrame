@@ -110,9 +110,9 @@ EXPECTED_PATHS=(
   "$APP/Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app"
   "$APP/Contents/Frameworks/Sparkle.framework"
   "$APP/Contents/Frameworks/libass.9.dylib"
-  "$APP/Contents/Frameworks/KhuaPlayerMediaCore.framework"
-  "$APP/Contents/Frameworks/KhuaPlayerCaptionsUI.framework"
-  "$APP/Contents/PlugIns/KhuaPlayerQuickLook.appex"
+  "$APP/Contents/Frameworks/OpenDuckFrameMediaCore.framework"
+  "$APP/Contents/Frameworks/OpenDuckFrameCaptionsUI.framework"
+  "$APP/Contents/PlugIns/OpenDuckFrameQuickLook.appex"
   "$APP"
 )
 for code in "${EXPECTED_PATHS[@]}"; do
@@ -135,7 +135,7 @@ MAIN_SANDBOX="$(entitlement_value "$APP" \
 [ "$MAIN_SANDBOX" != "true" ] || \
   die "Developer ID host app must remain outside the App Sandbox"
 
-APPEX="$APP/Contents/PlugIns/KhuaPlayerQuickLook.appex"
+APPEX="$APP/Contents/PlugIns/OpenDuckFrameQuickLook.appex"
 [ "$(entitlement_value "$APPEX" \
       com.apple.security.app-sandbox || true)" = "true" ] || \
   die "Quick Look extension must retain App Sandbox"
@@ -152,10 +152,10 @@ if [ -n "$BUNDLE_ID" ]; then
   APPEX_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
     "$APPEX/Contents/Info.plist")"
   MEDIA_ID="$(codesign -dv --verbose=4 \
-    "$APP/Contents/Frameworks/KhuaPlayerMediaCore.framework" 2>&1 |
+    "$APP/Contents/Frameworks/OpenDuckFrameMediaCore.framework" 2>&1 |
     sed -n 's/^Identifier=//p')"
   CAPTIONS_ID="$(codesign -dv --verbose=4 \
-    "$APP/Contents/Frameworks/KhuaPlayerCaptionsUI.framework" 2>&1 |
+    "$APP/Contents/Frameworks/OpenDuckFrameCaptionsUI.framework" 2>&1 |
     sed -n 's/^Identifier=//p')"
   [ "$MAIN_ID" = "$BUNDLE_ID" ] || \
     die "main bundle identifier mismatch: $MAIN_ID"

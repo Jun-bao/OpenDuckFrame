@@ -1,4 +1,4 @@
-// KhuaPlayer - damage map snapshot (timeline tri-state: fluent / partial / none)
+// OpenDuckFrame - damage map snapshot (timeline tri-state: fluent / partial / none)
 //
 // Built from byte-level evidence gathered during playback (all-zero packets, broken length chains,
 // out-of-range indexes, exhausted content) and decode results, recorded per track and merged into the

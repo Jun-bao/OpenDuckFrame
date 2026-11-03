@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build the optional Real-CUGAN in-process adapter in this checkout only.
-# It does not install or modify Homebrew, Vulkan, or the installed Khua app.
+# It does not install or modify Homebrew, Vulkan, or the installed OpenDuckFrame app.
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
@@ -31,19 +31,19 @@ python3 - "$src/CMakeLists.upstream.txt" "$src/CMakeLists.txt" <<'PY'
 import sys
 s=open(sys.argv[1]).read()
 a=s.index('if(USE_SYSTEM_WEBP)'); b=s.index('realcugan_add_shader(realcugan_preproc.comp)',a); c=s.index('add_executable(realcugan-ncnn-vulkan',b)
-s=s[:a]+s[b:c]+'''\nadd_library(khua_realcugan SHARED ${KHUA_REPO_ROOT}/ThirdParty/realcugan/realcugan.cpp ${KHUA_REPO_ROOT}/ThirdParty/realcugan/KhuaRealCUGAN.cpp)\ntarget_include_directories(khua_realcugan PRIVATE ${KHUA_REPO_ROOT}/ThirdParty/realcugan)\ntarget_link_libraries(khua_realcugan ncnn ${Vulkan_LIBRARY})\nadd_dependencies(khua_realcugan generate-spirv)\nset_target_properties(khua_realcugan PROPERTIES MACOSX_RPATH ON INSTALL_NAME_DIR "@rpath")\n'''
+s=s[:a]+s[b:c]+'''\nadd_library(odf_realcugan SHARED ${ODF_REPO_ROOT}/ThirdParty/realcugan/realcugan.cpp ${ODF_REPO_ROOT}/ThirdParty/realcugan/OpenDuckFrameRealCUGAN.cpp)\ntarget_include_directories(odf_realcugan PRIVATE ${ODF_REPO_ROOT}/ThirdParty/realcugan)\ntarget_link_libraries(odf_realcugan ncnn ${Vulkan_LIBRARY})\nadd_dependencies(odf_realcugan generate-spirv)\nset_target_properties(odf_realcugan PROPERTIES MACOSX_RPATH ON INSTALL_NAME_DIR "@rpath")\n'''
 open(sys.argv[2],'w').write(s)
 PY
 cmake -S "$src" -B "$build" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 -DNCNN_VULKAN=ON -DVulkan_INCLUDE_DIR="$headers" -DVulkan_LIBRARY="$molten" -DKHUA_REPO_ROOT="$repo_root"
-cmake --build "$build" --parallel 6 --target khua_realcugan
-for existing in "$runtime/libkhua_realcugan.dylib" "$runtime/libMoltenVK.dylib"; do
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 -DNCNN_VULKAN=ON -DVulkan_INCLUDE_DIR="$headers" -DVulkan_LIBRARY="$molten" -DODF_REPO_ROOT="$repo_root"
+cmake --build "$build" --parallel 6 --target odf_realcugan
+for existing in "$runtime/libodf_realcugan.dylib" "$runtime/libMoltenVK.dylib"; do
   [ ! -e "$existing" ] || chmod u+w "$existing"
 done
-cp "$build/libkhua_realcugan.dylib" "$runtime/"; cp -L "$molten" "$runtime/"
-chmod u+w "$runtime/libkhua_realcugan.dylib"
+cp "$build/libodf_realcugan.dylib" "$runtime/"; cp -L "$molten" "$runtime/"
+chmod u+w "$runtime/libodf_realcugan.dylib"
 molten_id="$(otool -D "$molten" | tail -1)"
-install_name_tool -id @rpath/libkhua_realcugan.dylib -change "$molten_id" @loader_path/libMoltenVK.dylib "$runtime/libkhua_realcugan.dylib"
-codesign --force --sign - "$runtime/libkhua_realcugan.dylib"
+install_name_tool -id @rpath/libodf_realcugan.dylib -change "$molten_id" @loader_path/libMoltenVK.dylib "$runtime/libodf_realcugan.dylib"
+codesign --force --sign - "$runtime/libodf_realcugan.dylib"
 shasum -a 256 "$runtime"/*.dylib > "$runtime/SHA256.txt"
 echo "Real-CUGAN runtime ready: $runtime (macOS 14 minimum)"

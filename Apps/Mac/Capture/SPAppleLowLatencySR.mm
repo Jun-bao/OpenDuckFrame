@@ -5,7 +5,7 @@
 #import <cmath>
 
 static NSError *SPSRError(NSInteger code, NSString *message) {
-    return [NSError errorWithDomain:@"app.khuaplayer.apple-low-sr" code:code userInfo:@{NSLocalizedDescriptionKey: message}];
+    return [NSError errorWithDomain:@"app.openduckframe.apple-low-sr" code:code userInfo:@{NSLocalizedDescriptionKey: message}];
 }
 
 static CVPixelBufferRef SPSRCreate(size_t width, size_t height, OSType format, NSDictionary *required) {
@@ -61,7 +61,7 @@ static void SPSREndProcessor(id processor) {
 
 - (instancetype)init {
     if (!(self = [super init])) return nil;
-    _queue = dispatch_queue_create("app.khuaplayer.apple-low-sr", DISPATCH_QUEUE_SERIAL);
+    _queue = dispatch_queue_create("app.openduckframe.apple-low-sr", DISPATCH_QUEUE_SERIAL);
     return self;
 }
 

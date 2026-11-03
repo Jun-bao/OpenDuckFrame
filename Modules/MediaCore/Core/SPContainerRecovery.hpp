@@ -1,4 +1,4 @@
-// KhuaPlayer - container structure candidate recovery (patch plans for the read-only byte overlay)
+// OpenDuckFrame - container structure candidate recovery (patch plans for the read-only byte overlay)
 //
 // Covers damage that never touches codec-essential metadata and only needs a few bytes changed in a
 // virtual view of the file (the source stays read-only and absolute offsets never move): fixed

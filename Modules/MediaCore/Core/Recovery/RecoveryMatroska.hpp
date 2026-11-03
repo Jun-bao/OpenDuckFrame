@@ -1,4 +1,4 @@
-// KhuaPlayer - container recovery: Matroska (cluster block chains, parent CRC sizes, Info/Tracks single-bit fields, FLAC lacing, ContentEncodings)
+// OpenDuckFrame - container recovery: Matroska (cluster block chains, parent CRC sizes, Info/Tracks single-bit fields, FLAC lacing, ContentEncodings)
 //
 // Split out of the umbrella header by section; function bodies, constants and inline
 // attributes are unchanged. Callers keep including the umbrella; this file only guarantees

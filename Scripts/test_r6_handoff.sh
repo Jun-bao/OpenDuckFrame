@@ -1,6 +1,6 @@
 #!/bin/bash
 # Tests only the local socket transport between two command-line processes.
-# This does not launch Khua or prove its App Sandbox / GUI behavior.
+# This does not launch OpenDuckFrame or prove its App Sandbox / GUI behavior.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 OUT="$ROOT/.build/r6-development"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export the production Khua AppIcon from its 1024 px master."""
+"""Export the production OpenDuckFrame AppIcon from its 1024 px master."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ except ModuleNotFoundError as error:
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_ORIGINAL = ROOT.parent / "Branding/OpenDuckFrame-20261103/OpenDuckFrame-1024.png"
-DEFAULT_MASTER = ROOT / "KhuaPlayer-StaticMaster-1024.png"
+DEFAULT_MASTER = ROOT / "OpenDuckFrame-StaticMaster-1024.png"
 DEFAULT_OUTPUT = ROOT / "AppIcon.appiconset"
 DEFAULT_MANIFEST = ROOT / "export-manifest.json"
 SIZES = (16, 32, 64, 128, 256, 512, 1024)
@@ -160,7 +160,7 @@ def compare_file(expected: Path, actual: Path) -> list[str]:
 
 
 def check(master: Path, output: Path, manifest: Path) -> None:
-    with tempfile.TemporaryDirectory(prefix="khua-appicon-check.") as temporary:
+    with tempfile.TemporaryDirectory(prefix="odf-appicon-check.") as temporary:
         expected_master = Path(temporary) / "master.png"
         render_master(DEFAULT_ORIGINAL, expected_master)
         errors: list[str] = compare_file(expected_master, master)

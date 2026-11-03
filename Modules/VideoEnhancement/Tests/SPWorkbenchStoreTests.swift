@@ -3,14 +3,14 @@ enum AppLanguage { static var current: String? { nil }; static func effectiveLan
 
 @main struct TestRunner {
  @MainActor static func main() throws {
-  let p0Args = ["--khua-p0-controls", "--khua-r7-opaque"]
+  let p0Args = ["--odf-p0-controls", "--odf-r7-opaque"]
   precondition(P0DiagnosticPolicy.controlsEnabled(args:p0Args,isolated:true))
   precondition(!P0DiagnosticPolicy.controlsEnabled(args:p0Args,isolated:false))
-  precondition(P0DiagnosticPolicy.flag("--khua-r7-opaque",args:p0Args,isolated:true,overrideValue:nil))
-  precondition(!P0DiagnosticPolicy.flag("--khua-r7-opaque",args:p0Args,isolated:true,overrideValue:false))
-  precondition(P0DiagnosticPolicy.flag("--khua-r7-activate",args:p0Args,isolated:true,overrideValue:true))
-  precondition(!P0DiagnosticPolicy.flag("--khua-r7-activate",args:p0Args,isolated:false,overrideValue:true))
-  precondition(!P0DiagnosticPolicy.flag("--khua-r7-activate",args:[],isolated:true,overrideValue:true))
+  precondition(P0DiagnosticPolicy.flag("--odf-r7-opaque",args:p0Args,isolated:true,overrideValue:nil))
+  precondition(!P0DiagnosticPolicy.flag("--odf-r7-opaque",args:p0Args,isolated:true,overrideValue:false))
+  precondition(P0DiagnosticPolicy.flag("--odf-r7-activate",args:p0Args,isolated:true,overrideValue:true))
+  precondition(!P0DiagnosticPolicy.flag("--odf-r7-activate",args:p0Args,isolated:false,overrideValue:true))
+  precondition(!P0DiagnosticPolicy.flag("--odf-r7-activate",args:[],isolated:true,overrideValue:true))
   precondition(WorkbenchTitle.text("Quality Workbench",candidate:" P1 ") == "Quality Workbench · P1")
   precondition(WorkbenchTitle.text("画质工作台",candidate:"P1") == "画质工作台 · P1")
   precondition(WorkbenchTitle.text("画质工作台",candidate:"") == "画质工作台")
@@ -40,7 +40,7 @@ enum AppLanguage { static var current: String? { nil }; static func effectiveLan
   precondition(WorkbenchDimensionPolicy.value("1920") == 1920 && WorkbenchDimensionPolicy.value(" 1081 ") == 1080)
   for invalid in ["", "—", "abc", "-2", "1", "99999999999999999999999999", "3.5"] { precondition(WorkbenchDimensionPolicy.value(invalid) == nil) }
   precondition(WorkbenchDimensionPolicy.text(0) == "—" && WorkbenchDimensionPolicy.text(1920) == "1920")
-  let temp=FileManager.default.temporaryDirectory.appendingPathComponent("khua-config-contract-"+UUID().uuidString)
+  let temp=FileManager.default.temporaryDirectory.appendingPathComponent("odf-config-contract-"+UUID().uuidString)
   try FileManager.default.createDirectory(at:temp,withIntermediateDirectories:true)
   defer { try? FileManager.default.removeItem(at:temp) }
   EnhancementProfileStore.testDirectory=temp
@@ -92,7 +92,7 @@ enum AppLanguage { static var current: String? { nil }; static func effectiveLan
   var gate=EnhancementCountdown();let first=gate.begin()!;precondition(gate.remaining==3 && gate.begin()==nil)
   precondition(gate.tick(first)==2);gate.cancel();precondition(gate.tick(first)==nil && !gate.active)
   let second=gate.begin()!;precondition(second != first && gate.tick(second)==2 && gate.tick(second)==1 && gate.tick(second)==0 && !gate.active)
-  let suite="khua-config-contract-"+UUID().uuidString
+  let suite="odf-config-contract-"+UUID().uuidString
   let defaults=UserDefaults(suiteName:suite)!
   defer { defaults.removePersistentDomain(forName:suite) }
   EnhancementText.setLanguage("zh",in:defaults);precondition(EnhancementText.language(in:defaults))

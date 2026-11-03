@@ -62,13 +62,13 @@ static const uint64_t SPQueueByteBudget = 160ull << 20;
 static std::atomic<uint64_t> SPR8NextJobID{1};
 static BOOL SPR8Enabled(void) {
     NSArray<NSString *> *a = NSProcessInfo.processInfo.arguments;
-    NSUInteger p = [a indexOfObject:@"--khua-isolated-profile"], l = [a indexOfObject:@"--khua-live-log"];
-    return [a containsObject:@"--khua-r8-quality-diagnostics"] && [a containsObject:@"--khua-pixel-diagnostics"] &&
+    NSUInteger p = [a indexOfObject:@"--odf-isolated-profile"], l = [a indexOfObject:@"--odf-live-log"];
+    return [a containsObject:@"--odf-r8-quality-diagnostics"] && [a containsObject:@"--odf-pixel-diagnostics"] &&
         p != NSNotFound && p + 1 < a.count && [a[p + 1] hasPrefix:@"/"] &&
         l != NSNotFound && l + 1 < a.count && [a[l + 1] hasPrefix:@"/"];
 }
 static BOOL SPR8FixtureEnabled(void) {
-    return SPR8Enabled() && [NSProcessInfo.processInfo.arguments containsObject:@"--khua-r8-fixture-diagnostics"];
+    return SPR8Enabled() && [NSProcessInfo.processInfo.arguments containsObject:@"--odf-r8-fixture-diagnostics"];
 }
 static int SPR8DecodeFixture(CVPixelBufferRef buffer) {
     if (!buffer) return -1;
@@ -175,9 +175,9 @@ static double SPPercentileMs(std::vector<int64_t> samples) {
 // R7 diagnostics are enabled only with both isolated profile and log paths.
 static BOOL SPR7Passthrough(void) {
     NSArray<NSString *> *args = NSProcessInfo.processInfo.arguments;
-    NSUInteger p = [args indexOfObject:@"--khua-isolated-profile"];
-    NSUInteger l = [args indexOfObject:@"--khua-live-log"];
-    return [args containsObject:@"--khua-r7-passthrough"] && [args containsObject:@"--khua-pixel-diagnostics"] &&
+    NSUInteger p = [args indexOfObject:@"--odf-isolated-profile"];
+    NSUInteger l = [args indexOfObject:@"--odf-live-log"];
+    return [args containsObject:@"--odf-r7-passthrough"] && [args containsObject:@"--odf-pixel-diagnostics"] &&
         p != NSNotFound && p + 1 < args.count && [args[p + 1] hasPrefix:@"/"] &&
         l != NSNotFound && l + 1 < args.count && [args[l + 1] hasPrefix:@"/"];
 }
@@ -203,7 +203,7 @@ static void SPProbeSpinUntilHost(int64_t deadline) {
 }
 
 static NSError *SPLiveError(NSInteger code, NSString *message) {
-    return [NSError errorWithDomain:@"app.khuaplayer.live" code:code
+    return [NSError errorWithDomain:@"app.openduckframe.live" code:code
                            userInfo:@{NSLocalizedDescriptionKey: message ?: @""}];
 }
 
@@ -718,7 +718,7 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
     _sourceCover.hidden = YES;
     [_metalLayer addSublayer:_sourceCover];
     _commandQueue = [_device newCommandQueue];
-    _presentQueue = dispatch_queue_create("app.khuaplayer.live-present",
+    _presentQueue = dispatch_queue_create("app.openduckframe.live-present",
                                           dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
     if (_device) CVMetalTextureCacheCreate(kCFAllocatorDefault, NULL, _device, NULL, &_cache);
     id<MTLLibrary> library = [_device newDefaultLibrary];
@@ -1595,7 +1595,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     if (!(self = [super init])) return nil;
     _capturePressureQueued = false;
     _capturePressureGeneration = 0;
-    _q = dispatch_queue_create("app.khuaplayer.live",
+    _q = dispatch_queue_create("app.openduckframe.live",
                                dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
     _request = [[SPLivePlanRequest alloc] init];
     _request.rateKind = SPLiveRateMultiplier;
@@ -1625,7 +1625,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     _scaleEwmaSec = 0.004;
     _probeMonotonic = YES;
     _probeSizeOK = YES;
-    _prepareQ = dispatch_queue_create("app.khuaplayer.live-prepare",
+    _prepareQ = dispatch_queue_create("app.openduckframe.live-prepare",
                                      dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
     dispatch_queue_set_specific(_q, SPLiveQueueKey, (__bridge void *)self, NULL);
     _epochMonotonic = YES;
@@ -2250,7 +2250,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"r8QualityDiagnostic": @(SPR8Enabled()),
         @"r8ExperimentActive": @([self r8CanExperiment]),
         @"r8AdmissionLimit": @([self r8AdmissionLimit]),
-        @"r8SessionsRequested": @(SPR8Option(@"--khua-r8-sessions", 2, @[@1,@2,@3,@4])),
+        @"r8SessionsRequested": @(SPR8Option(@"--odf-r8-sessions", 2, @[@1,@2,@3,@4])),
         @"r8SessionsActual": @(_engine ? _engine.sessionCount : 0),
         @"r8QueueBudgetScope": @"playout slot nominal bytes only; excludes capture pool, VT/Metal surfaces and model allocations",
         @"r8SlotCapByBytes": @([self slotCapByBytes]),
@@ -3337,7 +3337,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         // buffer). The current drawable remains visible; freeing these idle
         // redraw references leaves capture headroom. Active GPU jobs retain
         // their own references and are never forcibly released here.
-        CFStringRef ticket = CFSTR("app.khuaplayer.capture.poolTicket");
+        CFStringRef ticket = CFSTR("app.openduckframe.capture.poolTicket");
         if (self->_lastEnhanced && CVBufferGetAttachment(self->_lastEnhanced, ticket, NULL)) {
             CVPixelBufferRelease(self->_lastEnhanced); self->_lastEnhanced = nullptr;
         }
@@ -3937,10 +3937,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         _width <= 3840 && _height <= 2160;
 }
 - (uint64_t)r8QueueByteBudget {
-    return [self r8CanExperiment] ? ((uint64_t)SPR8Option(@"--khua-r8-budget-mib", 160, @[@160,@320,@480]) << 20) : SPQueueByteBudget;
+    return [self r8CanExperiment] ? ((uint64_t)SPR8Option(@"--odf-r8-budget-mib", 160, @[@160,@320,@480]) << 20) : SPQueueByteBudget;
 }
 - (int)r8AdmissionLimit {
-    return [self r8CanExperiment] ? SPR8Option(@"--khua-r8-inflight", 2, @[@1,@2,@3,@4]) : 2;
+    return [self r8CanExperiment] ? SPR8Option(@"--odf-r8-inflight", 2, @[@1,@2,@3,@4]) : 2;
 }
 - (NSUInteger)slotCapByBytes {
     int w = _resolved.outputWidth > 0 ? _resolved.outputWidth : (_width > 0 ? _width : 1920);
@@ -5137,7 +5137,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         }
     }
     if (error || outputs.count == 0) {
-        if (_rife && [error.domain isEqualToString:@"app.khuaplayer.rife"] && error.code == SPRifeBridgeErrorOutputPoolExhausted) {
+        if (_rife && [error.domain isEqualToString:@"app.openduckframe.rife"] && error.code == SPRifeBridgeErrorOutputPoolExhausted) {
             _rifePoolPressureEvents++;
             for (int i = 0; i < job->count; ++i) [self erasePending:job->pts[i]];
             int64_t now=SPHostNow(), retry=now+SPRationalToHost(sp::spMake(5,1000));
@@ -5341,7 +5341,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
                                                       error:&local];
         SPFRCQuality quality = _request.quality == SPFRCQualityHigh ? SPFRCQualityHigh : SPFRCQualityNormal;
         const BOOL continuousFRC = [[[NSProcessInfo processInfo] environment][@"CHUANFLOW_FRC_CONTINUOUS"] isEqualToString:@"1"];
-        int sessions = [self r8CanExperiment] ? SPR8Option(@"--khua-r8-sessions", continuousFRC ? 1 : 2, @[@1,@2,@3,@4]) : (continuousFRC ? 1 : 2);
+        int sessions = [self r8CanExperiment] ? SPR8Option(@"--odf-r8-sessions", continuousFRC ? 1 : 2, @[@1,@2,@3,@4]) : (continuousFRC ? 1 : 2);
         _engine = _metal ? [[SPFRCEngine alloc] initWithMetal:_metal sessions:sessions outputCapacity:8 quality:quality error:&local] : nil;
         if (!_engine) {
             if (error) *error = local ?: SPLiveError(32, @"插帧会话创建失败");
@@ -5604,7 +5604,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         _held[identity].source = item.buffer;
         _held[identity].host = item.host;
         _held[identity].pts = sp::spMake(item.ptsNum, item.ptsDen);
-        NSDictionary *geometry = CFBridgingRelease(CVBufferCopyAttachment(item.buffer, CFSTR("app.khuaplayer.capture.geometry"), NULL));
+        NSDictionary *geometry = CFBridgingRelease(CVBufferCopyAttachment(item.buffer, CFSTR("app.openduckframe.capture.geometry"), NULL));
         if ([geometry isKindOfClass:NSDictionary.class] && item.host > 0) {
             NSNumber *key = @(item.host); _geometryInputs[key] = [geometry copy]; [_geometryInputOrder addObject:key];
             while (_geometryInputOrder.count > 128) { NSNumber *old = _geometryInputOrder.firstObject; [_geometryInputOrder removeObjectAtIndex:0]; [_geometryInputs removeObjectForKey:old]; }
@@ -5863,9 +5863,9 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     if (!device) return @{ @"ok": @NO, @"error": @"no Metal device", @"cases": @[] };
     SPLiveProcessor *converter = [[SPLiveProcessor alloc] init];
     NSMutableArray *cases = [NSMutableArray array];
-    NSString *selection = NSProcessInfo.processInfo.environment[@"KHUA_NATIVE_BRIDGE_ENGINE"] ?: @"all";
+    NSString *selection = NSProcessInfo.processInfo.environment[@"ODF_NATIVE_BRIDGE_ENGINE"] ?: @"all";
     NSArray<NSString *> *choices = @[@"all", @"frc-normal", @"frc-quality", @"rife", @"llfi"];
-    if (![choices containsObject:selection]) return @{ @"ok":@NO, @"error":@"invalid KHUA_NATIVE_BRIDGE_ENGINE", @"cases":@[] };
+    if (![choices containsObject:selection]) return @{ @"ok":@NO, @"error":@"invalid ODF_NATIVE_BRIDGE_ENGINE", @"cases":@[] };
     BOOL allOK = YES, timedOut = NO;
     for (int style=0; style<2; ++style) for (int moving=0; moving<2; ++moving) {
         CVPixelBufferRef input=SPQualityNV12(NO,moving?8:0,style);
@@ -6084,7 +6084,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     if(inputTransfer)CFRelease(inputTransfer);
     SPLiveProcessor *p=[[SPLiveProcessor alloc] init]; [p adoptSourceGeneration:1];
     CVPixelBufferRef sampleFrame=frames[0];
-    BOOL forceRealtime=getenv("KHUA_TEST_KEEP_LOW_REALTIME")!=NULL;
+    BOOL forceRealtime=getenv("ODF_TEST_KEEP_LOW_REALTIME")!=NULL;
     dispatch_sync(p->_q, ^{ p->_width=width; p->_height=height; p->_testCapturePlayout=YES; p->_testKeepLowRealtime=forceRealtime;
         p->_held[999].source=CVPixelBufferRetain(sampleFrame); p->_held[999].pts=sp::spMake(0,1); });
     SPLivePlanRequest *request=[[SPLivePlanRequest alloc] init]; request.requestID=501; request.interpolationEnabled=YES;
@@ -6477,7 +6477,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             SPLiveJob *job=new SPLiveJob(); job->generation=1; job->configVersion=p->_configVersion; job->clockEpoch=p->_clockEpoch; job->inflightEpoch=p->_inflightEpoch;
             job->count=1; job->pts[0]=sp::spMake(2403+i*2,240); p->_frcEwmaSec=0.08;
             SPPendingPhase pending; pending.pts=job->pts[0]; pending.generation=1; pending.targetHost=SPHostNow(); p->_pending.push_back(pending);
-            NSError *pool=[NSError errorWithDomain:@"app.khuaplayer.rife" code:SPRifeBridgeErrorOutputPoolExhausted userInfo:nil];
+            NSError *pool=[NSError errorWithDomain:@"app.openduckframe.rife" code:SPRifeBridgeErrorOutputPoolExhausted userInfo:nil];
             [p finishJob:job token:0 outputs:@[] latency:0.5 error:pool];
             uint64_t id=30+i; p->_held[id].source=CVPixelBufferRetain(frame); p->_held[id].pts=sp::spMake(1203+i,120);
             p->_held[id].host=SPHostNow()-SPRationalToHost(sp::spMake(1,2));
@@ -6587,7 +6587,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         SPLiveJob *poolJob=new SPLiveJob(); poolJob->generation=1; poolJob->configVersion=d->_configVersion; poolJob->clockEpoch=d->_clockEpoch; poolJob->inflightEpoch=d->_inflightEpoch;
         poolJob->count=1; poolJob->frameA=51; poolJob->frameB=52; poolJob->pts[0]=sp::spMake(2401,240); poolJob->phase[0]=sp::spMake(1,4);
         poolJob->targetHost[0]=SPHostNow()+SPRationalToHost(sp::spMake(5,100));
-        int64_t deadline2=poolJob->targetHost[0]; NSError *pool=[NSError errorWithDomain:@"app.khuaplayer.rife" code:SPRifeBridgeErrorOutputPoolExhausted userInfo:nil];
+        int64_t deadline2=poolJob->targetHost[0]; NSError *pool=[NSError errorWithDomain:@"app.openduckframe.rife" code:SPRifeBridgeErrorOutputPoolExhausted userInfo:nil];
         [d finishJob:poolJob token:0 outputs:@[] latency:0 error:pool];
         poolRetry=d->_haveRifeDeferred && d->_rifePoolRetryAdmissions==1 && d->_rifeDeferredDeadline==deadline2 && d->_held[51].pins==1 && d->_held[52].pins==1;
         d->_haveLastPts=YES; d->_lastPresentedPts=sp::spMake(2401,240); uint64_t oldExpired=d->_rifeDeferredExpired;
@@ -7719,7 +7719,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         probeWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(120, 120, 640, 360)
                                                    styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
                                                      backing:NSBackingStoreBuffered defer:NO];
-        probeWindow.title = @"Khua presentation probe";
+        probeWindow.title = @"OpenDuckFrame presentation probe";
         probeWindow.contentView = probeView;
         [probeWindow orderFrontRegardless];
         [probeView refreshVisibilitySnapshot];

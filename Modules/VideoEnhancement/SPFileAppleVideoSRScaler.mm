@@ -6,7 +6,7 @@
 #include <atomic>
 
 static NSError *SPFileVideoSRError(NSInteger code, NSString *message) {
-    return [NSError errorWithDomain:@"Khua.FileAppleVideoSR" code:code userInfo:@{NSLocalizedDescriptionKey:message}];
+    return [NSError errorWithDomain:@"OpenDuckFrame.FileAppleVideoSR" code:code userInfo:@{NSLocalizedDescriptionKey:message}];
 }
 
 @implementation SPFileAppleVideoSRScaler {

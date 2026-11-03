@@ -16,7 +16,7 @@ final class SPUpdateUsageDelegate: NSObject {
     }
 
     nonisolated static func supports(feedURL: URL?) -> Bool {
-        feedURL?.absoluteString == "https://khua.app/updates/appcast.xml"
+        feedURL?.absoluteString == "https://openduckframe.app/updates/appcast.xml"
     }
 
     @objc(feedParametersForUpdater:sendingSystemProfile:)
@@ -36,9 +36,9 @@ final class SPUpdateUsageDelegate: NSObject {
         // This delegate only enriches an existing appcast request. It must not
         // start requests, change check cadence, or set global download headers.
         return [
-            ["key": "khua_usage", "value": identifier,
+            ["key": "odf_usage", "value": identifier,
              "displayKey": "Update installation ID", "displayValue": identifier],
-            ["key": "khua_usage_v", "value": "1",
+            ["key": "odf_usage_v", "value": "1",
              "displayKey": "Update statistics format", "displayValue": "1"],
         ]
     }

@@ -1,4 +1,4 @@
-// KhuaPlayer - container recovery basics: Patch/RecoveryPlan, byte helpers, fixed signatures and wrapper headers
+// OpenDuckFrame - container recovery basics: Patch/RecoveryPlan, byte helpers, fixed signatures and wrapper headers
 //
 // Split out of the umbrella header by section; function bodies, constants and inline
 // attributes are unchanged. Callers keep including the umbrella; this file only guarantees

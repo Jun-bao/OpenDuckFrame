@@ -1,4 +1,4 @@
-// KhuaPlayer - FFmpeg execution layer for private trial decodes (independent read-only context; bounded, cancellable; header-only)
+// OpenDuckFrame - FFmpeg execution layer for private trial decodes (independent read-only context; bounded, cancellable; header-only)
 //
 // SPTrialExecutor.hpp holds the pure budget / outcome / identity / executor pieces; this file only provides:
 //   openInput      - avformat_open_input with an interrupt callback (token + abort hook + deadline);

@@ -8,8 +8,8 @@ import Foundation
 @main struct SingleInstanceHandoffTests {
     @MainActor static func main() throws {
         let args = CommandLine.arguments
-        let documents = [URL(fileURLWithPath: "/private/tmp/khua handoff 测试.mp4"),
-                         URL(fileURLWithPath: "/private/tmp/khua-second.mov")]
+        let documents = [URL(fileURLWithPath: "/private/tmp/openduckframe handoff 测试.mp4"),
+                         URL(fileURLWithPath: "/private/tmp/odf-second.mov")]
         if args.count == 3 && args[1] == "sender", let target = Int32(args[2]) {
             SingleInstanceIPC.request(targetPID: target, urls: [], timeout: 3) { ok, error in
                 guard ok else { fputs("Reopen failed: \(error)\n", stderr); exit(1) }

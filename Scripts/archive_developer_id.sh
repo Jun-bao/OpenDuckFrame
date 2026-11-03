@@ -19,7 +19,7 @@ Usage: Scripts/archive_developer_id.sh \
   [--derived-data-path PATH]
 
 The output directory must not exist. Sparkle defaults to Distribution/sparkle.json.
-Override both KHUA_SPARKLE_FEED_URL and KHUA_SPARKLE_PUBLIC_ED_KEY together.
+Override both ODF_SPARKLE_FEED_URL and ODF_SPARKLE_PUBLIC_ED_KEY together.
 EOF
 }
 
@@ -125,13 +125,13 @@ security find-identity -v -p codesigning | grep -Fq "$IDENTITY" || \
   die "code-signing identity is not available: $IDENTITY"
 
 OUTPUT_PARENT="$(dirname "$OUTPUT_DIR")"
-WORK_DIR="$(mktemp -d "$OUTPUT_PARENT/.khua-developer-id.XXXXXX")"
+WORK_DIR="$(mktemp -d "$OUTPUT_PARENT/.odf-developer-id.XXXXXX")"
 TRANSPORT_CHECK="$(mktemp -d)"
 REMOVE_DERIVED_DATA=0
 if [ -n "$DERIVED_DATA_PATH" ]; then
   DERIVED_DATA_PATH="$(absolute_path "$DERIVED_DATA_PATH")"
 else
-  DERIVED_DATA_PATH="$(mktemp -d "$OUTPUT_PARENT/.khua-derived-data.XXXXXX")"
+  DERIVED_DATA_PATH="$(mktemp -d "$OUTPUT_PARENT/.odf-derived-data.XXXXXX")"
   REMOVE_DERIVED_DATA=1
 fi
 SOURCE_APP="$DERIVED_DATA_PATH/Build/Products/Release/OpenDuckFrame.app"
@@ -139,7 +139,7 @@ LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchS
 
 cleanup() {
   rm -rf "$WORK_DIR" "$TRANSPORT_CHECK"
-  pluginkit -r "$SOURCE_APP/Contents/PlugIns/KhuaPlayerQuickLook.appex" \
+  pluginkit -r "$SOURCE_APP/Contents/PlugIns/OpenDuckFrameQuickLook.appex" \
     >/dev/null 2>&1 || true
   "$LSREGISTER" -u "$SOURCE_APP" >/dev/null 2>&1 || true
   if [ "$REMOVE_DERIVED_DATA" -eq 1 ]; then
@@ -155,11 +155,11 @@ fi
 [ -n "$XCODEGEN_BIN" ] && [ -x "$XCODEGEN_BIN" ] || \
   die "xcodegen is required"
 
-SPARKLE_FEED_URL="${KHUA_SPARKLE_FEED_URL-$(plutil -extract feedUrl raw -o - "$ROOT/Distribution/sparkle.json")}"
-SPARKLE_PUBLIC_ED_KEY="${KHUA_SPARKLE_PUBLIC_ED_KEY-$(plutil -extract publicKey raw -o - "$ROOT/Distribution/sparkle.json")}"
+SPARKLE_FEED_URL="${ODF_SPARKLE_FEED_URL-$(plutil -extract feedUrl raw -o - "$ROOT/Distribution/sparkle.json")}"
+SPARKLE_PUBLIC_ED_KEY="${ODF_SPARKLE_PUBLIC_ED_KEY-$(plutil -extract publicKey raw -o - "$ROOT/Distribution/sparkle.json")}"
 if { [ -n "$SPARKLE_FEED_URL" ] && [ -z "$SPARKLE_PUBLIC_ED_KEY" ]; } ||
    { [ -z "$SPARKLE_FEED_URL" ] && [ -n "$SPARKLE_PUBLIC_ED_KEY" ]; }; then
-  die "KHUA_SPARKLE_FEED_URL and KHUA_SPARKLE_PUBLIC_ED_KEY must be supplied together"
+  die "ODF_SPARKLE_FEED_URL and ODF_SPARKLE_PUBLIC_ED_KEY must be supplied together"
 fi
 
 echo "==> Building pinned FFmpeg and dav1d dependencies"
@@ -169,19 +169,19 @@ echo "==> Building pinned subtitle dependencies"
 echo "==> Building pinned Sparkle framework and release tools"
 "$ROOT/Scripts/build_sparkle.sh"
 echo "==> Generating direct-distribution Xcode project"
-KHUA_ENABLE_SPARKLE=true \
-KHUA_SPARKLE_FEED_URL="$SPARKLE_FEED_URL" \
-KHUA_SPARKLE_PUBLIC_ED_KEY="$SPARKLE_PUBLIC_ED_KEY" \
+ODF_ENABLE_SPARKLE=true \
+ODF_SPARKLE_FEED_URL="$SPARKLE_FEED_URL" \
+ODF_SPARKLE_PUBLIC_ED_KEY="$SPARKLE_PUBLIC_ED_KEY" \
   "$XCODEGEN_BIN" generate --spec Apps/Mac/project.yml --project Apps/Mac --quiet
 
 echo "==> Building unsigned Release product"
 xcodebuild \
-  -project "$ROOT/Apps/Mac/KhuaPlayer.xcodeproj" \
-  -scheme KhuaPlayer \
+  -project "$ROOT/Apps/Mac/OpenDuckFrame.xcodeproj" \
+  -scheme OpenDuckFrame \
   -configuration Release \
   -destination "generic/platform=macOS" \
   -derivedDataPath "$DERIVED_DATA_PATH" \
-  KHUA_BUNDLE_ID="$BUNDLE_ID" \
+  ODF_BUNDLE_ID="$BUNDLE_ID" \
   MARKETING_VERSION="$MARKETING_VERSION" \
   CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
   CODE_SIGNING_ALLOWED=NO \
@@ -190,8 +190,8 @@ xcodebuild \
   build
 
 [ -d "$SOURCE_APP" ] || die "Release build product is missing: $SOURCE_APP"
-KHUA_SPARKLE_FEED_URL="$SPARKLE_FEED_URL" \
-KHUA_SPARKLE_PUBLIC_ED_KEY="$SPARKLE_PUBLIC_ED_KEY" \
+ODF_SPARKLE_FEED_URL="$SPARKLE_FEED_URL" \
+ODF_SPARKLE_PUBLIC_ED_KEY="$SPARKLE_PUBLIC_ED_KEY" \
   "$ROOT/Scripts/bundle_libs.sh" "$SOURCE_APP"
 
 APP="$WORK_DIR/OpenDuckFrame.app"
@@ -204,9 +204,9 @@ DSYMS_DIR="$WORK_DIR/dSYMs"
 mkdir -p "$DSYMS_DIR"
 for dsym_name in \
   OpenDuckFrame.app.dSYM \
-  KhuaPlayerMediaCore.framework.dSYM \
-  KhuaPlayerCaptionsUI.framework.dSYM \
-  KhuaPlayerQuickLook.appex.dSYM; do
+  OpenDuckFrameMediaCore.framework.dSYM \
+  OpenDuckFrameCaptionsUI.framework.dSYM \
+  OpenDuckFrameQuickLook.appex.dSYM; do
   DSYM_SOURCE="$DERIVED_DATA_PATH/Build/Products/Release/$dsym_name"
   [ -d "$DSYM_SOURCE" ] || die "release dSYM is missing: $DSYM_SOURCE"
   ditto --norsrc --noextattr --noqtn "$DSYM_SOURCE" "$DSYMS_DIR/$dsym_name"
@@ -215,21 +215,21 @@ done
 uuid_for() {
   dwarfdump --uuid "$1" | awk 'NR == 1 { print $2 }'
 }
-[ "$(uuid_for "$APP/Contents/MacOS/Khua")" = \
+[ "$(uuid_for "$APP/Contents/MacOS/OpenDuckFrame")" = \
   "$(uuid_for "$DSYMS_DIR/OpenDuckFrame.app.dSYM")" ] || \
   die "main app dSYM UUID does not match"
-[ "$(uuid_for "$APP/Contents/Frameworks/KhuaPlayerMediaCore.framework/Versions/A/KhuaPlayerMediaCore")" = \
-  "$(uuid_for "$DSYMS_DIR/KhuaPlayerMediaCore.framework.dSYM")" ] || \
+[ "$(uuid_for "$APP/Contents/Frameworks/OpenDuckFrameMediaCore.framework/Versions/A/OpenDuckFrameMediaCore")" = \
+  "$(uuid_for "$DSYMS_DIR/OpenDuckFrameMediaCore.framework.dSYM")" ] || \
   die "media framework dSYM UUID does not match"
-[ "$(uuid_for "$APP/Contents/Frameworks/KhuaPlayerCaptionsUI.framework/Versions/A/KhuaPlayerCaptionsUI")" = \
-  "$(uuid_for "$DSYMS_DIR/KhuaPlayerCaptionsUI.framework.dSYM")" ] || \
+[ "$(uuid_for "$APP/Contents/Frameworks/OpenDuckFrameCaptionsUI.framework/Versions/A/OpenDuckFrameCaptionsUI")" = \
+  "$(uuid_for "$DSYMS_DIR/OpenDuckFrameCaptionsUI.framework.dSYM")" ] || \
   die "caption UI framework dSYM UUID does not match"
-[ "$(uuid_for "$APP/Contents/PlugIns/KhuaPlayerQuickLook.appex/Contents/MacOS/KhuaPlayerQuickLook")" = \
-  "$(uuid_for "$DSYMS_DIR/KhuaPlayerQuickLook.appex.dSYM")" ] || \
+[ "$(uuid_for "$APP/Contents/PlugIns/OpenDuckFrameQuickLook.appex/Contents/MacOS/OpenDuckFrameQuickLook")" = \
+  "$(uuid_for "$DSYMS_DIR/OpenDuckFrameQuickLook.appex.dSYM")" ] || \
   die "Quick Look dSYM UUID does not match"
 
 MAIN_INFO="$APP/Contents/Info.plist"
-APPEX="$APP/Contents/PlugIns/KhuaPlayerQuickLook.appex"
+APPEX="$APP/Contents/PlugIns/OpenDuckFrameQuickLook.appex"
 APPEX_INFO="$APPEX/Contents/Info.plist"
 [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$MAIN_INFO")" = \
   "$BUNDLE_ID" ] || die "Xcode did not apply the requested bundle identifier"
@@ -248,8 +248,8 @@ sign_code() {
 
 SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
 SPARKLE_VERSION="$SPARKLE/Versions/B"
-MEDIA_CORE="$APP/Contents/Frameworks/KhuaPlayerMediaCore.framework"
-CAPTIONS_UI="$APP/Contents/Frameworks/KhuaPlayerCaptionsUI.framework"
+MEDIA_CORE="$APP/Contents/Frameworks/OpenDuckFrameMediaCore.framework"
+CAPTIONS_UI="$APP/Contents/Frameworks/OpenDuckFrameCaptionsUI.framework"
 LIBASS="$APP/Contents/Frameworks/libass.9.dylib"
 
 sign_code "$SPARKLE_VERSION/Autoupdate"
@@ -259,7 +259,7 @@ sign_code "$LIBASS"
 sign_code "$MEDIA_CORE"
 sign_code "$CAPTIONS_UI"
 sign_code --entitlements \
-  "$ROOT/Apps/Mac/QuickLook/KhuaPlayerQuickLook.entitlements" "$APPEX"
+  "$ROOT/Apps/Mac/QuickLook/OpenDuckFrameQuickLook.entitlements" "$APPEX"
 
 # The manifest hashes framework signatures and CodeResources. Recreate it only
 # after every nested component is final, then seal the host app last.

@@ -2,11 +2,11 @@ import Foundation
 
 @main struct R6PolicyTests {
     static func main() {
-        precondition(SingleInstancePolicy.matchesProductMetadata("OpenDuckFrame", "Khua"))
-        precondition(SingleInstancePolicy.matchesProductMetadata("小川帧流 · ChuanFlow", "Khua"))
+        precondition(SingleInstancePolicy.matchesProductMetadata("OpenDuckFrame", "OpenDuckFrame"))
+        precondition(!SingleInstancePolicy.matchesProductMetadata("小川帧流 · ChuanFlow", "OpenDuckFrame"))
         precondition(!SingleInstancePolicy.matchesProductMetadata("OpenDuckFrame", "Other"))
-        precondition(!SingleInstancePolicy.matchesProductMetadata("Other", "Khua"))
-        precondition(!SingleInstancePolicy.matchesProductMetadata(nil, "Khua"))
+        precondition(!SingleInstancePolicy.matchesProductMetadata("Other", "OpenDuckFrame"))
+        precondition(!SingleInstancePolicy.matchesProductMetadata(nil, "OpenDuckFrame"))
         typealias C = SingleInstancePolicy.Candidate
         let first = C(pid: 90, start: 100)
         let later = C(pid: 12, start: 101)
@@ -21,8 +21,8 @@ import Foundation
         precondition(SingleInstancePolicy.preferredPeer([later], ownPID: first.pid) == nil)
         precondition(SingleInstancePolicy.preferredPeer([later, first], ownPID: first.pid) == nil)
         precondition(SingleInstancePolicy.preferredPeer([first, later], ownPID: later.pid) == first)
-        precondition(SingleInstancePolicy.isContract(["Khua", "--khua-session-contract"]))
-        precondition(!SingleInstancePolicy.isContract(["Khua", "--khua-isolated-profile", "/tmp/example"]))
+        precondition(SingleInstancePolicy.isContract(["OpenDuckFrame", "--odf-session-contract"]))
+        precondition(!SingleInstancePolicy.isContract(["OpenDuckFrame", "--odf-isolated-profile", "/tmp/example"]))
 
         var saved: [String?] = []
         var notices = 0
@@ -36,11 +36,11 @@ import Foundation
         precondition(saved.count == 1 && saved[0] == "zh-Hans" && notices == 1)
         choose(nil, "zh-Hans", "en", "en")
         precondition(saved.count == 2 && saved[1] == nil && notices == 1)
-        let optIn = ["Khua", "--khua-pixel-diagnostics", "--khua-isolated-profile", "/tmp/profile", "--khua-live-log", "/tmp/live.ndjson"]
+        let optIn = ["OpenDuckFrame", "--odf-pixel-diagnostics", "--odf-isolated-profile", "/tmp/profile", "--odf-live-log", "/tmp/live.ndjson"]
         precondition(PixelDiagnosticsPolicy.enabled(optIn))
-        precondition(!PixelDiagnosticsPolicy.enabled(["Khua", "--khua-pixel-diagnostics", "--khua-isolated-profile", "/tmp/profile"]))
-        precondition(!PixelDiagnosticsPolicy.enabled(["Khua", "--khua-pixel-diagnostics", "--khua-isolated-profile", "relative", "--khua-live-log", "/tmp/log"]))
-        precondition(!PixelDiagnosticsPolicy.enabled(["Khua", "--khua-isolated-profile", "/tmp/profile", "--khua-live-log", "/tmp/log"]))
+        precondition(!PixelDiagnosticsPolicy.enabled(["OpenDuckFrame", "--odf-pixel-diagnostics", "--odf-isolated-profile", "/tmp/profile"]))
+        precondition(!PixelDiagnosticsPolicy.enabled(["OpenDuckFrame", "--odf-pixel-diagnostics", "--odf-isolated-profile", "relative", "--odf-live-log", "/tmp/log"]))
+        precondition(!PixelDiagnosticsPolicy.enabled(["OpenDuckFrame", "--odf-isolated-profile", "/tmp/profile", "--odf-live-log", "/tmp/log"]))
 
         let stats: [String: Any] = ["sourceGeneration": UInt64(7), "configVersion": UInt64(13),
             "overlayInputEstimateFPS": 120.1, "overlayPresentedFPS": 119.9, "estimatedRequestedFPS": 240.2,

@@ -4,10 +4,10 @@
 #include <cmath>
 #include <initializer_list>
 
-static NSError *SPDistilError(NSInteger code,NSString *message){return [NSError errorWithDomain:@"app.khuaplayer.distildrba" code:code userInfo:@{NSLocalizedDescriptionKey:message}];}
+static NSError *SPDistilError(NSInteger code,NSString *message){return [NSError errorWithDomain:@"app.openduckframe.distildrba" code:code userInfo:@{NSLocalizedDescriptionKey:message}];}
 static NSURL *SPDistilModelURL(NSBundle *bundle){
 #if SP_DISTIL_PROBE
-    NSString *path=NSProcessInfo.processInfo.environment[@"KHUA_DISTIL_PROBE_MODEL"];
+    NSString *path=NSProcessInfo.processInfo.environment[@"ODF_DISTIL_PROBE_MODEL"];
     if(path.length)return [NSURL fileURLWithPath:path];
 #endif
     return [bundle URLForResource:@"DistilDRBA_720p" withExtension:@"mlmodelc"];
@@ -41,7 +41,7 @@ static CVPixelBufferRef SPDistilBuffer(MLMultiArray *array,CVPixelBufferRef sour
     dispatch_queue_t _queue;MLModel *_model;NSBundle *_resourceBundle;VTPixelTransferSessionRef _transfer;uint64_t _epoch;BOOL _running,_inflight;
 }
 - (instancetype)init {return [self initWithResourceBundle:NSBundle.mainBundle];}
-- (instancetype)initWithResourceBundle:(NSBundle *)bundle {if(!(self=[super init]))return nil;_resourceBundle=bundle;_queue=dispatch_queue_create("app.khuaplayer.distildrba",DISPATCH_QUEUE_SERIAL);return self;}
+- (instancetype)initWithResourceBundle:(NSBundle *)bundle {if(!(self=[super init]))return nil;_resourceBundle=bundle;_queue=dispatch_queue_create("app.openduckframe.distildrba",DISPATCH_QUEUE_SERIAL);return self;}
 - (void)dealloc {if(_transfer)CFRelease(_transfer);}
 - (CVPixelBufferRef)copyBGRA:(CVPixelBufferRef)source {
     if(CVPixelBufferGetPixelFormatType(source)==kCVPixelFormatType_32BGRA)return CVPixelBufferRetain(source);

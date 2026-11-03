@@ -17,7 +17,7 @@ final class SPRifeBridge: NSObject {
     @objc(initWithResourceBundle:)
     init(resourceBundle: Bundle) { self.resourceBundle = resourceBundle; super.init() }
 
-    private let exec = DispatchQueue(label: "app.khuaplayer.rife", qos: .userInitiated)
+    private let exec = DispatchQueue(label: "app.openduckframe.rife", qos: .userInitiated)
     private let state = NSLock()
     private var interpolator: RifeInterpolator?
     private var transfer: VTPixelTransferSession?
@@ -208,7 +208,7 @@ final class SPRifeBridge: NSObject {
                 } catch {
                     self.stream?.reset(); self.streamPrevious = nil; self.streamKey = nil; self.count("resets")
                     let failure = Self.explain(error) as NSError
-                    if failure.domain == "app.khuaplayer.rife" && failure.code == 10 {
+                    if failure.domain == "app.openduckframe.rife" && failure.code == 10 {
                         completion(token, nil, recordTiming(self), failure)
                         return
                     }
@@ -713,6 +713,6 @@ final class SPRifeBridge: NSObject {
     }
 
     private static func error(_ code: Int, _ text: String) -> NSError {
-        NSError(domain: "app.khuaplayer.rife", code: code, userInfo: [NSLocalizedDescriptionKey: text])
+        NSError(domain: "app.openduckframe.rife", code: code, userInfo: [NSLocalizedDescriptionKey: text])
     }
 }

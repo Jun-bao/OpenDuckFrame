@@ -1,4 +1,4 @@
-// KhuaPlayer — pure CPU compositor for libass grayscale masks.
+// OpenDuckFrame — pure CPU compositor for libass grayscale masks.
 #pragma once
 
 #include <cstddef>

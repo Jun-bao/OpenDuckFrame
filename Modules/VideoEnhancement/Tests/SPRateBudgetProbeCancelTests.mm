@@ -74,7 +74,7 @@
 }
 - (instancetype)init {
     if (!(self = [super init])) return nil;
-    _q = dispatch_queue_create("app.khuaplayer.probe-contract", DISPATCH_QUEUE_SERIAL);
+    _q = dispatch_queue_create("app.openduckframe.probe-contract", DISPATCH_QUEUE_SERIAL);
     _request = [[SPLivePlanRequest alloc] init];
     return self;
 }

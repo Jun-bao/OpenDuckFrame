@@ -1,6 +1,6 @@
 # Third-party notices
 
-Khua builds the following libraries from the versions and source hashes
+OpenDuckFrame builds the following libraries from the versions and source hashes
 recorded in [`ThirdParty/deps.lock.json`](ThirdParty/deps.lock.json).
 
 | Component | Version | Selected license |

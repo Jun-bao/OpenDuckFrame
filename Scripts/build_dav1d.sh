@@ -1,5 +1,5 @@
 #!/bin/bash
-# Khua — reproducible static dav1d (AV1 software fallback).
+# OpenDuckFrame — reproducible static dav1d (AV1 software fallback).
 # Output: ThirdParty/dav1d-min/{include,lib}; source/output are not committed.
 set -euo pipefail
 

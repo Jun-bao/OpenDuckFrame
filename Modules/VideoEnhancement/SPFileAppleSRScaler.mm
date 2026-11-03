@@ -6,7 +6,7 @@
 #include <atomic>
 
 static NSError *SPFileSRError(NSInteger code, NSString *message) {
-    return [NSError errorWithDomain:@"Khua.FileAppleSR" code:code userInfo:@{NSLocalizedDescriptionKey:message}];
+    return [NSError errorWithDomain:@"OpenDuckFrame.FileAppleSR" code:code userInfo:@{NSLocalizedDescriptionKey:message}];
 }
 
 @implementation SPFileAppleSRScaler {

@@ -150,7 +150,7 @@ enum SPMainThreadSentinel {
             root = URL(fileURLWithPath: setting, isDirectory: true)
         } else {
             root = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
-                .appendingPathComponent("Library/Logs/KhuaPlayer/hangs", isDirectory: true)
+                .appendingPathComponent("Library/Logs/OpenDuckFrame/hangs", isDirectory: true)
         }
         return SPHangDiagnosticFiles.directory(root: root,
             bundleID: Bundle.main.bundleIdentifier ?? "unknown-bundle")

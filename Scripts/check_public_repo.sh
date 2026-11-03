@@ -13,13 +13,12 @@ case "${1:-}" in
     python3 Scripts/check_private_repo.py
     while IFS= read -r script; do /bin/bash -n "$script"; done < <(find Scripts Apps/Mac/Scripts -type f -name '*.sh' | sort)
     python3 -m json.tool ThirdParty/deps.lock.json >/dev/null
-    python3 -m json.tool Design/AppIcon/KhuaPlayer.icon/icon.json >/dev/null
     python3 -m json.tool Design/AppIcon/export-manifest.json >/dev/null
     python3 -m json.tool Apps/Mac/Resources/Assets.xcassets/Contents.json >/dev/null
     python3 -m json.tool Apps/Mac/Resources/Assets.xcassets/AppIcon.appiconset/Contents.json >/dev/null
     python3 Design/AppIcon/check_appicon.py --shipping Apps/Mac/Resources/Assets.xcassets/AppIcon.appiconset
     python3 Scripts/l10n.py check --full
-    for plist in Apps/Mac/Info.plist Apps/Mac/KhuaPlayer.entitlements Apps/Mac/QuickLook/Info.plist Apps/Mac/QuickLook/KhuaPlayerQuickLook.entitlements Apps/Mac/Resources/PrivacyInfo.xcprivacy; do
+    for plist in Apps/Mac/Info.plist Apps/Mac/OpenDuckFrame.entitlements Apps/Mac/QuickLook/Info.plist Apps/Mac/QuickLook/OpenDuckFrameQuickLook.entitlements Apps/Mac/Resources/PrivacyInfo.xcprivacy; do
       plutil -lint "$plist" >/dev/null
     done
     echo "Private product repository checks passed."
@@ -35,7 +34,7 @@ managed_source_digest() {
   python3 Scripts/lib/runtime_source.py "$1"
 }
 
-BASELINE_RELATIVE=".khua-managed-source.sha256"
+BASELINE_RELATIVE=".odf-managed-source.sha256"
 BASELINE_FILE="$ROOT/$BASELINE_RELATIVE"
 if ! git ls-files --error-unmatch -- "$BASELINE_RELATIVE" >/dev/null 2>&1; then
   echo "error: managed-source fingerprint is not tracked: $BASELINE_RELATIVE" >&2
@@ -75,10 +74,22 @@ for path in "${FORBIDDEN_PATHS[@]}"; do
 done
 
 TRACKED_RELEASE_ARTIFACTS="$(git ls-files | \
-  grep -E '(^|/)((Khua|OpenDuckFrame)[^/]*\.app/|(Khua|OpenDuckFrame)[^/]*\.(dmg|zip)$|[^/]+\.(dSYM|xcarchive)/)' || true)"
+  grep -E '(^|/)(OpenDuckFrame[^/]*\.app/|OpenDuckFrame[^/]*\.(dmg|zip)$|[^/]+\.(dSYM|xcarchive)/)' || true)"
 if [ -n "$TRACKED_RELEASE_ARTIFACTS" ]; then
   echo "error: generated release artifacts are tracked:" >&2
   printf '%s\n' "$TRACKED_RELEASE_ARTIFACTS" >&2
+  exit 1
+fi
+
+# The only permitted mention of the former upstream name is the MIT copyright
+# line it requires, in LICENSE and in the notice shipped inside the app.
+if git grep -nIE '[Kk]hua|KH[U]A' -- ':!LICENSE' ':!Apps/Mac/Resources/Notices/OpenDuckFrame-MIT.txt' >/dev/null 2>&1; then
+  echo "error: the former upstream product name remains outside the license notice" >&2
+  git grep -nIE '[Kk]hua|KH[U]A' -- ':!LICENSE' ':!Apps/Mac/Resources/Notices/OpenDuckFrame-MIT.txt' >&2 || true
+  exit 1
+fi
+if git ls-files | grep -iE 'k[h]ua' >/dev/null; then
+  echo "error: a tracked path still uses the former upstream name" >&2
   exit 1
 fi
 
@@ -103,7 +114,6 @@ ENGLISH_FILES=(
   Design/AppIcon/asset-manifest.txt
   Design/AppIcon/check_appicon.py
   Design/AppIcon/export_static_appicon.py
-  Design/AppIcon/prepare_icon_composer_layers.py
   Design/AppIcon/requirements.txt
   LICENSE
   PRIVACY.md
@@ -157,7 +167,7 @@ for path in "${ENGLISH_FILES[@]}"; do
   fi
 done
 
-if grep -nE 'window\.title[[:space:]]*=[[:space:]]*"KhuaPlayer"' \
+if grep -nE 'window\.title[[:space:]]*=[[:space:]]*"[K]hua' \
      Apps/Mac/UI/PlayerWindowController.swift >/dev/null 2>&1; then
   echo "error: bootstrap window title must use the public display name OpenDuckFrame" >&2
   exit 1
@@ -166,6 +176,7 @@ fi
 # retains the short name, independently of the full product name.
 python3 - <<'PY'
 import json
+import re
 from pathlib import Path
 
 catalog = json.loads(Path('Apps/Mac/Resources/Localizable.xcstrings').read_text())
@@ -174,7 +185,7 @@ if not names or any(record.get('stringUnit', {}).get('value') != 'OpenDuckFrame'
                     for record in names.values()):
     raise SystemExit('error: every app.displayName translation must be OpenDuckFrame')
 text = Path('Apps/Mac/Resources/Localizable.xcstrings').read_text()
-if 'KhuaPlayer' in text or 'Khua Player' in text:
+if re.search(r'[K]hua', text):
     raise SystemExit('error: app chrome must use the OpenDuckFrame name')
 PY
 
@@ -183,7 +194,6 @@ while IFS= read -r script; do
 done < <(find Scripts Apps/Mac/Scripts -type f -name '*.sh' | sort)
 
 python3 -m json.tool ThirdParty/deps.lock.json >/dev/null
-python3 -m json.tool Design/AppIcon/KhuaPlayer.icon/icon.json >/dev/null
 python3 -m json.tool Design/AppIcon/export-manifest.json >/dev/null
 python3 -m json.tool Apps/Mac/Resources/Localizable.xcstrings >/dev/null
 python3 -m json.tool Apps/Mac/Resources/Assets.xcassets/Contents.json >/dev/null
@@ -194,17 +204,17 @@ python3 Scripts/l10n.py check --full
 python3 Scripts/verify_public_surface.py
 
 plutil -lint Apps/Mac/Info.plist >/dev/null
-plutil -lint Apps/Mac/KhuaPlayer.entitlements >/dev/null
+plutil -lint Apps/Mac/OpenDuckFrame.entitlements >/dev/null
 plutil -lint Apps/Mac/QuickLook/Info.plist >/dev/null
-plutil -lint Apps/Mac/QuickLook/KhuaPlayerQuickLook.entitlements >/dev/null
+plutil -lint Apps/Mac/QuickLook/OpenDuckFrameQuickLook.entitlements >/dev/null
 plutil -lint Apps/Mac/Resources/PrivacyInfo.xcprivacy >/dev/null
 
 [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' Apps/Mac/Info.plist)" = "OpenDuckFrame" ] || {
   echo "error: main CFBundleName must be OpenDuckFrame" >&2
   exit 1
 }
-[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' Apps/Mac/Info.plist)" = '$(KHUA_DISPLAY_NAME)' ] || {
-  echo "error: main CFBundleDisplayName must use KHUA_DISPLAY_NAME" >&2
+[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' Apps/Mac/Info.plist)" = '$(ODF_DISPLAY_NAME)' ] || {
+  echo "error: main CFBundleDisplayName must use ODF_DISPLAY_NAME" >&2
   exit 1
 }
 [ "$(/usr/libexec/PlistBuddy -c 'Print :SPProductName' Apps/Mac/Info.plist)"  = "OpenDuckFrame" ] || {

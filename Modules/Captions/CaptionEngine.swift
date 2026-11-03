@@ -61,7 +61,7 @@ final class CaptionEngine: @unchecked Sendable {
     var onFinished: ((Error?) -> Void)?
     var onPlaybackWaitChanged: ((Bool) -> Void)?
 
-    private let readerQueue = DispatchQueue(label: "dev.khuaplayer.captions.audio", qos: .utility)
+    private let readerQueue = DispatchQueue(label: "dev.openduckframe.captions.audio", qos: .utility)
     private let lock = NSLock()
     private var stopped = false
     private var outputCommitStarted = false
@@ -427,7 +427,7 @@ final class CaptionEngine: @unchecked Sendable {
         }
         try checkCancellation()
         guard out.count == needed.count else {
-            throw NSError(domain: "dev.khuaplayer.captions", code: 1,
+            throw NSError(domain: "dev.openduckframe.captions", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: NSLocalizedString("captions.error.translationIncomplete", comment: "")])
         }
         for (src, dst) in zip(needed, out) { translations[src] = dst }
@@ -627,7 +627,7 @@ final class CaptionEngine: @unchecked Sendable {
         guard !candidates.isEmpty else { return nil }
         nonisolated(unsafe) let r = SPCaptionAudioReader(path: mediaURL.path, audioStreamIndex: Int32(audioStreamIndex))
         r.timelineOriginUs = timelineOriginUs
-        let q = DispatchQueue(label: "dev.khuaplayer.captions.probe", qos: .utility)
+        let q = DispatchQueue(label: "dev.openduckframe.captions.probe", qos: .utility)
         var fallback: Locale?
         for attempt in 0..<5 {
             try Task.checkCancellation()

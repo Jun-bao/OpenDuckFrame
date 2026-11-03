@@ -2,14 +2,14 @@
 # Loads the actual debug code into a headless test process; no app/window launch.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
-PRODUCTS="${KHUA_TEST_FRAMEWORKS_DIR:-$ROOT/.build/Build/Products/Debug}"
-APP="${KHUA_TEST_RESOURCE_APP:-$ROOT/.build/Build/Products/Debug/OpenDuckFrame.app}"
-DYLIB="${KHUA_TEST_DEBUG_DYLIB:-$ROOT/.build/Build/Products/Debug/OpenDuckFrame.app/Contents/MacOS/Khua.debug.dylib}"
+PRODUCTS="${ODF_TEST_FRAMEWORKS_DIR:-$ROOT/.build/Build/Products/Debug}"
+APP="${ODF_TEST_RESOURCE_APP:-$ROOT/.build/Build/Products/Debug/OpenDuckFrame.app}"
+DYLIB="${ODF_TEST_DEBUG_DYLIB:-$ROOT/.build/Build/Products/Debug/OpenDuckFrame.app/Contents/MacOS/OpenDuckFrame.debug.dylib}"
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_DIR"' EXIT
 "$(command -v ffmpeg)" -v error -f lavfi -i 'testsrc2=size=320x192:rate=24' -frames:v 2 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -color_primaries bt709 -color_trc bt709 -colorspace bt709 -an "$TEST_DIR/source.mp4"
 xcrun clang++ -std=c++17 -fobjc-arc -Wno-deprecated-declarations -Wno-nullability-completeness -I "$ROOT/Apps/Mac/Capture" -I "$ROOT/Modules/VideoEnhancement" \
-  "$ROOT/Modules/VideoEnhancement/Tests/SPFileRifeProviderTests.mm" -F "$PRODUCTS" -framework KhuaPlayerMediaCore -framework Foundation -framework CoreVideo -framework CoreMedia -framework AVFoundation \
+  "$ROOT/Modules/VideoEnhancement/Tests/SPFileRifeProviderTests.mm" -F "$PRODUCTS" -framework OpenDuckFrameMediaCore -framework Foundation -framework CoreVideo -framework CoreMedia -framework AVFoundation \
   -Wl,-rpath,"$PRODUCTS" -o "$TEST_DIR/test"
 for model in rife-v4.25 rife-v4.26; do
   for quality in fast balanced hq; do

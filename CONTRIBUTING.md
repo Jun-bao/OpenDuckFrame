@@ -34,13 +34,11 @@ then run `Scripts/l10n.py merge <directory>` and the full check again.
 
 ### Product naming
 
-Use `OpenDuckFrame` for every user-visible name: the app bundle, Dock, Finder,
-application menu, windows, About panel, localized `app.displayName`, download
-artifacts, and documentation. Mention Khua Player only as attribution ("based on
-Khua Player"). Internal identifiers inherited from Khua Player (bundle
-identifier, `Khua` executable, `KhuaPlayer` targets and modules, preference and
-lock keys) stay unchanged so existing settings and single-instance handoff keep
-working; do not rename them to change visible branding.
+Use `OpenDuckFrame` for every name: the app bundle, executable, Dock, Finder,
+menus, windows, About panel, localized `app.displayName`, bundle identifiers
+(`app.openduckframe.*`), targets, modules, environment variables (`ODF_*`),
+command-line flags (`--odf-*`), download artifacts and documentation.
+`Scripts/check_public_repo.sh` rejects any other product name.
 
 ### Checks
 
@@ -56,7 +54,7 @@ these commands from the repository root:
 
 `Scripts/build.sh` remains a compatibility entry point. Edit
 `Apps/Mac/project.yml` for Mac build configuration changes, not the generated
-`Apps/Mac/KhuaPlayer.xcodeproj`. The shared `.build` directory and root-level
+`Apps/Mac/OpenDuckFrame.xcodeproj`. The shared `.build` directory and root-level
 `OpenDuckFrame.app` deployment location are unchanged.
 
 Describe the media formats and macOS versions exercised in the pull request.

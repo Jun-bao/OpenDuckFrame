@@ -1,4 +1,4 @@
-// KhuaPlayer - container recovery: MPEG-TS/PS (PES lengths, PMT/PCR, transport headers, ADTS, PES header length), raw elementary streams, MPEG-2 sequence header
+// OpenDuckFrame - container recovery: MPEG-TS/PS (PES lengths, PMT/PCR, transport headers, ADTS, PES header length), raw elementary streams, MPEG-2 sequence header
 //
 // Split out of the umbrella header by section; function bodies, constants and inline
 // attributes are unchanged. Callers keep including the umbrella; this file only guarantees

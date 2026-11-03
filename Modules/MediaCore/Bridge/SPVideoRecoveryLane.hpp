@@ -1,4 +1,4 @@
-// KhuaPlayer - budget and retry policy for the video recovery lane (hardware to software replay and back); pure constants and functions
+// OpenDuckFrame - budget and retry policy for the video recovery lane (hardware to software replay and back); pure constants and functions
 //
 // Execution (GOP packet retention, software replay, returning to the hardware decoder, decoder ownership) stays in the
 // player core; only the thresholds that decide over-budget and give-up live here.

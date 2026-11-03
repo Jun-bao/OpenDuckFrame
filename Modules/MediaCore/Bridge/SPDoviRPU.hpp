@@ -1,4 +1,4 @@
-// KhuaPlayer — Dolby Vision RPU state and native Metal serialization.
+// OpenDuckFrame — Dolby Vision RPU state and native Metal serialization.
 // Parsing is provided by the version-matched, small adapter in ffmpeg-min.
 #pragma once
 #include <cstddef>

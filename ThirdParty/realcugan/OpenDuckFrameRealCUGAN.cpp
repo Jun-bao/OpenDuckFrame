@@ -14,8 +14,8 @@ unsigned liveHandles=0;
 struct Handle { RealCUGAN *model=nullptr; std::mutex work; };
 }
 extern "C" {
-int khua_realcugan_abi_version() { return 1; }
-void *khua_realcugan_create(const char *parameters,const char *weights,int *status) {
+int odf_realcugan_abi_version() { return 1; }
+void *odf_realcugan_create(const char *parameters,const char *weights,int *status) {
     if(status)*status=-1;
     if(!parameters || !weights)return nullptr;
     std::lock_guard<std::mutex> lock(globalMutex);
@@ -32,7 +32,7 @@ void *khua_realcugan_create(const char *parameters,const char *weights,int *stat
     handle->model->noise=noise;handle->model->scale=2;handle->model->tilesize=200;handle->model->prepadding=18;handle->model->syncgap=noise<0?0:3;
     liveHandles++;if(status)*status=0;return handle;
 }
-int khua_realcugan_process(void *opaque,const uint8_t *rgb,int width,int height,uint8_t *output) {
+int odf_realcugan_process(void *opaque,const uint8_t *rgb,int width,int height,uint8_t *output) {
     if(!opaque||!rgb||!output||width<2||height<2||width>1920||height>1080)return -1;
     Handle *handle=static_cast<Handle *>(opaque);std::lock_guard<std::mutex> lock(handle->work);
     ncnn::Mat input(width,height,(void *)rgb,(size_t)3,3);
@@ -42,7 +42,7 @@ int khua_realcugan_process(void *opaque,const uint8_t *rgb,int width,int height,
     if(code!=0)return code;
     memcpy(output,result.data,(size_t)width*height*4*3);return 0;
 }
-void khua_realcugan_destroy(void *opaque) {
+void odf_realcugan_destroy(void *opaque) {
     if(!opaque)return;
     Handle *handle=static_cast<Handle *>(opaque);
     std::lock_guard<std::mutex> lock(globalMutex);

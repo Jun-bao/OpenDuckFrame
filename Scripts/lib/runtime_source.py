@@ -10,7 +10,7 @@ MANAGED = (
     'Modules/MediaCore/Bridge', 'Modules/MediaCore/Core', 'Modules/MediaCore/Shaders',
     'Modules/Captions', 'Platform/macOS/Audio', 'Platform/macOS/Rendering',
     'Apps/Mac/UI', 'Apps/Mac/CaptionsHost', 'Apps/Mac/CaptionsUI',
-    'Apps/Mac/QuickLook/Preview', 'Apps/Mac/Support/KhuaPlayer-Bridging-Header.h',
+    'Apps/Mac/QuickLook/Preview', 'Apps/Mac/Support/OpenDuckFrame-Bridging-Header.h',
     'Apps/Mac/Resources/Localizable.xcstrings',
 )
 LEGACY = ('Bridge', 'Core', 'Shaders', 'UI', 'Captions', 'CaptionsUI',

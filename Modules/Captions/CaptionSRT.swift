@@ -207,7 +207,7 @@ enum CaptionSRT {
         try validateOutputURL(url)
         let data = Data(render(events).utf8)
         let temporary = url.deletingLastPathComponent()
-            .appendingPathComponent(".khuaplayer-caption-\(UUID().uuidString).tmp")
+            .appendingPathComponent(".openduckframe-caption-\(UUID().uuidString).tmp")
         // Let the kernel apply this process's existing umask and directory ACL;
         // reading umask via a set/reset pair would race unrelated app writes.
         let fd = temporary.withUnsafeFileSystemRepresentation { path -> Int32 in

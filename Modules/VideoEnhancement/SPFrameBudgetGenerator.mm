@@ -118,7 +118,7 @@ static NSString *spBudgetCalibDefaultsKey(uint32_t width, uint32_t height) {
     size_t len = sizeof(model) - 1;
     if (sysctlbyname("hw.model", model, &len, nullptr, 0) != 0) strlcpy(model, "unknown", sizeof(model));
     const NSOperatingSystemVersion os = NSProcessInfo.processInfo.operatingSystemVersion;
-    return [NSString stringWithFormat:@"dev.khuaplayer.frc.calib.%s.%s.%ld.%ld", bucket, model,
+    return [NSString stringWithFormat:@"dev.openduckframe.frc.calib.%s.%s.%ld.%ld", bucket, model,
             (long)os.majorVersion, (long)os.minorVersion];
 }
 
@@ -254,7 +254,7 @@ struct SPBudgetEmitStat { uint8_t covered = 0; uint8_t toggled = 0; float benefi
     _memoryDesiredSessions = 3;
     _memoryFits = true;
     _emitLastCovered = -1;
-    _work = dispatch_queue_create("dev.khuaplayer.frame-budget",
+    _work = dispatch_queue_create("dev.openduckframe.frame-budget",
                                   dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
     _fixedSessions = spBudgetFixedSessions();
     _publishedCode = -1;
@@ -545,7 +545,7 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
     _emitterStarted = true;
 
     _emitter = std::thread([self] {
-        pthread_setname_np("dev.khuaplayer.frame-budget-emit");
+        pthread_setname_np("dev.openduckframe.frame-budget-emit");
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
         [self emitterLoop];
     });
@@ -1400,7 +1400,7 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
                 : [provider submitPrevious:fa current:fb previousPTSUs:previousPTSUs currentPTSUs:currentPTSUs phases:phases token:token completion:done];
             if(!submitted){
                 CVPixelBufferRelease(fa);CVPixelBufferRelease(fb);
-                [self fileProviderCompleted:provider token:token generation:generation policy:policy outputs:nil error:[NSError errorWithDomain:@"Khua.FileProvider" code:1 userInfo:@{NSLocalizedDescriptionKey:@"文件插帧引擎无法接收任务。"}]];
+                [self fileProviderCompleted:provider token:token generation:generation policy:policy outputs:nil error:[NSError errorWithDomain:@"OpenDuckFrame.FileProvider" code:1 userInfo:@{NSLocalizedDescriptionKey:@"文件插帧引擎无法接收任务。"}]];
             }
             return;
         }

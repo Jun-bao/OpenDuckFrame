@@ -1,11 +1,11 @@
 # OpenDuckFrame 能力工作台开发快照
 
-本仓库是组织内部的 Khua 画质工作台开发快照，基于上游 `nake13/khuaplayer` 的 `9687b4a35c8cdc8152c17532b776f56e1ffc7ee9`。保留上游提交历史、许可证和第三方声明。
+本仓库是 OpenDuckFrame 画质工作台的开发快照，许可证和第三方声明见根目录。
 
 ## 2026-11-03：品牌与采集尺寸更新
 
 - 正式品牌为 **OpenDuckFrame**，中文昵称为“开源小鸭”。应用、关于窗口、17 种语言的产品名、Quick Look 和构建产物名称已统一，使用新的黄色鸭子图标。
-- 保留原 bundle ID、内部可执行名、配置路径和单实例锁；新代码识别旧品牌实例。没有创建第二套运行身份。
+- 2026-11-03 起 bundle ID、可执行名、配置路径、单实例锁、模块名和环境变量都改为 OpenDuckFrame 自己的标识（`app.openduckframe.*`、`ODF_*`、`--odf-*`），版本号从 0.1.0 开始。旧版的设置不会自动迁移。
 - Release 候选 ODF2 已独立核对源码、包清单和签名，并在真实工作台检查名称、图标、中英文和长标题显示。首次原生检查发现的标题裁切已修正，最终截图可完整显示名称。
 - 采集尺寸改为窗口尺寸稳定 300ms 后原地更新同一 SCStream 配置，不依赖下一帧触发，不改变采集代次。旧版压缩反例、修复后的真实缩小和放大、面板量尺及尺寸重启保留已取得有效证据；两轮新尺寸首次被日志看到的上界约 0.4 秒，底部与右侧死区均为 0。
 - **采集几何整单尚未全部通过。** 处理器重建的现有两阶段语义让配置号增加两次，转换期 FPS 有未知值，Chrome 拖动、原生全屏、真 120 帧和 Retina 等剩余项未完整验收。部分压力测试仅验证采集更新与持有帧稳定，未取得有效物理呈现段。没有把这些项改写为通过。
@@ -31,8 +31,8 @@
 ## 获取与构建
 
 ```sh
-git clone https://github.com/super-individual-ai/khua-workbench.git
-cd khua-workbench
+git clone https://github.com/super-individual-ai/OpenDuckFrame.git
+cd OpenDuckFrame
 ./Apps/Mac/Scripts/build.sh Debug
 ```
 

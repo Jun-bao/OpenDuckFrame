@@ -37000,103 +37000,103 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Deine Medien und dein Wiedergabeverlauf bleiben auf diesem Mac. Bestehende Update-Prüfungen senden eine zufällige Installations-ID und die App-Version an khua.app, um aktive Installationen zu zählen. Keine zusätzlichen Anfragen, Hardware-Kennungen oder Wiedergabedaten. Installationsbezogene Einträge umfassen die letzten 30 UTC-Kalendertage; zusammengefasste Zählwerte können länger gespeichert werden. Automatische Prüfungen lassen sich im App-Menü ausschalten. Manuelle Prüfungen senden diese Informationen weiterhin."
+            "value": "Deine Medien und dein Wiedergabeverlauf bleiben auf diesem Mac. Bestehende Update-Prüfungen senden eine zufällige Installations-ID und die App-Version an openduckframe.app, um aktive Installationen zu zählen. Keine zusätzlichen Anfragen, Hardware-Kennungen oder Wiedergabedaten. Installationsbezogene Einträge umfassen die letzten 30 UTC-Kalendertage; zusammengefasste Zählwerte können länger gespeichert werden. Automatische Prüfungen lassen sich im App-Menü ausschalten. Manuelle Prüfungen senden diese Informationen weiterhin."
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Your media and playback history stay on this Mac. Existing update checks send a random installation ID and the app version to khua.app to count active installations. No extra requests, hardware IDs, or playback data. Installation-level records cover the last 30 UTC dates; aggregate counts may be kept longer. Automatic checks can be turned off in the app menu. Manual checks still send this information."
+            "value": "Your media and playback history stay on this Mac. Existing update checks send a random installation ID and the app version to openduckframe.app to count active installations. No extra requests, hardware IDs, or playback data. Installation-level records cover the last 30 UTC dates; aggregate counts may be kept longer. Automatic checks can be turned off in the app menu. Manual checks still send this information."
           }
         },
         "es": {
           "stringUnit": {
             "state": "translated",
-            "value": "Tus archivos multimedia y tu historial de reproducción permanecen en este Mac. Las comprobaciones de actualizaciones existentes envían un ID de instalación aleatorio y la versión de la app a khua.app para contar las instalaciones activas. Sin solicitudes adicionales, identificadores de hardware ni datos de reproducción. Los registros por instalación abarcan las últimas 30 fechas UTC; los recuentos agregados pueden conservarse más tiempo. Puedes desactivar las comprobaciones automáticas en el menú de la app. Las comprobaciones manuales siguen enviando esta información."
+            "value": "Tus archivos multimedia y tu historial de reproducción permanecen en este Mac. Las comprobaciones de actualizaciones existentes envían un ID de instalación aleatorio y la versión de la app a openduckframe.app para contar las instalaciones activas. Sin solicitudes adicionales, identificadores de hardware ni datos de reproducción. Los registros por instalación abarcan las últimas 30 fechas UTC; los recuentos agregados pueden conservarse más tiempo. Puedes desactivar las comprobaciones automáticas en el menú de la app. Las comprobaciones manuales siguen enviando esta información."
           }
         },
         "fr": {
           "stringUnit": {
             "state": "translated",
-            "value": "Vos médias et votre historique de lecture restent sur ce Mac. Les vérifications de mise à jour existantes envoient un identifiant d’installation aléatoire et la version de l’app à khua.app pour compter les installations actives. Aucune requête supplémentaire, aucun identifiant matériel ni aucune donnée de lecture. Les données par installation couvrent les 30 dernières dates UTC ; les totaux agrégés peuvent être conservés plus longtemps. Vous pouvez désactiver les vérifications automatiques dans le menu de l’app. Les vérifications manuelles continuent d’envoyer ces informations."
+            "value": "Vos médias et votre historique de lecture restent sur ce Mac. Les vérifications de mise à jour existantes envoient un identifiant d’installation aléatoire et la version de l’app à openduckframe.app pour compter les installations actives. Aucune requête supplémentaire, aucun identifiant matériel ni aucune donnée de lecture. Les données par installation couvrent les 30 dernières dates UTC ; les totaux agrégés peuvent être conservés plus longtemps. Vous pouvez désactiver les vérifications automatiques dans le menu de l’app. Les vérifications manuelles continuent d’envoyer ces informations."
           }
         },
         "id": {
           "stringUnit": {
             "state": "translated",
-            "value": "Media dan riwayat pemutaran Anda tetap di Mac ini. Pemeriksaan pembaruan yang sudah ada mengirim ID instalasi acak dan versi aplikasi ke khua.app untuk menghitung instalasi aktif. Tanpa permintaan tambahan, pengenal perangkat keras, atau data pemutaran. Catatan per instalasi mencakup 30 tanggal UTC terakhir; jumlah agregat dapat disimpan lebih lama. Pemeriksaan otomatis dapat dimatikan di menu aplikasi. Pemeriksaan manual tetap mengirim informasi ini."
+            "value": "Media dan riwayat pemutaran Anda tetap di Mac ini. Pemeriksaan pembaruan yang sudah ada mengirim ID instalasi acak dan versi aplikasi ke openduckframe.app untuk menghitung instalasi aktif. Tanpa permintaan tambahan, pengenal perangkat keras, atau data pemutaran. Catatan per instalasi mencakup 30 tanggal UTC terakhir; jumlah agregat dapat disimpan lebih lama. Pemeriksaan otomatis dapat dimatikan di menu aplikasi. Pemeriksaan manual tetap mengirim informasi ini."
           }
         },
         "it": {
           "stringUnit": {
             "state": "translated",
-            "value": "I tuoi contenuti multimediali e la cronologia di riproduzione restano su questo Mac. I controlli degli aggiornamenti esistenti inviano un ID di installazione casuale e la versione dell’app a khua.app per contare le installazioni attive. Nessuna richiesta aggiuntiva, nessun identificativo hardware o dato di riproduzione. I record per installazione coprono le ultime 30 date UTC; i conteggi aggregati possono essere conservati più a lungo. Puoi disattivare i controlli automatici nel menu dell’app. I controlli manuali continuano a inviare queste informazioni."
+            "value": "I tuoi contenuti multimediali e la cronologia di riproduzione restano su questo Mac. I controlli degli aggiornamenti esistenti inviano un ID di installazione casuale e la versione dell’app a openduckframe.app per contare le installazioni attive. Nessuna richiesta aggiuntiva, nessun identificativo hardware o dato di riproduzione. I record per installazione coprono le ultime 30 date UTC; i conteggi aggregati possono essere conservati più a lungo. Puoi disattivare i controlli automatici nel menu dell’app. I controlli manuali continuano a inviare queste informazioni."
           }
         },
         "ja": {
           "stringUnit": {
             "state": "translated",
-            "value": "メディアと再生履歴はこの Mac に保存されます。既存のアップデート確認時に、ランダムなインストール ID とアプリのバージョンを khua.app に送信し、利用中のインストール数を集計します。追加のリクエスト、ハードウェア識別子、再生データはありません。インストールごとの記録は直近30日分（UTCの日付）を対象とし、集計値はそれより長く保存される場合があります。自動確認はアプリのメニューでオフにできます。手動確認時には引き続きこの情報が送信されます。"
+            "value": "メディアと再生履歴はこの Mac に保存されます。既存のアップデート確認時に、ランダムなインストール ID とアプリのバージョンを openduckframe.app に送信し、利用中のインストール数を集計します。追加のリクエスト、ハードウェア識別子、再生データはありません。インストールごとの記録は直近30日分（UTCの日付）を対象とし、集計値はそれより長く保存される場合があります。自動確認はアプリのメニューでオフにできます。手動確認時には引き続きこの情報が送信されます。"
           }
         },
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "미디어와 재생 기록은 이 Mac에만 저장됩니다. 기존 업데이트 확인 시 무작위 설치 ID와 앱 버전이 khua.app으로 전송되어 활성 설치 수를 집계합니다. 추가 요청, 하드웨어 식별자 또는 재생 데이터는 없습니다. 설치별 기록은 최근 30개 UTC 날짜를 포함하며 집계 수치는 더 오래 보관될 수 있습니다. 앱 메뉴에서 자동 확인을 끌 수 있습니다. 수동 확인 시에는 이 정보가 계속 전송됩니다."
+            "value": "미디어와 재생 기록은 이 Mac에만 저장됩니다. 기존 업데이트 확인 시 무작위 설치 ID와 앱 버전이 openduckframe.app으로 전송되어 활성 설치 수를 집계합니다. 추가 요청, 하드웨어 식별자 또는 재생 데이터는 없습니다. 설치별 기록은 최근 30개 UTC 날짜를 포함하며 집계 수치는 더 오래 보관될 수 있습니다. 앱 메뉴에서 자동 확인을 끌 수 있습니다. 수동 확인 시에는 이 정보가 계속 전송됩니다."
           }
         },
         "nl": {
           "stringUnit": {
             "state": "translated",
-            "value": "Je media en afspeelgeschiedenis blijven op deze Mac. Bestaande updatecontroles sturen een willekeurige installatie-ID en de appversie naar khua.app om actieve installaties te tellen. Geen extra verzoeken, hardware-ID’s of afspeelgegevens. Registraties per installatie beslaan de laatste 30 UTC-datums; samengevoegde aantallen kunnen langer worden bewaard. Je kunt automatische controles uitschakelen in het appmenu. Handmatige controles blijven deze informatie versturen."
+            "value": "Je media en afspeelgeschiedenis blijven op deze Mac. Bestaande updatecontroles sturen een willekeurige installatie-ID en de appversie naar openduckframe.app om actieve installaties te tellen. Geen extra verzoeken, hardware-ID’s of afspeelgegevens. Registraties per installatie beslaan de laatste 30 UTC-datums; samengevoegde aantallen kunnen langer worden bewaard. Je kunt automatische controles uitschakelen in het appmenu. Handmatige controles blijven deze informatie versturen."
           }
         },
         "pl": {
           "stringUnit": {
             "state": "translated",
-            "value": "Multimedia i historia odtwarzania pozostają na tym Macu. Dotychczasowe sprawdzanie aktualizacji wysyła losowy identyfikator instalacji i wersję aplikacji do khua.app w celu liczenia aktywnych instalacji. Bez dodatkowych żądań, identyfikatorów sprzętu ani danych odtwarzania. Rekordy poszczególnych instalacji obejmują ostatnie 30 dat UTC; zbiorcze wyniki mogą być przechowywane dłużej. Automatyczne sprawdzanie można wyłączyć w menu aplikacji. Ręczne sprawdzanie nadal wysyła te informacje."
+            "value": "Multimedia i historia odtwarzania pozostają na tym Macu. Dotychczasowe sprawdzanie aktualizacji wysyła losowy identyfikator instalacji i wersję aplikacji do openduckframe.app w celu liczenia aktywnych instalacji. Bez dodatkowych żądań, identyfikatorów sprzętu ani danych odtwarzania. Rekordy poszczególnych instalacji obejmują ostatnie 30 dat UTC; zbiorcze wyniki mogą być przechowywane dłużej. Automatyczne sprawdzanie można wyłączyć w menu aplikacji. Ręczne sprawdzanie nadal wysyła te informacje."
           }
         },
         "pt": {
           "stringUnit": {
             "state": "translated",
-            "value": "Sua mídia e seu histórico de reprodução ficam neste Mac. As verificações de atualizações existentes enviam um ID de instalação aleatório e a versão do app para khua.app para contar as instalações ativas. Sem solicitações adicionais, identificadores de hardware ou dados de reprodução. Os registros por instalação abrangem as últimas 30 datas UTC; as contagens agregadas podem ser mantidas por mais tempo. Você pode desativar as verificações automáticas no menu do app. As verificações manuais continuam enviando essas informações."
+            "value": "Sua mídia e seu histórico de reprodução ficam neste Mac. As verificações de atualizações existentes enviam um ID de instalação aleatório e a versão do app para openduckframe.app para contar as instalações ativas. Sem solicitações adicionais, identificadores de hardware ou dados de reprodução. Os registros por instalação abrangem as últimas 30 datas UTC; as contagens agregadas podem ser mantidas por mais tempo. Você pode desativar as verificações automáticas no menu do app. As verificações manuais continuam enviando essas informações."
           }
         },
         "ru": {
           "stringUnit": {
             "state": "translated",
-            "value": "Медиафайлы и история воспроизведения остаются на этом Mac. Обычные проверки обновлений отправляют случайный идентификатор установки и версию приложения на khua.app для подсчёта активных установок. Без дополнительных запросов, аппаратных идентификаторов и данных о воспроизведении. Записи по установкам охватывают последние 30 дат UTC; сводные показатели могут храниться дольше. Автоматические проверки можно отключить в меню приложения. При ручной проверке эти сведения по-прежнему отправляются."
+            "value": "Медиафайлы и история воспроизведения остаются на этом Mac. Обычные проверки обновлений отправляют случайный идентификатор установки и версию приложения на openduckframe.app для подсчёта активных установок. Без дополнительных запросов, аппаратных идентификаторов и данных о воспроизведении. Записи по установкам охватывают последние 30 дат UTC; сводные показатели могут храниться дольше. Автоматические проверки можно отключить в меню приложения. При ручной проверке эти сведения по-прежнему отправляются."
           }
         },
         "th": {
           "stringUnit": {
             "state": "translated",
-            "value": "สื่อและประวัติการเล่นของคุณอยู่บน Mac เครื่องนี้ การตรวจหาอัปเดตที่มีอยู่จะส่งรหัสการติดตั้งแบบสุ่มและเวอร์ชันแอปไปยัง khua.app เพื่อนับการติดตั้งที่ใช้งานอยู่ ไม่มีคำขอเพิ่มเติม รหัสฮาร์ดแวร์ หรือข้อมูลการเล่น บันทึกระดับการติดตั้งครอบคลุม 30 วันที่ผ่านมาตาม UTC ส่วนยอดรวมอาจเก็บไว้นานกว่านั้น คุณสามารถปิดการตรวจหาอัปเดตอัตโนมัติได้ในเมนูแอป การตรวจหาด้วยตนเองจะยังส่งข้อมูลนี้"
+            "value": "สื่อและประวัติการเล่นของคุณอยู่บน Mac เครื่องนี้ การตรวจหาอัปเดตที่มีอยู่จะส่งรหัสการติดตั้งแบบสุ่มและเวอร์ชันแอปไปยัง openduckframe.app เพื่อนับการติดตั้งที่ใช้งานอยู่ ไม่มีคำขอเพิ่มเติม รหัสฮาร์ดแวร์ หรือข้อมูลการเล่น บันทึกระดับการติดตั้งครอบคลุม 30 วันที่ผ่านมาตาม UTC ส่วนยอดรวมอาจเก็บไว้นานกว่านั้น คุณสามารถปิดการตรวจหาอัปเดตอัตโนมัติได้ในเมนูแอป การตรวจหาด้วยตนเองจะยังส่งข้อมูลนี้"
           }
         },
         "tr": {
           "stringUnit": {
             "state": "translated",
-            "value": "Medyanız ve oynatma geçmişiniz bu Mac’te kalır. Mevcut güncelleme denetimleri, etkin kurulumları saymak için khua.app adresine rastgele bir kurulum kimliği ve uygulama sürümünü gönderir. Ek istek, donanım kimliği veya oynatma verisi gönderilmez. Kurulum kayıtları son 30 UTC tarihini kapsar; toplu sayımlar daha uzun süre saklanabilir. Otomatik denetimleri uygulama menüsünden kapatabilirsiniz. Elle yapılan denetimler bu bilgileri göndermeye devam eder."
+            "value": "Medyanız ve oynatma geçmişiniz bu Mac’te kalır. Mevcut güncelleme denetimleri, etkin kurulumları saymak için openduckframe.app adresine rastgele bir kurulum kimliği ve uygulama sürümünü gönderir. Ek istek, donanım kimliği veya oynatma verisi gönderilmez. Kurulum kayıtları son 30 UTC tarihini kapsar; toplu sayımlar daha uzun süre saklanabilir. Otomatik denetimleri uygulama menüsünden kapatabilirsiniz. Elle yapılan denetimler bu bilgileri göndermeye devam eder."
           }
         },
         "vi": {
           "stringUnit": {
             "state": "translated",
-            "value": "Nội dung đa phương tiện và lịch sử phát của bạn được giữ trên máy Mac này. Các lần kiểm tra cập nhật hiện có gửi mã cài đặt ngẫu nhiên và phiên bản ứng dụng đến khua.app để đếm số bản cài đặt đang hoạt động. Không có yêu cầu bổ sung, mã định danh phần cứng hay dữ liệu phát. Bản ghi theo cài đặt bao gồm 30 ngày UTC gần nhất; số liệu tổng hợp có thể được lưu lâu hơn. Bạn có thể tắt kiểm tra tự động trong menu ứng dụng. Kiểm tra thủ công vẫn gửi thông tin này."
+            "value": "Nội dung đa phương tiện và lịch sử phát của bạn được giữ trên máy Mac này. Các lần kiểm tra cập nhật hiện có gửi mã cài đặt ngẫu nhiên và phiên bản ứng dụng đến openduckframe.app để đếm số bản cài đặt đang hoạt động. Không có yêu cầu bổ sung, mã định danh phần cứng hay dữ liệu phát. Bản ghi theo cài đặt bao gồm 30 ngày UTC gần nhất; số liệu tổng hợp có thể được lưu lâu hơn. Bạn có thể tắt kiểm tra tự động trong menu ứng dụng. Kiểm tra thủ công vẫn gửi thông tin này."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "你的媒体和播放历史只留在这台 Mac 上。现有的更新检查会向 khua.app 发送一个随机生成的安装标识和 App 版本，用于统计活跃安装数。不会增加请求，也不发送硬件标识或播放数据。安装级记录保留最近 30 个 UTC 日期的数据，汇总数字可能保留更久。你可以在 App 菜单中关闭自动检查更新；手动检查更新时仍会发送这些信息。"
+            "value": "你的媒体和播放历史只留在这台 Mac 上。现有的更新检查会向 openduckframe.app 发送一个随机生成的安装标识和 App 版本，用于统计活跃安装数。不会增加请求，也不发送硬件标识或播放数据。安装级记录保留最近 30 个 UTC 日期的数据，汇总数字可能保留更久。你可以在 App 菜单中关闭自动检查更新；手动检查更新时仍会发送这些信息。"
           }
         },
         "zh-Hant": {
           "stringUnit": {
             "state": "translated",
-            "value": "你的媒體與播放記錄只留在這部 Mac。現有的更新檢查會向 khua.app 傳送一個隨機產生的安裝識別碼和 App 版本，用於統計活躍安裝數。不會增加請求，也不傳送硬體識別碼或播放資料。安裝層級的記錄保留最近 30 個 UTC 日期的資料，彙總數字可能保留更久。你可以在 App 選單中關閉自動檢查更新；手動檢查更新時仍會傳送這些資訊。"
+            "value": "你的媒體與播放記錄只留在這部 Mac。現有的更新檢查會向 openduckframe.app 傳送一個隨機產生的安裝識別碼和 App 版本，用於統計活躍安裝數。不會增加請求，也不傳送硬體識別碼或播放資料。安裝層級的記錄保留最近 30 個 UTC 日期的資料，彙總數字可能保留更久。你可以在 App 選單中關閉自動檢查更新；手動檢查更新時仍會傳送這些資訊。"
           }
         }
       }

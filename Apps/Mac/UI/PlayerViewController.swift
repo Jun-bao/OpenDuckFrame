@@ -77,7 +77,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     /// cover thousands of names; serializing it prevents several player windows
     /// from turning a background convenience into a burst of foreground CPU.
     private static let directorySubtitleRankingQueue = DispatchQueue(
-        label: "dev.khuaplayer.directory-subtitle-ranking", qos: .utility)
+        label: "dev.openduckframe.directory-subtitle-ranking", qos: .utility)
 
     private let playerView = PlayerView()
     private var workbenchFPSPlate: NSView?
@@ -2511,7 +2511,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     static let resumeSaveQueue =
-        DispatchQueue(label: "dev.khuaplayer.resume-save", qos: .utility)
+        DispatchQueue(label: "dev.openduckframe.resume-save", qos: .utility)
 
     private func persistCompletedResumeState(_ core: SPPlayerCore) {
         guard hasMediaSession, let fp = core.currentFilePath else { return }
@@ -3446,7 +3446,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
         core.frameInterpolationMode = hasVideoSession ? mode : .off
         refreshMotionSmoothingControl()
-        NotificationCenter.default.post(name: .khuaMotionPlusChanged, object: self)
+        NotificationCenter.default.post(name: .odfMotionPlusChanged, object: self)
     }
 
     func workbenchSetMotionPlus(_ enabled: Bool) {
@@ -3479,7 +3479,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         let committed = core.commitFilePlan(withInterpolation: interpolation, usePreparedProvider: rife, cadence: cadence, numerator: numerator, denominator: denominator, usePreparedScaler: scaler)
         if committed {
             refreshMotionSmoothingControl()
-            NotificationCenter.default.post(name: .khuaMotionPlusChanged, object: self)
+            NotificationCenter.default.post(name: .odfMotionPlusChanged, object: self)
         }
         return committed
     }

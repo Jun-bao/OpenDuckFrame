@@ -50,7 +50,7 @@ TEAM_ID=""
 BUNDLE_ID=""
 MARKETING_VERSION=""
 BUILD_NUMBER=""
-ARCHIVE_PATH=".build/AppStore/Khua.xcarchive"
+ARCHIVE_PATH=".build/AppStore/OpenDuckFrame.xcarchive"
 DERIVED_DATA_PATH=".build/AppStore/DerivedData"
 ALLOW_PROVISIONING_UPDATES=0
 
@@ -132,9 +132,9 @@ unregister_archive_products() {
   local lsregister
   lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
   for app in \
-    "$DERIVED_DATA_PATH/Build/Intermediates.noindex/ArchiveIntermediates/KhuaPlayer/InstallationBuildProductsLocation/Applications/OpenDuckFrame.app" \
+    "$DERIVED_DATA_PATH/Build/Intermediates.noindex/ArchiveIntermediates/OpenDuckFrame/InstallationBuildProductsLocation/Applications/OpenDuckFrame.app" \
     "$ARCHIVE_PATH/Products/Applications/OpenDuckFrame.app"; do
-    pluginkit -r "$app/Contents/PlugIns/KhuaPlayerQuickLook.appex" 2>/dev/null || true
+    pluginkit -r "$app/Contents/PlugIns/OpenDuckFrameQuickLook.appex" 2>/dev/null || true
     "$lsregister" -u "$app" 2>/dev/null || true
   done
 }
@@ -151,22 +151,22 @@ echo "==> Building pinned FFmpeg and dav1d dependencies"
 "$ROOT/Scripts/build_ffmpeg_min.sh"
 echo "==> Building pinned subtitle dependencies"
 "$ROOT/Scripts/build_subtitle_libs.sh"
-echo "==> Generating Apps/Mac/KhuaPlayer.xcodeproj"
-KHUA_ENABLE_SPARKLE=false \
-KHUA_SPARKLE_FEED_URL= \
-KHUA_SPARKLE_PUBLIC_ED_KEY= \
+echo "==> Generating Apps/Mac/OpenDuckFrame.xcodeproj"
+ODF_ENABLE_SPARKLE=false \
+ODF_SPARKLE_FEED_URL= \
+ODF_SPARKLE_PUBLIC_ED_KEY= \
   "$XCODEGEN_BIN" generate --spec Apps/Mac/project.yml --project Apps/Mac --quiet
 
 XCODEBUILD_ARGS=(
-  -project "$ROOT/Apps/Mac/KhuaPlayer.xcodeproj"
-  -scheme KhuaPlayer
+  -project "$ROOT/Apps/Mac/OpenDuckFrame.xcodeproj"
+  -scheme OpenDuckFrame
   -configuration AppStore
   -destination "generic/platform=macOS"
   -archivePath "$ARCHIVE_PATH"
   -derivedDataPath "$DERIVED_DATA_PATH"
-  KHUA_DEVELOPMENT_TEAM="$TEAM_ID"
+  ODF_DEVELOPMENT_TEAM="$TEAM_ID"
   DEVELOPMENT_TEAM="$TEAM_ID"
-  KHUA_BUNDLE_ID="$BUNDLE_ID"
+  ODF_BUNDLE_ID="$BUNDLE_ID"
   MARKETING_VERSION="$MARKETING_VERSION"
   CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
   CODE_SIGN_STYLE=Automatic

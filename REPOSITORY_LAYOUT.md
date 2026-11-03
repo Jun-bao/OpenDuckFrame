@@ -1,6 +1,6 @@
 # Repository layout
 
-Khua separates product-specific source from media and subtitle code and from
+OpenDuckFrame separates product-specific source from media and subtitle code and from
 platform implementations. These directories describe source ownership, not
 independent frameworks or Swift packages. Only the Mac product currently
 builds; the layout prepares for a future iPhone and iPad product without
@@ -52,25 +52,25 @@ arguments, environment settings, and the product build's exit status. Existing
 commands that use that entry point remain valid.
 
 Edit `Apps/Mac/project.yml` and its adjacent Sparkle include for Mac project
-changes. The build generates `Apps/Mac/KhuaPlayer.xcodeproj`; it is ignored and
+changes. The build generates `Apps/Mac/OpenDuckFrame.xcodeproj`; it is ignored and
 must not be edited as the source of truth. Running `xcodegen` without an
 explicit project definition from the repository root is no longer sufficient.
 Use the build entry point so that dependency and distribution configuration
 are prepared together.
 
 Build products remain under the repository-root `.build` directory. Release
-builds also deploy `Khua.app` to the repository root; Debug builds do not
+builds also deploy `OpenDuckFrame.app` to the repository root; Debug builds do not
 replace it. Neither location is tracked by Git. Signing, archive, App Store
 smoke checks, notarization, and DMG tools remain in `Scripts/`; their output
 locations and distribution channels are described in [RELEASING.md](RELEASING.md).
 
 ## Current compilation boundaries
 
-The `KhuaPlayer` app compiles `Apps/Mac/UI`, `Apps/Mac/CaptionsHost`, and
-`Modules/Captions`. `KhuaPlayerMediaCore` still combines `Modules/MediaCore`
+The `OpenDuckFrame` app compiles `Apps/Mac/UI`, `Apps/Mac/CaptionsHost`, and
+`Modules/Captions`. `OpenDuckFrameMediaCore` still combines `Modules/MediaCore`
 with `Modules/VideoEnhancement` and the implementations under `Platform/macOS`
 in one framework. Quick Look
-uses that same media framework. `KhuaPlayerCaptionsUI` remains a separate,
+uses that same media framework. `OpenDuckFrameCaptionsUI` remains a separate,
 lazily loaded Mac framework; it is distinct from `CaptionsHost`.
 
 Motion+ uses a separately compiled `FrameBudget.metallib` in the media framework.

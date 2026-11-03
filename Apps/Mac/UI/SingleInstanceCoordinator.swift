@@ -62,7 +62,7 @@ import Darwin
 
     private static func enforceWithLock(_ app: NSApplication, arguments: [String]) {
         let ownPID = ProcessInfo.processInfo.processIdentifier
-        let path = "/private/tmp/khua-chuanflow-\(getuid()).lock"
+        let path = "/private/tmp/odf-chuanflow-\(getuid()).lock"
         guard let lock = SingleInstanceLock(path: path) else {
             fputs("Single-instance guard: could not securely open the product lock.\n", stderr)
             exit(74)

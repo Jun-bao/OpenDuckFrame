@@ -98,7 +98,7 @@ root [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) maps each dependency
 to its selected license; `deps.lock.json` records the corresponding source URL.
 
 The component directories and `Licenses/THIRD_PARTY_NOTICES.txt` ship as a folder
-resource in `KhuaPlayerMediaCore.framework/Resources/Licenses`, shared by the
+resource in `OpenDuckFrameMediaCore.framework/Resources/Licenses`, shared by the
 host app and Quick Look extension. `build_manifest.py` requires every notice;
 bundle verification compares the complete relative-file set and bytes against
 the source directory, including for Store archives without a build manifest.

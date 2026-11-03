@@ -6,7 +6,7 @@
 #include <cmath>
 
 static NSError *SPFileLLError(NSInteger code, NSString *message) {
-    return [NSError errorWithDomain:@"Khua.FileLowLatency" code:code userInfo:@{NSLocalizedDescriptionKey:message}];
+    return [NSError errorWithDomain:@"OpenDuckFrame.FileLowLatency" code:code userInfo:@{NSLocalizedDescriptionKey:message}];
 }
 static BOOL SPFileLLCompatible(CVPixelBufferRef b, int width, int height, OSType format) {
     if (!b || CVPixelBufferGetWidth(b)!=(size_t)width || CVPixelBufferGetHeight(b)!=(size_t)height ||
@@ -61,7 +61,7 @@ static CVPixelBufferRef SPFileLLConvert(VTPixelTransferSessionRef transfer, CVPi
 }
 - (instancetype)init {
     if (!(self=[super init])) return nil;
-    _queue=dispatch_queue_create("app.khuaplayer.file-lowlatency",DISPATCH_QUEUE_SERIAL);
+    _queue=dispatch_queue_create("app.openduckframe.file-lowlatency",DISPATCH_QUEUE_SERIAL);
     _busy.store(false); return self;
 }
 - (void)dealloc { if (_toNV12) CFRelease(_toNV12); if (_toRGB) CFRelease(_toRGB); }

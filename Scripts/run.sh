@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build and run Khua, optionally opening a media file.
+# Build and run OpenDuckFrame, optionally opening a media file.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

@@ -205,28 +205,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     private var enhancementSelfTest: Bool {
-        CommandLine.arguments.contains("--khua-enhancement-selftest")
+        CommandLine.arguments.contains("--odf-enhancement-selftest")
     }
 
     private var sessionContract: Bool {
-        CommandLine.arguments.contains("--khua-session-contract")
+        CommandLine.arguments.contains("--odf-session-contract")
     }
 
     private var engineProbe: Bool {
-        CommandLine.arguments.contains("--khua-engine-probe")
+        CommandLine.arguments.contains("--odf-engine-probe")
     }
 
     private var srPipelineContract: Bool {
-        CommandLine.arguments.contains("--khua-sr-pipeline-contract")
+        CommandLine.arguments.contains("--odf-sr-pipeline-contract")
     }
     private var videoSRPipelineContract: Bool {
-        CommandLine.arguments.contains("--khua-video-sr-pipeline-contract")
+        CommandLine.arguments.contains("--odf-video-sr-pipeline-contract")
     }
     private var anime4KPipelineContract: Bool {
-        CommandLine.arguments.contains("--khua-anime4k-pipeline-contract")
+        CommandLine.arguments.contains("--odf-anime4k-pipeline-contract")
     }
     private var cuganPipelineContract: Bool {
-        CommandLine.arguments.contains("--khua-realcugan-pipeline-contract")
+        CommandLine.arguments.contains("--odf-realcugan-pipeline-contract")
     }
 
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
@@ -237,18 +237,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         spLaunchMark("didFinishLaunching 入口")
         let args = CommandLine.arguments
         if args.contains(PixelDiagnosticsPolicy.flag) && !PixelDiagnosticsPolicy.enabled(args) {
-            fputs("--khua-pixel-diagnostics requires absolute --khua-isolated-profile and --khua-live-log paths\n", stderr)
+            fputs("--odf-pixel-diagnostics requires absolute --odf-isolated-profile and --odf-live-log paths\n", stderr)
             exit(2)
         }
-        if let index = args.firstIndex(of: "--khua-isolated-profile") {
+        if let index = args.firstIndex(of: "--odf-isolated-profile") {
             guard args.indices.contains(index + 1), args[index + 1].hasPrefix("/") else {
-                fputs("--khua-isolated-profile requires an absolute directory\n", stderr)
+                fputs("--odf-isolated-profile requires an absolute directory\n", stderr)
                 exit(2)
             }
             EnhancementProfileStore.testDirectory = URL(fileURLWithPath: args[index + 1], isDirectory: true)
         }
         if cuganPipelineContract {
-            let output = args.firstIndex(of: "--khua-realcugan-pipeline-contract").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil } ?? "/tmp/khua-realcugan-pipeline-contract.json"
+            let output = args.firstIndex(of: "--odf-realcugan-pipeline-contract").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil } ?? "/tmp/odf-realcugan-pipeline-contract.json"
             DispatchQueue.global(qos: .userInitiated).async {
                 var report = SPLiveProcessor.runRealCUGANPipelineContract() as? [String: Any] ?? [:]
                 var profile = EnhancementProfile(); profile.scaleEnabled = true; profile.scaleEngineID = "realcugan"; profile.scaleQualityID = "medium"; profile.outputWidth = 0; profile.outputHeight = 0
@@ -267,7 +267,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return
         }
         if anime4KPipelineContract {
-            let output = args.firstIndex(of: "--khua-anime4k-pipeline-contract").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil } ?? "/tmp/khua-anime4k-pipeline-contract.json"
+            let output = args.firstIndex(of: "--odf-anime4k-pipeline-contract").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil } ?? "/tmp/odf-anime4k-pipeline-contract.json"
             DispatchQueue.global(qos: .userInitiated).async {
                 var report = SPLiveProcessor.runAnime4KPipelineContract() as? [String: Any] ?? [:]
                 var profile = EnhancementProfile(); profile.scaleEnabled = true; profile.scaleEngineID = "anime4k"; profile.outputWidth = 0; profile.outputHeight = 0
@@ -279,7 +279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return
         }
         if videoSRPipelineContract {
-            let output = args.firstIndex(of: "--khua-video-sr-pipeline-contract").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil } ?? "/tmp/khua-video-sr-pipeline-contract.json"
+            let output = args.firstIndex(of: "--odf-video-sr-pipeline-contract").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil } ?? "/tmp/odf-video-sr-pipeline-contract.json"
             DispatchQueue.global(qos: .userInitiated).async {
                 var report = SPLiveProcessor.runVideoSRPipelineContract() as? [String: Any] ?? [:]
                 var profile = EnhancementProfile()
@@ -295,7 +295,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return
         }
         if srPipelineContract {
-            let output = args.firstIndex(of: "--khua-sr-pipeline-contract").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil } ?? "/tmp/khua-sr-pipeline-contract.json"
+            let output = args.firstIndex(of: "--odf-sr-pipeline-contract").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil } ?? "/tmp/odf-sr-pipeline-contract.json"
             DispatchQueue.global(qos: .userInitiated).async {
                 var report = SPLiveProcessor.runSRPipelineContract() as? [String: Any] ?? [:]
                 var profile = EnhancementProfile()
@@ -313,13 +313,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             }
             return
         }
-        if let index = args.firstIndex(of: "--khua-live-log"), args.indices.contains(index + 1) {
+        if let index = args.firstIndex(of: "--odf-live-log"), args.indices.contains(index + 1) {
             EnhancementWorkbenchController.liveLogPath = args[index + 1]
         }
         if engineProbe {
-            let output = args.firstIndex(of: "--khua-engine-probe").flatMap { index in
+            let output = args.firstIndex(of: "--odf-engine-probe").flatMap { index in
                 args.indices.contains(index + 1) ? args[index + 1] : nil
-            } ?? "/tmp/khua-engine-probe.json"
+            } ?? "/tmp/odf-engine-probe.json"
             DispatchQueue.global(qos: .userInitiated).async {
                 let report = SPLiveProcessor.runEngineProbe() as? [String: Any] ?? [:]
                 let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
@@ -329,9 +329,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return
         }
         if sessionContract {
-            let output = args.firstIndex(of: "--khua-session-contract").flatMap { index in
+            let output = args.firstIndex(of: "--odf-session-contract").flatMap { index in
                 args.indices.contains(index + 1) ? args[index + 1] : nil
-            } ?? "/tmp/khua-session-contract.json"
+            } ?? "/tmp/odf-session-contract.json"
             DispatchQueue.global(qos: .userInitiated).async {
                 var report = SPLiveProcessor.runSessionContract() as? [String: Any] ?? [:]
                 report["copyIsolation"] = WindowCaptureSource.copyIsolationCheck()
@@ -346,9 +346,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         }
         if enhancementSelfTest {
             let args = CommandLine.arguments
-            let output = args.firstIndex(of: "--khua-enhancement-selftest").flatMap { index in
+            let output = args.firstIndex(of: "--odf-enhancement-selftest").flatMap { index in
                 args.indices.contains(index + 1) ? args[index + 1] : nil
-            } ?? "/tmp/khua-enhancement-probe.json"
+            } ?? "/tmp/odf-enhancement-probe.json"
             DispatchQueue.global(qos: .userInitiated).async {
                 var report = SPLiveProcessor.runProbe() as? [String: Any] ?? [:]
                 report["profileRoundTrip"] = EnhancementProfileStore.roundTripForTest()

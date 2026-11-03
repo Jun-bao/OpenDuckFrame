@@ -4,7 +4,7 @@
 #import <VideoToolbox/VideoToolbox.h>
 #include <atomic>
 
-static NSError *SPFileMetalFXError(NSInteger code,NSString *message){return [NSError errorWithDomain:@"Khua.FileMetalFX" code:code userInfo:@{NSLocalizedDescriptionKey:message}];}
+static NSError *SPFileMetalFXError(NSInteger code,NSString *message){return [NSError errorWithDomain:@"OpenDuckFrame.FileMetalFX" code:code userInfo:@{NSLocalizedDescriptionKey:message}];}
 @implementation SPFileMetalFXScaler {
     id<MTLDevice> _device; id<MTLCommandQueue> _commands; id<MTLFXSpatialScaler> _scaler;
     id<MTLTexture> _inputPrivate,_outputPrivate;
@@ -17,7 +17,7 @@ static NSError *SPFileMetalFXError(NSInteger code,NSString *message){return [NSE
         if(error)*error=SPFileMetalFXError(1,@"设备不支持 MetalFX 或文件输出尺寸无效。");return nil;
     }
     _device=device;_inputWidth=sourceWidth;_inputHeight=sourceHeight;_outputWidth=outputWidth;_outputHeight=outputHeight;
-    _commands=[device newCommandQueue];_queue=dispatch_queue_create("app.khuaplayer.file-metalfx",DISPATCH_QUEUE_SERIAL);
+    _commands=[device newCommandQueue];_queue=dispatch_queue_create("app.openduckframe.file-metalfx",DISPATCH_QUEUE_SERIAL);
     MTLFXSpatialScalerDescriptor *d=[MTLFXSpatialScalerDescriptor new];d.inputWidth=sourceWidth;d.inputHeight=sourceHeight;d.outputWidth=outputWidth;d.outputHeight=outputHeight;
     d.colorTextureFormat=MTLPixelFormatBGRA8Unorm;d.outputTextureFormat=MTLPixelFormatBGRA8Unorm;d.colorProcessingMode=MTLFXSpatialScalerColorProcessingModePerceptual;
     _scaler=[d newSpatialScalerWithDevice:device];

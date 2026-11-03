@@ -167,7 +167,7 @@ def verify_captions_framework(app: Path, main_bundle_id: str) -> Path:
     It is loaded with Bundle.load, so the normal linked-dependency closure
     cannot detect a missing embedded framework in an App Store archive.
     """
-    framework = app / "Contents/Frameworks/KhuaPlayerCaptionsUI.framework"
+    framework = app / "Contents/Frameworks/OpenDuckFrameCaptionsUI.framework"
     info_path = framework / "Resources/Info.plist"
     if not main_bundle_id:
         raise BundleError("main app has no bundle identifier")
@@ -181,12 +181,12 @@ def verify_captions_framework(app: Path, main_bundle_id: str) -> Path:
     expected_id = f"{main_bundle_id}.CaptionsUI"
     if info.get("CFBundleIdentifier") != expected_id:
         raise BundleError(f"caption UI framework bundle identifier must be {expected_id}")
-    if info.get("CFBundleExecutable") != "KhuaPlayerCaptionsUI":
-        raise BundleError("caption UI framework executable must be KhuaPlayerCaptionsUI")
-    binary = framework / "KhuaPlayerCaptionsUI"
+    if info.get("CFBundleExecutable") != "OpenDuckFrameCaptionsUI":
+        raise BundleError("caption UI framework executable must be OpenDuckFrameCaptionsUI")
+    binary = framework / "OpenDuckFrameCaptionsUI"
     if not binary.is_file():
         raise BundleError(f"caption UI framework executable is missing: {binary}")
-    return ensure_inside_app(binary, app, "KhuaPlayerCaptionsUI.framework")
+    return ensure_inside_app(binary, app, "OpenDuckFrameCaptionsUI.framework")
 
 
 def verify_update_usage_privacy(app: Path, info: dict) -> None:
@@ -202,7 +202,7 @@ def verify_update_usage_privacy(app: Path, info: dict) -> None:
         if privacy.get("NSPrivacyCollectedDataTypes") != []:
             raise BundleError("inactive update statistics require the neutral privacy manifest")
         return
-    if (info.get("SUFeedURL") != "https://khua.app/updates/appcast.xml"
+    if (info.get("SUFeedURL") != "https://openduckframe.app/updates/appcast.xml"
             or not info.get("SUPublicEDKey")
             or info.get("SUEnableSystemProfiling") is not False):
         raise BundleError("update statistics require the official feed with system profiling off")
@@ -251,8 +251,8 @@ def verify_bundle(
     if info.get("SPProductName") != "OpenDuckFrame":
         raise BundleError("Info.plist SPProductName must be OpenDuckFrame for About")
     executable_name = str(info.get("CFBundleExecutable", ""))
-    if executable_name != "Khua":
-        raise BundleError("Info.plist CFBundleExecutable must be Khua")
+    if executable_name != "OpenDuckFrame":
+        raise BundleError("Info.plist CFBundleExecutable must be OpenDuckFrame")
     main = app / "Contents/MacOS" / executable_name
     if not main.is_file():
         raise BundleError(f"main executable missing: {main}")
@@ -279,7 +279,7 @@ def verify_bundle(
     # Optional Anime4K is loaded only after the app checks the OS version.
     # Its separately packaged runtime may target macOS 27; it must never enter
     # the main app's ordinary Mach-O dependency graph on older systems.
-    optional_anime_names = {"libplacebo.360.dylib", "libshaderc_shared.1.dylib", "liblcms2.2.dylib", "libMoltenVK.dylib", "libkhua_realcugan.dylib"}
+    optional_anime_names = {"libplacebo.360.dylib", "libshaderc_shared.1.dylib", "liblcms2.2.dylib", "libMoltenVK.dylib", "libodf_realcugan.dylib"}
     optional_anime = {(app / "Contents/Frameworks" / name).resolve() for name in optional_anime_names}
     for image in machos:
         archs = run(["lipo", "-archs", str(image)]).strip().split()
@@ -311,7 +311,7 @@ def verify_bundle(
                 raise BundleError(f"resolved dependency is not packaged Mach-O: {resolved}")
             if resolved is not None and resolved.resolve() in optional_anime and image.resolve() not in optional_anime:
                 raise BundleError(f"optional Anime4K runtime must not be linked into the base app: {image}: {dependency}")
-            if resolved is not None and image.name in {"libkhua_realcugan.dylib", "libMoltenVK.dylib"} and resolved.name in high_minos_optional:
+            if resolved is not None and image.name in {"libodf_realcugan.dylib", "libMoltenVK.dylib"} and resolved.name in high_minos_optional:
                 raise BundleError(f"macOS 14 Real-CUGAN must not depend on the macOS 27 runtime: {image}: {dependency}")
         if verify_codesign:
             run(["codesign", "--verify", "--strict", str(image)])

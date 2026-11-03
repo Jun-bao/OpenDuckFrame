@@ -1,5 +1,5 @@
 #!/bin/bash
-# Khua — reproducible minimal static FFmpeg for Apple Silicon.
+# OpenDuckFrame — reproducible minimal static FFmpeg for Apple Silicon.
 # Output: ThirdParty/ffmpeg-min/{include,lib}; source/output are not committed.
 set -euo pipefail
 
@@ -201,7 +201,7 @@ cp "$SP_ROOT/Scripts/lib/sp_dovi_rpu.h" "$STAGED_PREFIX/include/libavcodec/sp_do
 mkdir -p "$STAGED_PREFIX/share"
 "$WORK/ffmpeg-capabilities" > "$STAGED_PREFIX/share/ffmpeg-capabilities.json"
 missing_result=0
-"$WORK/ffmpeg-capabilities" --require-decoder khua_missing_decoder \
+"$WORK/ffmpeg-capabilities" --require-decoder odf_missing_decoder \
   >"$WORK/missing-capability.json" 2>"$WORK/missing-capability.log" || missing_result=$?
 [ "$missing_result" -eq 1 ] || sp_die "FFmpeg missing-decoder gate must return 1, received $missing_result"
 BUILT_VERSION="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["ffmpeg_version"])' \

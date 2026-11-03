@@ -90,7 +90,7 @@ final class CaptionTaskCenter {
     private(set) var lastOutcome: (name: String, error: Error?)?
     private(set) var recoverableSaves: [Task] = []
     private(set) var savingRecovery: Task?
-    private static let recoveryIO = DispatchQueue(label: "dev.khuaplayer.captions.recovery", qos: .utility)
+    private static let recoveryIO = DispatchQueue(label: "dev.openduckframe.captions.recovery", qos: .utility)
 
     fileprivate struct PendingSave: Sendable {
         var url: URL

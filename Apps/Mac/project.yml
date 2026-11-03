@@ -1,4 +1,4 @@
-name: KhuaPlayer
+name: OpenDuckFrame
 packages:
   RifeMetal:
     url: https://github.com/cinemore/rife-metal.git
@@ -6,9 +6,9 @@ packages:
     exactVersion: 0.1.8
 include:
   - path: project.sparkle.yml
-    enable: ${KHUA_ENABLE_SPARKLE}
+    enable: ${ODF_ENABLE_SPARKLE}
 options:
-  bundleIdPrefix: app.khuaplayer
+  bundleIdPrefix: app.openduckframe
   deploymentTarget:
     macOS: "14.0"
   createIntermediateGroups: true
@@ -21,7 +21,7 @@ configs:
 
 settings:
   base:
-    KHUA_REPO_ROOT: "$(SRCROOT)/../.."
+    ODF_REPO_ROOT: "$(SRCROOT)/../.."
     SWIFT_VERSION: "6.0"
     SWIFT_STRICT_CONCURRENCY: minimal
     CLANG_CXX_LANGUAGE_STANDARD: c++20
@@ -32,25 +32,25 @@ settings:
     SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SP_ENHANCE"
     MACOSX_DEPLOYMENT_TARGET: "14.0"
     ARCHS: arm64
-    MARKETING_VERSION: "0.7.0"
-    CURRENT_PROJECT_VERSION: "12"
-    KHUA_BUNDLE_ID: app.khuaplayer.KhuaPlayer
-    KHUA_DISPLAY_NAME: OpenDuckFrame
-    KHUA_CANDIDATE_LABEL: "r6"
-    KHUA_SINGLE_INSTANCE_LOCK_VERSION: "1"
-    KHUA_DEVELOPMENT_TEAM: ""
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ODF_BUNDLE_ID: app.openduckframe.OpenDuckFrame
+    ODF_DISPLAY_NAME: OpenDuckFrame
+    ODF_CANDIDATE_LABEL: "r6"
+    ODF_SINGLE_INSTANCE_LOCK_VERSION: "1"
+    ODF_DEVELOPMENT_TEAM: ""
     ENABLE_USER_SCRIPT_SANDBOXING: NO
     HEADER_SEARCH_PATHS:
       - $(inherited)
-      - $(KHUA_REPO_ROOT)/BuildGenerated
-      - $(KHUA_REPO_ROOT)/Modules/MediaCore/Core
-      - $(KHUA_REPO_ROOT)/Modules/MediaCore/Bridge
-      - $(KHUA_REPO_ROOT)/Modules/VideoEnhancement
+      - $(ODF_REPO_ROOT)/BuildGenerated
+      - $(ODF_REPO_ROOT)/Modules/MediaCore/Core
+      - $(ODF_REPO_ROOT)/Modules/MediaCore/Bridge
+      - $(ODF_REPO_ROOT)/Modules/VideoEnhancement
       - $(SRCROOT)/Capture
-      - $(KHUA_REPO_ROOT)/ThirdParty/ffmpeg-min/include
-      - $(KHUA_REPO_ROOT)/ThirdParty/dav1d-min/include
-      - $(KHUA_REPO_ROOT)/ThirdParty/subtitles-min/include
-      - $(KHUA_REPO_ROOT)/ThirdParty/libplacebo/include
+      - $(ODF_REPO_ROOT)/ThirdParty/ffmpeg-min/include
+      - $(ODF_REPO_ROOT)/ThirdParty/dav1d-min/include
+      - $(ODF_REPO_ROOT)/ThirdParty/subtitles-min/include
+      - $(ODF_REPO_ROOT)/ThirdParty/libplacebo/include
   configs:
     Debug:
       CODE_SIGN_IDENTITY: "-"
@@ -70,12 +70,12 @@ settings:
       STRIP_STYLE: all
       DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
     AppStore:
-      KHUA_SINGLE_INSTANCE_LOCK_VERSION: "0"
+      ODF_SINGLE_INSTANCE_LOCK_VERSION: "0"
       CODE_SIGN_STYLE: Automatic
       CODE_SIGN_IDENTITY: "Apple Distribution"
       CODE_SIGNING_REQUIRED: YES
       CODE_SIGNING_ALLOWED: YES
-      DEVELOPMENT_TEAM: $(KHUA_DEVELOPMENT_TEAM)
+      DEVELOPMENT_TEAM: $(ODF_DEVELOPMENT_TEAM)
       ENABLE_APP_SANDBOX: YES
       ENABLE_HARDENED_RUNTIME: YES
       SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SP_ENHANCE SP_APP_STORE"
@@ -89,7 +89,7 @@ settings:
       DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
 
 targets:
-  KhuaPlayer:
+  OpenDuckFrame:
     type: application
     platform: macOS
     preBuildScripts:
@@ -97,7 +97,7 @@ targets:
         script: |
           set -eu
           if [ "${CONFIGURATION}" = "AppStore" ] && \
-             [ "${KHUA_SPARKLE_EMBEDDED:-NO}" = "YES" ]; then
+             [ "${ODF_SPARKLE_EMBEDDED:-NO}" = "YES" ]; then
             echo "error: this project was generated for direct distribution and embeds Sparkle" >&2
             echo "error: regenerate and archive with Scripts/archive_app_store.sh" >&2
             exit 1
@@ -151,14 +151,14 @@ targets:
         weak: true
       - sdk: Translation.framework
         weak: true
-      - target: KhuaPlayerMediaCore
+      - target: OpenDuckFrameMediaCore
         embed: true
         codeSign: true
-      - target: KhuaPlayerQuickLook
+      - target: OpenDuckFrameQuickLook
         embed: true
         codeSign: true
       # Load the system translation download UI only when it is requested.
-      - target: KhuaPlayerCaptionsUI
+      - target: OpenDuckFrameCaptionsUI
         embed: true
         link: false
         codeSign: true
@@ -170,11 +170,11 @@ targets:
       path: Info.plist
       properties:
         CFBundleName: OpenDuckFrame
-        CFBundleDisplayName: $(KHUA_DISPLAY_NAME)
+        CFBundleDisplayName: $(ODF_DISPLAY_NAME)
         SPProductName: OpenDuckFrame
-        SPCandidateLabel: $(KHUA_CANDIDATE_LABEL)
+        SPCandidateLabel: $(ODF_CANDIDATE_LABEL)
         SPSingleInstanceProtocol: 1
-        SPSingleInstanceLockVersion: $(KHUA_SINGLE_INSTANCE_LOCK_VERSION)
+        SPSingleInstanceLockVersion: $(ODF_SINGLE_INSTANCE_LOCK_VERSION)
         CFBundleDevelopmentRegion: en
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
@@ -182,14 +182,14 @@ targets:
         LSMinimumSystemVersion: "14.0"
         NSHighResolutionCapable: true
         LSApplicationCategoryType: public.app-category.video
-        NSHumanReadableCopyright: "Copyright © 2026 OpenDuckFrame contributors. Based on Khua Player (MIT License)."
+        NSHumanReadableCopyright: "Copyright © 2026 OpenDuckFrame contributors"
         # Help menu links; an empty value hides that item.
         ODFWebsiteURL: ""
-        ODFRepositoryURL: "https://github.com/super-individual-ai/khua-workbench"
-        ODFFeedbackURL: "https://github.com/super-individual-ai/khua-workbench/issues"
+        ODFRepositoryURL: "https://github.com/super-individual-ai/OpenDuckFrame"
+        ODFFeedbackURL: "https://github.com/super-individual-ai/OpenDuckFrame/issues"
         NSSpeechRecognitionUsageDescription: "OpenDuckFrame generates subtitles from the audio of the media you open. Processing takes place on this Mac."
         NSScreenCaptureUsageDescription: "OpenDuckFrame shows and enhances the window or display you select. Capture stays on this Mac."
-        # Folder and volume privacy prompts appear only when Khua scans the
+        # Folder and volume privacy prompts appear only when OpenDuckFrame scans the
         # folder of a video you opened. Translations: Resources/InfoPlist.xcstrings.
         NSDesktopFolderUsageDescription: "Used to find subtitles and the next episode in the folder of the video you open."
         NSDocumentsFolderUsageDescription: "Used to find subtitles and the next episode in the folder of the video you open."
@@ -299,28 +299,28 @@ targets:
             UTTypeTagSpecification:
               public.filename-extension: [mxf]
               public.mime-type: [application/mxf]
-          - UTTypeIdentifier: app.khuaplayer.av1-video
+          - UTTypeIdentifier: app.openduckframe.av1-video
             UTTypeDescription: "AV1 Elementary Video"
             UTTypeConformsTo: [public.movie]
             UTTypeTagSpecification:
               public.filename-extension: [av1, obu]
-          - UTTypeIdentifier: app.khuaplayer.vvc-video
+          - UTTypeIdentifier: app.openduckframe.vvc-video
             UTTypeDescription: "VVC Elementary Video"
             UTTypeConformsTo: [public.movie]
             UTTypeTagSpecification:
               public.filename-extension: [vvc, h266]
-          - UTTypeIdentifier: app.khuaplayer.cavs-video
+          - UTTypeIdentifier: app.openduckframe.cavs-video
             UTTypeDescription: "CAVS Elementary Video"
             UTTypeConformsTo: [public.movie]
             UTTypeTagSpecification:
               public.filename-extension: [cavs]
-          - UTTypeIdentifier: app.khuaplayer.dnx-video
+          - UTTypeIdentifier: app.openduckframe.dnx-video
             UTTypeDescription: "DNxHD and DNxHR Elementary Video"
             UTTypeConformsTo: [public.movie]
             UTTypeTagSpecification:
               public.filename-extension: [dnxhd, dnxhr]
     entitlements:
-      path: KhuaPlayer.entitlements
+      path: OpenDuckFrame.entitlements
       properties:
         com.apple.security.app-sandbox: true
         # Files and folders the user opens or grants in an open panel.
@@ -333,17 +333,17 @@ targets:
         com.apple.security.assets.movies.read-write: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: $(KHUA_BUNDLE_ID)
+        PRODUCT_BUNDLE_IDENTIFIER: $(ODF_BUNDLE_ID)
         GENERATE_INFOPLIST_FILE: NO
-        SWIFT_OBJC_BRIDGING_HEADER: Support/KhuaPlayer-Bridging-Header.h
+        SWIFT_OBJC_BRIDGING_HEADER: Support/OpenDuckFrame-Bridging-Header.h
         PRODUCT_NAME: OpenDuckFrame
-        EXECUTABLE_NAME: Khua
-        PRODUCT_MODULE_NAME: KhuaPlayer
+        EXECUTABLE_NAME: OpenDuckFrame
+        PRODUCT_MODULE_NAME: OpenDuckFrame
         COMBINE_HIDPI_IMAGES: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
 
-  KhuaPlayerMediaCore:
+  OpenDuckFrameMediaCore:
     type: framework
     platform: macOS
     sources:
@@ -361,7 +361,7 @@ targets:
         excludes:
           - Shaders
           - Tests
-      - path: Support/KhuaPlayer-Bridging-Header.h
+      - path: Support/OpenDuckFrame-Bridging-Header.h
       - path: ../../Platform/macOS
       - path: ../../Modules/MediaCore/Shaders/Video.metal
       - path: ../../ThirdParty/Licenses
@@ -370,12 +370,12 @@ targets:
     preBuildScripts:
       - name: Generate Shader Header
         script: |
-          python3 "${KHUA_REPO_ROOT}/Scripts/gen_shader_header.py"
+          python3 "${ODF_REPO_ROOT}/Scripts/gen_shader_header.py"
           mkdir -p "${DERIVED_FILE_DIR}"
           /usr/bin/touch "${DERIVED_FILE_DIR}/shader-header-fw.stamp"
         inputFiles:
-          - $(KHUA_REPO_ROOT)/Modules/MediaCore/Shaders/Video.metal
-          - $(KHUA_REPO_ROOT)/Scripts/gen_shader_header.py
+          - $(ODF_REPO_ROOT)/Modules/MediaCore/Shaders/Video.metal
+          - $(ODF_REPO_ROOT)/Scripts/gen_shader_header.py
         outputFiles:
           - $(DERIVED_FILE_DIR)/shader-header-fw.stamp
         basedOnDependencyAnalysis: true
@@ -387,10 +387,10 @@ targets:
           OUT="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/FrameBudget.metallib"
           mkdir -p "$(dirname "${OUT}")"
           xcrun -sdk macosx metal -c -target "air64-apple-macos${MACOSX_DEPLOYMENT_TARGET}" \
-            "${KHUA_REPO_ROOT}/Modules/VideoEnhancement/Shaders/FrameBudget.metal" -o "${AIR}"
+            "${ODF_REPO_ROOT}/Modules/VideoEnhancement/Shaders/FrameBudget.metal" -o "${AIR}"
           xcrun -sdk macosx metallib "${AIR}" -o "${OUT}"
         inputFiles:
-          - $(KHUA_REPO_ROOT)/Modules/VideoEnhancement/Shaders/FrameBudget.metal
+          - $(ODF_REPO_ROOT)/Modules/VideoEnhancement/Shaders/FrameBudget.metal
         outputFiles:
           - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/FrameBudget.metallib
         basedOnDependencyAnalysis: true
@@ -410,8 +410,8 @@ targets:
       - sdk: IOSurface.framework
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: $(KHUA_BUNDLE_ID).MediaCore
-        PRODUCT_NAME: KhuaPlayerMediaCore
+        PRODUCT_BUNDLE_IDENTIFIER: $(ODF_BUNDLE_ID).MediaCore
+        PRODUCT_NAME: OpenDuckFrameMediaCore
         GENERATE_INFOPLIST_FILE: YES
         SKIP_INSTALL: YES
         APPLICATION_EXTENSION_API_ONLY: YES
@@ -419,9 +419,9 @@ targets:
         STRIP_STYLE: non-global
         LIBRARY_SEARCH_PATHS:
           - $(inherited)
-          - $(KHUA_REPO_ROOT)/ThirdParty/ffmpeg-min/lib
-          - $(KHUA_REPO_ROOT)/ThirdParty/dav1d-min/lib
-          - $(KHUA_REPO_ROOT)/ThirdParty/speex-min/lib
+          - $(ODF_REPO_ROOT)/ThirdParty/ffmpeg-min/lib
+          - $(ODF_REPO_ROOT)/ThirdParty/dav1d-min/lib
+          - $(ODF_REPO_ROOT)/ThirdParty/speex-min/lib
         OTHER_LDFLAGS:
           - $(inherited)
           - -lavformat
@@ -434,7 +434,7 @@ targets:
           - -lz
           - -lbz2
 
-  KhuaPlayerCaptionsUI:
+  OpenDuckFrameCaptionsUI:
     type: framework
     platform: macOS
     sources:
@@ -447,8 +447,8 @@ targets:
         weak: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: $(KHUA_BUNDLE_ID).CaptionsUI
-        PRODUCT_NAME: KhuaPlayerCaptionsUI
+        PRODUCT_BUNDLE_IDENTIFIER: $(ODF_BUNDLE_ID).CaptionsUI
+        PRODUCT_NAME: OpenDuckFrameCaptionsUI
         # The system translation callback requires Swift 5 isolation semantics.
         SWIFT_VERSION: "5"
         GENERATE_INFOPLIST_FILE: YES
@@ -457,7 +457,7 @@ targets:
         STRIP_STYLE: non-global
         DEFINES_MODULE: NO
 
-  KhuaPlayerQuickLook:
+  OpenDuckFrameQuickLook:
     type: app-extension
     platform: macOS
     sources:
@@ -474,13 +474,13 @@ targets:
       - sdk: UniformTypeIdentifiers.framework
       - sdk: QuickLookUI.framework
       - sdk: IOKit.framework
-      - target: KhuaPlayerMediaCore
+      - target: OpenDuckFrameMediaCore
         embed: false
         link: true
     info:
       path: QuickLook/Info.plist
       properties:
-        CFBundleName: KhuaPlayerQuickLook
+        CFBundleName: OpenDuckFrameQuickLook
         CFBundleDisplayName: OpenDuckFrame Quick Look
         CFBundlePackageType: XPC!
         CFBundleShortVersionString: $(MARKETING_VERSION)
@@ -500,16 +500,16 @@ targets:
             QLIsDataBasedPreview: false
             QLSupportsSearchableItems: false
     entitlements:
-      path: QuickLook/KhuaPlayerQuickLook.entitlements
+      path: QuickLook/OpenDuckFrameQuickLook.entitlements
       properties:
         com.apple.security.app-sandbox: true
         com.apple.security.files.user-selected.read-only: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: $(KHUA_BUNDLE_ID).QuickLook
-        PRODUCT_NAME: KhuaPlayerQuickLook
+        PRODUCT_BUNDLE_IDENTIFIER: $(ODF_BUNDLE_ID).QuickLook
+        PRODUCT_NAME: OpenDuckFrameQuickLook
         GENERATE_INFOPLIST_FILE: NO
         APPLICATION_EXTENSION_API_ONLY: YES
         SKIP_INSTALL: YES
-        SWIFT_OBJC_BRIDGING_HEADER: Support/KhuaPlayer-Bridging-Header.h
+        SWIFT_OBJC_BRIDGING_HEADER: Support/OpenDuckFrame-Bridging-Header.h
         LD_RUNPATH_SEARCH_PATHS: "@executable_path/../../../../Frameworks"

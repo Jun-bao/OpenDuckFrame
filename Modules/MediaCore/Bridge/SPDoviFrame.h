@@ -6,18 +6,18 @@
 #include <cstring>
 #include <utility>
 
-static CFStringRef const kSPDoviFrameMetadata = CFSTR("dev.khuaplayer.dovi.metadata.v2");
-static CFStringRef const kSPDoviEnhancementFrame = CFSTR("dev.khuaplayer.dovi.enhancement.v1");
+static CFStringRef const kSPDoviFrameMetadata = CFSTR("dev.openduckframe.dovi.metadata.v2");
+static CFStringRef const kSPDoviEnhancementFrame = CFSTR("dev.openduckframe.dovi.enhancement.v1");
 // Frame-owned diagnosis, replaced on every decorator output; a constant boolean
 // avoids allocating per-frame strings or adding another PTS-indexed queue.
-static CFStringRef const kSPDoviMissingEnhancement = CFSTR("dev.khuaplayer.dovi.missing-enhancement.v1");
+static CFStringRef const kSPDoviMissingEnhancement = CFSTR("dev.openduckframe.dovi.missing-enhancement.v1");
 // Backend inspected metadata on this exact AV1 picture, including absence or
 // rejection. Packet-level metadata must not replace this decision.
-static CFStringRef const kSPDoviPictureMetadata = CFSTR("dev.khuaplayer.dovi.picture-metadata.v1");
+static CFStringRef const kSPDoviPictureMetadata = CFSTR("dev.openduckframe.dovi.picture-metadata.v1");
 // Synthetic DV pictures have already consumed reshape and (for FEL) residuals.
 // Their pixels are limited-range BT.2020 PQ P010; the original immutable RPU
 // remains attached solely for display management. Never apply reconstruction twice.
-static CFStringRef const kSPDoviReconstructedFrame = CFSTR("dev.khuaplayer.dovi.reconstructed.v1");
+static CFStringRef const kSPDoviReconstructedFrame = CFSTR("dev.openduckframe.dovi.reconstructed.v1");
 static inline bool spDoviFrameIsReconstructed(CVPixelBufferRef buffer) {
     return CVBufferGetAttachment(buffer, kSPDoviReconstructedFrame, nullptr) == kCFBooleanTrue;
 }

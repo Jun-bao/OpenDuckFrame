@@ -82,7 +82,7 @@ LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchS
 cleanup() {
   if [ "$ATTACHED" -eq 1 ]; then
     pluginkit -r \
-      "$MOUNT_POINT/OpenDuckFrame.app/Contents/PlugIns/KhuaPlayerQuickLook.appex" \
+      "$MOUNT_POINT/OpenDuckFrame.app/Contents/PlugIns/OpenDuckFrameQuickLook.appex" \
       >/dev/null 2>&1 || true
     "$LSREGISTER" -u "$MOUNT_POINT/OpenDuckFrame.app" >/dev/null 2>&1 || true
     hdiutil detach "$MOUNT_POINT" -quiet >/dev/null 2>&1 || \

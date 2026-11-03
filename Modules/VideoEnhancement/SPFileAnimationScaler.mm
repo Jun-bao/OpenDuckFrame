@@ -6,7 +6,7 @@
 #include <atomic>
 
 static NSError *SPFileAnimationError(NSInteger code, NSString *message) {
-    return [NSError errorWithDomain:@"Khua.FileAnimation" code:code userInfo:@{NSLocalizedDescriptionKey:message}];
+    return [NSError errorWithDomain:@"OpenDuckFrame.FileAnimation" code:code userInfo:@{NSLocalizedDescriptionKey:message}];
 }
 
 @implementation SPFileAnimationScaler {

@@ -36,10 +36,10 @@ void spRegisterPlanarPixelFormats(void) {
     dispatch_once(&once, ^{
         spRegisterOne(kSPPixelFormat420Planar16VideoRange,
                       kCVPixelFormatComponentRange_VideoRange,
-                      @"KhuaPlayer 4:2:0 planar 16-bit (video range)");
+                      @"OpenDuckFrame 4:2:0 planar 16-bit (video range)");
         spRegisterOne(kSPPixelFormat420Planar16FullRange,
                       kCVPixelFormatComponentRange_FullRange,
-                      @"KhuaPlayer 4:2:0 planar 16-bit (full range)");
+                      @"OpenDuckFrame 4:2:0 planar 16-bit (full range)");
     });
 }
 

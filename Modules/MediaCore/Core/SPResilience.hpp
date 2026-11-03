@@ -1,4 +1,4 @@
-// KhuaPlayer - pure policy and evidence module for resilient playback of damaged or incomplete media
+// OpenDuckFrame - pure policy and evidence module for resilient playback of damaged or incomplete media
 //
 // No platform or FFmpeg dependency and no shared state; everything is unit-testable.
 //   - The signal that starts resilient handling may be loose (a decoder complaint), but the evidence that

@@ -1,4 +1,4 @@
-// KhuaPlayer - container recovery: FLV (PreviousTagSize, DataSize reverse chain, AVCPacketType)
+// OpenDuckFrame - container recovery: FLV (PreviousTagSize, DataSize reverse chain, AVCPacketType)
 //
 // Split out of the umbrella header by section; function bodies, constants and inline
 // attributes are unchanged. Callers keep including the umbrella; this file only guarantees

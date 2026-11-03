@@ -1,5 +1,5 @@
 #!/bin/bash
-# Khua Mac product build. Usage: Apps/Mac/Scripts/build.sh [Debug|Release]
+# OpenDuckFrame Mac product build. Usage: Apps/Mac/Scripts/build.sh [Debug|Release]
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
 
@@ -31,31 +31,31 @@ echo "==> Verifying/building the self-contained subtitle stack"
 echo "==> Verifying/building Sparkle for optional direct-distribution updates"
 ./Scripts/build_sparkle.sh
 
-SPARKLE_FEED_URL="${KHUA_SPARKLE_FEED_URL:-}"
-SPARKLE_PUBLIC_ED_KEY="${KHUA_SPARKLE_PUBLIC_ED_KEY:-}"
+SPARKLE_FEED_URL="${ODF_SPARKLE_FEED_URL:-}"
+SPARKLE_PUBLIC_ED_KEY="${ODF_SPARKLE_PUBLIC_ED_KEY:-}"
 if { [ -n "$SPARKLE_FEED_URL" ] && [ -z "$SPARKLE_PUBLIC_ED_KEY" ]; } ||
    { [ -z "$SPARKLE_FEED_URL" ] && [ -n "$SPARKLE_PUBLIC_ED_KEY" ]; }; then
-  echo "error: KHUA_SPARKLE_FEED_URL and KHUA_SPARKLE_PUBLIC_ED_KEY must be supplied together" >&2
+  echo "error: ODF_SPARKLE_FEED_URL and ODF_SPARKLE_PUBLIC_ED_KEY must be supplied together" >&2
   exit 2
 fi
-export KHUA_ENABLE_SPARKLE=true
-export KHUA_SPARKLE_FEED_URL="$SPARKLE_FEED_URL"
-export KHUA_SPARKLE_PUBLIC_ED_KEY="$SPARKLE_PUBLIC_ED_KEY"
+export ODF_ENABLE_SPARKLE=true
+export ODF_SPARKLE_FEED_URL="$SPARKLE_FEED_URL"
+export ODF_SPARKLE_PUBLIC_ED_KEY="$SPARKLE_PUBLIC_ED_KEY"
 
 echo "==> Generating the Xcode project (xcodegen)"
 "$XCODEGEN" generate --spec Apps/Mac/project.yml --project Apps/Mac --quiet
 
 echo "==> Building ($CONFIG)"
 XCODE_SETTINGS=(REGISTER_WITH_LAUNCH_SERVICES=NO)
-if [ -n "${KHUA_BUNDLE_ID:-}" ]; then
-  XCODE_SETTINGS+=(KHUA_BUNDLE_ID="$KHUA_BUNDLE_ID")
+if [ -n "${ODF_BUNDLE_ID:-}" ]; then
+  XCODE_SETTINGS+=(ODF_BUNDLE_ID="$ODF_BUNDLE_ID")
 fi
-if [ -n "${KHUA_DISPLAY_NAME:-}" ]; then
-  XCODE_SETTINGS+=(KHUA_DISPLAY_NAME="$KHUA_DISPLAY_NAME")
+if [ -n "${ODF_DISPLAY_NAME:-}" ]; then
+  XCODE_SETTINGS+=(ODF_DISPLAY_NAME="$ODF_DISPLAY_NAME")
 fi
 xcodebuild -skipPackagePluginValidation \
-           -project Apps/Mac/KhuaPlayer.xcodeproj \
-           -scheme KhuaPlayer \
+           -project Apps/Mac/OpenDuckFrame.xcodeproj \
+           -scheme OpenDuckFrame \
            -configuration "$CONFIG" \
            -derivedDataPath .build \
            "${XCODE_SETTINGS[@]}" \
@@ -90,7 +90,7 @@ if [ "$CONFIG" = "Release" ]; then
   verify_deployed_app() { codesign --verify --deep --strict "$1"; }
   sp_recover_atomic_directory "$ROOT_DIR/OpenDuckFrame.app" "$ROOT_DIR" verify_deployed_app
   CLEANROOM="$(mktemp -d)"
-  DEPLOY_TMP="$(mktemp -d "$ROOT_DIR/.khuaplayer-deploy.XXXXXX")"
+  DEPLOY_TMP="$(mktemp -d "$ROOT_DIR/.openduckframe-deploy.XXXXXX")"
   trap 'rm -rf "$CLEANROOM" "$DEPLOY_TMP"' EXIT
   cp -R "$APP" "$CLEANROOM/"
   xattr -cr "$CLEANROOM/OpenDuckFrame.app"
@@ -102,8 +102,8 @@ if [ "$CONFIG" = "Release" ]; then
 
   # Xcode build products and archive intermediates must not accumulate as
   # duplicate Quick Look registrations. Keep only the published root app.
-  QL_IDENTIFIER="app.khuaplayer.KhuaPlayer.QuickLook"
-  QL_APPEX="$ROOT_DIR/OpenDuckFrame.app/Contents/PlugIns/KhuaPlayerQuickLook.appex"
+  QL_IDENTIFIER="app.openduckframe.OpenDuckFrame.QuickLook"
+  QL_APPEX="$ROOT_DIR/OpenDuckFrame.app/Contents/PlugIns/OpenDuckFrameQuickLook.appex"
   LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
   registered_ql_paths() {

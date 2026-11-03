@@ -50,6 +50,3 @@ running application.
 If a future version adds purchases, network playback, crash reporting, update
 statistics, or any other data processing, this policy must be updated before
 that version is distributed.
-
-OpenDuckFrame is based on Khua Player. Khua Player's own privacy policy applies
-only to builds distributed by the Khua Player project.

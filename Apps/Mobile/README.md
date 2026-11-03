@@ -1,8 +1,8 @@
-# Khua for iPhone and iPad — planned
+# OpenDuckFrame for iPhone and iPad — planned
 
 This directory reserves the product boundary for a future iPhone and iPad
 app. It currently contains no Xcode target, runnable app, bundle identifier,
-signing configuration, or purchase integration. Khua currently supports macOS
+signing configuration, or purchase integration. OpenDuckFrame currently supports macOS
 only.
 
 The intended direction is one mobile product with interface adaptations for

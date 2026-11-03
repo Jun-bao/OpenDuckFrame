@@ -62,23 +62,23 @@ int main(int argc,const char **argv) { @autoreleasepool {
     [core cancelPreparedFileLanczos];
     bool cancelDone=awaitCondition(^BOOL{return cancelFinished;},15);
     bool cancelKept=cancelDone && !cancelAccepted && core.fileLanczosActive && core.fileLanczosWidth==outputWidth;
-    bool fakeRequested=getenv("KHUA_TEST_FAKE_FILE_PROVIDER")!=nullptr, realRequested=getenv("KHUA_TEST_REAL_FILE_RIFE")!=nullptr, lowRequested=getenv("KHUA_TEST_REAL_FILE_LOW_LATENCY")!=nullptr, distilRequested=getenv("KHUA_TEST_REAL_FILE_DISTIL")!=nullptr;
+    bool fakeRequested=getenv("ODF_TEST_FAKE_FILE_PROVIDER")!=nullptr, realRequested=getenv("ODF_TEST_REAL_FILE_RIFE")!=nullptr, lowRequested=getenv("ODF_TEST_REAL_FILE_LOW_LATENCY")!=nullptr, distilRequested=getenv("ODF_TEST_REAL_FILE_DISTIL")!=nullptr;
     bool providerRequested=fakeRequested||realRequested||lowRequested||distilRequested;
     id<SPFileFrameProvider> provider=nil;
     if(fakeRequested) provider=[[HeadlessFileProvider alloc] init];
     if(realRequested){
-        const char *path=getenv("KHUA_TEST_DEBUG_DYLIB"),*app=getenv("KHUA_TEST_RESOURCE_APP"),*model=getenv("KHUA_TEST_REAL_FILE_RIFE");
+        const char *path=getenv("ODF_TEST_DEBUG_DYLIB"),*app=getenv("ODF_TEST_RESOURCE_APP"),*model=getenv("ODF_TEST_REAL_FILE_RIFE");
         if(!path||!app||!dlopen(path,RTLD_NOW|RTLD_LOCAL)){fprintf(stderr,"debug dylib: %s\n",dlerror());return 7;}
         Class type=NSClassFromString(@"SPFileRifeEngine");provider=(id)[[type alloc] initWithModelID:[NSString stringWithUTF8String:model] quality:@"fast" resourceBundle:[NSBundle bundleWithPath:[NSString stringWithUTF8String:app]]];
         if(!provider)return 7;
     }
     if(lowRequested) {
-        const char *path=getenv("KHUA_TEST_DEBUG_DYLIB");
+        const char *path=getenv("ODF_TEST_DEBUG_DYLIB");
         if(!path||!dlopen(path,RTLD_NOW|RTLD_LOCAL)){fprintf(stderr,"debug dylib: %s\n",dlerror());return 7;}
         provider=(id)[NSClassFromString(@"SPFileLowLatencyEngine") new]; if(!provider)return 7;
     }
     if(distilRequested) {
-        const char *path=getenv("KHUA_TEST_DEBUG_DYLIB"),*app=getenv("KHUA_TEST_RESOURCE_APP");
+        const char *path=getenv("ODF_TEST_DEBUG_DYLIB"),*app=getenv("ODF_TEST_RESOURCE_APP");
         if(!path||!app||!dlopen(path,RTLD_NOW|RTLD_LOCAL)){fprintf(stderr,"debug dylib: %s\n",dlerror());return 7;}
         provider=(id)[(SPFileDistilEngine *)[NSClassFromString(@"SPFileDistilEngine") alloc] initWithResourceBundle:[NSBundle bundleWithPath:[NSString stringWithUTF8String:app]]];if(!provider)return 7;
     }
@@ -93,7 +93,7 @@ int main(int argc,const char **argv) { @autoreleasepool {
     bool videoRandomOK=!videoSR || ([videoDiagnostics[@"random"] unsignedIntegerValue]>=1 && [videoDiagnostics[@"sequential"] unsignedIntegerValue]==0 && [videoDiagnostics[@"history"] unsignedIntegerValue]==0 && ![videoDiagnostics[@"temporal"] boolValue] && [videoDiagnostics[@"mode"] isEqualToString:@"Random"]);
     bool rejectedAndKept=!providerRequested || (![core commitFilePlanWithInterpolation:YES usePreparedProvider:YES cadence:((lowRequested||distilRequested)?2:3) numerator:0 denominator:1 usePreparedScaler:NO] && core.fileLanczosActive);
     // Keep unknown scan fail-closed; test same-file recovery by seeking to its initial keyframe.
-    bool scanTest=getenv("KHUA_TEST_SCAN_WAIT")!=nullptr;
+    bool scanTest=getenv("ODF_TEST_SCAN_WAIT")!=nullptr;
     bool sawScanWait=!scanTest || (providerRequested && awaitCondition(^BOOL{return core.frameInterpolationAwaitingScan;},5));
     if(providerRequested)[core seekTo:scanTest?0.0:0.5];
     bool providerActive=!providerRequested || awaitCondition(^BOOL{return core.frameInterpolationActive;},8);

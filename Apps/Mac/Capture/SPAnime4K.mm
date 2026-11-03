@@ -7,7 +7,7 @@
 #include <libplacebo/shaders/custom.h>
 #include <libplacebo/colorspace.h>
 
-static NSError *SPAnimeError(NSInteger code, NSString *message) { return [NSError errorWithDomain:@"app.khuaplayer.anime4k" code:code userInfo:@{NSLocalizedDescriptionKey:message}]; }
+static NSError *SPAnimeError(NSInteger code, NSString *message) { return [NSError errorWithDomain:@"app.openduckframe.anime4k" code:code userInfo:@{NSLocalizedDescriptionKey:message}]; }
 struct SPAnimeAPI {
     void *library=nullptr;
     decltype(&pl_vulkan_create) vulkanCreate=nullptr; decltype(&pl_vulkan_destroy) vulkanDestroy=nullptr;
@@ -42,7 +42,7 @@ struct SPAnimeAPI {
     BOOL _running,_inflight;
 }
 - (instancetype)init { return [self initWithResourceBundle:NSBundle.mainBundle]; }
-- (instancetype)initWithResourceBundle:(NSBundle *)bundle {if(!(self=[super init]))return nil;_resourceBundle=bundle;_queue=dispatch_queue_create("app.khuaplayer.anime4k",DISPATCH_QUEUE_SERIAL);return self;}
+- (instancetype)initWithResourceBundle:(NSBundle *)bundle {if(!(self=[super init]))return nil;_resourceBundle=bundle;_queue=dispatch_queue_create("app.openduckframe.anime4k",DISPATCH_QUEUE_SERIAL);return self;}
 + (BOOL)isPackagedForThisSystem { return [self isPackagedInBundle:NSBundle.mainBundle]; }
 + (BOOL)isPackagedInBundle:(NSBundle *)bundle {
     if (NSProcessInfo.processInfo.operatingSystemVersion.majorVersion < 27) return NO;

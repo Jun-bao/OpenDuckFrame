@@ -54,10 +54,10 @@ int main(int argc,const char **argv) { @autoreleasepool {
     std::atomic<int> mode{SPFrameInterpolationModeDoubleRate}; std::atomic<uint64_t> epoch{1},late{0}; std::atomic<double> hz{240},rate{1};
     sp::SPFrameGeneratorLiveState live; live.generation=&generation;live.seekPending=&seek;live.requestedMode=&mode;live.policyEpoch=&epoch;live.firstFramePending=&first;live.running=&running;live.paused=&paused;live.displayMaximumFPS=&hz;live.playbackRate=&rate;live.activeValue=&active;live.lateDrops=&late;
     const bool distilArg=argc>3 && strcmp(argv[3],"distil")==0;
-    const bool probeVideoSR=getenv("KHUA_PROBE_VIDEO_SR")!=nullptr;
+    const bool probeVideoSR=getenv("ODF_PROBE_VIDEO_SR")!=nullptr;
     const int sourceWidth=distilArg?1280:(probeVideoSR?480:320),sourceHeight=distilArg?720:(probeVideoSR?270:192);
-    const bool probeMetalFX=getenv("KHUA_PROBE_METALFX")!=nullptr;
-    const bool probeScale = getenv("KHUA_PROBE_SCALE") != nullptr || probeMetalFX || probeVideoSR;
+    const bool probeMetalFX=getenv("ODF_PROBE_METALFX")!=nullptr;
+    const bool probeScale = getenv("ODF_PROBE_SCALE") != nullptr || probeMetalFX || probeVideoSR;
     const int scaleWidth=sourceWidth*(probeVideoSR?4:2),scaleHeight=sourceHeight*(probeVideoSR?4:2);
     NSError *scaleError=nil; SPFileLanczosScaler *scaler=probeVideoSR ? [[SPFileAppleVideoSRScaler alloc] initWithSourceWidth:sourceWidth sourceHeight:sourceHeight outputWidth:scaleWidth outputHeight:scaleHeight error:&scaleError] : (probeMetalFX ? [[SPFileMetalFXScaler alloc] initWithDevice:MTLCreateSystemDefaultDevice() sourceWidth:sourceWidth sourceHeight:sourceHeight outputWidth:scaleWidth outputHeight:scaleHeight error:&scaleError] : (probeScale ? [[SPFileLanczosScaler alloc] initWithDevice:MTLCreateSystemDefaultDevice() width:scaleWidth height:scaleHeight error:&scaleError] : nil));
     if (probeScale && !scaler) { fprintf(stderr,"scaler: %s\n",scaleError.localizedDescription.UTF8String); return 3; }
@@ -88,7 +88,7 @@ int main(int argc,const char **argv) { @autoreleasepool {
     BOOL realDistil=argc>3 && strcmp(argv[3],"distil")==0;
     if(fakeProvider)[g setPendingFileProvider:threeProvider ? [ThreeSourceFakeProvider new] : [FakeFileProvider new]];
     if(realRife || realLow || realDistil){
-        const char *path=getenv("KHUA_TEST_DEBUG_DYLIB"),*app=getenv("KHUA_TEST_RESOURCE_APP");
+        const char *path=getenv("ODF_TEST_DEBUG_DYLIB"),*app=getenv("ODF_TEST_RESOURCE_APP");
         if(!path||!app||!dlopen(path,RTLD_NOW|RTLD_LOCAL)){fprintf(stderr,"debug dylib unavailable: %s\n",dlerror());return 3;}
         Class type=NSClassFromString(realLow?@"SPFileLowLatencyEngine":(realDistil?@"SPFileDistilEngine":@"SPFileRifeEngine"));NSBundle *bundle=[NSBundle bundleWithPath:[NSString stringWithUTF8String:app]];
         id<SPFileFrameProvider> real=realLow?(id)[type new]:(realDistil?(id)[(SPFileDistilEngine *)[type alloc] initWithResourceBundle:bundle]:(id)[[type alloc] initWithModelID:[NSString stringWithUTF8String:argv[3]] quality:@"fast" resourceBundle:bundle]);

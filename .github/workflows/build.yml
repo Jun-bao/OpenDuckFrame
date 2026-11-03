@@ -42,7 +42,7 @@ jobs:
             ThirdParty/ffmpeg-min
             ThirdParty/subtitles-min
             ThirdParty/sparkle-min
-          key: khua-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ThirdParty/deps.lock.json', 'Scripts/build_*.sh', 'Scripts/lib/**', 'Scripts/patches/**') }}
+          key: odf-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ThirdParty/deps.lock.json', 'Scripts/build_*.sh', 'Scripts/lib/**', 'Scripts/patches/**') }}
 
       - name: Check public repository boundary
         run: ./Scripts/check_public_repo.sh

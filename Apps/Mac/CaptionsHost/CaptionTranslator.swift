@@ -127,7 +127,7 @@ enum CaptionDownloadHostLoader {
     static func download(source: Locale.Language, target: Locale.Language, window: NSWindow?) async throws {
         try Task.checkCancellation()
         guard let url = Bundle.main.privateFrameworksURL?
-            .appendingPathComponent("KhuaPlayerCaptionsUI.framework"),
+            .appendingPathComponent("OpenDuckFrameCaptionsUI.framework"),
               let bundle = Bundle(url: url) else { throw LoadError.frameworkMissing }
         if !bundle.isLoaded { try bundle.loadAndReturnError() }
         guard let cls = bundle.classNamed("SPCaptionDownloadHost") ?? NSClassFromString("SPCaptionDownloadHost")

@@ -6,7 +6,7 @@
 #include <cmath>
 
 static std::atomic<bool> SPFileDistilPreflightBusy{false};
-static NSError *SPFileDistilError(NSInteger code,NSString *message){return [NSError errorWithDomain:@"Khua.FileDistil" code:code userInfo:@{NSLocalizedDescriptionKey:message}];}
+static NSError *SPFileDistilError(NSInteger code,NSString *message){return [NSError errorWithDomain:@"OpenDuckFrame.FileDistil" code:code userInfo:@{NSLocalizedDescriptionKey:message}];}
 static BOOL SPDistilFileCompatible(CVPixelBufferRef b, int width, int height, OSType format) {
     if (!b || CVPixelBufferGetWidth(b)!=(size_t)width || CVPixelBufferGetHeight(b)!=(size_t)height ||
         CVPixelBufferGetPixelFormatType(b)!=format ||
@@ -56,7 +56,7 @@ static CVPixelBufferRef SPDistilFileConvert(VTPixelTransferSessionRef transfer, 
 - (instancetype)init { return [self initWithResourceBundle:NSBundle.mainBundle]; }
 - (instancetype)initWithResourceBundle:(NSBundle *)bundle {
     if(!(self=[super init]))return nil; _bundle=bundle; _busy.store(false);
-    _queue=dispatch_queue_create("app.khuaplayer.file-distil",DISPATCH_QUEUE_SERIAL);return self;
+    _queue=dispatch_queue_create("app.openduckframe.file-distil",DISPATCH_QUEUE_SERIAL);return self;
 }
 - (void)dealloc {if(_toRGB)CFRelease(_toRGB);if(_toNV12)CFRelease(_toNV12);}
 - (BOOL)requiresPrecedingSource{return YES;}

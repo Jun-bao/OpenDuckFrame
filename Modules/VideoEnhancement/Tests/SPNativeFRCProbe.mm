@@ -10,7 +10,7 @@
 static CVReturn lastBufferStatus = kCVReturnSuccess;
 static CVPixelBufferRef makeFrame(int shift, bool glyph) {
     const int w=2560,h=1440; CVPixelBufferRef p=nullptr;
-    NSDictionary *attrs=getenv("KHUA_PROBE_CPU_BUFFERS") ? @{} : @{(id)kCVPixelBufferIOSurfacePropertiesKey:@{},(id)kCVPixelBufferMetalCompatibilityKey:@YES};
+    NSDictionary *attrs=getenv("ODF_PROBE_CPU_BUFFERS") ? @{} : @{(id)kCVPixelBufferIOSurfacePropertiesKey:@{},(id)kCVPixelBufferMetalCompatibilityKey:@YES};
     CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault,w,h,kCVPixelFormatType_64RGBAHalf,(__bridge CFDictionaryRef)attrs,&p);
     lastBufferStatus = status;
     if (status!=kCVReturnSuccess) { fprintf(stderr,"CVPixelBufferCreate status=%d\n",status); return nullptr; }
@@ -35,7 +35,7 @@ int main() { @autoreleasepool {
     for (int glyph=0;glyph<2;glyph++) for (int moving=0;moving<2;moving++) {
         CVPixelBufferRef a=makeFrame(0,glyph),b=makeFrame(moving?8:0,glyph),gt=makeFrame(moving?4:0,glyph);
         if(!a||!b||!gt) {
-            NSDictionary *result=@{@"scope":@"Direct VT SDK buffer test; no inference performed", @"bufferAllocation":getenv("KHUA_PROBE_CPU_BUFFERS") ? @"CPU buffer" : @"IOSurface Metal compatible", @"failure":@"CVPixelBufferCreate failed", @"cvReturn":@(lastBufferStatus), @"cases":cases};
+            NSDictionary *result=@{@"scope":@"Direct VT SDK buffer test; no inference performed", @"bufferAllocation":getenv("ODF_PROBE_CPU_BUFFERS") ? @"CPU buffer" : @"IOSurface Metal compatible", @"failure":@"CVPixelBufferCreate failed", @"cvReturn":@(lastBufferStatus), @"cases":cases};
             NSData *json=[NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingPrettyPrinted error:nil];fwrite(json.bytes,1,json.length,stdout);putchar('\n');
             if(a)CVPixelBufferRelease(a); if(b)CVPixelBufferRelease(b); if(gt)CVPixelBufferRelease(gt); return 2;
         }
@@ -63,6 +63,6 @@ int main() { @autoreleasepool {
             if(ready)[proc endSession];[cases addObject:entry];
         } CVPixelBufferRelease(a);CVPixelBufferRelease(b);CVPixelBufferRelease(gt);
     }
-    NSDictionary *result=@{@"scope":@"Direct VT SDK buffer test; not Khua live bridge, file provider, physical display or subjective acceptance",@"bufferAllocation":getenv("KHUA_PROBE_CPU_BUFFERS") ? @"CPU buffer (no IOSurface requested)" : @"IOSurface Metal compatible",@"frcSupported":@(VTFrameRateConversionConfiguration.isSupported),@"complete":@(allReady),@"cases":cases};
+    NSDictionary *result=@{@"scope":@"Direct VT SDK buffer test; not OpenDuckFrame live bridge, file provider, physical display or subjective acceptance",@"bufferAllocation":getenv("ODF_PROBE_CPU_BUFFERS") ? @"CPU buffer (no IOSurface requested)" : @"IOSurface Metal compatible",@"frcSupported":@(VTFrameRateConversionConfiguration.isSupported),@"complete":@(allReady),@"cases":cases};
     NSData *json=[NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingPrettyPrinted error:nil];fwrite(json.bytes,1,json.length,stdout);putchar('\n');return allReady ? 0 : 1;
 }}

@@ -4,7 +4,7 @@
 
 # OpenDuckFrame — 开源小鸭
 
-OpenDuckFrame is a macOS workbench for frame generation, interpolation and upscaling, built on the Khua Player project.
+OpenDuckFrame is a macOS app for real-time frame generation and upscaling of any window, display or video file.
 
 Get smoother motion with frame interpolation, generate and translate subtitles on your Mac,
 and keep watching the playable parts of damaged or unfinished files.
@@ -81,7 +81,7 @@ Build the application:
 Run these commands from the repository root. `Scripts/build.sh` remains a
 compatibility entry point with the same arguments and environment settings.
 The Mac project definition is [`Apps/Mac/project.yml`](Apps/Mac/project.yml);
-the build generates `Apps/Mac/KhuaPlayer.xcodeproj`. Edit the definition, not
+the build generates `Apps/Mac/OpenDuckFrame.xcodeproj`. Edit the definition, not
 the generated Xcode project.
 
 The first build downloads checksum-pinned dependency source archives, builds
@@ -129,7 +129,7 @@ Applications shortcut. Generated apps, DMGs, ZIPs, archives, and symbols stay
 outside Git history and are published through the release host.
 
 Direct-distribution builds contain configuration-gated Sparkle support. Without
-both `KHUA_SPARKLE_FEED_URL` and `KHUA_SPARKLE_PUBLIC_ED_KEY`, the updater does
+both `ODF_SPARKLE_FEED_URL` and `ODF_SPARKLE_PUBLIC_ED_KEY`, the updater does
 not load, create a menu item, or make a network request. App Store builds omit
 Sparkle and its configuration entirely. Configured direct builds check
 automatically by default and expose an App-menu toggle to disable that behavior.
@@ -139,8 +139,7 @@ automatically by default and expose an App-menu toggle to disable that behavior.
 The application does not collect or transmit playback data. See
 [PRIVACY.md](PRIVACY.md) for the current behavior.
 
-OpenDuckFrame's own source code, including the code inherited from Khua Player,
-is available under the [MIT License](LICENSE).
+OpenDuckFrame's own source code is available under the [MIT License](LICENSE).
 Third-party components retain their own licenses; see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and
 [`ThirdParty/Licenses`](ThirdParty/Licenses). Distributors are responsible for

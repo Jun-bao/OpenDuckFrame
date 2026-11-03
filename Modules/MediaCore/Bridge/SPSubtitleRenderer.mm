@@ -194,7 +194,7 @@ AssApi &assApi() {
         _spLogId = logId;
 
         _assQueue = dispatch_queue_create(
-            [NSString stringWithFormat:@"dev.khuaplayer.subtitle.c%u", logId].UTF8String,
+            [NSString stringWithFormat:@"dev.openduckframe.subtitle.c%u", logId].UTF8String,
             attr);
         _lib = NULL;
         _renderer = NULL;

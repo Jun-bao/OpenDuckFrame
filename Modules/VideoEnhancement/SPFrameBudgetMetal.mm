@@ -18,7 +18,7 @@ static_assert(sizeof(SPBudgetColorCPU) == 32, "SPBudgetColor layout");
 static_assert(sizeof(SPBudgetBlockResult) == 32, "SPBudgetBlockResult layout");
 
 static NSError *SPBudgetMetalError(NSInteger code, NSString *message) {
-    return [NSError errorWithDomain:@"dev.khuaplayer.FrameBudgetMetal" code:code
+    return [NSError errorWithDomain:@"dev.openduckframe.FrameBudgetMetal" code:code
                            userInfo:@{NSLocalizedDescriptionKey: message ?: @""}];
 }
 
@@ -71,7 +71,7 @@ static NSError *SPBudgetMetalError(NSInteger code, NSString *message) {
         }
     }
     _commandQueue = [device newCommandQueue];
-    _commandQueue.label = @"dev.khuaplayer.frame-budget";
+    _commandQueue.label = @"dev.openduckframe.frame-budget";
     auto pso = [&](NSString *name, NSError **e) -> id<MTLComputePipelineState> {
         id<MTLFunction> fn = [library newFunctionWithName:name];
         return fn ? [device newComputePipelineStateWithFunction:fn error:e] : nil;

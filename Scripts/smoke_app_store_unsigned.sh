@@ -58,7 +58,7 @@ assert_equal() {
     die "$label mismatch: expected '$expected', got '$actual'"
 }
 
-ARCHIVE_PATH=".build/AppStoreSmoke/Khua.xcarchive"
+ARCHIVE_PATH=".build/AppStoreSmoke/OpenDuckFrame.xcarchive"
 DERIVED_DATA_PATH=".build/AppStoreSmoke/DerivedData"
 
 while [ "$#" -gt 0 ]; do
@@ -101,9 +101,9 @@ unregister_archive_products() {
   local lsregister
   lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
   for app in \
-    "$DERIVED_DATA_PATH/Build/Intermediates.noindex/ArchiveIntermediates/KhuaPlayer/InstallationBuildProductsLocation/Applications/OpenDuckFrame.app" \
+    "$DERIVED_DATA_PATH/Build/Intermediates.noindex/ArchiveIntermediates/OpenDuckFrame/InstallationBuildProductsLocation/Applications/OpenDuckFrame.app" \
     "$ARCHIVE_PATH/Products/Applications/OpenDuckFrame.app"; do
-    pluginkit -r "$app/Contents/PlugIns/KhuaPlayerQuickLook.appex" 2>/dev/null || true
+    pluginkit -r "$app/Contents/PlugIns/OpenDuckFrameQuickLook.appex" 2>/dev/null || true
     "$lsregister" -u "$app" 2>/dev/null || true
   done
 }
@@ -120,16 +120,16 @@ echo "==> Building pinned FFmpeg and dav1d dependencies"
 "$ROOT/Scripts/build_ffmpeg_min.sh"
 echo "==> Building pinned subtitle dependencies"
 "$ROOT/Scripts/build_subtitle_libs.sh"
-echo "==> Generating Apps/Mac/KhuaPlayer.xcodeproj"
-KHUA_ENABLE_SPARKLE=false \
-KHUA_SPARKLE_FEED_URL= \
-KHUA_SPARKLE_PUBLIC_ED_KEY= \
+echo "==> Generating Apps/Mac/OpenDuckFrame.xcodeproj"
+ODF_ENABLE_SPARKLE=false \
+ODF_SPARKLE_FEED_URL= \
+ODF_SPARKLE_PUBLIC_ED_KEY= \
   "$XCODEGEN_BIN" generate --spec Apps/Mac/project.yml --project Apps/Mac --quiet
 
 echo "==> Archiving unsigned AppStore configuration"
 /usr/bin/xcodebuild \
-  -project "$ROOT/Apps/Mac/KhuaPlayer.xcodeproj" \
-  -scheme KhuaPlayer \
+  -project "$ROOT/Apps/Mac/OpenDuckFrame.xcodeproj" \
+  -scheme OpenDuckFrame \
   -configuration AppStore \
   -destination "generic/platform=macOS" \
   -archivePath "$ARCHIVE_PATH" \
@@ -140,14 +140,14 @@ echo "==> Archiving unsigned AppStore configuration"
   CODE_SIGN_IDENTITY= \
   EXPANDED_CODE_SIGN_IDENTITY= \
   DEVELOPMENT_TEAM= \
-  KHUA_DEVELOPMENT_TEAM= \
+  ODF_DEVELOPMENT_TEAM= \
   PROVISIONING_PROFILE_SPECIFIER= \
   archive
 
 # Nothing below this point writes to, signs, or otherwise mutates the archive.
 APP="$ARCHIVE_PATH/Products/Applications/OpenDuckFrame.app"
-APPEX="$APP/Contents/PlugIns/KhuaPlayerQuickLook.appex"
-FRAMEWORK="$APP/Contents/Frameworks/KhuaPlayerMediaCore.framework"
+APPEX="$APP/Contents/PlugIns/OpenDuckFrameQuickLook.appex"
+FRAMEWORK="$APP/Contents/Frameworks/OpenDuckFrameMediaCore.framework"
 LIBASS="$APP/Contents/Frameworks/libass.9.dylib"
 SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
 MAIN_PRIVACY="$APP/Contents/Resources/PrivacyInfo.xcprivacy"
@@ -180,7 +180,7 @@ assert_equal "main bundle name" \
 assert_equal "main display name" \
   "$(plist_value "$APP/Contents/Info.plist" CFBundleDisplayName)" "OpenDuckFrame"
 assert_equal "main executable name" \
-  "$(plist_value "$APP/Contents/Info.plist" CFBundleExecutable)" "Khua"
+  "$(plist_value "$APP/Contents/Info.plist" CFBundleExecutable)" "OpenDuckFrame"
 assert_equal "Quick Look display name" \
   "$(plist_value "$APPEX/Contents/Info.plist" CFBundleDisplayName)" "OpenDuckFrame Quick Look"
 assert_equal "Quick Look bundle identifier" \

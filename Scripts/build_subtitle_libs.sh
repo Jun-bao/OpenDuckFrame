@@ -1,5 +1,5 @@
 #!/bin/bash
-# Khua — reproducible libass dylib with a fully static dependency chain.
+# OpenDuckFrame — reproducible libass dylib with a fully static dependency chain.
 # Output: ThirdParty/subtitles-min/lib/libass.9.dylib (macOS 14+, arm64).
 set -euo pipefail
 

@@ -1,4 +1,4 @@
-// KhuaPlayer - container recovery: AVI (idx1, chunk sizes, ODML, undeclared stream ids)
+// OpenDuckFrame - container recovery: AVI (idx1, chunk sizes, ODML, undeclared stream ids)
 //
 // Split out of the umbrella header by section; function bodies, constants and inline
 // attributes are unchanged. Callers keep including the umbrella; this file only guarantees

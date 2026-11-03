@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create and verify Khua's deterministic embedded build manifest."""
+"""Create and verify OpenDuckFrame's deterministic embedded build manifest."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ MANIFEST_RELATIVE_PATH = Path("Contents/Resources/BuildManifest.json")
 # Shaders ship inside the shared MediaCore framework (looked up via
 # bundleForClass), not the host app's Resources.
 _MEDIACORE_RESOURCES = Path(
-    "Contents/Frameworks/KhuaPlayerMediaCore.framework/Versions/A/Resources"
+    "Contents/Frameworks/OpenDuckFrameMediaCore.framework/Versions/A/Resources"
 )
 REQUIRED_METALLIBS = (
     _MEDIACORE_RESOURCES / "default.metallib",
@@ -49,7 +49,7 @@ THIRD_PARTY_LICENSES = (
 )
 REQUIRED_ARTIFACTS = REQUIRED_METALLIBS + (
     Path("Contents/Frameworks/libass.9.dylib"),
-    Path("Contents/Frameworks/KhuaPlayerCaptionsUI.framework/Versions/A/KhuaPlayerCaptionsUI"),
+    Path("Contents/Frameworks/OpenDuckFrameCaptionsUI.framework/Versions/A/OpenDuckFrameCaptionsUI"),
 ) + tuple(_MEDIACORE_RESOURCES / "Licenses" / name for name in THIRD_PARTY_LICENSES)
 
 

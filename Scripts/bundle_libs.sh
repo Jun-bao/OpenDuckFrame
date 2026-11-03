@@ -85,11 +85,11 @@ MAIN_INFO="$CLEAN_APP/Contents/Info.plist"
 # The tracked source plist remains channel-neutral. Add updater configuration
 # only to the clean direct-distribution bundle, before the outer signature is
 # created. Blank configuration removes every SU key and keeps the updater inert.
-SPARKLE_FEED_URL="${KHUA_SPARKLE_FEED_URL:-}"
-SPARKLE_PUBLIC_ED_KEY="${KHUA_SPARKLE_PUBLIC_ED_KEY:-}"
+SPARKLE_FEED_URL="${ODF_SPARKLE_FEED_URL:-}"
+SPARKLE_PUBLIC_ED_KEY="${ODF_SPARKLE_PUBLIC_ED_KEY:-}"
 if { [ -n "$SPARKLE_FEED_URL" ] && [ -z "$SPARKLE_PUBLIC_ED_KEY" ]; } ||
    { [ -z "$SPARKLE_FEED_URL" ] && [ -n "$SPARKLE_PUBLIC_ED_KEY" ]; }; then
-  echo "error: KHUA_SPARKLE_FEED_URL and KHUA_SPARKLE_PUBLIC_ED_KEY must be supplied together" >&2
+  echo "error: ODF_SPARKLE_FEED_URL and ODF_SPARKLE_PUBLIC_ED_KEY must be supplied together" >&2
   exit 2
 fi
 for update_key in SUFeedURL SUPublicEDKey SUEnableAutomaticChecks SPUpdateUsageEnabled \
@@ -106,18 +106,13 @@ if [ -n "$SPARKLE_FEED_URL" ]; then
   /usr/bin/plutil -insert SURequireSignedFeed -bool YES "$MAIN_INFO"
 fi
 
-# Only the official direct-download channel counts existing update checks.
-# Other distributors and Store builds retain the neutral privacy manifest.
+# Update checks never carry installation statistics; every build ships the
+# neutral privacy manifest.
 cp "$ROOT/Apps/Mac/Resources/PrivacyInfo.xcprivacy" \
    "$CLEAN_APP/Contents/Resources/PrivacyInfo.xcprivacy"
-if [ "$SPARKLE_FEED_URL" = "https://khua.app/updates/appcast.xml" ]; then
-  /usr/bin/plutil -insert SPUpdateUsageEnabled -bool YES "$MAIN_INFO"
-  cp "$ROOT/Distribution/PrivacyInfo-Direct.xcprivacy" \
-     "$CLEAN_APP/Contents/Resources/PrivacyInfo.xcprivacy"
-fi
 
 # Assemble loose dylibs from empty so stale libraries cannot survive a
-# rebuild. Xcode-embedded frameworks (KhuaPlayerMediaCore) are kept: the
+# rebuild. Xcode-embedded frameworks (OpenDuckFrameMediaCore) are kept: the
 # source app copy is a fresh build product, so they cannot be stale.
 mkdir -p "$FW"
 find "$FW" -maxdepth 1 -type f -delete
@@ -151,13 +146,13 @@ CUGAN_RUNTIME="$ROOT/.build/realcugan-runtime"
 if [ -d "$CUGAN_RUNTIME" ]; then
   [ -f "$CUGAN_RUNTIME/SHA256.txt" ] || { echo "Real-CUGAN runtime has no hash inventory" >&2; exit 1; }
   shasum -a 256 -c "$CUGAN_RUNTIME/SHA256.txt" >/dev/null
-  [ -f "$CUGAN_RUNTIME/libkhua_realcugan.dylib" ] && [ -f "$CUGAN_RUNTIME/libMoltenVK.dylib" ] || { echo "Real-CUGAN runtime is incomplete" >&2; exit 1; }
+  [ -f "$CUGAN_RUNTIME/libodf_realcugan.dylib" ] && [ -f "$CUGAN_RUNTIME/libMoltenVK.dylib" ] || { echo "Real-CUGAN runtime is incomplete" >&2; exit 1; }
   if [ -f "$FW/libMoltenVK.dylib" ]; then
     cmp -s "$FW/libMoltenVK.dylib" "$CUGAN_RUNTIME/libMoltenVK.dylib" || { echo "Anime4K and Real-CUGAN MoltenVK versions differ" >&2; exit 1; }
   else
     cp "$CUGAN_RUNTIME/libMoltenVK.dylib" "$FW/libMoltenVK.dylib"
   fi
-  cp "$CUGAN_RUNTIME/libkhua_realcugan.dylib" "$FW/libkhua_realcugan.dylib"
+  cp "$CUGAN_RUNTIME/libodf_realcugan.dylib" "$FW/libodf_realcugan.dylib"
 fi
 chmod u+w "$FW/libass.9.dylib"
 install_name_tool -id "@rpath/libass.9.dylib" "$FW/libass.9.dylib"
@@ -240,7 +235,7 @@ codesign -s "$SP_SIGN_ID" $SP_SIGN_OPTS --force "$CLEAN_APP"
 
 # Stage publication beside the target, then use the same serialized,
 # crash-recoverable rename transaction as third-party dependency publication.
-PUBLISH_DIR="$(mktemp -d "$APP_PARENT/.khuaplayer-publish.XXXXXX")"
+PUBLISH_DIR="$(mktemp -d "$APP_PARENT/.openduckframe-publish.XXXXXX")"
 PUBLISH_APP="$PUBLISH_DIR/$(basename "$APP")"
 ditto "$CLEAN_APP" "$PUBLISH_APP"
 sp_atomic_replace_directory "$PUBLISH_APP" "$APP" "$APP_PARENT"

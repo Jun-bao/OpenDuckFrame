@@ -2,11 +2,11 @@
 .build/
 build/
 # Numbered copies created by Finder's "Keep Both" action (for example,
-# Khua 2.app). Unregister them with lsregister before deletion to avoid
+# OpenDuckFrame 2.app). Unregister them with lsregister before deletion to avoid
 # duplicate entries in the Finder "Open With" menu.
-Khua*.app/
-Khua*.dmg
-Khua*.zip
+OpenDuckFrame*.app/
+OpenDuckFrame*.dmg
+OpenDuckFrame*.zip
 OpenDuckFrame*.app/
 OpenDuckFrame*.dmg
 OpenDuckFrame*.zip
@@ -14,7 +14,7 @@ OpenDuckFrame*.zip
 *.xcarchive/
 /dist/
 
-# Apps/Mac/KhuaPlayer.xcodeproj is generated from Apps/Mac/project.yml.
+# Apps/Mac/OpenDuckFrame.xcodeproj is generated from Apps/Mac/project.yml.
 # Future generated product projects are ignored by the same rule.
 *.xcodeproj/
 

@@ -12,7 +12,7 @@ final class SPPlaybackSleepController {
     init(queue: DispatchQueue = SPPlaybackSleepAssertion.queue,
          createAssertion: @escaping @Sendable () -> IOPMAssertionID? = {
         var id = IOPMAssertionID(kIOPMNullAssertionID)
-        // Resolve the product name on the worker too (Khua / Quick Look builds).
+        // Resolve the product name on the worker too (OpenDuckFrame / Quick Look builds).
         let product = Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
             ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String
             ?? ProcessInfo.processInfo.processName
@@ -57,7 +57,7 @@ final class SPPlaybackSleepController {
 /// Sendable because assertionID and both injected operations are used only on
 /// the serial queue. Enqueued jobs retain this worker until cleanup completes.
 private final class SPPlaybackSleepAssertion: @unchecked Sendable {
-    static let queue = DispatchQueue(label: "dev.khuaplayer.playback-sleep", qos: .utility)
+    static let queue = DispatchQueue(label: "dev.openduckframe.playback-sleep", qos: .utility)
     private let queue: DispatchQueue
     private let create: @Sendable () -> IOPMAssertionID?
     private let release: @Sendable (IOPMAssertionID) -> Void

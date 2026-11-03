@@ -3,7 +3,7 @@
 #import <VideoToolbox/VTFrameProcessor_SuperResolutionScaler.h>
 
 static NSError *SPVideoSRError(NSInteger code, NSString *message) {
-    return [NSError errorWithDomain:@"app.khuaplayer.apple-video-sr" code:code userInfo:@{NSLocalizedDescriptionKey:message}];
+    return [NSError errorWithDomain:@"app.openduckframe.apple-video-sr" code:code userInfo:@{NSLocalizedDescriptionKey:message}];
 }
 static CVPixelBufferRef SPVideoSRBuffer(int width, int height, OSType format, NSDictionary *required) {
     NSDictionary *local=@{(id)kCVPixelBufferWidthKey:@(width),(id)kCVPixelBufferHeightKey:@(height),
@@ -37,7 +37,7 @@ static void SPVideoSREnd(id processor) { if (@available(macOS 15.4,*)) [(VTFrame
 }
 - (instancetype)init {
     if (!(self=[super init])) return nil;
-    _queue=dispatch_queue_create("app.khuaplayer.apple-video-sr",DISPATCH_QUEUE_SERIAL);
+    _queue=dispatch_queue_create("app.openduckframe.apple-video-sr",DISPATCH_QUEUE_SERIAL);
     _previousPTS=kCMTimeInvalid;
     return self;
 }

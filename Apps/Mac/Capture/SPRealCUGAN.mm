@@ -4,7 +4,7 @@
 #include <vector>
 #include <new>
 
-static NSError *SPCUGANError(NSInteger code, NSString *message) { return [NSError errorWithDomain:@"app.khuaplayer.realcugan" code:code userInfo:@{NSLocalizedDescriptionKey:message}]; }
+static NSError *SPCUGANError(NSInteger code, NSString *message) { return [NSError errorWithDomain:@"app.openduckframe.realcugan" code:code userInfo:@{NSLocalizedDescriptionKey:message}]; }
 static NSURL *SPCUGANResource(NSBundle *bundle,NSString *name,NSString *ext) {
     NSURL *url=[bundle URLForResource:name withExtension:ext subdirectory:@"RealCUGAN"];
     return url ?: [bundle URLForResource:name withExtension:ext];
@@ -20,7 +20,7 @@ struct SPCUGANAPI {
     int (*process)(void *,const uint8_t *,int,int,uint8_t *)=nullptr;void (*destroy)(void *)=nullptr;
     bool open(NSString *path){library=dlopen(path.fileSystemRepresentation,RTLD_NOW|RTLD_LOCAL);if(!library)return false;
 #define LOAD(field,name) field=reinterpret_cast<decltype(field)>(dlsym(library,name));if(!field)return false
-      LOAD(version,"khua_realcugan_abi_version");LOAD(create,"khua_realcugan_create");LOAD(process,"khua_realcugan_process");LOAD(destroy,"khua_realcugan_destroy");
+      LOAD(version,"odf_realcugan_abi_version");LOAD(create,"odf_realcugan_create");LOAD(process,"odf_realcugan_process");LOAD(destroy,"odf_realcugan_destroy");
 #undef LOAD
       return version()==1;
     }
@@ -30,12 +30,12 @@ struct SPCUGANAPI {
     NSBundle *_resourceBundle;dispatch_queue_t _queue;SPCUGANAPI _api;void *_model;int _width,_height;uint64_t _epoch;BOOL _running,_inflight;
 }
 - (instancetype)init {return [self initWithResourceBundle:NSBundle.mainBundle];}
-- (instancetype)initWithResourceBundle:(NSBundle *)bundle {if(!(self=[super init]))return nil;_resourceBundle=bundle;_queue=dispatch_queue_create("app.khuaplayer.realcugan",DISPATCH_QUEUE_SERIAL);return self;}
+- (instancetype)initWithResourceBundle:(NSBundle *)bundle {if(!(self=[super init]))return nil;_resourceBundle=bundle;_queue=dispatch_queue_create("app.openduckframe.realcugan",DISPATCH_QUEUE_SERIAL);return self;}
 + (BOOL)isPackagedForThisSystem {return [self isPackagedInBundle:NSBundle.mainBundle];}
 + (BOOL)isPackagedInBundle:(NSBundle *)bundle {
     if (NSProcessInfo.processInfo.operatingSystemVersion.majorVersion < 27) return NO;
     NSString *frameworks=bundle.privateFrameworksPath;
-    for(NSString *name in @[@"libkhua_realcugan.dylib",@"libMoltenVK.dylib"])if(![[NSFileManager defaultManager] fileExistsAtPath:[frameworks stringByAppendingPathComponent:name]])return NO;
+    for(NSString *name in @[@"libodf_realcugan.dylib",@"libMoltenVK.dylib"])if(![[NSFileManager defaultManager] fileExistsAtPath:[frameworks stringByAppendingPathComponent:name]])return NO;
     return SPCUGANResource(bundle,@"up2x-no-denoise",@"param") && SPCUGANResource(bundle,@"up2x-no-denoise",@"bin");
 }
 - (void)closeOnQueue {if(_model&&_api.destroy)_api.destroy(_model);_model=nullptr;_api.close();}
@@ -54,7 +54,7 @@ struct SPCUGANAPI {
     if(!param||!weight||!SPCUGANCheckHash(param,entry[1])||!SPCUGANCheckHash(weight,entry[2])){if(error)*error=SPCUGANError(3,@"Real-CUGAN 模型缺失或校验失败。");return NO;}
     __block BOOL ok=NO;dispatch_sync(_queue,^{
         @synchronized(self){if(self->_running||self->_inflight)return;}
-        NSString *path=[self->_resourceBundle.privateFrameworksPath stringByAppendingPathComponent:@"libkhua_realcugan.dylib"];
+        NSString *path=[self->_resourceBundle.privateFrameworksPath stringByAppendingPathComponent:@"libodf_realcugan.dylib"];
         if(!self->_api.open(path)){[self closeOnQueue];return;}
         int status=-1;self->_model=self->_api.create(param.fileSystemRepresentation,weight.fileSystemRepresentation,&status);
         if(!self->_model||status!=0){[self closeOnQueue];return;}

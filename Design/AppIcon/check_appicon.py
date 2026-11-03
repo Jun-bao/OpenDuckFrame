@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the editable source and deterministic Khua AppIcon export."""
+"""Validate the editable source and deterministic OpenDuckFrame AppIcon export."""
 
 from __future__ import annotations
 
@@ -16,11 +16,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SIZES = (16, 32, 64, 128, 256, 512, 1024)
-EXPECTED_LAYERS = {
-    "01-Background.png",
-    "03-RearRibbons.png",
-    "04-PlayTriangle.png",
-}
 EXPECTED_SLOTS = {
     ("AppIcon-16.png", "mac", "1x", "16x16"),
     ("AppIcon-32.png", "mac", "2x", "16x16"),
@@ -116,33 +111,6 @@ def validate_png(path: Path, size: int) -> None:
             fail(f"near-white border detected: {path}")
 
 
-def validate_icon_composer_source() -> None:
-    document_path = ROOT / "KhuaPlayer.icon" / "icon.json"
-    document = json.loads(document_path.read_text(encoding="utf-8"))
-    groups = document.get("groups")
-    if not isinstance(groups, list) or len(groups) != 1:
-        fail("KhuaPlayer.icon must contain exactly one layer group")
-    group = groups[0]
-    layers = group.get("layers")
-    if not isinstance(layers, list):
-        fail("KhuaPlayer.icon layers are missing")
-    referenced = {layer.get("image-name") for layer in layers}
-    if referenced != EXPECTED_LAYERS:
-        fail(f"unexpected Icon Composer layer set: {sorted(referenced)}")
-
-    assets_dir = ROOT / "KhuaPlayer.icon" / "Assets"
-    available = {path.name for path in assets_dir.glob("*.png")}
-    if available != EXPECTED_LAYERS:
-        fail(f"unexpected Icon Composer assets: {sorted(available)}")
-    if group.get("specular") is not False:
-        fail("Icon Composer group specular must remain disabled")
-    translucency = group.get("translucency", {})
-    if translucency.get("enabled") is not False:
-        fail("Icon Composer group translucency must remain disabled")
-    if group.get("shadow", {}).get("kind") != "none":
-        fail("Icon Composer group shadow must remain disabled")
-
-
 def validate_manifest() -> None:
     manifest = json.loads((ROOT / "export-manifest.json").read_text(encoding="utf-8"))
     if manifest.get("schemaVersion") != 1:
@@ -150,7 +118,7 @@ def validate_manifest() -> None:
     original = ROOT.parent / "Branding/OpenDuckFrame-20261103/OpenDuckFrame-1024.png"
     if not original.is_file() or manifest.get("original", {}).get("sha256") != sha256(original) or manifest.get("original", {}).get("file") != original.name:
         fail("full-bleed original does not match export-manifest.json")
-    master = ROOT / "KhuaPlayer-StaticMaster-1024.png"
+    master = ROOT / "OpenDuckFrame-StaticMaster-1024.png"
     validate_png(master, 1024)
     source = manifest.get("source", {})
     if source.get("file") != master.name or source.get("sha256") != sha256(master):
@@ -240,7 +208,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     arguments = parse_args()
-    validate_icon_composer_source()
     validate_manifest()
     validate_asset_manifest()
     subprocess.run([sys.executable, str(ROOT / "export_static_appicon.py"), "--check"], check=True)
