@@ -1,0 +1,37 @@
+<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:
+IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
+--><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>OpenDuckFrame</title>
+        <item>
+            <title>0.1.0</title>
+            <pubDate>Tue, 03 Nov 2026 14:10:41 +0800</pubDate>
+            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
+            <sparkle:version>2</sparkle:version>
+            <sparkle:shortVersionString>0.1.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<meta charset="utf-8">
+<h2>OpenDuckFrame 0.1.0</h2>
+<p>First public Mac download, with signed in-app update checking.</p>
+<ul>
+<li>Enhance a window, display or local video with frame generation and scaling.</li>
+<li>Choose supported Apple and RIFE backends and save profiles for your content.</li>
+<li>Local playback, subtitles and Finder Quick Look previews.</li>
+<li>Check for updates from the OpenDuckFrame menu; automatic checking can be disabled.</li>
+</ul>
+<p>Requires an Apple silicon Mac and macOS 14 or later. Some backends require
+macOS 26 or later, supported hardware or additional models. Requested multipliers
+do not guarantee an achieved frame rate.</p>
+<p>This community build is ad-hoc signed and is <strong>not Apple notarized</strong>.
+macOS may block its first launch. If you trust the download, review the app under
+System Settings → Privacy &amp; Security and choose whether to allow it.
+No Apple security settings are changed by the installer.</p>
+]]></description>
+            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.1.0/OpenDuckFrame-0.1.0.zip" length="42462153" type="application/octet-stream" sparkle:edSignature="q1B+Ks3YKpGJsP3OKt4Ma2WmIrtY+gWdj0Ivqixq/Njvp4iP7tVymxQCqkuElIhWpB6Ed5kF14FSzyTFqeIvBw=="></enclosure>
+        </item>
+    </channel>
+</rss><!-- sparkle-signatures:
+edSignature: PoKEaAv+DcpuExquBR3Y2gQCdhJCrNQxbuCq0SeQwLNFHFAQ/ZG8z5JiMtf0C1sHYpyovQnMG62UjHU3vLFDBQ==
+length: 2225
+-->
