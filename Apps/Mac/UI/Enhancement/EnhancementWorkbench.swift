@@ -881,9 +881,9 @@ enum P0DiagnosticPolicy {
 }
 
 enum WorkbenchTitle {
-    static func text(_ base: String, candidate: String) -> String {
-        let label = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
-        return base + (label.isEmpty ? "" : " · " + label)
+    static func text(_ base: String, version: String?) -> String {
+        let value = (version ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return base + (value.isEmpty ? "" : " · v" + value)
     }
 }
 
@@ -1090,9 +1090,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let window = WorkbenchWindow(contentRect: NSRect(x: 0, y: 0, width: 1180, height: 760),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable],
                               backing: .buffered, defer: false)
-        let candidate = (Bundle.main.object(forInfoDictionaryKey: "SPCandidateLabel") as? String ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        window.title = WorkbenchTitle.text(EnhancementText.t("Quality Workbench", "画质工作台"), candidate: candidate)
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        window.title = WorkbenchTitle.text(EnhancementText.t("Quality Workbench", "画质工作台"), version: version)
         window.minSize = NSSize(width: 1100, height: 760)
         super.init(window: window)
         profile.configID = EnhancementProfileStore.resolvedID(profile)
@@ -3679,8 +3678,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             for child in view.subviews { visit(child) }
         }
         if let root = window?.contentView { visit(root) }
-        let candidate = (Bundle.main.object(forInfoDictionaryKey: "SPCandidateLabel") as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        window?.title = WorkbenchTitle.text(EnhancementText.t("Quality Workbench", "画质工作台"), candidate: candidate)
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        window?.title = WorkbenchTitle.text(EnhancementText.t("Quality Workbench", "画质工作台"), version: version)
         outputWindow?.title = EnhancementText.t("Enhanced output", "增强输出")
         if let first = displayPopup.item(at: 0) { first.title = EnhancementText.t("Main display", "主显示器") }
         statusLabel.stringValue = EnhancementText.runtime(translate(statusLabel.stringValue))
