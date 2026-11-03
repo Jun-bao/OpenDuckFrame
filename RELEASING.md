@@ -122,6 +122,11 @@ the current feed is retrieved, its signature checked and its history preserved.
 Build numbers must increase. GitHub Pages must serve the root of `gh-pages`.
 For a first-time setup, enable that source in repository Pages settings.
 
+The separate `publish_github_release.sh` tool is for the notarized Developer ID
+lane and only publishes its download assets. It does not update the community
+Sparkle feed. Use `community_release.py --publish` for the current no-account
+community lane so that downloads and in-app update information are published together.
+
 Each subsequent version needs a new application build and notes. Follow the
 version/build policy above. The fixed `OpenDuckFrame.dmg` asset name supports the
 website's latest-download link; Sparkle uses the versioned ZIP URL from its signed

@@ -26,6 +26,12 @@ notarization.
    complete bundle verifier again.
 6. A second probe of that updated copy returned “No new update available”.
 7. The separately running development app retained its process and executable path.
+8. After publication, the live GitHub Pages feed returned HTTP 200, matched the
+   prepared feed byte for byte and passed signature verification. GitHub's asset
+   digests matched all four local release files.
+9. A fresh real-product build-1 copy found the release using its embedded HTTPS
+   feed URL, downloaded the published ZIP from GitHub Releases and installed
+   build 2 successfully. The installed bundle passed verification again.
 
 The official updater's `--application` option pointed at an inactive test watcher
 so the installation did not terminate or relaunch the user's running development
@@ -35,6 +41,9 @@ The first attempt to build the official updater tool failed because its default
 10.13 deployment target is unsupported by the installed Xcode. Retrying with the
 12.0 deployment target used by this repository's Sparkle recipe passed. An initial
 probe command combined incompatible CLI flags; the corrected probe passed.
+The standalone local Python installation lacked a usable default CA chain for a
+feed-download check; the check used system curl with certificate validation on.
+Sparkle's own live HTTPS check and full update both passed.
 
 ## Limits
 
