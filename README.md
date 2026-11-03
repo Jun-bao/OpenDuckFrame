@@ -31,6 +31,8 @@ your Mac, without an account or uploading your picture.
 The player has 17 interface languages; the enhancement workbench supports Chinese
 and English. Experimental backends and constraints are described in [the feature guide](docs/features.md).
 
+<p align="center"><img src="Website/assets/openduckframe-library.webp" alt="The OpenDuckFrame v0.1.0 technology library on macOS" width="900"></p>
+
 ## Get started
 
 The source is available now. Build it with the commands below; packaged downloads,
