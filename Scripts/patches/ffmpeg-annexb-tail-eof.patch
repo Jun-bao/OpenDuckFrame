@@ -1,0 +1,105 @@
+--- a/libavformat/av1dec.c
++++ b/libavformat/av1dec.c
+@@ -37,6 +37,14 @@
+     uint32_t temporal_unit_size;
+     uint32_t frame_unit_size;
+     int64_t pos;
++    /* Default-off, one-shot acknowledgement of an exact payload
++     * EOF. Read-only facts are written only by annexb_read_packet. */
++    int tail_control; /* -1 reset, 0 off, 1 acknowledge once */
++    int tail_pending;
++    int64_t tail_position;
++    int64_t tail_requested;
++    int64_t tail_received;
++    int output_seen;
+ } AV1DemuxContext;
+ 
+ //return < 0 if we need more data
+@@ -112,6 +120,11 @@
+ #define OFFSET(x) offsetof(AV1DemuxContext, x)
+ static const AVOption av1_options[] = {
+     { "framerate", "", OFFSET(framerate), AV_OPT_TYPE_VIDEO_RATE, {.str = "25"}, 0, INT_MAX, DEC},
++    { "sp_annexb_tail_control", "reset/off/acknowledge one truncated payload EOF", OFFSET(tail_control), AV_OPT_TYPE_INT, {.i64 = 0}, -1, 1, DEC },
++    { "sp_annexb_tail_pending", "exact truncated payload EOF pending", OFFSET(tail_pending), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, DEC | AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
++    { "sp_annexb_tail_position", "physical input position of pending EOF", OFFSET(tail_position), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, INT64_MAX, DEC | AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
++    { "sp_annexb_tail_requested", "requested payload bytes", OFFSET(tail_requested), AV_OPT_TYPE_INT64, {.i64 = 0}, 0, UINT32_MAX, DEC | AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
++    { "sp_annexb_tail_received", "received payload bytes", OFFSET(tail_received), AV_OPT_TYPE_INT64, {.i64 = 0}, INT_MIN, INT_MAX, DEC | AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
+     { NULL },
+ };
+ #undef OFFSET
+@@ -221,12 +234,42 @@
+     return 0;
+ }
+ 
++static void annexb_clear_tail(AV1DemuxContext *c)
++{
++    c->tail_control = c->tail_pending = 0;
++    c->tail_position = -1;
++    c->tail_requested = c->tail_received = 0;
++}
++
+ static int annexb_read_packet(AVFormatContext *s, AVPacket *pkt)
+ {
+     AV1DemuxContext *const c = s->priv_data;
+     uint32_t obu_unit_size;
+     int64_t pos = c->pos;
+     int ret, len;
++
++    if (c->tail_control < 0 || s->io_repositioned) {
++        annexb_clear_tail(c);
++        c->output_seen = 0;
++        /* Consume only the notification; this does not add/change raw seek. */
++        s->io_repositioned = 0;
++    }
++    if (c->tail_pending &&
++        (avio_tell(s->pb) != c->tail_position || s->pb->error))
++        annexb_clear_tail(c);
++    if (c->tail_control > 0) {
++        /* Permission is consumed even when its facts no longer hold. */
++        c->tail_control = 0;
++        if (c->tail_pending && c->output_seen && !s->pb->error &&
++            avio_tell(s->pb) == c->tail_position && avio_feof(s->pb) &&
++            !s->pb->error && avio_tell(s->pb) == c->tail_position) {
++            annexb_clear_tail(c);
++            av_packet_unref(pkt);
++            c->temporal_unit_size = c->frame_unit_size = 0;
++            goto end;
++        }
++        annexb_clear_tail(c);
++    }
+ 
+ retry:
+     if (avio_feof(s->pb)) {
+@@ -258,10 +301,20 @@
+         return AVERROR_INVALIDDATA;
+ 
+     ret = av_get_packet(s->pb, pkt, obu_unit_size);
+-    if (ret < 0)
+-        return ret;
+-    if (ret != obu_unit_size)
+-        return AVERROR_INVALIDDATA;
++    if (ret < 0 || ret != obu_unit_size) {
++        /* Record payload EOF after outer lengths passed their parent bounds.
++         * This does not prove the partial OBU header or frame is valid. */
++        if (c->output_seen && (ret >= 0 || ret == AVERROR_EOF) &&
++            s->pb->eof_reached && !s->pb->error && avio_feof(s->pb) &&
++            !s->pb->error) {
++            c->tail_pending = 1;
++            c->tail_position = avio_tell(s->pb);
++            c->tail_requested = obu_unit_size;
++            c->tail_received = ret;
++        }
++        av_packet_unref(pkt);
++        return ret < 0 ? ret : AVERROR_INVALIDDATA;
++    }
+ 
+     c->temporal_unit_size -= obu_unit_size + len;
+     c->frame_unit_size -= obu_unit_size + len;
+@@ -285,6 +338,7 @@
+     }
+ 
+     pkt->pos = pos;
++    c->output_seen = 1;
+ 
+     return 0;
+ }

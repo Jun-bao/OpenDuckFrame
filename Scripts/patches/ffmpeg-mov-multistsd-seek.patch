@@ -1,0 +1,24 @@
+diff --git a/libavformat/mov.c b/libavformat/mov.c
+index 72f8cb84fb..fc81605173 100644
+--- a/libavformat/mov.c
++++ b/libavformat/mov.c
+@@ -11766,6 +11766,20 @@ static int mov_read_seek(AVFormatContext *s, int stream_index, int64_t sample_ti
+             mov_current_sample_inc(sc);
+         }
+     }
++
++    /* Invalidate the cached stsd after a successful seek. Reading ahead may
++     * have advanced last_stsd_index even though the caller later discards
++     * those packets. Without this reset, seeking to the same sample
++     * description suppresses AV_PKT_DATA_NEW_EXTRADATA on the first packet
++     * and leaves a flushed decoder with stale configuration. Restrict the
++     * reset to tracks that actually have multiple sample descriptions so a
++     * normal single-stsd seek does not manufacture redundant side data. */
++    for (i = 0; i < s->nb_streams; i++) {
++        MOVStreamContext *sc = s->streams[i]->priv_data;
++        if (sc->stsd_count > 1)
++            sc->last_stsd_index = -1;
++    }
++
+     return 0;
+ }

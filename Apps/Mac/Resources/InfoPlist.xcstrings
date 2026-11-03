@@ -1,0 +1,762 @@
+{
+  "sourceLanguage": "en",
+  "strings": {
+    "NSDesktopFolderUsageDescription": {
+      "comment": "Privacy prompt purpose: scanning the opened video's folder",
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wird verwendet, um im Ordner des geöffneten Videos Untertitel und die nächste Folge zu finden."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Used to find subtitles and the next episode in the folder of the video you open."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Se usa para buscar subtítulos y el siguiente episodio en la carpeta del vídeo que abres."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Permet de trouver les sous-titres et l’épisode suivant dans le dossier de la vidéo ouverte."
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Digunakan untuk menemukan subtitel dan episode berikutnya di folder video yang Anda buka."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Serve per trovare i sottotitoli e l’episodio successivo nella cartella del video aperto."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "開いたビデオと同じフォルダ内の字幕や次のエピソードを探すために使用します。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "연 동영상과 같은 폴더에서 자막과 다음 에피소드를 찾는 데 사용됩니다."
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wordt gebruikt om ondertitels en de volgende aflevering te vinden in de map van de geopende video."
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Służy do wyszukiwania napisów i następnego odcinka w folderze otwartego wideo."
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Usado para encontrar legendas e o próximo episódio na pasta do vídeo aberto."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Используется для поиска субтитров и следующей серии в папке открытого видео."
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ใช้ค้นหาคำบรรยายและตอนถัดไปในโฟลเดอร์ของวิดีโอที่คุณเปิด"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Açtığınız videonun klasöründe altyazıları ve sonraki bölümü bulmak için kullanılır."
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dùng để tìm phụ đề và tập tiếp theo trong thư mục của video bạn mở."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "用于在你打开的视频所在文件夹中查找字幕和下一集。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "用於在你開啟的影片所在資料夾中尋找字幕和下一集。"
+          }
+        }
+      }
+    },
+    "NSDocumentsFolderUsageDescription": {
+      "comment": "Privacy prompt purpose: scanning the opened video's folder",
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wird verwendet, um im Ordner des geöffneten Videos Untertitel und die nächste Folge zu finden."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Used to find subtitles and the next episode in the folder of the video you open."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Se usa para buscar subtítulos y el siguiente episodio en la carpeta del vídeo que abres."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Permet de trouver les sous-titres et l’épisode suivant dans le dossier de la vidéo ouverte."
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Digunakan untuk menemukan subtitel dan episode berikutnya di folder video yang Anda buka."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Serve per trovare i sottotitoli e l’episodio successivo nella cartella del video aperto."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "開いたビデオと同じフォルダ内の字幕や次のエピソードを探すために使用します。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "연 동영상과 같은 폴더에서 자막과 다음 에피소드를 찾는 데 사용됩니다."
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wordt gebruikt om ondertitels en de volgende aflevering te vinden in de map van de geopende video."
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Służy do wyszukiwania napisów i następnego odcinka w folderze otwartego wideo."
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Usado para encontrar legendas e o próximo episódio na pasta do vídeo aberto."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Используется для поиска субтитров и следующей серии в папке открытого видео."
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ใช้ค้นหาคำบรรยายและตอนถัดไปในโฟลเดอร์ของวิดีโอที่คุณเปิด"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Açtığınız videonun klasöründe altyazıları ve sonraki bölümü bulmak için kullanılır."
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dùng để tìm phụ đề và tập tiếp theo trong thư mục của video bạn mở."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "用于在你打开的视频所在文件夹中查找字幕和下一集。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "用於在你開啟的影片所在資料夾中尋找字幕和下一集。"
+          }
+        }
+      }
+    },
+    "NSDownloadsFolderUsageDescription": {
+      "comment": "Privacy prompt purpose: scanning the opened video's folder",
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wird verwendet, um im Ordner des geöffneten Videos Untertitel und die nächste Folge zu finden."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Used to find subtitles and the next episode in the folder of the video you open."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Se usa para buscar subtítulos y el siguiente episodio en la carpeta del vídeo que abres."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Permet de trouver les sous-titres et l’épisode suivant dans le dossier de la vidéo ouverte."
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Digunakan untuk menemukan subtitel dan episode berikutnya di folder video yang Anda buka."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Serve per trovare i sottotitoli e l’episodio successivo nella cartella del video aperto."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "開いたビデオと同じフォルダ内の字幕や次のエピソードを探すために使用します。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "연 동영상과 같은 폴더에서 자막과 다음 에피소드를 찾는 데 사용됩니다."
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wordt gebruikt om ondertitels en de volgende aflevering te vinden in de map van de geopende video."
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Służy do wyszukiwania napisów i następnego odcinka w folderze otwartego wideo."
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Usado para encontrar legendas e o próximo episódio na pasta do vídeo aberto."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Используется для поиска субтитров и следующей серии в папке открытого видео."
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ใช้ค้นหาคำบรรยายและตอนถัดไปในโฟลเดอร์ของวิดีโอที่คุณเปิด"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Açtığınız videonun klasöründe altyazıları ve sonraki bölümü bulmak için kullanılır."
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dùng để tìm phụ đề và tập tiếp theo trong thư mục của video bạn mở."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "用于在你打开的视频所在文件夹中查找字幕和下一集。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "用於在你開啟的影片所在資料夾中尋找字幕和下一集。"
+          }
+        }
+      }
+    },
+    "NSNetworkVolumesUsageDescription": {
+      "comment": "Privacy prompt purpose: scanning the opened video's folder",
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wird verwendet, um im Ordner des geöffneten Videos Untertitel und die nächste Folge zu finden."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Used to find subtitles and the next episode in the folder of the video you open."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Se usa para buscar subtítulos y el siguiente episodio en la carpeta del vídeo que abres."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Permet de trouver les sous-titres et l’épisode suivant dans le dossier de la vidéo ouverte."
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Digunakan untuk menemukan subtitel dan episode berikutnya di folder video yang Anda buka."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Serve per trovare i sottotitoli e l’episodio successivo nella cartella del video aperto."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "開いたビデオと同じフォルダ内の字幕や次のエピソードを探すために使用します。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "연 동영상과 같은 폴더에서 자막과 다음 에피소드를 찾는 데 사용됩니다."
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wordt gebruikt om ondertitels en de volgende aflevering te vinden in de map van de geopende video."
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Służy do wyszukiwania napisów i następnego odcinka w folderze otwartego wideo."
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Usado para encontrar legendas e o próximo episódio na pasta do vídeo aberto."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Используется для поиска субтитров и следующей серии в папке открытого видео."
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ใช้ค้นหาคำบรรยายและตอนถัดไปในโฟลเดอร์ของวิดีโอที่คุณเปิด"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Açtığınız videonun klasöründe altyazıları ve sonraki bölümü bulmak için kullanılır."
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dùng để tìm phụ đề và tập tiếp theo trong thư mục của video bạn mở."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "用于在你打开的视频所在文件夹中查找字幕和下一集。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "用於在你開啟的影片所在資料夾中尋找字幕和下一集。"
+          }
+        }
+      }
+    },
+    "NSRemovableVolumesUsageDescription": {
+      "comment": "Privacy prompt purpose: scanning the opened video's folder",
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wird verwendet, um im Ordner des geöffneten Videos Untertitel und die nächste Folge zu finden."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Used to find subtitles and the next episode in the folder of the video you open."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Se usa para buscar subtítulos y el siguiente episodio en la carpeta del vídeo que abres."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Permet de trouver les sous-titres et l’épisode suivant dans le dossier de la vidéo ouverte."
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Digunakan untuk menemukan subtitel dan episode berikutnya di folder video yang Anda buka."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Serve per trovare i sottotitoli e l’episodio successivo nella cartella del video aperto."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "開いたビデオと同じフォルダ内の字幕や次のエピソードを探すために使用します。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "연 동영상과 같은 폴더에서 자막과 다음 에피소드를 찾는 데 사용됩니다."
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wordt gebruikt om ondertitels en de volgende aflevering te vinden in de map van de geopende video."
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Służy do wyszukiwania napisów i następnego odcinka w folderze otwartego wideo."
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Usado para encontrar legendas e o próximo episódio na pasta do vídeo aberto."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Используется для поиска субтитров и следующей серии в папке открытого видео."
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ใช้ค้นหาคำบรรยายและตอนถัดไปในโฟลเดอร์ของวิดีโอที่คุณเปิด"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Açtığınız videonun klasöründe altyazıları ve sonraki bölümü bulmak için kullanılır."
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dùng để tìm phụ đề và tập tiếp theo trong thư mục của video bạn mở."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "用于在你打开的视频所在文件夹中查找字幕和下一集。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "用於在你開啟的影片所在資料夾中尋找字幕和下一集。"
+          }
+        }
+      }
+    },
+    "NSScreenCaptureUsageDescription": {
+      "comment": "Privacy prompt purpose: capturing the selected window or display",
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame zeigt und verbessert das ausgewählte Fenster oder den ausgewählten Bildschirm. Die Aufnahme bleibt auf diesem Mac."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame shows and enhances the window or display you select. Capture stays on this Mac."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame muestra y mejora la ventana o pantalla que selecciones. La captura se queda en este Mac."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame affiche et améliore la fenêtre ou l’écran que vous sélectionnez. La capture reste sur ce Mac."
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame menampilkan dan meningkatkan jendela atau layar yang Anda pilih. Tangkapan tetap berada di Mac ini."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame mostra e migliora la finestra o lo schermo selezionato. L’acquisizione resta su questo Mac."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame は選択したウインドウまたはディスプレイを表示して画質を向上させます。キャプチャはこの Mac の中だけで処理されます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame은 선택한 윈도우나 디스플레이를 표시하고 화질을 향상합니다. 캡처한 화면은 이 Mac에만 남습니다."
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame toont en verbetert het venster of scherm dat je kiest. De opname blijft op deze Mac."
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame wyświetla i ulepsza wybrane okno lub ekran. Przechwytywany obraz pozostaje na tym Macu."
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O OpenDuckFrame mostra e melhora a janela ou o monitor que você selecionar. A captura fica neste Mac."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame показывает и улучшает выбранное окно или дисплей. Захваченное изображение остаётся на этом Mac."
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame จะแสดงและปรับปรุงภาพของหน้าต่างหรือจอภาพที่คุณเลือก ภาพที่จับได้จะอยู่ใน Mac เครื่องนี้เท่านั้น"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame seçtiğiniz pencereyi veya ekranı gösterir ve iyileştirir. Yakalanan görüntü bu Mac’te kalır."
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame hiển thị và cải thiện cửa sổ hoặc màn hình bạn chọn. Hình ảnh ghi lại chỉ ở trên máy Mac này."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame 会显示并增强你选择的窗口或显示器画面。采集的画面只留在这台 Mac 上。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame 會顯示並增強你選擇的視窗或顯示器畫面。擷取的畫面只會留在這台 Mac 上。"
+          }
+        }
+      }
+    },
+    "NSSpeechRecognitionUsageDescription": {
+      "comment": "Privacy prompt purpose: generating subtitles from audio",
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame erstellt Untertitel aus dem Ton der geöffneten Medien. Die Verarbeitung erfolgt auf diesem Mac."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame generates subtitles from the audio of the media you open. Processing takes place on this Mac."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame genera subtítulos a partir del audio del contenido que abras. El procesamiento se realiza en este Mac."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame génère des sous-titres à partir de l’audio des médias que vous ouvrez. Le traitement a lieu sur ce Mac."
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame membuat subtitel dari audio media yang Anda buka. Pemrosesan berlangsung di Mac ini."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame genera sottotitoli dall’audio dei contenuti che apri. L’elaborazione avviene su questo Mac."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame は開いたメディアの音声から字幕を生成します。処理はこの Mac 上で行われます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame은 연 미디어의 오디오로 자막을 생성합니다. 처리는 이 Mac에서 이루어집니다."
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame maakt ondertitels op basis van de audio van de media die je opent. De verwerking gebeurt op deze Mac."
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame tworzy napisy na podstawie dźwięku otwartych multimediów. Przetwarzanie odbywa się na tym Macu."
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O OpenDuckFrame gera legendas a partir do áudio da mídia que você abrir. O processamento acontece neste Mac."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame создаёт субтитры по звуку открытых медиафайлов. Обработка выполняется на этом Mac."
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame สร้างคำบรรยายจากเสียงของสื่อที่คุณเปิด การประมวลผลเกิดขึ้นบน Mac เครื่องนี้"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame açtığınız medyanın sesinden altyazı oluşturur. İşlem bu Mac’te yapılır."
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame tạo phụ đề từ âm thanh của nội dung bạn mở. Quá trình xử lý diễn ra trên máy Mac này."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame 会根据你打开的媒体音频生成字幕。处理在这台 Mac 上完成。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OpenDuckFrame 會根據你開啟的媒體音訊產生字幕。處理會在這台 Mac 上完成。"
+          }
+        }
+      }
+    }
+  },
+  "version": "1.0"
+}

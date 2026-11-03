@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>OpenDuckFrame · Mac 实时补帧与超分</title>
+  <meta name="description" content="OpenDuckFrame（开源小鸭），Mac 实时补帧与超分应用。支持窗口、显示器和本地视频，Apple 与 RIFE 插帧，画面在本机处理，MIT 开源。">
+  <link rel="icon" type="image/png" href="assets/openduckframe-icon.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <div class="wrap bar">
+      <a class="brand" href="#hero">
+        <span class="logo-slot has-logo" aria-hidden="true"><img src="assets/openduckframe-icon.png" width="32" height="32" alt=""></span>
+        <span data-brand-name translate="no">OpenDuckFrame</span>
+      </a>
+      <nav data-i18n-aria="ariaNav" aria-label="页面章节">
+        <a href="#how" data-i18n="navHow">怎么工作</a>
+        <a href="#uses" data-i18n="navUses">使用场景</a>
+        <a href="#faq" data-i18n="navFaq">常见问题</a>
+        <a href="https://github.com/Jun-bao/OpenDuckFrame">GitHub</a>
+      </nav>
+      <div class="end">
+        <button type="button" class="icon-btn" data-action="lang" aria-label="切换语言">中 / EN</button>
+        <button type="button" class="icon-btn" data-action="theme" aria-label="切换到深色">
+          <svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 3.2a8.2 8.2 0 1 0 5.3 12.6A7.2 7.2 0 0 1 15.5 3.2Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+          <svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.4" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 3.2v1.8M12 19v1.8M4.9 4.9l1.3 1.3M17.8 17.8l1.3 1.3M3.2 12h1.8M19 12h1.8M4.9 19.1l1.3-1.3M17.8 6.2l1.3-1.3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section id="hero">
+      <div class="wrap">
+        <h1><span data-i18n="h1a">让 Mac 上的画面</span><br><span data-i18n="h1b">更流畅、更清晰</span></h1>
+        <p class="sub" data-i18n="sub">给正在看的画面补帧，给低分辨率内容超分。浏览器、游戏、串流窗口和本地视频，在一个工作台里设置，全部在你的 Mac 上处理。</p>
+        <div class="actions">
+          <a class="btn solid" href="https://github.com/Jun-bao/OpenDuckFrame/releases/latest/download/OpenDuckFrame.dmg" data-i18n="download">下载 Mac 版</a>
+          <a class="btn" href="https://github.com/Jun-bao/OpenDuckFrame/blob/main/docs/quick-start.md" data-i18n="seeHow">使用指南</a>
+        </div>
+        <p class="requirements" data-i18n="requirements">Apple 芯片 · macOS 14+ · MIT 开源</p>
+      </div>
+    </section>
+
+    <section id="demo">
+      <div class="wrap">
+        <div class="window">
+          <div class="titlebar">
+            <div class="dots" aria-hidden="true"><i></i><i></i><i></i></div>
+            <div class="hud">24 → 48 fps · 2×</div>
+          </div>
+          <div class="panes">
+            <div class="pane" data-kind="source">
+              <p class="pane-label" data-i18n="srcLabel">原始 24 fps</p>
+              <div class="stage"><span class="ball" data-demo="source"></span></div>
+            </div>
+            <div class="pane" data-kind="output">
+              <p class="pane-label" data-i18n="outLabel">补帧后 48 fps</p>
+              <div class="stage"><span class="ball" data-demo="output"></span></div>
+            </div>
+          </div>
+        </div>
+        <p class="caption" data-i18n="demoNote">示意动画，非实机录屏</p>
+      </div>
+    </section>
+
+    <section id="product" class="section product-preview">
+      <div class="wrap">
+        <h2 data-i18n="productTitle">按内容选择技术，在一个工作台里完成</h2>
+        <img class="product-shot" src="assets/openduckframe-library-v2.webp" width="1180" height="792" loading="lazy" alt="OpenDuckFrame technology library on macOS">
+        <p class="caption" data-i18n="productCaption">OpenDuckFrame v0.1.0 实机技术库界面。部分实验技术需要额外模型或运行库。</p>
+      </div>
+    </section>
+
+    <section id="how" class="section">
+      <div class="wrap split">
+        <div class="side">
+          <h2 data-i18n="howTitle">它是怎么工作的</h2>
+          <p class="lede"><span data-i18n="howBefore">选好画面来源，</span><span data-brand-name translate="no">OpenDuckFrame</span><span data-i18n="howAfter">把采集、补帧、超分与显示连在一起。根据内容和设备选择技术，也可以只开启其中一项。</span></p>
+        </div>
+        <ol class="steps">
+          <li>
+            <strong data-i18n="how1t">选择画面来源</strong>
+            <span data-i18n="how1d">选窗口、显示器或视频文件。网页视频和串流可通过对应的应用窗口接入。</span>
+          </li>
+          <li>
+            <strong data-i18n="how2t">选择补帧与超分技术</strong>
+            <span data-i18n="how2d">Apple 插帧与 RIFE 可选；Lanczos、MetalFX 等负责放大画面。可用技术随系统、硬件和输入变化。</span>
+          </li>
+          <li>
+            <strong data-i18n="how3t">找到合适的处理档位</strong>
+            <span data-i18n="how3d">设置目标帧率或 X2 / X3 / X4。跟不上时，可以降低分辨率、倍率，或切换更轻的引擎。</span>
+          </li>
+          <li>
+            <strong data-i18n="how4t">按显示器能力输出</strong>
+            <span data-i18n="how4d">实际呈现受屏幕刷新率和处理预算限制。请求的倍率与最终看到的帧率分别显示。</span>
+          </li>
+          <li>
+            <strong data-i18n="how5t">让输出跟随你的观看方式</strong>
+            <span data-i18n="how5d">跟随来源窗口，或在指定显示器全屏输出。把常用设置保存成配置，下次直接切换。</span>
+          </li>
+          <li>
+            <strong data-i18n="how6t">全部本地处理</strong>
+            <span data-i18n="how6d">采集和模型都在本机运行，画面不上传。</span>
+          </li>
+          <li>
+            <strong data-i18n="how7t">看实际输出，再判断效果</strong>
+            <span data-i18n="how7d">查看帧率显示，在原始、增强和对比视图之间切换，用自己的内容判断画质和流畅度。</span>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <section id="uses" class="section">
+      <div class="wrap">
+        <div class="head">
+          <h2 data-i18n="usesTitle">适合用在哪</h2>
+          <p class="lede" data-i18n="usesLede">视频、游戏和串流，各有适合的处理方式。</p>
+        </div>
+        <div class="cards">
+          <article class="card" data-card>
+            <div class="illu-wrap">
+              <svg class="scene" viewBox="0 0 320 200" aria-hidden="true">
+                <rect class="win" x="46" y="22" width="228" height="132" rx="12"/>
+                <circle cx="64" cy="38" r="3.5" fill="#ff5f57"/>
+                <circle cx="76" cy="38" r="3.5" fill="#febc2e"/>
+                <circle cx="88" cy="38" r="3.5" fill="#28c840"/>
+                <rect class="chip" x="104" y="33" width="86" height="10" rx="5"/>
+                <rect class="screen" x="60" y="52" width="200" height="86" rx="6"/>
+                <path class="accent" d="M146 80l26 15-26 15z"/>
+              </svg>
+              <span class="rate"><i class="pip"></i><span data-i18n="browserBadge">浏览器窗口</span></span>
+            </div>
+            <h3 data-i18n="use1t">网页视频</h3>
+            <p data-i18n="use1d">选择浏览器里的视频窗口，在本机补帧和放大画面。受保护的视频可能无法采集。</p>
+          </article>
+          <article class="card" data-card>
+            <div class="illu-wrap">
+              <svg class="scene" viewBox="0 0 320 200" aria-hidden="true">
+                <rect class="hole" x="28" y="36" width="12" height="9" rx="2"/>
+                <rect class="hole" x="28" y="54" width="12" height="9" rx="2"/>
+                <rect class="hole" x="28" y="72" width="12" height="9" rx="2"/>
+                <rect class="hole" x="28" y="90" width="12" height="9" rx="2"/>
+                <rect class="hole" x="28" y="108" width="12" height="9" rx="2"/>
+                <rect class="hole" x="28" y="126" width="12" height="9" rx="2"/>
+                <rect class="win" x="52" y="28" width="232" height="128" rx="10"/>
+                <rect class="ink" x="64" y="40" width="208" height="12" rx="3"/>
+                <rect class="ink" x="64" y="132" width="208" height="12" rx="3"/>
+                <rect class="screen" x="64" y="52" width="208" height="80"/>
+                <circle class="accent" cx="198" cy="82" r="11"/>
+                <path class="ground" d="M64 108c26-16 46-14 76-4s50 0 70 8 38 6 62-2v18H64z"/>
+              </svg>
+              <span class="rate"><i class="pip"></i>MKV · MP4 · MOV</span>
+            </div>
+            <h3 data-i18n="use2t">本地视频</h3>
+            <p data-i18n="use2d">直接打开 MKV、MP4、MOV 等文件，配合字幕播放，再按片源选择补帧和超分。</p>
+          </article>
+          <article class="card" data-card>
+            <div class="illu-wrap">
+              <svg class="scene" viewBox="0 0 320 200" aria-hidden="true">
+                <rect class="win" x="28" y="64" width="84" height="58" rx="8"/>
+                <rect class="screen" x="36" y="72" width="68" height="34"/>
+                <path class="accent" d="M128 86h20v-7l16 14-16 14v-7h-20z"/>
+                <rect class="win" x="176" y="34" width="116" height="118" rx="10"/>
+                <rect class="screen" x="186" y="46" width="96" height="82" rx="4"/>
+                <circle class="accent" cx="228" cy="72" r="9"/>
+                <path class="ground" d="M186 112c18-12 32-10 50-2s30 2 46 8v8H186z"/>
+              </svg>
+              <span class="rate"><i class="pip"></i>MetalFX · Lanczos</span>
+            </div>
+            <h3 data-i18n="use3t">游戏超分</h3>
+            <p data-i18n="use3d">将游戏窗口作为来源，用 MetalFX 或 Lanczos 放大画面；补帧是否合适，需要结合游戏节奏与延迟判断。</p>
+          </article>
+          <article class="card" data-card>
+            <div class="illu-wrap">
+              <svg class="scene" viewBox="0 0 320 200" aria-hidden="true">
+                <rect class="win" x="24" y="78" width="32" height="68" rx="4"/>
+                <rect class="chip" x="30" y="90" width="20" height="4" rx="1"/>
+                <rect class="chip" x="30" y="100" width="20" height="4" rx="1"/>
+                <circle class="accent" cx="40" cy="128" r="3"/>
+                <rect class="win" x="66" y="46" width="78" height="56" rx="6"/>
+                <rect class="screen" x="72" y="52" width="66" height="38"/>
+                <rect class="ink" x="96" y="102" width="18" height="6"/>
+                <rect class="ink" x="84" y="108" width="42" height="4" rx="1"/>
+                <path class="accent" d="M156 84h18v-6l14 12-14 12v-6h-18z"/>
+                <rect class="win" x="204" y="52" width="86" height="56" rx="6"/>
+                <rect class="screen" x="210" y="58" width="74" height="42"/>
+                <path class="ink" d="M192 112h118l-12 14H204z"/>
+              </svg>
+              <span class="rate"><i class="pip"></i>PC → Mac</span>
+            </div>
+            <h3 data-i18n="use4t">Windows 游戏串流到 Mac</h3>
+            <p data-i18n="use4d">先用你熟悉的串流软件将 PC 画面传到 Mac，再选择串流窗口进行增强。</p>
+          </article>
+          <article class="card card-any" data-card>
+            <div class="plus-bar">
+              <span class="plus-btn" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+              </span>
+              <div class="plus-copy">
+                <h3 data-i18n="use5t">从你正在看的窗口开始</h3>
+                <p data-i18n="use5d">选择来源、设置技术、对比画面。常用设置可以保存下来。</p>
+              </div>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="faq" class="section">
+      <div class="wrap split">
+        <div class="side">
+          <h2 data-i18n="faqTitle">常见问题</h2>
+          <p class="note"><span data-i18n="faqLede">还有别的问题？</span> <a href="https://github.com/Jun-bao/OpenDuckFrame/discussions" data-i18n="faqContact">到 GitHub 交流</a></p>
+        </div>
+        <div class="faq-list">
+          <div data-faq>
+            <button type="button" aria-expanded="false" aria-controls="faq-a1">
+              <span class="q"><span data-i18n="faq1before"></span><span data-brand-name translate="no">OpenDuckFrame</span><span data-i18n="faq1after">是什么？</span></span>
+            </button>
+            <div class="answer" id="faq-a1" role="region" aria-hidden="true">
+              <div class="answer-inner">
+                <p data-i18n="faq1a">OpenDuckFrame（开源小鸭）是一款原生 Mac 实时补帧与超分应用。它可以处理窗口、显示器或本地视频，也带有支持字幕、Quick Look 和多种格式的视频播放器。</p>
+              </div>
+            </div>
+          </div>
+          <div data-faq>
+            <button type="button" aria-expanded="false" aria-controls="faq-a2">
+              <span class="q" data-i18n="faq2q">需要什么样的 Mac？</span>
+            </button>
+            <div class="answer" id="faq-a2" role="region" aria-hidden="true">
+              <div class="answer-inner">
+                <p data-i18n="faq2a">需要 Apple 芯片 Mac，基础播放要求 macOS 14 或更高版本。Apple 插帧、Apple 超分与字幕生成翻译需要 macOS 26 或更高版本及支持的硬件。部分实验技术还需要额外模型或更新的系统。</p>
+              </div>
+            </div>
+          </div>
+          <div data-faq>
+            <button type="button" aria-expanded="false" aria-controls="faq-a3">
+              <span class="q" data-i18n="faq3q">会增加延迟吗？</span>
+            </button>
+            <div class="answer" id="faq-a3" role="region" aria-hidden="true">
+              <div class="answer-inner">
+                <p data-i18n="faq3a">会增加处理延迟，具体取决于引擎、来源分辨率和质量设置。不同算法对前后帧的需求也不同。看视频与玩游戏对延迟的容忍度不同，建议先用原始和增强视图对比自己的内容。</p>
+              </div>
+            </div>
+          </div>
+          <div data-faq>
+            <button type="button" aria-expanded="false" aria-controls="faq-a4">
+              <span class="q" data-i18n="faq4q">支持全屏吗？</span>
+            </button>
+            <div class="answer" id="faq-a4" role="region" aria-hidden="true">
+              <div class="answer-inner">
+                <p data-i18n="faq4a">可以选择输出显示器并使用全屏输出。来源窗口的原生全屏、网页全屏和遮挡行为会因应用与 macOS 而异；遇到问题时可先退回普通窗口或重新选择来源。</p>
+              </div>
+            </div>
+          </div>
+          <div data-faq>
+            <button type="button" aria-expanded="false" aria-controls="faq-a5">
+              <span class="q" data-i18n="faq5q">画面会上传吗？</span>
+            </button>
+            <div class="answer" id="faq-a5" role="region" aria-hidden="true">
+              <div class="answer-inner">
+                <p data-i18n="faq5a">不会。采集画面、视频和字幕内容都在你的 Mac 上处理。无需账号，没有播放统计。系统字幕服务首次使用时，macOS 可能下载所需的语言模型。</p>
+              </div>
+            </div>
+          </div>
+          <div data-faq>
+            <button type="button" aria-expanded="false" aria-controls="faq-a6">
+              <span class="q" data-i18n="faq6q">是免费开源的吗？</span>
+            </button>
+            <div class="answer" id="faq-a6" role="region" aria-hidden="true">
+              <div class="answer-inner">
+                <p data-i18n="faq6a">是。OpenDuckFrame 自有代码采用 MIT 许可证，可以免费获取、修改和构建。第三方库和模型分别遵循各自的许可证，完整说明在 GitHub 仓库中。</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="get" class="section center">
+      <div class="wrap">
+        <h2 data-i18n="getTitle">让你正在看的内容，更合心意</h2>
+        <p class="lede"><span data-brand-name translate="no">OpenDuckFrame</span><span data-i18n="getAfter"> 现已开源。按你的内容，选择合适的补帧与超分。</span></p>
+        <div class="actions">
+          <a class="btn solid" href="https://github.com/Jun-bao/OpenDuckFrame/releases/latest/download/OpenDuckFrame.dmg" data-i18n="download">下载 Mac 版</a>
+        </div>
+        <p class="requirements"><span data-i18n="sourceNote">社区版未经过 Apple 公证，首次打开可能被 macOS 拦截。</span> <a href="https://github.com/Jun-bao/OpenDuckFrame/releases" data-i18n="releases">查看版本</a></p>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap foot">
+      <a class="brand" href="#hero">
+        <span class="logo-slot has-logo" aria-hidden="true"><img src="assets/openduckframe-icon.png" width="32" height="32" alt=""></span>
+        <span data-brand-name translate="no">OpenDuckFrame</span>
+      </a>
+      <nav data-i18n-aria="ariaFoot" aria-label="页脚">
+        <a href="https://github.com/Jun-bao/OpenDuckFrame/blob/main/PRIVACY.md" data-i18n="privacy">隐私</a>
+        <a href="https://github.com/Jun-bao/OpenDuckFrame/issues" data-i18n="contact">反馈问题</a>
+      </nav>
+      <p class="fine">© 2026 <span data-brand-name translate="no">OpenDuckFrame</span></p>
+    </div>
+  </footer>
+  <script src="main.js"></script>
+</body>
+</html>

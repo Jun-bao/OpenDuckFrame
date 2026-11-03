@@ -1,0 +1,9 @@
+RIFE 4.26 weights bundled as Models/rife-v4.26.rmw.
+SHA256 01c6ce74e26a3b2eb3430eb2c0bdb490e2725cb2f2bf6136c2b0e98148bc0ee1
+These weights are Practical-RIFE v4.26, a separate checkpoint from v4.25.
+The upstream checkpoint is flownet.pkl, converted to the RifeMetal .rmw
+format using its convert-weights.py tool (fp16 weights, NHWC layout).
+Upstream project: https://github.com/hzwer/Practical-RIFE
+License: MIT. Copyright (c) 2021 hzwer.
+The MIT text is in rife-metal-THIRD-PARTY.md.
+The file is packaged inside the app. Runtime does not read a developer experiment path.

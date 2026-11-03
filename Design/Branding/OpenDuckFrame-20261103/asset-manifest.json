@@ -1,0 +1,94 @@
+{
+  "date": "2026-11-03",
+  "name": "OpenDuckFrame",
+  "chinese_name": "开源小鸭",
+  "recommended_repository_slug": "openduckframe",
+  "generation_method": "Built-in image_gen; no CLI/API fallback",
+  "source_image": "OpenDuckFrame-original.png",
+  "source_size": [
+    1254,
+    1254
+  ],
+  "original_alpha": "fully opaque",
+  "derived_images": "sips size conversion only; original unmodified",
+  "icns_conversion": "macOS iconutil",
+  "application_replaced": false,
+  "repository_visibility_changed": false,
+  "files": [
+    {
+      "path": "OpenDuckFrame-1024.png",
+      "bytes": 1046418,
+      "sha256": "90fd0deab680cd0f59bdf48adf5ff8823057f5136854b04d26bfac2c454ed44c"
+    },
+    {
+      "path": "OpenDuckFrame-original.png",
+      "bytes": 1450479,
+      "sha256": "79210f69c2c66d9d31815d16914060d85055f079d7e280bc028c28a2e627c5ee"
+    },
+    {
+      "path": "OpenDuckFrame.icns",
+      "bytes": 1765257,
+      "sha256": "8735900ad0fb4f07c727070004a24745cbdf2b566492d5cdf179ec57d11d224a"
+    },
+    {
+      "path": "OpenDuckFrame.iconset/icon_128x128.png",
+      "bytes": 18765,
+      "sha256": "455a9770eb118aec3bc518006add399cf815ea0769ad619b997b7fbf6fed5847"
+    },
+    {
+      "path": "OpenDuckFrame.iconset/icon_128x128@2x.png",
+      "bytes": 70271,
+      "sha256": "e5c0d9146cf58493e66f3551fe45b43bf4e24b24aa41b8885f5537c378609ac3"
+    },
+    {
+      "path": "OpenDuckFrame.iconset/icon_16x16.png",
+      "bytes": 788,
+      "sha256": "5e7a3eafd7a2d73e5691ad2853e38e593bc2c8e3a51652daed3be0f3c4caf2d5"
+    },
+    {
+      "path": "OpenDuckFrame.iconset/icon_16x16@2x.png",
+      "bytes": 2065,
+      "sha256": "e053c278e5c01766a46467a8ea66bf843e9c31cefb66acb31d4914527618f120"
+    },
+    {
+      "path": "OpenDuckFrame.iconset/icon_256x256.png",
+      "bytes": 70271,
+      "sha256": "e5c0d9146cf58493e66f3551fe45b43bf4e24b24aa41b8885f5537c378609ac3"
+    },
+    {
+      "path": "OpenDuckFrame.iconset/icon_256x256@2x.png",
+      "bytes": 274031,
+      "sha256": "3b920c2e3c7bfda2729ed48fcff509ff02f61dc34b9fb5f455c8d79fc1ab7714"
+    },
+    {
+      "path": "OpenDuckFrame.iconset/icon_32x32.png",
+      "bytes": 2065,
+      "sha256": "e053c278e5c01766a46467a8ea66bf843e9c31cefb66acb31d4914527618f120"
+    },
+    {
+      "path": "OpenDuckFrame.iconset/icon_32x32@2x.png",
+      "bytes": 5906,
+      "sha256": "1d17aafb1ca79d999694d213c735eb22a164b7d90161d5a7e6f415fd8f80bd14"
+    },
+    {
+      "path": "OpenDuckFrame.iconset/icon_512x512.png",
+      "bytes": 274031,
+      "sha256": "3b920c2e3c7bfda2729ed48fcff509ff02f61dc34b9fb5f455c8d79fc1ab7714"
+    },
+    {
+      "path": "OpenDuckFrame.iconset/icon_512x512@2x.png",
+      "bytes": 1046418,
+      "sha256": "90fd0deab680cd0f59bdf48adf5ff8823057f5136854b04d26bfac2c454ed44c"
+    },
+    {
+      "path": "generation-prompt.txt",
+      "bytes": 1795,
+      "sha256": "964f0ceaf735d146b3e2792a52798b1e4342e521f49a091b24e31f615baa2bd1"
+    },
+    {
+      "path": "品牌与搜索命名.md",
+      "bytes": 2383,
+      "sha256": "fde4d190d5c8e85f7ad6a7e0b5297587e4f848d25b9923935ec3a37737292e42"
+    }
+  ]
+}

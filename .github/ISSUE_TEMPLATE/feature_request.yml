@@ -1,0 +1,16 @@
+name: Feature request
+description: Suggest an improvement to OpenDuckFrame.
+title: "[Feature] "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the real setup or task and what gets in the way.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Suggested improvement
+      description: Include alternatives or workarounds you have tried.

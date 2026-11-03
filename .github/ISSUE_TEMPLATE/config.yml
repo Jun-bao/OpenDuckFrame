@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and setup sharing
+    url: https://github.com/Jun-bao/OpenDuckFrame/discussions
+    about: Ask questions or share your configuration.
+  - name: Security vulnerabilities
+    url: https://github.com/Jun-bao/OpenDuckFrame/security
+    about: Use private vulnerability reporting instead of a public bug report.

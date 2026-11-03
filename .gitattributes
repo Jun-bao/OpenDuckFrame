@@ -1,0 +1,10 @@
+* text=auto eol=lf
+*.png binary
+*.xcstrings text eol=lf
+*.plist text eol=lf
+*.xcprivacy text eol=lf
+*.entitlements text eol=lf
+# Preserve upstream license typography; do not flag its intentional spacing.
+ThirdParty/Licenses/** -whitespace
+# Unified diffs require a leading space on blank context lines.
+Scripts/patches/*.patch whitespace=-blank-at-eol

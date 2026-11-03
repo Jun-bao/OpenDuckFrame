@@ -1,0 +1,51 @@
+--- a/libavcodec/libspeexdec.c
++++ b/libavcodec/libspeexdec.c
+@@ -35,6 +35,8 @@
+     void *dec_state;
+     int frame_size;
+     int pktsize;
++    int mode;
++    int flush_error;
+ } LibSpeexContext;
+ 
+ 
+@@ -86,6 +88,7 @@
+         }
+     }
+ 
++    s->mode = spx_mode;
+     mode = speex_lib_get_mode(spx_mode);
+     if (!mode) {
+         av_log(avctx, AV_LOG_ERROR, "Unknown Speex mode %d", spx_mode);
+@@ -133,6 +136,9 @@
+     int16_t *output;
+     int ret, consumed = 0;
+     avctx->sample_fmt = AV_SAMPLE_FMT_S16;
++
++    if (s->flush_error)
++        return s->flush_error;
+ 
+     /* get output buffer */
+     frame->nb_samples = s->frame_size;
+@@ -187,7 +193,21 @@
+ static av_cold void libspeex_decode_flush(AVCodecContext *avctx)
+ {
+     LibSpeexContext *s = avctx->priv_data;
++    void *replacement = speex_decoder_init(speex_lib_get_mode(s->mode));
+     speex_bits_reset(&s->bits);
++    s->flush_error = replacement ? 0 : AVERROR(ENOMEM);
++    if (!replacement)
++        return;
++    speex_decoder_destroy(s->dec_state);
++    s->dec_state = replacement;
++    s->stereo = (SpeexStereoState)SPEEX_STEREO_STATE_INIT;
++    if (avctx->ch_layout.nb_channels == 2) {
++        SpeexCallback callback = {0};
++        callback.callback_id = SPEEX_INBAND_STEREO;
++        callback.func = speex_std_stereo_request_handler;
++        callback.data = &s->stereo;
++        speex_decoder_ctl(s->dec_state, SPEEX_SET_HANDLER, &callback);
++    }
+ }
+ 
+ const FFCodec ff_libspeex_decoder = {
