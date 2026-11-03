@@ -35,8 +35,15 @@ and English. Experimental backends and constraints are described in [the feature
 
 ## Get started
 
-The source is available now. Build it with the commands below; packaged downloads,
-when published, will be listed under [Releases](https://github.com/Jun-bao/OpenDuckFrame/releases).
+Download the [Mac app](https://github.com/Jun-bao/OpenDuckFrame/releases/latest/download/OpenDuckFrame.dmg)
+or [browse releases](https://github.com/Jun-bao/OpenDuckFrame/releases).
+The community download is ad-hoc signed and **not Apple notarized**, so macOS may
+block its first launch. Only allow it in System Settings → Privacy & Security if
+you trust the source. Apple silicon and macOS 14+ are required.
+
+The app checks for signed updates and lets you choose when to install them.
+You can also use **OpenDuckFrame → Check for Updates**, or disable automatic
+checks from the same menu. Updating never uploads your media.
 
 1. Open **File → Quality Workbench** (⇧⌘E).
 2. Choose a window, display, or video file. macOS asks for Screen Recording

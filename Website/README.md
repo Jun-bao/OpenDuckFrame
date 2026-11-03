@@ -23,5 +23,5 @@ python3 -m http.server 4178 --bind 127.0.0.1
 - `assets/openduckframe-icon.png`：成品应用图标。
 - `assets/openduckframe-library-v2.webp`：v0.1.0 应用技术库实机截图。
 
-首页按钮指向公开仓库的源码构建指南；打包下载单独链接至 Releases。
+首页按钮下载个人仓库最新 Release 的 DMG。社区版未经过 Apple 公证，页面明确标注首次打开可能被拦截。
 补帧动画标明为原理示意，不代表实测帧率。系统要求和功能范围以产品源码与公开说明为准。

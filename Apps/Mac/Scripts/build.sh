@@ -31,8 +31,8 @@ echo "==> Verifying/building the self-contained subtitle stack"
 echo "==> Verifying/building Sparkle for optional direct-distribution updates"
 ./Scripts/build_sparkle.sh
 
-SPARKLE_FEED_URL="${ODF_SPARKLE_FEED_URL:-}"
-SPARKLE_PUBLIC_ED_KEY="${ODF_SPARKLE_PUBLIC_ED_KEY:-}"
+SPARKLE_FEED_URL="${ODF_SPARKLE_FEED_URL-$(plutil -extract feedUrl raw -o - Distribution/sparkle.json)}"
+SPARKLE_PUBLIC_ED_KEY="${ODF_SPARKLE_PUBLIC_ED_KEY-$(plutil -extract publicKey raw -o - Distribution/sparkle.json)}"
 if { [ -n "$SPARKLE_FEED_URL" ] && [ -z "$SPARKLE_PUBLIC_ED_KEY" ]; } ||
    { [ -z "$SPARKLE_FEED_URL" ] && [ -n "$SPARKLE_PUBLIC_ED_KEY" ]; }; then
   echo "error: ODF_SPARKLE_FEED_URL and ODF_SPARKLE_PUBLIC_ED_KEY must be supplied together" >&2

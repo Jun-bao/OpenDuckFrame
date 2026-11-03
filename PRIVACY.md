@@ -34,10 +34,19 @@ settings. No microphone recording is used.
 
 ## Software updates
 
-Current OpenDuckFrame builds ship without an update feed, so the updater stays
-inactive and makes no network request. When an official update feed is
-introduced, this policy will describe the host, the data sent with each check,
-and how to turn automatic checks off before that version is distributed.
+Community downloads check the signed version feed at
+`https://jun-bao.github.io/OpenDuckFrame/appcast.xml` and download updates from
+`https://github.com/Jun-bao/OpenDuckFrame/releases`. These requests expose normal
+connection information such as IP address and an updater User-Agent to GitHub.
+System profiling and installation statistics are disabled; no media, screen
+content, subtitles, playback history or persistent installation identifier is sent.
+
+Automatic checking can be disabled in **OpenDuckFrame → Automatically Check for
+Updates**. **Check for Updates** remains available for a manual check. Checking
+does not force installation. Custom source builds can disable update networking
+by explicitly setting both `ODF_SPARKLE_FEED_URL` and
+`ODF_SPARKLE_PUBLIC_ED_KEY` to empty strings at build time. App Store builds do
+not include this updater.
 
 ## Build-time downloads
 

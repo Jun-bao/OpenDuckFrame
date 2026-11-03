@@ -25,8 +25,14 @@ OpenDuckFrame 是一款原生 Mac 画质增强应用。浏览器视频、游戏�
 
 ## 开始使用
 
-源码现已提供，可按下面的命令构建。打包版本发布后会出现在
-[Releases](https://github.com/Jun-bao/OpenDuckFrame/releases)。
+下载 [Mac 安装包](https://github.com/Jun-bao/OpenDuckFrame/releases/latest/download/OpenDuckFrame.dmg)，
+或查看 [版本列表](https://github.com/Jun-bao/OpenDuckFrame/releases)。
+社区安装包使用临时签名，**未经过 Apple 公证**，首次打开可能被 macOS 拦截。
+确认信任来源后，由你在系统设置 → 隐私与安全性中决定是否允许打开。
+需要 Apple 芯片和 macOS 14 或更高版本。
+
+应用会检查经过更新签名的版本，并由你选择安装时间。也可以使用 **OpenDuckFrame → 检查更新**，
+或在同一菜单关闭自动检查。更新不会上传你的媒体内容。
 
 1. 打开 **文件 → 画质工作台**（⇧⌘E）。
 2. 选择窗口、显示器或视频文件。采集窗口或显示器时，按 macOS 提示授予屏幕录制权限。

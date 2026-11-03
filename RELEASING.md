@@ -82,11 +82,57 @@ automation and stress controls are not part of the shipping source.
 
 ## Direct-distribution updates
 
-`Debug` and `Release` builds include Sparkle. Ordinary local builds remain
-inactive unless both settings below are supplied. The Developer ID archive
-script defaults to `Distribution/sparkle.json`. Its feed URL and public key are
-intentionally empty until the official `openduckframe.app` update feed and its
-EdDSA key pair exist; fill both only with values we control.
+### Community downloads without an Apple Developer account
+
+The community lane uses an ad-hoc code signature and an independent EdDSA update
+signature. It is not Apple notarized. Never describe this lane as Developer ID
+signed, Gatekeeper approved or App Store approved. A user may need to allow the
+first launch through macOS Privacy & Security.
+
+`Distribution/sparkle.json` contains the public feed and public key. The private
+key remains in the maintainer's login Keychain under the configured account;
+it is never exported by the release script. Loss of that key can prevent existing
+users from accepting future updates. Keep control of that Keychain and the GitHub
+account. Forks should override both update settings with their own values or
+explicitly set both to empty strings.
+
+First compile and validate the desired Release app. Then package it using the
+checkout that has its matching dependency stamps and Sparkle tools:
+
+```sh
+python3 Scripts/community_release.py \
+  --app /path/to/OpenDuckFrame.app \
+  --verification-root /path/to/matching-build-checkout \
+  --version 0.1.0 --build-number 2 \
+  --binary-source-commit FULL_40_CHARACTER_COMMIT \
+  --notes Distribution/release-notes/0.1.0.html \
+  --output .build/releases/0.1.0-2
+```
+
+This preserves the supplied app, verifies it, configures a separate copy, aligns
+the Quick Look build, re-signs the changed bundles ad hoc, validates a ZIP round
+trip, creates a DMG, and generates and verifies a signed appcast. Its release
+record distinguishes the compiled binary's source from the packaging commit.
+It does not claim a new compilation. Inspect and test these artifacts before
+running the command with a fresh output path and `--publish`.
+
+`--publish` publishes immutable assets under `v<version>` in GitHub Releases,
+then commits the signed feed to `gh-pages`. Existing releases are never replaced;
+the current feed is retrieved, its signature checked and its history preserved.
+Build numbers must increase. GitHub Pages must serve the root of `gh-pages`.
+For a first-time setup, enable that source in repository Pages settings.
+
+Each subsequent version needs a new application build and notes. Follow the
+version/build policy above. The fixed `OpenDuckFrame.dmg` asset name supports the
+website's latest-download link; Sparkle uses the versioned ZIP URL from its signed
+feed. Existing 0.1.0 local builds without update configuration must first be
+replaced manually with an update-enabled download.
+
+### Developer ID lane
+
+`Debug` and `Release` builds include Sparkle and default to
+`Distribution/sparkle.json`. The Developer ID archive script uses that same
+configuration. Both values can be overridden together:
 
 ```sh
 ODF_SPARKLE_FEED_URL=https://example.invalid/updates/appcast.xml \
