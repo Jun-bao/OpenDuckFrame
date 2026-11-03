@@ -134,7 +134,7 @@ else
   DERIVED_DATA_PATH="$(mktemp -d "$OUTPUT_PARENT/.khua-derived-data.XXXXXX")"
   REMOVE_DERIVED_DATA=1
 fi
-SOURCE_APP="$DERIVED_DATA_PATH/Build/Products/Release/Khua.app"
+SOURCE_APP="$DERIVED_DATA_PATH/Build/Products/Release/OpenDuckFrame.app"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
 cleanup() {
@@ -194,7 +194,7 @@ KHUA_SPARKLE_FEED_URL="$SPARKLE_FEED_URL" \
 KHUA_SPARKLE_PUBLIC_ED_KEY="$SPARKLE_PUBLIC_ED_KEY" \
   "$ROOT/Scripts/bundle_libs.sh" "$SOURCE_APP"
 
-APP="$WORK_DIR/Khua.app"
+APP="$WORK_DIR/OpenDuckFrame.app"
 ditto --norsrc --noextattr --noqtn "$SOURCE_APP" "$APP"
 xattr -cr "$APP" 2>/dev/null || true
 
@@ -203,7 +203,7 @@ xattr -cr "$APP" 2>/dev/null || true
 DSYMS_DIR="$WORK_DIR/dSYMs"
 mkdir -p "$DSYMS_DIR"
 for dsym_name in \
-  Khua.app.dSYM \
+  OpenDuckFrame.app.dSYM \
   KhuaPlayerMediaCore.framework.dSYM \
   KhuaPlayerCaptionsUI.framework.dSYM \
   KhuaPlayerQuickLook.appex.dSYM; do
@@ -216,7 +216,7 @@ uuid_for() {
   dwarfdump --uuid "$1" | awk 'NR == 1 { print $2 }'
 }
 [ "$(uuid_for "$APP/Contents/MacOS/Khua")" = \
-  "$(uuid_for "$DSYMS_DIR/Khua.app.dSYM")" ] || \
+  "$(uuid_for "$DSYMS_DIR/OpenDuckFrame.app.dSYM")" ] || \
   die "main app dSYM UUID does not match"
 [ "$(uuid_for "$APP/Contents/Frameworks/KhuaPlayerMediaCore.framework/Versions/A/KhuaPlayerMediaCore")" = \
   "$(uuid_for "$DSYMS_DIR/KhuaPlayerMediaCore.framework.dSYM")" ] || \
@@ -285,7 +285,7 @@ ditto -c -k --keepParent "$APP" "$SUBMISSION_ZIP"
   shasum -a 256 Khua-notarization.zip >Khua-notarization.zip.sha256)
 ditto -x -k "$SUBMISSION_ZIP" "$TRANSPORT_CHECK"
 "$ROOT/Scripts/lib/verify_developer_id_app.sh" \
-  --app "$TRANSPORT_CHECK/Khua.app" \
+  --app "$TRANSPORT_CHECK/OpenDuckFrame.app" \
   --team-id "$TEAM_ID" \
   --bundle-id "$BUNDLE_ID"
 

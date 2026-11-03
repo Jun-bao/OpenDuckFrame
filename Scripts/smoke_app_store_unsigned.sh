@@ -101,8 +101,8 @@ unregister_archive_products() {
   local lsregister
   lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
   for app in \
-    "$DERIVED_DATA_PATH/Build/Intermediates.noindex/ArchiveIntermediates/KhuaPlayer/InstallationBuildProductsLocation/Applications/Khua.app" \
-    "$ARCHIVE_PATH/Products/Applications/Khua.app"; do
+    "$DERIVED_DATA_PATH/Build/Intermediates.noindex/ArchiveIntermediates/KhuaPlayer/InstallationBuildProductsLocation/Applications/OpenDuckFrame.app" \
+    "$ARCHIVE_PATH/Products/Applications/OpenDuckFrame.app"; do
     pluginkit -r "$app/Contents/PlugIns/KhuaPlayerQuickLook.appex" 2>/dev/null || true
     "$lsregister" -u "$app" 2>/dev/null || true
   done
@@ -145,7 +145,7 @@ echo "==> Archiving unsigned AppStore configuration"
   archive
 
 # Nothing below this point writes to, signs, or otherwise mutates the archive.
-APP="$ARCHIVE_PATH/Products/Applications/Khua.app"
+APP="$ARCHIVE_PATH/Products/Applications/OpenDuckFrame.app"
 APPEX="$APP/Contents/PlugIns/KhuaPlayerQuickLook.appex"
 FRAMEWORK="$APP/Contents/Frameworks/KhuaPlayerMediaCore.framework"
 LIBASS="$APP/Contents/Frameworks/libass.9.dylib"
@@ -153,7 +153,7 @@ SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
 MAIN_PRIVACY="$APP/Contents/Resources/PrivacyInfo.xcprivacy"
 APPEX_PRIVACY="$APPEX/Contents/Resources/PrivacyInfo.xcprivacy"
 
-[ -d "$APP" ] || die "archive has no Khua.app: $APP"
+[ -d "$APP" ] || die "archive has no OpenDuckFrame.app: $APP"
 [ -d "$APPEX" ] || die "Quick Look extension is missing: $APPEX"
 [ -d "$FRAMEWORK" ] || die "media framework is missing: $FRAMEWORK"
 [ -f "$LIBASS" ] || die "bundled libass is missing: $LIBASS"
@@ -176,13 +176,13 @@ done
 
 MAIN_ID="$(plist_value "$APP/Contents/Info.plist" CFBundleIdentifier)"
 assert_equal "main bundle name" \
-  "$(plist_value "$APP/Contents/Info.plist" CFBundleName)" "小川帧流"
+  "$(plist_value "$APP/Contents/Info.plist" CFBundleName)" "OpenDuckFrame"
 assert_equal "main display name" \
-  "$(plist_value "$APP/Contents/Info.plist" CFBundleDisplayName)" "小川帧流"
+  "$(plist_value "$APP/Contents/Info.plist" CFBundleDisplayName)" "OpenDuckFrame"
 assert_equal "main executable name" \
   "$(plist_value "$APP/Contents/Info.plist" CFBundleExecutable)" "Khua"
 assert_equal "Quick Look display name" \
-  "$(plist_value "$APPEX/Contents/Info.plist" CFBundleDisplayName)" "Khua Quick Look"
+  "$(plist_value "$APPEX/Contents/Info.plist" CFBundleDisplayName)" "OpenDuckFrame Quick Look"
 assert_equal "Quick Look bundle identifier" \
   "$(plist_value "$APPEX/Contents/Info.plist" CFBundleIdentifier)" \
   "$MAIN_ID.QuickLook"

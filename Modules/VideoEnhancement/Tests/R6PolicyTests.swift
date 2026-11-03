@@ -2,6 +2,11 @@ import Foundation
 
 @main struct R6PolicyTests {
     static func main() {
+        precondition(SingleInstancePolicy.matchesProductMetadata("OpenDuckFrame", "Khua"))
+        precondition(SingleInstancePolicy.matchesProductMetadata("小川帧流 · ChuanFlow", "Khua"))
+        precondition(!SingleInstancePolicy.matchesProductMetadata("OpenDuckFrame", "Other"))
+        precondition(!SingleInstancePolicy.matchesProductMetadata("Other", "Khua"))
+        precondition(!SingleInstancePolicy.matchesProductMetadata(nil, "Khua"))
         typealias C = SingleInstancePolicy.Candidate
         let first = C(pid: 90, start: 100)
         let later = C(pid: 12, start: 101)

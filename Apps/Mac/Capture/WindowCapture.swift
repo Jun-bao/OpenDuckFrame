@@ -325,6 +325,10 @@ enum CaptureTarget: Equatable {
 }
 
 final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCContentSharingPickerObserver, @unchecked Sendable {
+    private final class ResizeStreamBox: @unchecked Sendable {
+        let stream: SCStream
+        init(_ stream: SCStream) { self.stream = stream }
+    }
     private final class ShareableResult: @unchecked Sendable {
         let value: Result<SCShareableContent, Error>
         init(_ value: Result<SCShareableContent, Error>) { self.value = value }
@@ -360,6 +364,24 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     private let queue = DispatchQueue(label: "app.khuaplayer.capture", qos: .userInitiated)
     private var filter: SCContentFilter?
     private var selectionRevision: UInt64 = 0
+    private var streamUsesBiplanar = true
+    private var confirmedResizeSize: CaptureResizePolicy.Size?
+    private var resizePolicy: CaptureResizePolicy?
+    private var resizeTimer: DispatchSourceTimer?
+    private var resizeRevision: UInt64 = 0
+    private var resizeCounters = CaptureResizeCounters()
+    private var resizeLastTarget: CaptureResizePolicy.Size?
+    private var resizeLastConfirmMs: Double = -1
+    private var resizeEvents: [[String: Any]] = []
+    private var resizePendingConfirm: (size: CaptureResizePolicy.Size, from: CaptureResizePolicy.Size, start: Int64)?
+    private var resizeLastFrame: (size: CaptureResizePolicy.Size, host: Int64)?
+    private let resizeObservationLock = NSLock()
+    private var resizeObservedGeneration: UInt64 = 0
+    private var resizeObservedTarget: CaptureResizePolicy.Size?
+    private var resizeObservedBuffer: CaptureResizePolicy.Size?
+    private var resizeWatch: (generation: UInt64, size: CaptureResizePolicy.Size, start: Int64, notified: Bool)?
+    private let resizeDiagnosticsLock = NSLock()
+    private var resizeDiagnosticsValue: [String: Any] = [:]
     private let geometryLock = NSLock()
     private var screenRectGeneration: UInt64 = 0
     private var screenRectValue: CGRect?
@@ -475,7 +497,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         commit(filter: filter)
     }
 
-    private func commit(filter: SCContentFilter) {
+    private func commit(filter: SCContentFilter, restartSize: CaptureResizePolicy.Size? = nil) {
         self.filter = filter
         if #available(macOS 15.2, *) {
             if filter.style == .display, let display = filter.includedDisplays.first {
@@ -487,6 +509,9 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         issuedGeneration += 1
         let generation = issuedGeneration
         currentGeneration = generation
+        resizeCounters.reset(generation: generation)
+        resizeLastTarget = nil; resizeLastConfirmMs = -1; resizeEvents.removeAll(); resizePendingConfirm = nil; resizeLastFrame = nil
+        publishResizeDiagnostics()
         geometryLock.lock()
         screenRectGeneration = generation
         screenRectValue = nil
@@ -519,7 +544,9 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         onDiagnostic?("start generation \(generation)")
         describe(filter)
         let pixelSize = pixelSize(of: filter)
-        startStream(filter: filter, width: pixelSize.width, height: pixelSize.height, biplanar: true, generation: generation)
+        let chosen = restartSize ?? CaptureResizePolicy.Size(width: pixelSize.width, height: pixelSize.height)
+        confirmedResizeSize = chosen
+        startStream(filter: filter, width: chosen.width, height: chosen.height, biplanar: true, generation: generation)
     }
 
     @discardableResult
@@ -530,8 +557,9 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             return false
         }
         selectionRevision &+= 1
+        let remembered = confirmedResizeSize
         stopStream()
-        commit(filter: filter)
+        commit(filter: filter, restartSize: remembered)
         return true
     }
 
@@ -542,6 +570,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     }
 
     private func stopStream() {
+        stopResizeMonitoring(note: "stream stopped")
         let current = stream
         streamBinding.retire()
         geometryLock.lock(); frameGeometryValue = nil; geometryLock.unlock()
@@ -591,23 +620,14 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     }
 
     private func startStream(filter: SCContentFilter, width: Int, height: Int, biplanar: Bool, generation: UInt64) {
-        let configuration = SCStreamConfiguration()
-        configuration.width = width
-        configuration.height = height
-        configuration.pixelFormat = biplanar
-            ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-            : kCVPixelFormatType_32BGRA
-        configuration.queueDepth = 3
         requestedCaptureFPS = captureCapFPS == 30 || captureCapFPS == 60 ? captureCapFPS : 0
-        CaptureRatePolicy.configure(configuration, capFPS: captureCapFPS)
-        configuration.showsCursor = false
-        configuration.capturesAudio = false
-        configuration.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2
-        configuration.colorSpaceName = CGColorSpace.itur_709
+        let configuration = CaptureStreamConfiguration.make(width: width, height: height, biplanar: biplanar, capFPS: captureCapFPS)
         let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
         do {
             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
             self.stream = stream
+            streamUsesBiplanar = biplanar
+            resizePolicy = CaptureResizePolicy(generation: generation, configured: .init(width: width, height: height))
             streamBinding.activate(stream, generation: generation)
             stream.startCapture { [weak self] error in
                 DispatchQueue.main.async {
@@ -627,6 +647,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
                         }
                     } else {
                         self.running = true
+                        self.startResizeMonitoringIfNeeded(stream: stream, generation: generation)
                         self.onStatus?(biplanar ? "正在捕获" : "正在捕获（BGRA，将转换）", false)
                     }
                 }
@@ -640,6 +661,111 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
                 onDiagnostic?("addStreamOutput failed: \(error.localizedDescription)")
                 onStatus?("捕获没有开始：\(error.localizedDescription)", true)
             }
+        }
+    }
+
+    private func publishResizeDiagnostics() {
+        let value: [String: Any] = ["requested": resizeCounters.requested, "completed": resizeCounters.completed,
+            "failed": resizeCounters.failed, "confirmed": resizeCounters.confirmed,
+            "lastTarget": resizeLastTarget.map { [$0.width, $0.height] } as Any? ?? NSNull(),
+            "lastConfirmMs": resizeLastConfirmMs]
+        resizeDiagnosticsLock.lock(); resizeDiagnosticsValue = ["resize": value, "resizeEvents": resizeEvents]; resizeDiagnosticsLock.unlock()
+    }
+    private func startResizeMonitoringIfNeeded(stream: SCStream, generation: UInt64) {
+        stopResizeMonitoring(note: "new stream")
+        guard self.stream === stream, currentGeneration == generation, case .window = target,
+              let size = confirmedResizeSize else { publishResizeDiagnostics(); return }
+        resizePolicy = CaptureResizePolicy(generation: generation, configured: size)
+        publishResizeDiagnostics()
+    }
+    private func stopResizeMonitoring(note: String) {
+        resizeRevision &+= 1; resizeTimer?.cancel(); resizeTimer = nil; resizePolicy = nil
+        resizePendingConfirm = nil; resizeLastFrame = nil
+        resizeObservationLock.lock(); resizeObservedGeneration = 0; resizeObservedTarget = nil; resizeObservedBuffer = nil; resizeWatch = nil; resizeObservationLock.unlock()
+    }
+    private func scheduleResize(stream: SCStream, generation: UInt64) {
+        resizeTimer?.cancel(); resizeTimer = nil
+        guard let policy = resizePolicy, policy.inFlight == nil, policy.candidate != nil else { return }
+        let now = Int64(DispatchTime.now().uptimeNanoseconds)
+        let remaining = max(0, policy.candidateSince + CaptureResizePolicy.quietNs - now)
+        let revision = resizeRevision
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + .nanoseconds(Int(remaining)))
+        timer.setEventHandler { [weak self, weak stream] in
+            guard let self, let stream, self.resizeRevision == revision, self.stream === stream,
+                  self.currentGeneration == generation, self.running else { return }
+            self.resizeTimer = nil
+            let start = Int64(DispatchTime.now().uptimeNanoseconds)
+            guard let request = self.resizePolicy?.tick(nowNs: start, running: true) else { return }
+            let from = self.resizePolicy!.configured
+            self.resizeCounters.requested += 1; self.resizeLastTarget = request.size
+            self.resizeEvents.append(["host": start, "from": [from.width, from.height], "to": [request.size.width, request.size.height], "result": "requested", "elapsedMs": 0])
+            if self.resizeEvents.count > 16 { self.resizeEvents.removeFirst() }
+            self.publishResizeDiagnostics()
+            let config = CaptureStreamConfiguration.make(width: request.size.width, height: request.size.height,
+                biplanar: self.streamUsesBiplanar, capFPS: self.captureCapFPS)
+            self.resizeObservationLock.lock()
+            self.resizeWatch = (generation, request.size, start, false)
+            self.resizeObservationLock.unlock()
+            let streamBox = ResizeStreamBox(stream)
+            stream.updateConfiguration(config) { [weak self, streamBox] error in
+                let message = error?.localizedDescription
+                DispatchQueue.main.async {
+                    let stream = streamBox.stream
+                    guard let self, self.resizeRevision == revision, self.stream === stream,
+                          self.currentGeneration == generation, self.resizePolicy?.inFlight == request else { return }
+                    let now = Int64(DispatchTime.now().uptimeNanoseconds)
+                    self.resizePolicy?.complete(request, success: message == nil, nowNs: now)
+                    if message == nil {
+                        self.resizeCounters.completed += 1; self.resizePendingConfirm = (request.size, from, start)
+                        self.confirmResizeIfObserved()
+                    } else {
+                        self.resizeCounters.failed += 1
+                        self.resizeObservationLock.lock(); self.resizeWatch = nil; self.resizeObservationLock.unlock()
+                    }
+                    self.resizeEvents.append(["host": now, "from": [from.width, from.height], "to": [request.size.width, request.size.height],
+                        "result": message == nil ? "completed" : "failed", "elapsedMs": Double(now-start)/1e6])
+                    if self.resizeEvents.count > 16 { self.resizeEvents.removeFirst() }
+                    self.publishResizeDiagnostics(); self.scheduleResize(stream: stream, generation: generation)
+                }
+            }
+        }
+        resizeTimer = timer; timer.resume()
+    }
+    private func confirmResizeIfObserved() {
+        guard let pending = resizePendingConfirm, let frame = resizeLastFrame,
+              frame.size == pending.size, frame.host >= pending.start else { return }
+        confirmedResizeSize = pending.size; resizeCounters.confirmed += 1
+        resizeObservationLock.lock(); resizeWatch = nil; resizeObservationLock.unlock()
+        resizeLastConfirmMs = Double(frame.host - pending.start) / 1e6; resizePendingConfirm = nil
+        resizeEvents.append(["host": frame.host, "from": [pending.from.width, pending.from.height], "to": [frame.size.width, frame.size.height],
+                             "result": "confirmed", "elapsedMs": resizeLastConfirmMs])
+        if resizeEvents.count > 16 { resizeEvents.removeFirst() }
+    }
+    // Called on the capture queue. Coalesce unchanged targets/buffer sizes here,
+    // so static or repeated frames never enqueue a main-thread task each frame.
+    private func observeResizeGeometry(_ geometry: [String: Any], image: CVPixelBuffer, stream: SCStream, generation: UInt64, host: UInt64) {
+        guard let screen = geometry["screenRect"] as? [CGFloat], screen.count == 4,
+              let content = geometry["contentRect"] as? [CGFloat], content.count == 4,
+              let scale = geometry["scaleFactor"] as? Double,
+              let desired = CaptureResizePolicy.target(screenRect: CGRect(x: screen[0], y: screen[1], width: screen[2], height: screen[3]),
+                contentRect: CGRect(x: content[0], y: content[1], width: content[2], height: content[3]), scaleFactor: scale) else { return }
+        let buffer = CaptureResizePolicy.Size(width: CVPixelBufferGetWidth(image), height: CVPixelBufferGetHeight(image))
+        let frameHost = contentHostNs(host)
+        resizeObservationLock.lock()
+        var changed = resizeObservedGeneration != generation || resizeObservedTarget != desired || resizeObservedBuffer != buffer
+        if var watch = resizeWatch, watch.generation == generation, watch.size == buffer, frameHost >= watch.start, !watch.notified {
+            watch.notified = true; resizeWatch = watch; changed = true
+        }
+        resizeObservedGeneration = generation; resizeObservedTarget = desired; resizeObservedBuffer = buffer
+        resizeObservationLock.unlock()
+        guard changed else { return }
+        DispatchQueue.main.async { [weak self, weak stream] in
+            guard let self, let stream, self.stream === stream, self.currentGeneration == generation,
+                  self.running, case .window = self.target, self.resizePolicy != nil else { return }
+            self.resizeLastFrame = (buffer, frameHost); self.confirmResizeIfObserved()
+            self.resizePolicy?.observe(desired, nowNs: frameHost)
+            self.publishResizeDiagnostics(); self.scheduleResize(stream: stream, generation: generation)
         }
     }
 
@@ -671,6 +797,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
                 return
             }
             self.running = false
+            self.stopResizeMonitoring(note: "stream delegate stopped")
             self.queue.async { self.stoppedCount += 1 }
             self.onDiagnostic?("stream stopped: \(error.localizedDescription)")
             self.onStatus?("来源中断：\(error.localizedDescription)", true)
@@ -760,6 +887,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             geometryLock.unlock()
             onGeometry?(frameGeometry, generation)
         }) else { retiredDrops += 1; return }
+        if let frameGeometry { observeResizeGeometry(frameGeometry, image: image, stream: stream, generation: generation, host: captureHost) }
         // Geometry remains current even for a duplicate, but duplicate pixels do
         // not become native-cadence evidence or enter the processor queue.
         if contentFrameGate.evaluate(buffer: image, generation: generation, hostNs: contentHostNs(captureHost)) == .duplicate { return }
@@ -908,6 +1036,10 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         for (key, value) in contentFrameGate.diagnostics(nowNs: contentHostNs(mach_absolute_time()), expectedGeneration: currentGeneration) {
             report[key] = value
         }
+        resizeDiagnosticsLock.lock()
+        report["resize"] = resizeDiagnosticsValue["resize"] ?? [:]
+        report["resizeEvents"] = resizeDiagnosticsValue["resizeEvents"] ?? []
+        resizeDiagnosticsLock.unlock()
         return report
     }
 

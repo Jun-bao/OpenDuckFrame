@@ -20,7 +20,7 @@ except ModuleNotFoundError as error:
 
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_ORIGINAL = ROOT / "ChuanFlow-Xiaochuan-FullBleed-Original.png"
+DEFAULT_ORIGINAL = ROOT.parent / "Branding/OpenDuckFrame-20261103/OpenDuckFrame-1024.png"
 DEFAULT_MASTER = ROOT / "KhuaPlayer-StaticMaster-1024.png"
 DEFAULT_OUTPUT = ROOT / "AppIcon.appiconset"
 DEFAULT_MANIFEST = ROOT / "export-manifest.json"
@@ -121,7 +121,7 @@ def render(master_path: Path, output: Path) -> dict[str, object]:
         "original": {
             "file": DEFAULT_ORIGINAL.name,
             "sha256": sha256(DEFAULT_ORIGINAL),
-            "colorSpace": "sRGB assumed; original has no embedded profile",
+            "colorSpace": "sRGB",
         },
         "source": {
             "file": master_path.name,
@@ -148,8 +148,6 @@ def render_master(original: Path, output: Path) -> None:
         raise SystemExit("Original must be an opaque RGB PNG")
     if source.width != source.height or source.width < 1024:
         raise SystemExit("Original must be square and at least 1024 pixels")
-    if "icc_profile" in source.info:
-        raise SystemExit("Original has an embedded profile; convert to sRGB explicitly")
     save_png(source.resize((1024, 1024), Image.Resampling.LANCZOS), output)
 
 

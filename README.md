@@ -1,26 +1,17 @@
 > **Private workbench development snapshot:** this organization repository includes the enhancement workbench changes. It is not a validated release. See [current status and known limitations](docs/workbench-status.md).
 
-<img src="Design/AppIcon/AppIcon.appiconset/AppIcon-128.png" width="96" height="96" alt="Khua Player app icon">
+<img src="Design/AppIcon/AppIcon.appiconset/AppIcon-128.png" width="96" height="96" alt="OpenDuckFrame app icon">
 
-# Khua Player
+# OpenDuckFrame — 开源小鸭
 
-Khua Player is a lightweight, native video player built for modern macOS and Apple silicon.
+OpenDuckFrame is a macOS workbench for frame generation, interpolation and upscaling, built on the Khua Player project.
 
 Get smoother motion with frame interpolation, generate and translate subtitles on your Mac,
 and keep watching the playable parts of damaged or unfinished files.
 
 Designed from the ground up for fast, responsive, and efficient playback.
 
-[**Download for macOS**](https://khua.app/download) ·
-[Website](https://khua.app) ·
-[Release history](https://khua.app/releases) ·
-[Build from source](#build-from-source)
-
-Apple silicon · macOS 14 or later · Open source
-
-Download the DMG, open it, and drag **Khua** to **Applications**. The official
-download is Developer ID signed, notarized, and stapled; no extra codec packs
-or Homebrew installation are needed to use it.
+This development snapshot has not yet been audited for public distribution.
 
 ## More than playback
 

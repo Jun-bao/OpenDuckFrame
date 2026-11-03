@@ -12,7 +12,7 @@ Usage: Scripts/create_developer_id_dmg.sh \
   --identity "Developer ID Application: Name (TEAM_ID)" \
   --team-id TEAM_ID
 
-The release directory must contain the signed Khua.app produced by
+The release directory must contain the signed OpenDuckFrame.app produced by
 archive_developer_id.sh, notarized and stapled by notarize_developer_id.sh.
 The output is Khua-notarization.dmg; it is not a final
 public download until notarize_developer_id_dmg.sh accepts and staples it.
@@ -84,7 +84,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-APP="$RELEASE_DIR/Khua.app"
+APP="$RELEASE_DIR/OpenDuckFrame.app"
 SUBMISSION_DMG="$RELEASE_DIR/Khua-notarization.dmg"
 SUBMISSION_CHECKSUM="$RELEASE_DIR/Khua-notarization.dmg.sha256"
 [ -d "$APP" ] || die "prepared app is missing: $APP"
@@ -148,8 +148,8 @@ OUTPUT_STAGE="$(mktemp -d "$RELEASE_DIR/.dmg-output.XXXXXX")"
 DMG_TMP="$OUTPUT_STAGE/Khua-notarization.dmg"
 CHECKSUM_TMP="$OUTPUT_STAGE/Khua-notarization.dmg.sha256"
 
-echo "==> Staging Khua.app and the Applications shortcut"
-ditto --norsrc --noextattr --noqtn "$APP" "$STAGE/Khua.app"
+echo "==> Staging OpenDuckFrame.app and the Applications shortcut"
+ditto --norsrc --noextattr --noqtn "$APP" "$STAGE/OpenDuckFrame.app"
 ln -s /Applications "$STAGE/Applications"
 
 echo "==> Creating compressed read-only disk image"

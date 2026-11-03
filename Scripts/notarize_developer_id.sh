@@ -67,7 +67,7 @@ done
 [ -d "$RELEASE_DIR" ] || die "release directory does not exist: $RELEASE_DIR"
 RELEASE_DIR="$(cd "$RELEASE_DIR" && pwd -P)"
 
-APP="$RELEASE_DIR/Khua.app"
+APP="$RELEASE_DIR/OpenDuckFrame.app"
 SUBMISSION_ZIP="$RELEASE_DIR/Khua-notarization.zip"
 SUBMISSION_CHECKSUM="$RELEASE_DIR/Khua-notarization.zip.sha256"
 FINAL_ZIP="$RELEASE_DIR/Khua.zip"
@@ -123,16 +123,16 @@ plist_value() {
 ditto -x -k "$SUBMISSION_ZIP" "$SUBMISSION_CHECK"
 [ "$(find "$SUBMISSION_CHECK" -mindepth 1 -maxdepth 1 -print | \
       wc -l | tr -d ' ')" = "1" ] || \
-  die "submission ZIP must contain only Khua.app"
-[ -d "$SUBMISSION_CHECK/Khua.app" ] || \
-  die "submission ZIP does not contain Khua.app"
+  die "submission ZIP must contain only OpenDuckFrame.app"
+[ -d "$SUBMISSION_CHECK/OpenDuckFrame.app" ] || \
+  die "submission ZIP does not contain OpenDuckFrame.app"
 "$ROOT/Scripts/lib/verify_developer_id_app.sh" \
-  --app "$SUBMISSION_CHECK/Khua.app" --team-id "$TEAM_ID"
-ARCHIVED_APP="$SUBMISSION_CHECK/Khua.app"
+  --app "$SUBMISSION_CHECK/OpenDuckFrame.app" --team-id "$TEAM_ID"
+ARCHIVED_APP="$SUBMISSION_CHECK/OpenDuckFrame.app"
 APP_CDHASH="$(code_directory_hash "$APP")"
 ARCHIVED_CDHASH="$(code_directory_hash "$ARCHIVED_APP")"
 [ -n "$APP_CDHASH" ] && [ "$APP_CDHASH" = "$ARCHIVED_CDHASH" ] || \
-  die "Khua.app CodeDirectory differs from the app in the submission ZIP"
+  die "OpenDuckFrame.app CodeDirectory differs from the app in the submission ZIP"
 for plist_key in CFBundleIdentifier CFBundleShortVersionString CFBundleVersion; do
   [ "$(plist_value "$APP" "$plist_key")" = \
     "$(plist_value "$ARCHIVED_APP" "$plist_key")" ] || \
@@ -205,7 +205,7 @@ ARCHIVE_SHA256="$(shasum -a 256 "$SUBMISSION_ZIP" | awk '{print $1}')"
 [ "$NOTARY_STATUS" = "Accepted" ] || \
   die "notarization status is $NOTARY_STATUS; inspect $RESULT and $LOG"
 
-echo "==> Stapling accepted ticket to Khua.app"
+echo "==> Stapling accepted ticket to OpenDuckFrame.app"
 if ! xcrun stapler validate -q "$APP" >/dev/null 2>&1; then
   xcrun stapler staple -v "$APP"
 fi
@@ -227,12 +227,12 @@ grep -Fq 'source=Notarized Developer ID' <<<"$SPCTL_OUTPUT" || \
 ditto -c -k --keepParent "$APP" "$FINAL_ZIP_TMP"
 TRANSPORT_CHECK="$(mktemp -d)"
 ditto -x -k "$FINAL_ZIP_TMP" "$TRANSPORT_CHECK"
-xcrun stapler validate -q "$TRANSPORT_CHECK/Khua.app"
-"$ROOT/Scripts/verify_app_bundle.sh" "$TRANSPORT_CHECK/Khua.app"
+xcrun stapler validate -q "$TRANSPORT_CHECK/OpenDuckFrame.app"
+"$ROOT/Scripts/verify_app_bundle.sh" "$TRANSPORT_CHECK/OpenDuckFrame.app"
 "$ROOT/Scripts/lib/verify_developer_id_app.sh" \
-  --app "$TRANSPORT_CHECK/Khua.app" --team-id "$TEAM_ID"
+  --app "$TRANSPORT_CHECK/OpenDuckFrame.app" --team-id "$TEAM_ID"
 spctl --assess --type execute --verbose=4 \
-  "$TRANSPORT_CHECK/Khua.app" >/dev/null
+  "$TRANSPORT_CHECK/OpenDuckFrame.app" >/dev/null
 rm -rf "$TRANSPORT_CHECK"
 TRANSPORT_CHECK=""
 mv "$FINAL_ZIP_TMP" "$FINAL_ZIP"

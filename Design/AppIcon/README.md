@@ -1,15 +1,6 @@
-# ChuanFlow App Icon
+# OpenDuckFrame App Icon
 
-`ChuanFlow-Xiaochuan-FullBleed-Original.png` is the current selected artwork.
-It fills the square with a blue background; macOS supplies its own icon shape.
-The original is untagged RGB, so its pixels are assumed to be sRGB. The
-1024px `KhuaPlayer-StaticMaster-1024.png` is an opaque RGB sRGB master derived
-from that artwork. Every AppIcon size is rendered directly from this master,
-without transparency, and both the canonical and shipping sets must match.
-
-`ChuanFlow-Xiaochuan-Original.png` is the previous artwork, kept for history.
-`KhuaPlayer.icon` is the earlier Icon Composer artwork and is not the source
-of the current icon.
+The approved `Design/Branding/OpenDuckFrame-20261103/OpenDuckFrame-1024.png` is the full-bleed source. The opaque sRGB master and all shipping sizes are generated with the existing static pipeline. The prior ChuanFlow artwork and Icon Composer files remain for history.
 
 ```sh
 python3 Design/AppIcon/export_static_appicon.py --refresh-master

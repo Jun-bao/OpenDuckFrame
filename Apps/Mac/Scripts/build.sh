@@ -61,7 +61,7 @@ xcodebuild -skipPackagePluginValidation \
            "${XCODE_SETTINGS[@]}" \
            build
 
-APP=.build/Build/Products/$CONFIG/Khua.app
+APP=.build/Build/Products/$CONFIG/OpenDuckFrame.app
 
 # Bundle libass and its dependency stack. FFmpeg is linked statically, so the
 # resulting app is self-contained.
@@ -88,22 +88,22 @@ if [ "$CONFIG" = "Release" ]; then
   source "$(pwd)/Scripts/lib/build_common.sh"
   ROOT_DIR="$(pwd -P)"
   verify_deployed_app() { codesign --verify --deep --strict "$1"; }
-  sp_recover_atomic_directory "$ROOT_DIR/Khua.app" "$ROOT_DIR" verify_deployed_app
+  sp_recover_atomic_directory "$ROOT_DIR/OpenDuckFrame.app" "$ROOT_DIR" verify_deployed_app
   CLEANROOM="$(mktemp -d)"
   DEPLOY_TMP="$(mktemp -d "$ROOT_DIR/.khuaplayer-deploy.XXXXXX")"
   trap 'rm -rf "$CLEANROOM" "$DEPLOY_TMP"' EXIT
   cp -R "$APP" "$CLEANROOM/"
-  xattr -cr "$CLEANROOM/Khua.app"
-  codesign --verify --strict "$CLEANROOM/Khua.app" || { echo "Signature verification failed before deployment"; exit 1; }
-  mv "$CLEANROOM/Khua.app" "$DEPLOY_TMP/Khua.app"
-  sp_atomic_replace_directory "$DEPLOY_TMP/Khua.app" "$ROOT_DIR/Khua.app" "$ROOT_DIR" verify_deployed_app
+  xattr -cr "$CLEANROOM/OpenDuckFrame.app"
+  codesign --verify --strict "$CLEANROOM/OpenDuckFrame.app" || { echo "Signature verification failed before deployment"; exit 1; }
+  mv "$CLEANROOM/OpenDuckFrame.app" "$DEPLOY_TMP/OpenDuckFrame.app"
+  sp_atomic_replace_directory "$DEPLOY_TMP/OpenDuckFrame.app" "$ROOT_DIR/OpenDuckFrame.app" "$ROOT_DIR" verify_deployed_app
   rm -rf "$CLEANROOM" "$DEPLOY_TMP"
   trap - EXIT
 
   # Xcode build products and archive intermediates must not accumulate as
   # duplicate Quick Look registrations. Keep only the published root app.
   QL_IDENTIFIER="app.khuaplayer.KhuaPlayer.QuickLook"
-  QL_APPEX="$ROOT_DIR/Khua.app/Contents/PlugIns/KhuaPlayerQuickLook.appex"
+  QL_APPEX="$ROOT_DIR/OpenDuckFrame.app/Contents/PlugIns/KhuaPlayerQuickLook.appex"
   LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
   registered_ql_paths() {
@@ -125,7 +125,7 @@ if [ "$CONFIG" = "Release" ]; then
   }
 
   register_release_app() {
-    "$LSREGISTER" -f -R -trusted "$ROOT_DIR/Khua.app"
+    "$LSREGISTER" -f -R -trusted "$ROOT_DIR/OpenDuckFrame.app"
     pluginkit -a "$QL_APPEX"
     pluginkit -e use -i "$QL_IDENTIFIER" 2>/dev/null || true
   }
@@ -147,5 +147,5 @@ if [ "$CONFIG" = "Release" ]; then
     printf '%s\n' "$REGISTERED_QL_PATHS" >&2
     exit 1
   fi
-  echo "==> Deployed: $ROOT_DIR/Khua.app"
+  echo "==> Deployed: $ROOT_DIR/OpenDuckFrame.app"
 fi

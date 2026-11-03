@@ -75,7 +75,7 @@ for path in "${FORBIDDEN_PATHS[@]}"; do
 done
 
 TRACKED_RELEASE_ARTIFACTS="$(git ls-files | \
-  grep -E '(^|/)(Khua[^/]*\.app/|Khua[^/]*\.(dmg|zip)$|[^/]+\.(dSYM|xcarchive)/)' || true)"
+  grep -E '(^|/)((Khua|OpenDuckFrame)[^/]*\.app/|(Khua|OpenDuckFrame)[^/]*\.(dmg|zip)$|[^/]+\.(dSYM|xcarchive)/)' || true)"
 if [ -n "$TRACKED_RELEASE_ARTIFACTS" ]; then
   echo "error: generated release artifacts are tracked:" >&2
   printf '%s\n' "$TRACKED_RELEASE_ARTIFACTS" >&2
@@ -170,12 +170,12 @@ from pathlib import Path
 
 catalog = json.loads(Path('Apps/Mac/Resources/Localizable.xcstrings').read_text())
 names = catalog['strings']['app.displayName']['localizations']
-if not names or any(record.get('stringUnit', {}).get('value') != 'Khua'
+if not names or any(record.get('stringUnit', {}).get('value') != 'OpenDuckFrame'
                     for record in names.values()):
-    raise SystemExit('error: every app.displayName translation must be Khua')
+    raise SystemExit('error: every app.displayName translation must be OpenDuckFrame')
 text = Path('Apps/Mac/Resources/Localizable.xcstrings').read_text()
 if 'KhuaPlayer' in text or 'Khua Player' in text:
-    raise SystemExit('error: app chrome must use the short name Khua')
+    raise SystemExit('error: app chrome must use the OpenDuckFrame name')
 PY
 
 while IFS= read -r script; do
@@ -199,28 +199,28 @@ plutil -lint Apps/Mac/QuickLook/Info.plist >/dev/null
 plutil -lint Apps/Mac/QuickLook/KhuaPlayerQuickLook.entitlements >/dev/null
 plutil -lint Apps/Mac/Resources/PrivacyInfo.xcprivacy >/dev/null
 
-[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' Apps/Mac/Info.plist)" = "Khua" ] || {
-  echo "error: main CFBundleName must be Khua" >&2
+[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' Apps/Mac/Info.plist)" = "OpenDuckFrame" ] || {
+  echo "error: main CFBundleName must be OpenDuckFrame" >&2
   exit 1
 }
-[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' Apps/Mac/Info.plist)" = "Khua" ] || {
-  echo "error: main CFBundleDisplayName must be Khua" >&2
+[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' Apps/Mac/Info.plist)" = '$(KHUA_DISPLAY_NAME)' ] || {
+  echo "error: main CFBundleDisplayName must use KHUA_DISPLAY_NAME" >&2
   exit 1
 }
-[ "$(/usr/libexec/PlistBuddy -c 'Print :SPProductName' Apps/Mac/Info.plist)" = "Khua Player" ] || {
-  echo "error: About product name must be Khua Player" >&2
+[ "$(/usr/libexec/PlistBuddy -c 'Print :SPProductName' Apps/Mac/Info.plist)"  = "OpenDuckFrame" ] || {
+  echo "error: About product name must be OpenDuckFrame" >&2
   exit 1
 }
-grep -Eq '^[[:space:]]+SPProductName:[[:space:]]+Khua Player$' Apps/Mac/project.yml || {
-  echo "error: project About product name must be Khua Player" >&2
+grep -Eq '^[[:space:]]+SPProductName:[[:space:]]+OpenDuckFrame$' Apps/Mac/project.yml || {
+  echo "error: project About product name must be OpenDuckFrame" >&2
   exit 1
 }
-[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' Apps/Mac/QuickLook/Info.plist)" = "Khua Quick Look" ] || {
-  echo "error: Quick Look CFBundleDisplayName must be Khua Quick Look" >&2
+[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' Apps/Mac/QuickLook/Info.plist)" = "OpenDuckFrame Quick Look" ] || {
+  echo "error: Quick Look CFBundleDisplayName must be OpenDuckFrame Quick Look" >&2
   exit 1
 }
-grep -Eq '^[[:space:]]+PRODUCT_NAME:[[:space:]]+Khua$' Apps/Mac/project.yml || {
-  echo "error: main PRODUCT_NAME must be Khua" >&2
+grep -Eq '^[[:space:]]+PRODUCT_NAME:[[:space:]]+OpenDuckFrame$' Apps/Mac/project.yml || {
+  echo "error: main PRODUCT_NAME must be OpenDuckFrame" >&2
   exit 1
 }
 

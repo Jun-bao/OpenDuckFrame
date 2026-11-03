@@ -2,7 +2,7 @@
 # Actual decoded NV12 frames into the player's FRC generator, without a GUI.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
-PRODUCTS="${KHUA_TEST_FRAMEWORKS_DIR:-$ROOT/.build/Build/Products/Debug/Khua.app/Contents/Frameworks}"
+PRODUCTS="${KHUA_TEST_FRAMEWORKS_DIR:-$ROOT/.build/Build/Products/Debug/OpenDuckFrame.app/Contents/Frameworks}"
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_DIR"' EXIT
 VIDEO_SIZE=320x192

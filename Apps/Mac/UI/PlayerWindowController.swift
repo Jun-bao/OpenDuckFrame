@@ -66,7 +66,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         window.center()
         // Use the workbench language setting without loading the localization
         // catalog before the first window appears. Idle states use the catalog.
-        window.title = EnhancementText.t("ChuanFlow", "小川帧流")
+        window.title = EnhancementText.t("OpenDuckFrame", "OpenDuckFrame")
         window.minSize = NSSize(width: 480, height: 270)
         window.isReleasedWhenClosed = false
 

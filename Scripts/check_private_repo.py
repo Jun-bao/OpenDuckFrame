@@ -64,7 +64,7 @@ def main():
         check_file(path)
     catalog = json.loads((ROOT / 'Apps/Mac/Resources/Localizable.xcstrings').read_text())
     names = catalog['strings']['app.displayName']['localizations']
-    expected = {language: ('小川帧流' if language == 'zh-Hans' else '小川幀流' if language == 'zh-Hant' else 'ChuanFlow') for language in supported_languages()}
+    expected = {language: ('OpenDuckFrame' if language == 'zh-Hans' else 'OpenDuckFrame' if language == 'zh-Hant' else 'OpenDuckFrame') for language in supported_languages()}
     actual = {language: record.get('stringUnit', {}).get('value') for language, record in names.items()}
     if actual != expected:
         fail('app.displayName does not match the supported localized product names')
@@ -74,11 +74,11 @@ def main():
             if re.search(r'(?i)\bkhua\b(?!\.)', value):
                 fail(f'old user-visible product name in {key} ({language})')
     plist = plistlib.loads((ROOT / 'Apps/Mac/Info.plist').read_bytes())
-    for key, value in {'CFBundleName': '小川帧流', 'CFBundleDisplayName': '$(KHUA_DISPLAY_NAME)', 'SPProductName': '小川帧流 · ChuanFlow'}.items():
+    for key, value in {'CFBundleName': 'OpenDuckFrame', 'CFBundleDisplayName': '$(KHUA_DISPLAY_NAME)', 'SPProductName': 'OpenDuckFrame'}.items():
         if plist.get(key) != value:
             fail(f'product Info.plist {key} does not match the current brand')
     project = (ROOT / 'Apps/Mac/project.yml').read_text()
-    for line in ('KHUA_DISPLAY_NAME: 小川帧流', 'CFBundleName: 小川帧流', 'CFBundleDisplayName: $(KHUA_DISPLAY_NAME)', 'SPProductName: 小川帧流 · ChuanFlow', 'PRODUCT_NAME: Khua'):
+    for line in ('KHUA_DISPLAY_NAME: OpenDuckFrame', 'CFBundleName: OpenDuckFrame', 'CFBundleDisplayName: $(KHUA_DISPLAY_NAME)', 'SPProductName: OpenDuckFrame', 'PRODUCT_NAME: OpenDuckFrame', 'EXECUTABLE_NAME: Khua'):
         if not re.search(r'^\s*' + re.escape(line) + r'\s*$', project, re.M):
             fail(f'project metadata missing {line}')
     print(f'Private product source and boundary checks passed ({len(files)} runtime files).')

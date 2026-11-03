@@ -7,6 +7,9 @@ build/
 Khua*.app/
 Khua*.dmg
 Khua*.zip
+OpenDuckFrame*.app/
+OpenDuckFrame*.dmg
+OpenDuckFrame*.zip
 *.dSYM/
 *.xcarchive/
 /dist/

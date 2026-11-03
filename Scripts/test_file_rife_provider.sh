@@ -3,8 +3,8 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 PRODUCTS="${KHUA_TEST_FRAMEWORKS_DIR:-$ROOT/.build/Build/Products/Debug}"
-APP="${KHUA_TEST_RESOURCE_APP:-$ROOT/.build/Build/Products/Debug/Khua.app}"
-DYLIB="${KHUA_TEST_DEBUG_DYLIB:-$ROOT/.build/Build/Products/Debug/Khua.app/Contents/MacOS/Khua.debug.dylib}"
+APP="${KHUA_TEST_RESOURCE_APP:-$ROOT/.build/Build/Products/Debug/OpenDuckFrame.app}"
+DYLIB="${KHUA_TEST_DEBUG_DYLIB:-$ROOT/.build/Build/Products/Debug/OpenDuckFrame.app/Contents/MacOS/Khua.debug.dylib}"
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_DIR"' EXIT
 "$(command -v ffmpeg)" -v error -f lavfi -i 'testsrc2=size=320x192:rate=24' -frames:v 2 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -color_primaries bt709 -color_trc bt709 -colorspace bt709 -an "$TEST_DIR/source.mp4"

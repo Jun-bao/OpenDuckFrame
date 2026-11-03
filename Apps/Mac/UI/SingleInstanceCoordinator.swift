@@ -2,8 +2,6 @@ import AppKit
 import Darwin
 
 @MainActor enum SingleInstanceCoordinator {
-    private static let product = "小川帧流 · ChuanFlow"
-    private static let executable = "Khua"
 
     private static func processInfo(_ pid: pid_t) -> (uid: uid_t, start: TimeInterval)? {
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
@@ -22,8 +20,9 @@ import Darwin
     private static func identity(_ app: NSRunningApplication) -> Bool {
         guard !app.isTerminated, app.processIdentifier > 0,
               let bundleURL = app.bundleURL, let bundle = Bundle(url: bundleURL),
-              bundle.object(forInfoDictionaryKey: "SPProductName") as? String == product,
-              bundle.object(forInfoDictionaryKey: "CFBundleExecutable") as? String == executable,
+              SingleInstancePolicy.matchesProductMetadata(
+                  bundle.object(forInfoDictionaryKey: "SPProductName") as? String,
+                  bundle.object(forInfoDictionaryKey: "CFBundleExecutable") as? String),
               bundle.object(forInfoDictionaryKey: "CFBundlePackageType") as? String == "APPL",
               let declared = bundle.executableURL?.resolvingSymlinksInPath().standardizedFileURL,
               let actual = app.executableURL?.resolvingSymlinksInPath().standardizedFileURL,

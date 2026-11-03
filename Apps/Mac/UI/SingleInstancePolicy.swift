@@ -3,6 +3,10 @@ import Foundation
 // Election never depends on mutable AppKit launch state: a relay can itself
 // finish launching while it is still handing off to the actual primary.
 enum SingleInstancePolicy {
+    static func matchesProductMetadata(_ product: String?, _ executable: String?) -> Bool {
+        (product == "OpenDuckFrame" || product == "小川帧流 · ChuanFlow") && executable == "Khua"
+    }
+
     struct Candidate: Equatable {
         let pid: Int32
         let start: TimeInterval?

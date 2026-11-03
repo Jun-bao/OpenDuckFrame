@@ -3,7 +3,7 @@
 # a clean temporary directory, and fail closed on any incomplete bundle.
 set -euo pipefail
 
-APP="${1:?usage: bundle_libs.sh <path-to-Khua.app>}"
+APP="${1:?usage: bundle_libs.sh <path-to-OpenDuckFrame.app>}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=Scripts/lib/build_common.sh
 source "$ROOT/Scripts/lib/build_common.sh"

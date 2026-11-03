@@ -88,7 +88,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-APP="$RELEASE_DIR/Khua.app"
+APP="$RELEASE_DIR/OpenDuckFrame.app"
 SUBMISSION_DMG="$RELEASE_DIR/Khua-notarization.dmg"
 SUBMISSION_CHECKSUM="$RELEASE_DIR/Khua-notarization.dmg.sha256"
 STATE_DIR="$RELEASE_DIR/DmgNotarization"

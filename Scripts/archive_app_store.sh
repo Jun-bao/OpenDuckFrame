@@ -132,8 +132,8 @@ unregister_archive_products() {
   local lsregister
   lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
   for app in \
-    "$DERIVED_DATA_PATH/Build/Intermediates.noindex/ArchiveIntermediates/KhuaPlayer/InstallationBuildProductsLocation/Applications/Khua.app" \
-    "$ARCHIVE_PATH/Products/Applications/Khua.app"; do
+    "$DERIVED_DATA_PATH/Build/Intermediates.noindex/ArchiveIntermediates/KhuaPlayer/InstallationBuildProductsLocation/Applications/OpenDuckFrame.app" \
+    "$ARCHIVE_PATH/Products/Applications/OpenDuckFrame.app"; do
     pluginkit -r "$app/Contents/PlugIns/KhuaPlayerQuickLook.appex" 2>/dev/null || true
     "$lsregister" -u "$app" 2>/dev/null || true
   done

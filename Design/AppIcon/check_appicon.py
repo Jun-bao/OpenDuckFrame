@@ -147,7 +147,7 @@ def validate_manifest() -> None:
     manifest = json.loads((ROOT / "export-manifest.json").read_text(encoding="utf-8"))
     if manifest.get("schemaVersion") != 1:
         fail("unsupported export-manifest.json schema")
-    original = ROOT / "ChuanFlow-Xiaochuan-FullBleed-Original.png"
+    original = ROOT.parent / "Branding/OpenDuckFrame-20261103/OpenDuckFrame-1024.png"
     if not original.is_file() or manifest.get("original", {}).get("sha256") != sha256(original) or manifest.get("original", {}).get("file") != original.name:
         fail("full-bleed original does not match export-manifest.json")
     master = ROOT / "KhuaPlayer-StaticMaster-1024.png"

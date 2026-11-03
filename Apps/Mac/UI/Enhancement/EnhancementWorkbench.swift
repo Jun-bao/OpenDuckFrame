@@ -1278,8 +1278,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         root.addSubview(sourceHost)
         root.addSubview(libraryHost)
 
-        let brand = NSTextField(labelWithString: EnhancementText.t("ChuanFlow", "小川帧流"))
-        brand.font = .systemFont(ofSize: 26, weight: .bold)
+        let brand = NSTextField(labelWithString: EnhancementText.t("OpenDuckFrame", "OpenDuckFrame"))
+        brand.font = .systemFont(ofSize: 20, weight: .bold)
         brand.textColor = .labelColor
         let brandSub = NSTextField(labelWithString: EnhancementText.t("Quality", "画质"))
         brandSub.identifier = NSUserInterfaceItemIdentifier("brand-quality")

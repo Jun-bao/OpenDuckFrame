@@ -2,7 +2,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 PRODUCTS="${KHUA_TEST_FRAMEWORKS_DIR:-$ROOT/.build/Build/Products/Debug}"
-APP="${KHUA_TEST_RESOURCE_APP:-$ROOT/.build/Build/Products/Debug/Khua.app}"
+APP="${KHUA_TEST_RESOURCE_APP:-$ROOT/.build/Build/Products/Debug/OpenDuckFrame.app}"
 DYLIB="${KHUA_TEST_DEBUG_DYLIB:-$APP/Contents/MacOS/Khua.debug.dylib}"
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_DIR"' EXIT

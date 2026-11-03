@@ -107,6 +107,18 @@ final class SourceView: NSView {
     var lastDraw: CFTimeInterval = 0
     var logInput = false
     var qualityScene = false
+    var geometryMarks = false
+    private func drawGeometryMarks() {
+        guard geometryMarks, let context = NSGraphicsContext.current?.cgContext else { return }
+        context.saveGState(); defer { context.restoreGState() }
+        context.setShouldAntialias(false)
+        NSColor(srgbRed: 0, green: 1, blue: 1, alpha: 1).setFill()
+        NSRect(x: 40, y: bounds.height * 0.55, width: 200, height: 200).fill()
+        NSColor(srgbRed: 1, green: 0, blue: 1, alpha: 1).setFill()
+        NSRect(x: 0, y: bounds.height - 4, width: bounds.width, height: 4).fill()
+        NSColor(srgbRed: 1, green: 1, blue: 0, alpha: 1).setFill()
+        NSRect(x: bounds.width - 4, y: 0, width: 4, height: bounds.height).fill()
+    }
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { true }
     func recordInput(_ kind: String, _ event: NSEvent) {
@@ -130,7 +142,16 @@ final class SourceView: NSView {
         if let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
            let json = String(data: data, encoding: .utf8) { print("sourceInput \(json)"); fflush(stdout) }
     }
-    override func mouseDown(with event: NSEvent) { recordInput("down", event); clickCount += 1; window?.makeFirstResponder(self); needsDisplay = true }
+    override func mouseDown(with event: NSEvent) {
+        recordInput("down", event); clickCount += 1
+        if geometryMarks, let window {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            print("sourceActivationRequested monotonic=\(CACurrentMediaTime()) pid=\(ProcessInfo.processInfo.processIdentifier) windowNumber=\(window.windowNumber)")
+            fflush(stdout)
+        }
+        window?.makeFirstResponder(self); needsDisplay = true
+    }
     override func mouseUp(with event: NSEvent) { recordInput("up", event) }
     override func mouseDragged(with event: NSEvent) { recordInput("drag", event); dragCount += 1; needsDisplay = true }
     override func mouseMoved(with event: NSEvent) { recordInput("move", event) }
@@ -188,6 +209,7 @@ final class SourceView: NSView {
         return Double(values.count - 1) / (last - first)
     }
     override func draw(_ dirtyRect: NSRect) {
+        defer { drawGeometryMarks() }
         let now = CACurrentMediaTime()
         lastDraw = now
         draws.append(now); draws.removeAll { now - $0 > 2 }
@@ -227,6 +249,54 @@ final class SourceView: NSView {
         print(String(format: "sourceDraw monotonic=%.9f mach=%llu callbackSequence=%d drawnSequence=%d encodedSequence=%d drawCount=%d contentPoints=%.1fx%.1f",
                      now, mach_absolute_time(), callbackSequence, drawnSequence, drawnSequence & 0x00ff_ffff,
                      drawCount, bounds.width, bounds.height))
+    }
+}
+
+// Explicit fixture-only script. Geometry uses outer window points; AppKit's
+// bottom-left origin requires recomputing y to hold the top-left corner fixed.
+struct SourceResizeStep {
+    let seconds: Double, width: CGFloat, height: CGFloat, duration: Double
+    static func parse(_ value: String) -> [SourceResizeStep]? {
+        var result: [SourceResizeStep] = []
+        for item in value.split(separator: ",", omittingEmptySubsequences: false) {
+            let fields = item.split(separator: ":", omittingEmptySubsequences: false)
+            guard (3...4).contains(fields.count), let t = Double(fields[0]), let w = Double(fields[1]), let h = Double(fields[2]),
+                  let ms = fields.count == 4 ? Double(fields[3]) : 0,
+                  t.isFinite, w.isFinite, h.isFinite, ms.isFinite, t >= 0, w >= 160, h >= 160, w <= 8192, h <= 8192, ms >= 0,
+                  result.last.map({ t >= $0.seconds + $0.duration }) ?? true else { return nil }
+            result.append(.init(seconds: t, width: w, height: h, duration: ms / 1000))
+        }
+        return result.isEmpty ? nil : result
+    }
+}
+final class SourceResizeScript {
+    weak var window: NSWindow?
+    let steps: [SourceResizeStep], started = CACurrentMediaTime()
+    var next = 0, active: (step: SourceResizeStep, from: NSRect)?
+    var timer: Timer?
+    init(window: NSWindow, steps: [SourceResizeStep]) { self.window = window; self.steps = steps }
+    func start() {
+        let t = Timer(timeInterval: 1.0 / 60, repeats: true) { [self] _ in advance() }
+        timer = t; RunLoop.main.add(t, forMode: .common)
+    }
+    func advance() {
+        guard let window else { timer?.invalidate(); timer = nil; return }
+        let elapsed = CACurrentMediaTime() - started
+        if active == nil && next < steps.count && elapsed >= steps[next].seconds {
+            let step = steps[next]; next += 1; active = (step, window.frame)
+            print("sourceResize start monotonic=\(CACurrentMediaTime()) elapsed=\(elapsed) from=\(window.frame) target=\(step.width)x\(step.height) duration=\(step.duration)"); fflush(stdout)
+        }
+        if let current = active {
+            let fraction = current.step.duration == 0 ? 1 : min(1, max(0, (elapsed - current.step.seconds) / current.step.duration))
+            let width = current.from.width + (current.step.width - current.from.width) * fraction
+            let height = current.from.height + (current.step.height - current.from.height) * fraction
+            window.setFrame(NSRect(x: current.from.minX, y: current.from.maxY - height, width: width, height: height), display: true)
+            if fraction >= 1 {
+                print("sourceResize finish monotonic=\(CACurrentMediaTime()) elapsed=\(elapsed) actual=\(window.frame)"); fflush(stdout)
+                active = nil
+            }
+        }
+        if active == nil && next == steps.count { timer?.invalidate(); timer = nil }
     }
 }
 
@@ -393,6 +463,18 @@ final class WebSource {
             }
             contentFPS = fps
         }
+        let sizeIndices = args.indices.filter { args[$0] == "--size-script" }
+        var resizeSteps: [SourceResizeStep] = []
+        if !sizeIndices.isEmpty {
+            guard sizeIndices.count == 1, let i = sizeIndices.first, i + 1 < args.count,
+                  let parsed = SourceResizeStep.parse(args[i + 1]), !args.contains("--web") else {
+                fputs("--size-script requires ordered non-overlapping t:w:h[:ms] native steps\n", stderr); exit(2)
+            }
+            resizeSteps = parsed
+        }
+        if args.contains("--geometry-marks") && args.contains("--web") {
+            fputs("--geometry-marks requires native source\n", stderr); exit(2)
+        }
         let app = NSApplication.shared; app.setActivationPolicy(.regular)
         let scale = NSScreen.main?.backingScaleFactor ?? 1
         func dimension(_ option: String, fallback: CGFloat) -> CGFloat {
@@ -406,6 +488,7 @@ final class WebSource {
         view.logInput = args.contains("--input-events")
         view.contentFPS = contentFPS
         view.qualityScene = args.contains("--quality-scene")
+        view.geometryMarks = args.contains("--geometry-marks")
         if let index = args.firstIndex(of: "--fps"), index + 1 < args.count, let fps = Int(args[index + 1]), [60, 120].contains(fps) { view.targetFPS = fps }
         let web = args.contains("--web") ? WebSource(frame: frame) : nil
         let window = NSWindow(contentRect: frame, styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
@@ -415,6 +498,8 @@ final class WebSource {
         window.center(); window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(web?.view ?? view); app.activate(ignoringOtherApps: true)
         if web == nil { view.startDisplayLink() }
+        let resizeScript = resizeSteps.isEmpty ? nil : SourceResizeScript(window: window, steps: resizeSteps)
+        resizeScript?.start()
         let heartbeat = Timer(timeInterval: 1, repeats: true) { _ in
             if let web { web.reportHeartbeat() } else { view.reportHeartbeat() }
         }
