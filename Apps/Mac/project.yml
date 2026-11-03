@@ -182,7 +182,11 @@ targets:
         LSMinimumSystemVersion: "14.0"
         NSHighResolutionCapable: true
         LSApplicationCategoryType: public.app-category.video
-        NSHumanReadableCopyright: "Copyright © 2026 Khua contributors"
+        NSHumanReadableCopyright: "Copyright © 2026 OpenDuckFrame contributors. Based on Khua Player (MIT License)."
+        # Help menu links; an empty value hides that item.
+        ODFWebsiteURL: ""
+        ODFRepositoryURL: "https://github.com/super-individual-ai/khua-workbench"
+        ODFFeedbackURL: "https://github.com/super-individual-ai/khua-workbench/issues"
         NSSpeechRecognitionUsageDescription: "OpenDuckFrame generates subtitles from the audio of the media you open. Processing takes place on this Mac."
         NSScreenCaptureUsageDescription: "OpenDuckFrame shows and enhances the window or display you select. Capture stays on this Mac."
         # Folder and volume privacy prompts appear only when Khua scans the

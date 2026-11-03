@@ -1,6 +1,6 @@
 # Contributing
 
-Thank you for helping improve Khua.
+Thank you for helping improve OpenDuckFrame.
 
 ## Before opening a change
 
@@ -34,11 +34,13 @@ then run `Scripts/l10n.py merge <directory>` and the full check again.
 
 ### Product naming
 
-Use `Khua` for the app bundle, Dock, Finder, application menu, idle window, and
-localized `app.displayName`. The About panel uses the full product name
-`Khua Player` from `SPProductName` in `Apps/Mac/project.yml` and its generated
-Info.plist. Keep that metadata separate from system display names; do not rename
-bundle identifiers or internal `KhuaPlayer` modules to change visible branding.
+Use `OpenDuckFrame` for every user-visible name: the app bundle, Dock, Finder,
+application menu, windows, About panel, localized `app.displayName`, download
+artifacts, and documentation. Mention Khua Player only as attribution ("based on
+Khua Player"). Internal identifiers inherited from Khua Player (bundle
+identifier, `Khua` executable, `KhuaPlayer` targets and modules, preference and
+lock keys) stay unchanged so existing settings and single-instance handoff keep
+working; do not rename them to change visible branding.
 
 ### Checks
 
@@ -49,13 +51,13 @@ these commands from the repository root:
 ./Scripts/check_public_repo.sh
 ./Apps/Mac/Scripts/build.sh Release
 ./Scripts/verify_app_bundle.sh \
-  .build/Build/Products/Release/Khua.app
+  .build/Build/Products/Release/OpenDuckFrame.app
 ```
 
 `Scripts/build.sh` remains a compatibility entry point. Edit
 `Apps/Mac/project.yml` for Mac build configuration changes, not the generated
 `Apps/Mac/KhuaPlayer.xcodeproj`. The shared `.build` directory and root-level
-`Khua.app` deployment location are unchanged.
+`OpenDuckFrame.app` deployment location are unchanged.
 
 Describe the media formats and macOS versions exercised in the pull request.
 The public repository intentionally does not ship large media fixtures or the

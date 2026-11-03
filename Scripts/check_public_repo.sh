@@ -159,7 +159,7 @@ done
 
 if grep -nE 'window\.title[[:space:]]*=[[:space:]]*"KhuaPlayer"' \
      Apps/Mac/UI/PlayerWindowController.swift >/dev/null 2>&1; then
-  echo "error: bootstrap window title must use the public display name Khua" >&2
+  echo "error: bootstrap window title must use the public display name OpenDuckFrame" >&2
   exit 1
 fi
 # Full product names are valid in About metadata and documentation. App chrome

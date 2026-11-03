@@ -64,6 +64,18 @@ enum MainMenuBuilder {
                         action: #selector(AppDelegate.privacyPolicyAction(_:)),
                         keyEquivalent: "")
         appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: L("menu.hide"),
+                        action: #selector(NSApplication.hide(_:)),
+                        keyEquivalent: "h")
+        let hideOthers = NSMenuItem(title: L("menu.hideOthers"),
+                                    action: #selector(NSApplication.hideOtherApplications(_:)),
+                                    keyEquivalent: "h")
+        hideOthers.keyEquivalentModifierMask = [.command, .option]
+        appMenu.addItem(hideOthers)
+        appMenu.addItem(withTitle: L("menu.showAll"),
+                        action: #selector(NSApplication.unhideAllApplications(_:)),
+                        keyEquivalent: "")
+        appMenu.addItem(.separator())
         appMenu.addItem(withTitle: L("menu.quit"),
                         action: #selector(NSApplication.terminate(_:)),
                         keyEquivalent: "q")
@@ -77,7 +89,7 @@ enum MainMenuBuilder {
         fileItem.submenu = fileMenu
         let openItem = NSMenuItem(title: L("menu.open"), action: #selector(PlayerViewController.openDocumentAction(_:)), keyEquivalent: "o")
         fileMenu.addItem(openItem)
-        let workbenchItem = NSMenuItem(title: "Quality Workbench",
+        let workbenchItem = NSMenuItem(title: L("menu.qualityWorkbench"),
                                        action: #selector(AppDelegate.openQualityWorkbenchAction(_:)),
                                        keyEquivalent: "e")
         workbenchItem.keyEquivalentModifierMask = [.command, .shift]
@@ -91,6 +103,21 @@ enum MainMenuBuilder {
         fileMenu.addItem(recentItem)
         fileMenu.addItem(.separator())
         fileMenu.addItem(withTitle: L("menu.closeWindow"), action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+
+        // Standard editing commands so ⌘C, ⌘V, ⌘A and ⌘Z reach text fields.
+        let editItem = NSMenuItem()
+        mainMenu.addItem(editItem)
+        let editMenu = NSMenu(title: L("menu.edit"))
+        editItem.submenu = editMenu
+        editMenu.addItem(withTitle: L("menu.edit.undo"), action: Selector(("undo:")), keyEquivalent: "z")
+        let redoItem = NSMenuItem(title: L("menu.edit.redo"), action: Selector(("redo:")), keyEquivalent: "z")
+        redoItem.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(redoItem)
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: L("menu.edit.cut"), action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: L("menu.edit.copy"), action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: L("menu.edit.paste"), action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: L("menu.edit.selectAll"), action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
 
         let playItem = NSMenuItem()
         mainMenu.addItem(playItem)
@@ -162,9 +189,6 @@ enum MainMenuBuilder {
             }
             motionItem.submenu = motionMenu
             playMenu.addItem(motionItem)
-            playMenu.addItem(withTitle: "Quality Workbench",
-                             action: #selector(AppDelegate.openQualityWorkbenchAction(_:)),
-                             keyEquivalent: "")
             playMenu.addItem(.separator())
         }
 
@@ -272,6 +296,45 @@ enum MainMenuBuilder {
         }
         mirrorItem.submenu = mirrorMenu
         viewMenu.addItem(mirrorItem)
+
+        let windowItem = NSMenuItem()
+        mainMenu.addItem(windowItem)
+        let windowMenu = NSMenu(title: L("menu.window"))
+        windowMenu.identifier = NSUserInterfaceItemIdentifier("sp.windowMenu")
+        windowItem.submenu = windowMenu
+        windowMenu.addItem(withTitle: L("menu.window.minimize"),
+                           action: #selector(NSWindow.performMiniaturize(_:)),
+                           keyEquivalent: "m")
+        windowMenu.addItem(withTitle: L("menu.window.zoom"),
+                           action: #selector(NSWindow.performZoom(_:)),
+                           keyEquivalent: "")
+        windowMenu.addItem(.separator())
+        windowMenu.addItem(withTitle: L("menu.qualityWorkbench"),
+                           action: #selector(AppDelegate.openQualityWorkbenchAction(_:)),
+                           keyEquivalent: "")
+
+        // Project links come from Info.plist so a build without a public
+        // website or repository simply omits that item.
+        let helpItem = NSMenuItem()
+        let helpMenu = NSMenu(title: L("menu.help"))
+        helpMenu.identifier = NSUserInterfaceItemIdentifier("sp.helpMenu")
+        helpItem.submenu = helpMenu
+        for (title, infoKey) in [(L("menu.help.website"), "ODFWebsiteURL"),
+                                 (L("menu.help.github"), "ODFRepositoryURL"),
+                                 (L("menu.help.feedback"), "ODFFeedbackURL")] {
+            guard let value = Bundle.main.object(forInfoDictionaryKey: infoKey) as? String,
+                  !value.isEmpty, URL(string: value) != nil else { continue }
+            let item = NSMenuItem(title: title,
+                                  action: #selector(AppDelegate.openProjectLinkAction(_:)),
+                                  keyEquivalent: "")
+            item.representedObject = value
+            helpMenu.addItem(item)
+        }
+        if !helpMenu.items.isEmpty { helpMenu.addItem(.separator()) }
+        helpMenu.addItem(withTitle: L("menu.privacyPolicy"),
+                         action: #selector(AppDelegate.privacyPolicyAction(_:)),
+                         keyEquivalent: "")
+        mainMenu.addItem(helpItem)
 
         return mainMenu
     }

@@ -1,4 +1,4 @@
-# Releasing Khua
+# Releasing OpenDuckFrame
 
 This document describes the macOS release workflows. Run its commands from
 the repository root. The Mac project definition and product build entry point
@@ -7,7 +7,7 @@ archive, signing, packaging, and verification tools remain in `Scripts/`.
 `Scripts/build.sh` forwards to the Mac build for compatibility. There is no
 iPhone or iPad release workflow yet.
 
-Khua uses a dedicated App Store build configuration and the standard
+OpenDuckFrame uses a dedicated App Store build configuration and the standard
 Xcode archive/export pipeline. A release archive is immutable: do not copy
 libraries into it, regenerate resources, change extended attributes, or re-sign
 it after `xcodebuild archive` completes.
@@ -84,11 +84,14 @@ automation and stress controls are not part of the shipping source.
 
 `Debug` and `Release` builds include Sparkle. Ordinary local builds remain
 inactive unless both settings below are supplied. The Developer ID archive
-script defaults to the public configuration in `Distribution/sparkle.json`;
-version 0.6.0 (10) is the first official download with updates enabled.
+script defaults to `Distribution/sparkle.json`. Its feed URL and public key are
+intentionally empty: the values inherited from Khua Player pointed at the
+upstream `khua.app` feed and signing key, which would let upstream releases
+replace OpenDuckFrame. Fill both only with an OpenDuckFrame feed and a key pair
+we control.
 
 ```sh
-KHUA_SPARKLE_FEED_URL=https://khua.app/updates/appcast.xml \
+KHUA_SPARKLE_FEED_URL=https://example.invalid/updates/appcast.xml \
 KHUA_SPARKLE_PUBLIC_ED_KEY=BASE64_PUBLIC_KEY \
   Apps/Mac/Scripts/build.sh Release
 ```
@@ -152,7 +155,7 @@ Scripts/archive_developer_id.sh \
 ```
 
 First notarize the signed app and staple its ticket. This uses the prepared
-ZIP as an upload container and also produces an optional `Khua.zip` download:
+ZIP as an upload container and also produces an optional `OpenDuckFrame.zip` download:
 
 ```sh
 Scripts/notarize_developer_id.sh \
@@ -168,7 +171,7 @@ Do not re-sign or change the app after its ticket has been stapled.
 
 Create the primary user-facing layout. It contains only `Khua.app` and a real
 symbolic link to `/Applications`, then becomes a read-only UDZO disk image
-signed with the same Developer ID identity. `Khua-notarization.dmg` is an
+signed with the same Developer ID identity. `OpenDuckFrame-notarization.dmg` is an
 internal immutable submission artifact and must not be published. Packaging
 and mounted-image verification both require a valid ticket on the inner app:
 
@@ -196,7 +199,7 @@ therefore carries both app and container tickets. Do not modify,
 convert, lay out, or re-sign the submitted DMG after upload. Those operations
 change its CodeDirectory and make the ticket impossible to staple.
 
-Publishing the `Khua.zip` produced by the app-notarization stage is optional.
+Publishing the `OpenDuckFrame.zip` produced by the app-notarization stage is optional.
 ZIP files cannot carry tickets themselves; that archive contains the stapled
 app. A ZIP download is not needed for normal drag-to-Applications installation.
 

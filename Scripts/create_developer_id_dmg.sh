@@ -14,7 +14,7 @@ Usage: Scripts/create_developer_id_dmg.sh \
 
 The release directory must contain the signed OpenDuckFrame.app produced by
 archive_developer_id.sh, notarized and stapled by notarize_developer_id.sh.
-The output is Khua-notarization.dmg; it is not a final
+The output is OpenDuckFrame-notarization.dmg; it is not a final
 public download until notarize_developer_id_dmg.sh accepts and staples it.
 EOF
 }
@@ -85,8 +85,8 @@ cleanup() {
 trap cleanup EXIT
 
 APP="$RELEASE_DIR/OpenDuckFrame.app"
-SUBMISSION_DMG="$RELEASE_DIR/Khua-notarization.dmg"
-SUBMISSION_CHECKSUM="$RELEASE_DIR/Khua-notarization.dmg.sha256"
+SUBMISSION_DMG="$RELEASE_DIR/OpenDuckFrame-notarization.dmg"
+SUBMISSION_CHECKSUM="$RELEASE_DIR/OpenDuckFrame-notarization.dmg.sha256"
 [ -d "$APP" ] || die "prepared app is missing: $APP"
 security find-identity -v -p codesigning | grep -Fq "$IDENTITY" || \
   die "code-signing identity is not available: $IDENTITY"
@@ -99,7 +99,7 @@ MARKETING_VERSION="$(/usr/libexec/PlistBuddy -c \
   die "app has an invalid bundle identifier: $BUNDLE_ID"
 [[ "$MARKETING_VERSION" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] || \
   die "app has an invalid marketing version: $MARKETING_VERSION"
-[ ! -e "$RELEASE_DIR/Khua-$MARKETING_VERSION.dmg" ] || \
+[ ! -e "$RELEASE_DIR/OpenDuckFrame-$MARKETING_VERSION.dmg" ] || \
   die "final disk image already exists for version $MARKETING_VERSION"
 
 "$ROOT/Scripts/lib/verify_developer_id_app.sh" \
@@ -145,8 +145,8 @@ fi
 
 STAGE="$(mktemp -d "$RELEASE_DIR/.dmg-payload.XXXXXX")"
 OUTPUT_STAGE="$(mktemp -d "$RELEASE_DIR/.dmg-output.XXXXXX")"
-DMG_TMP="$OUTPUT_STAGE/Khua-notarization.dmg"
-CHECKSUM_TMP="$OUTPUT_STAGE/Khua-notarization.dmg.sha256"
+DMG_TMP="$OUTPUT_STAGE/OpenDuckFrame-notarization.dmg"
+CHECKSUM_TMP="$OUTPUT_STAGE/OpenDuckFrame-notarization.dmg.sha256"
 
 echo "==> Staging OpenDuckFrame.app and the Applications shortcut"
 ditto --norsrc --noextattr --noqtn "$APP" "$STAGE/OpenDuckFrame.app"
@@ -157,7 +157,7 @@ hdiutil create \
   -quiet \
   -fs HFS+ \
   -format UDZO \
-  -volname Khua \
+  -volname OpenDuckFrame \
   -srcfolder "$STAGE" \
   "$DMG_TMP"
 
@@ -176,7 +176,7 @@ codesign \
   --source-app "$APP"
 
 (cd "$OUTPUT_STAGE" && \
-  shasum -a 256 Khua-notarization.dmg >Khua-notarization.dmg.sha256)
+  shasum -a 256 OpenDuckFrame-notarization.dmg >OpenDuckFrame-notarization.dmg.sha256)
 mv "$DMG_TMP" "$SUBMISSION_DMG"
 mv "$CHECKSUM_TMP" "$SUBMISSION_CHECKSUM"
 rmdir "$OUTPUT_STAGE"

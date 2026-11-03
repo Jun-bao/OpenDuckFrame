@@ -20,7 +20,7 @@ This development snapshot has not yet been audited for public distribution.
 - **Subtitles, made on your Mac.** Generate subtitles from video audio, translate
   generated or existing text subtitles, and save the results as SRT. Processing
   stays on your Mac. Requires macOS 26; macOS may download a language model first.
-- **Playback for imperfect files.** Khua attempts to recover playable content
+- **Playback for imperfect files.** OpenDuckFrame attempts to recover playable content
   from damaged or partially downloaded files, marks problem areas on the
   timeline, and leaves the original file unchanged. Recovery is best-effort;
   not every damaged or incomplete file can be played.
@@ -29,7 +29,7 @@ This development snapshot has not yet been audited for public distribution.
 - **A timeline drawn from your video.** Particle Star Trail takes its colors
   from the video itself. Liquid and Classic styles are also available.
 - **Preview right in Finder.** Select a supported video and press **Space** for
-  Quick Look playback, including MKV. Set Khua as the default player by file format.
+  Quick Look playback, including MKV. Set OpenDuckFrame as the default player by file format.
 
 Motion+ requires macOS 26 and a supported Mac. See [Requirements](#requirements)
 for feature availability.
@@ -39,7 +39,7 @@ for feature availability.
 - **Broad format support:** MKV, MP4, MOV, WebM, AVI, MPEG-TS, FLV, WMV, and common
   audio formats, with hardware decoding where supported and a bundled fallback.
 - **Subtitles that travel with your video:** embedded and external text subtitles,
-  including subtitle files in the same folder. Khua does not search for or download subtitles.
+  including subtitle files in the same folder. OpenDuckFrame does not search for or download subtitles.
 - **Natural-sounding speed control:** hold Space for Turbo playback, then release
   to return to normal speed. Voices keep their pitch.
 - **Native multichannel audio:** 5.1 and 7.1 output on supported audio devices.
@@ -63,7 +63,7 @@ Mac app is currently available.
 ## Build from source
 
 Building requires an Apple silicon Mac and Xcode with the macOS 26.4 SDK or later.
-You do not need the build tools to use the [official download](https://khua.app/download).
+There is no public OpenDuckFrame download yet; build from source to try it.
 
 Install the build tools once:
 
@@ -98,8 +98,8 @@ open event:
 ```
 
 The generated app is located at
-`.build/Build/Products/<configuration>/Khua.app`. Release builds also deploy
-the verified app to `Khua.app` at the repository root; Debug builds leave that
+`.build/Build/Products/<configuration>/OpenDuckFrame.app`. Release builds also deploy
+the verified app to `OpenDuckFrame.app` at the repository root; Debug builds leave that
 copy unchanged. Both locations are ignored by Git. Local Release builds are
 still ad-hoc signed, not distribution-ready artifacts.
 
@@ -139,7 +139,8 @@ automatically by default and expose an App-menu toggle to disable that behavior.
 The application does not collect or transmit playback data. See
 [PRIVACY.md](PRIVACY.md) for the current behavior.
 
-Khua's own source code is available under the [MIT License](LICENSE).
+OpenDuckFrame's own source code, including the code inherited from Khua Player,
+is available under the [MIT License](LICENSE).
 Third-party components retain their own licenses; see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and
 [`ThirdParty/Licenses`](ThirdParty/Licenses). Distributors are responsible for

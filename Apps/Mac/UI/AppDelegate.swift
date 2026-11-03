@@ -66,7 +66,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         // The full product name can differ from the short Dock and Finder name.
         let productName = Bundle.main.object(forInfoDictionaryKey: "SPProductName") as? String
             ?? L("app.displayName")
-        NSApp.orderFrontStandardAboutPanel(options: [.applicationName: productName])
+        let style = NSMutableParagraphStyle()
+        style.alignment = .center
+        let credits = NSAttributedString(string: L("about.credits"), attributes: [
+            .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: style,
+        ])
+        NSApp.orderFrontStandardAboutPanel(options: [.applicationName: productName, .credits: credits])
+    }
+
+    @MainActor @objc func openProjectLinkAction(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? String, let url = URL(string: value) else { return }
+        NSWorkspace.shared.open(url)
     }
 
     @MainActor @objc func openDocumentAction(_ sender: Any?) {

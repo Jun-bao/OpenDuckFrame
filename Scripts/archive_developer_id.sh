@@ -279,10 +279,10 @@ sign_code "$APP"
   --team-id "$TEAM_ID" \
   --bundle-id "$BUNDLE_ID"
 
-SUBMISSION_ZIP="$WORK_DIR/Khua-notarization.zip"
+SUBMISSION_ZIP="$WORK_DIR/OpenDuckFrame-notarization.zip"
 ditto -c -k --keepParent "$APP" "$SUBMISSION_ZIP"
 (cd "$WORK_DIR" && \
-  shasum -a 256 Khua-notarization.zip >Khua-notarization.zip.sha256)
+  shasum -a 256 OpenDuckFrame-notarization.zip >OpenDuckFrame-notarization.zip.sha256)
 ditto -x -k "$SUBMISSION_ZIP" "$TRANSPORT_CHECK"
 "$ROOT/Scripts/lib/verify_developer_id_app.sh" \
   --app "$TRANSPORT_CHECK/OpenDuckFrame.app" \
@@ -291,7 +291,7 @@ ditto -x -k "$SUBMISSION_ZIP" "$TRANSPORT_CHECK"
 
 mv "$WORK_DIR" "$OUTPUT_DIR"
 WORK_DIR=""
-echo "==> Developer ID archive ready: $OUTPUT_DIR/Khua-notarization.zip"
+echo "==> Developer ID archive ready: $OUTPUT_DIR/OpenDuckFrame-notarization.zip"
 echo "==> Matching dSYMs: $OUTPUT_DIR/dSYMs"
 echo "==> Notarize and staple the app with Scripts/notarize_developer_id.sh"
 echo "==> Then package the stapled app with Scripts/create_developer_id_dmg.sh"

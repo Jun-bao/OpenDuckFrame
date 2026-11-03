@@ -2,6 +2,16 @@
 
 All notable public releases will be documented here.
 
+## Unreleased — OpenDuckFrame
+
+- Renamed the app to OpenDuckFrame with a new icon; based on Khua Player 0.7.0.
+- Added the enhancement workbench for real-time frame generation and upscaling
+  of a selected window or display.
+- Release packages are named OpenDuckFrame, and builds ship without the
+  inherited Khua Player update feed.
+
+The entries below are Khua Player releases.
+
 ## 0.7.0
 
 - Improved Dolby Vision playback, thumbnails, and Motion+ compatibility.
