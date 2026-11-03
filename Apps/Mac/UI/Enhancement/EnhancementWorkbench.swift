@@ -8,6 +8,16 @@ extension Notification.Name {
     static let khuaMotionPlusChanged = Notification.Name("khua.motionPlusChanged")
 }
 
+/// One place for the workbench type scale, spacing and surfaces.
+private enum WorkbenchStyle {
+    static let edge: CGFloat = 16
+    static let panelRadius: CGFloat = 12
+    static let groupRadius: CGFloat = 10
+    static var titleFont: NSFont { .systemFont(ofSize: 20, weight: .semibold) }
+    static var brandFont: NSFont { .systemFont(ofSize: 15, weight: .semibold) }
+    static var captionFont: NSFont { .systemFont(ofSize: 11) }
+}
+
 @MainActor enum EnhancementText {
     static let languageKey = "KhuaWorkbenchLanguage"
     static var pairs: [String: (en: String, zh: String)] = [:]
@@ -30,7 +40,12 @@ extension Notification.Name {
         guard let pair = pairs[text] else { return text }
         return chinese ? pair.zh : pair.en
     }
+    static let budgetWarningText = (zh: "电脑跟不上目标帧率，部分画面会保持原画。可以降低倍率或换更轻的引擎。",
+                                    en: "This Mac can't keep up with the target rate, so some frames stay original. Try a lower multiplier or a lighter engine.")
     static func runtime(_ value: String) -> String {
+        if value == LiveRuntimeStatus.interactiveBudgetWarning || value == budgetWarningText.zh || value == budgetWarningText.en {
+            return chinese ? budgetWarningText.zh : budgetWarningText.en
+        }
         let messages: [(String, String)] = [
             ("正在捕获", "Capturing"), ("正在捕获（BGRA，将转换）", "Capturing (BGRA)"),
             ("增强运行", "Enhancement running"), ("缩放运行", "Scaling"),
@@ -1098,20 +1113,20 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private func installCountdownLabels() {
         for (host, label) in [(preview, previewCountdown), (outputPreview, outputCountdown)] {
-            label.font = .systemFont(ofSize: 42, weight: .bold)
+            label.font = .monospacedDigitSystemFont(ofSize: 40, weight: .semibold)
             label.textColor = .white
             label.alignment = .center
             label.wantsLayer = true
-            label.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.6).cgColor
-            label.layer?.cornerRadius = 14
+            label.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.55).cgColor
+            label.layer?.cornerRadius = 48
             label.isHidden = true
             label.translatesAutoresizingMaskIntoConstraints = false
             host.addSubview(label)
             NSLayoutConstraint.activate([
                 label.centerXAnchor.constraint(equalTo: host.centerXAnchor),
                 label.centerYAnchor.constraint(equalTo: host.centerYAnchor),
-                label.widthAnchor.constraint(equalToConstant: 80),
-                label.heightAnchor.constraint(equalToConstant: 66),
+                label.widthAnchor.constraint(equalToConstant: 96),
+                label.heightAnchor.constraint(equalToConstant: 96),
             ])
         }
     }
@@ -1279,12 +1294,17 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         root.addSubview(libraryHost)
 
         let brand = NSTextField(labelWithString: EnhancementText.t("OpenDuckFrame", "OpenDuckFrame"))
-        brand.font = .systemFont(ofSize: 20, weight: .bold)
+        brand.font = WorkbenchStyle.brandFont
         brand.textColor = .labelColor
-        let brandSub = NSTextField(labelWithString: EnhancementText.t("Quality", "画质"))
-        brandSub.identifier = NSUserInterfaceItemIdentifier("brand-quality")
-        brandSub.font = .systemFont(ofSize: 13, weight: .medium)
-        brandSub.textColor = .secondaryLabelColor
+        let brandIcon = NSImageView(image: NSApp.applicationIconImage)
+        brandIcon.imageScaling = .scaleProportionallyUpOrDown
+        brandIcon.translatesAutoresizingMaskIntoConstraints = false
+        brandIcon.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        brandIcon.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        let brandRow = NSStackView(views: [brandIcon, brand])
+        brandRow.orientation = .horizontal
+        brandRow.alignment = .centerY
+        brandRow.spacing = 8
         navButtons = [
             navButton(EnhancementText.t("Workbench", "工作台"), "rectangle.inset.filled", #selector(showStage)),
             navButton(EnhancementText.t("Input", "输入源"), "macwindow", #selector(showSourcePage)),
@@ -1297,12 +1317,13 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let sideStack = NSStackView()
         sideStack.orientation = .vertical
         sideStack.alignment = .leading
-        sideStack.spacing = 10
-        sideStack.addArrangedSubview(brand)
-        sideStack.addArrangedSubview(brandSub)
+        sideStack.spacing = 2
+        sideStack.addArrangedSubview(brandRow)
+        sideStack.setCustomSpacing(18, after: brandRow)
         sideStack.addArrangedSubview(navButtons[0])
         sideStack.addArrangedSubview(navButtons[1])
         sideStack.addArrangedSubview(navButtons[2])
+        sideStack.setCustomSpacing(20, after: navButtons[2])
         if p0ControlsEnabled {
             let opaque = NSButton(title: "", target: self, action: #selector(toggleP0OpaqueFromMain))
             let focus = NSButton(title: "", target: self, action: #selector(toggleP0ActivationFromMain))
@@ -1346,7 +1367,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         ])
 
         let title = NSTextField(labelWithString: EnhancementText.t("Quality Workbench", "画质工作台"))
-        title.font = .systemFont(ofSize: 22, weight: .bold)
+        title.font = WorkbenchStyle.titleFont
         title.textColor = .labelColor
         sourceKindControl.target = self
         sourceKindControl.action = #selector(sourceKindChanged)
@@ -1394,7 +1415,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let well = NSView()
         well.wantsLayer = true
         well.layer?.backgroundColor = NSColor.black.cgColor
-        well.layer?.cornerRadius = 16
+        well.layer?.cornerRadius = WorkbenchStyle.panelRadius
         well.translatesAutoresizingMaskIntoConstraints = false
         well.addSubview(preview)
         emptyOverlay.translatesAutoresizingMaskIntoConstraints = false
@@ -1477,14 +1498,14 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let libraryScroll = scrolled(libraryColumn())
         libraryHost.addSubview(libraryScroll)
         NSLayoutConstraint.activate([
-            sidebar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
-            sidebar.topAnchor.constraint(equalTo: root.topAnchor, constant: 12),
-            sidebar.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -12),
+            sidebar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: WorkbenchStyle.edge),
+            sidebar.topAnchor.constraint(equalTo: root.topAnchor, constant: WorkbenchStyle.edge),
+            sidebar.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -WorkbenchStyle.edge),
             sidebar.widthAnchor.constraint(equalToConstant: 200),
             stageHost.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: 12),
-            stageHost.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
-            stageHost.topAnchor.constraint(equalTo: root.topAnchor, constant: 12),
-            stageHost.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -12),
+            stageHost.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -WorkbenchStyle.edge),
+            stageHost.topAnchor.constraint(equalTo: root.topAnchor, constant: WorkbenchStyle.edge),
+            stageHost.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -WorkbenchStyle.edge),
             sourceHost.leadingAnchor.constraint(equalTo: stageHost.leadingAnchor),
             sourceHost.trailingAnchor.constraint(equalTo: stageHost.trailingAnchor),
             sourceHost.topAnchor.constraint(equalTo: stageHost.topAnchor),
@@ -1534,8 +1555,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         override init(frame: NSRect) {
             super.init(frame: frame)
             wantsLayer = true
-            layer?.cornerRadius = 14
-            layer?.borderWidth = 1
+            layer?.cornerRadius = WorkbenchStyle.groupRadius
         }
         required init?(coder: NSCoder) { nil }
         override func viewDidMoveToWindow() {
@@ -1553,8 +1573,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         func refresh() {
             let appearance = window?.effectiveAppearance ?? effectiveAppearance
             appearance.performAsCurrentDrawingAppearance {
-                layer?.backgroundColor = NSColor.textBackgroundColor.cgColor
-                layer?.borderColor = NSColor.separatorColor.cgColor
+                layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.045).cgColor
             }
         }
     }
@@ -1564,14 +1583,14 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         override init(frame: NSRect) {
             super.init(frame: frame)
             wantsLayer = true
-            layer?.cornerRadius = 16
+            layer?.cornerRadius = WorkbenchStyle.panelRadius
             content.translatesAutoresizingMaskIntoConstraints = false
             content.wantsLayer = true
-            content.layer?.cornerRadius = 12
+            content.layer?.cornerRadius = WorkbenchStyle.panelRadius
             if #available(macOS 26.0, *) {
                 let glass = NSGlassEffectView()
                 glass.translatesAutoresizingMaskIntoConstraints = false
-                glass.cornerRadius = 16
+                glass.cornerRadius = WorkbenchStyle.panelRadius
                 glass.contentView = content
                 addSubview(glass)
                 pin(glass, to: self)
@@ -1599,17 +1618,20 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         func refreshPlate() {
             let appearance = window?.effectiveAppearance ?? effectiveAppearance
-            var plate = NSColor.textBackgroundColor
+            var glassAvailable = false
+            if #available(macOS 26.0, *) { glassAvailable = true }
             appearance.performAsCurrentDrawingAppearance {
-                plate = NSColor.textBackgroundColor
+                // Liquid Glass draws its own fill and depth; older systems get a
+                // translucent plate over the window material instead of opaque white.
+                content.layer?.backgroundColor = glassAvailable ? NSColor.clear.cgColor
+                    : NSColor.controlBackgroundColor.withAlphaComponent(0.55).cgColor
+                content.layer?.borderWidth = 0.5
+                content.layer?.borderColor = NSColor.separatorColor.cgColor
+                layer?.shadowColor = NSColor.black.cgColor
             }
-            content.layer?.backgroundColor = plate.cgColor
-            content.layer?.borderWidth = 1
-            content.layer?.borderColor = NSColor.separatorColor.cgColor
-            layer?.shadowColor = NSColor.shadowColor.cgColor
-            layer?.shadowOpacity = 0.16
-            layer?.shadowRadius = 12
-            layer?.shadowOffset = CGSize(width: 0, height: 4)
+            layer?.shadowOpacity = glassAvailable ? 0 : 0.06
+            layer?.shadowRadius = 4
+            layer?.shadowOffset = CGSize(width: 0, height: 1)
             layer?.masksToBounds = false
         }
         private func pin(_ child: NSView, to parent: NSView) {
@@ -1843,7 +1865,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         statusColumn.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         statusColumn.addArrangedSubview(statusLabel)
         for label in [statsLabel, budgetLabel] {
-            label.font = .systemFont(ofSize: 11)
+            label.font = WorkbenchStyle.captionFont
             label.textColor = .secondaryLabelColor
             label.lineBreakMode = .byTruncatingTail
             label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -1878,7 +1900,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         button.isBordered = false
         button.translatesAutoresizingMaskIntoConstraints = false
         button.widthAnchor.constraint(equalToConstant: 168).isActive = true
-        button.heightAnchor.constraint(equalToConstant: 36).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 32).isActive = true
         button.cell?.lineBreakMode = .byTruncatingTail
         button.toolTip = title
         button.wantsLayer = true
@@ -2026,7 +2048,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             let selected = index == next
             button.contentTintColor = selected ? .controlAccentColor : .secondaryLabelColor
             button.font = .systemFont(ofSize: 13, weight: selected ? .semibold : .regular)
-            button.layer?.backgroundColor = selected ? NSColor.controlAccentColor.withAlphaComponent(0.18).cgColor : NSColor.clear.cgColor
+            button.layer?.backgroundColor = selected ? NSColor.controlAccentColor.withAlphaComponent(0.14).cgColor : NSColor.clear.cgColor
         }
         if next == 0 { redrawPreview() }
     }
@@ -2154,7 +2176,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             let selected = active == id
             item.contentTintColor = selected ? .controlAccentColor : .secondaryLabelColor
             item.font = .systemFont(ofSize: 13, weight: selected ? .semibold : .regular)
-            item.layer?.backgroundColor = selected ? NSColor.controlAccentColor.withAlphaComponent(0.18).cgColor : NSColor.clear.cgColor
+            item.layer?.backgroundColor = selected ? NSColor.controlAccentColor.withAlphaComponent(0.14).cgColor : NSColor.clear.cgColor
             configRows.addArrangedSubview(item)
         }
         for preset in EnhancementProfileStore.presets where !metadata.hiddenPresets.contains(preset.id) {
@@ -2756,7 +2778,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 return
             }
             self.statusLabel.stringValue = EnhancementText.runtime(text)
-            self.statusLabel.textColor = failed ? .systemRed : .labelColor
+            self.statusLabel.textColor = text == LiveRuntimeStatus.interactiveBudgetWarning ? .systemOrange
+                : (failed ? .systemRed : .labelColor)
             self.refreshActions()
         }
         processor.planHandler = { [weak self] state, engine, model, reason, requestID in
@@ -2985,7 +3008,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         if let width = stats["sourceWidth"] as? Int, let height = stats["sourceHeight"] as? Int, width > 0 {
             let fps = stats["callbackFPS"] as? Double ?? 0
             let label = EnhancementText.t("Capture", "采集回调")
-            sourceMetaLabel.stringValue = fps > 1 ? "\(width)×\(height) · \(label) \(String(format: "%.0f", fps)) fps" : "\(width)×\(height)"
+            sourceMetaLabel.stringValue = fps > 1 && (r7Diagnostics || p0ControlsEnabled) ? "\(width)×\(height) · \(label) \(String(format: "%.0f", fps)) fps" : "\(width)×\(height)"
         }
         let presented = (stats["epochPhysicalSynthetic"] as? Int) ?? 0
         let scheduled = LiveCoverage.modelScheduled(total: (stats["epochScheduled"] as? Int) ?? 0,
@@ -3020,9 +3043,13 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             ? EnhancementText.t("Enhancement job delayed", "增强任务超时") : ""
         let holds = ((stats["epochStaticHoldPhases"] as? Int) ?? 0) > 0
             ? EnhancementText.t("Identical frames held", "静止画面保持原图") : ""
-        let lines = FooterMetrics.lines(target: targetText, output: rate, generation: generationRates,
+        // Coverage counts, scheduler rates and the size chain are for diagnosis;
+        // everyday use sees the output rate, the target and actionable warnings.
+        let diagnostics = r7Diagnostics || p0ControlsEnabled
+        let lines = FooterMetrics.lines(target: targetText, output: rate, generation: diagnostics ? generationRates : "",
             budget: budgetLimited, stalled: outputStalled, overdue: modelOverdue,
-            supplemental: [coverage, budget, holds, sizeChainLabel.stringValue, hint.trimmingCharacters(in: .whitespaces)])
+            supplemental: diagnostics ? [coverage, budget, holds, sizeChainLabel.stringValue, hint.trimmingCharacters(in: .whitespaces)]
+                : [hint.trimmingCharacters(in: .whitespaces)])
         statsLabel.stringValue = capture.running ? lines.primary : ""
         budgetLabel.stringValue = capture.running ? lines.secondary : ""
         budgetLabel.textColor = budgetLimited.isEmpty ? .secondaryLabelColor : .systemOrange
@@ -3351,6 +3378,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let selectedKind = profile.sourceKind
         let selectedGeneration = capture.currentGeneration
         countdownSourceGeneration = selectedKind == "file" ? nil : selectedGeneration
+        statusLabel.stringValue = selectedKind == "file"
+            ? EnhancementText.t("Starting in 3 seconds.", "3 秒后开始。")
+            : EnhancementText.t("Starting in 3 seconds. Switch to the source window now.", "3 秒后开始，请切到来源窗口。")
+        statusLabel.textColor = .secondaryLabelColor
         updateCountdownDisplay()
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
