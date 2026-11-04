@@ -1,8 +1,38 @@
-<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:
+<?xml version="1.0" standalone="yes"?>
+<!-- sparkle-sign-warning:
 IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
---><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+-->
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
     <channel>
         <title>OpenDuckFrame</title>
+        <item>
+            <title>0.1.1</title>
+            <pubDate>Wed, 04 Nov 2026 15:41:13 +0800</pubDate>
+            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
+            <sparkle:version>3</sparkle:version>
+            <sparkle:shortVersionString>0.1.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<meta charset="utf-8">
+<h2>OpenDuckFrame 0.1.1</h2>
+<p>New installations and the built-in Default preset now start with the same
+frame-generation settings in source builds and official downloads:</p>
+<ul>
+<li>Frame generation enabled, using RIFE 4.25 at fast quality.</li>
+<li>Experimental RIFE stream cache enabled for live window and display capture.</li>
+<li>X2 multiplier and window output following the source.</li>
+<li>Scaling remains off until selected by the user.</li>
+</ul>
+<p>Existing saved profiles are retained. Selecting this configuration does not
+start capture or enhancement automatically. Other engines remain selectable;
+this release changes defaults and does not claim to fix their existing issues.</p>
+<p>新安装与内置“默认”预设统一采用 RIFE 4.25、fast、连续缓存、倍率 X2 和跟随来源。
+源码构建与官网下载使用相同默认值。已有保存配置继续保留。</p>
+<p>This community build uses an ad-hoc code signature and signed update metadata.
+It is <strong>not Apple notarized</strong>.</p>
+]]></description>
+            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.1.1/OpenDuckFrame-0.1.1.zip" length="42463292" type="application/octet-stream" sparkle:edSignature="Wck6CrhX8KBm7DsijvgC5evMquoYjA/gzeT3vANGTXu+irJXMRmJ0SUQthNLk0UMdYELyvpTdH3kmMn7tjuiCg=="/>
+        </item>
         <item>
             <title>0.1.0</title>
             <pubDate>Tue, 03 Nov 2026 14:10:41 +0800</pubDate>
@@ -28,10 +58,11 @@ macOS may block its first launch. If you trust the download, review the app unde
 System Settings → Privacy &amp; Security and choose whether to allow it.
 No Apple security settings are changed by the installer.</p>
 ]]></description>
-            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.1.0/OpenDuckFrame-0.1.0.zip" length="42462153" type="application/octet-stream" sparkle:edSignature="q1B+Ks3YKpGJsP3OKt4Ma2WmIrtY+gWdj0Ivqixq/Njvp4iP7tVymxQCqkuElIhWpB6Ed5kF14FSzyTFqeIvBw=="></enclosure>
+            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.1.0/OpenDuckFrame-0.1.0.zip" length="42462153" type="application/octet-stream" sparkle:edSignature="q1B+Ks3YKpGJsP3OKt4Ma2WmIrtY+gWdj0Ivqixq/Njvp4iP7tVymxQCqkuElIhWpB6Ed5kF14FSzyTFqeIvBw=="/>
         </item>
     </channel>
-</rss><!-- sparkle-signatures:
-edSignature: PoKEaAv+DcpuExquBR3Y2gQCdhJCrNQxbuCq0SeQwLNFHFAQ/ZG8z5JiMtf0C1sHYpyovQnMG62UjHU3vLFDBQ==
-length: 2225
+</rss>
+<!-- sparkle-signatures:
+edSignature: lPqoOMSlLyrdd9zjSIwKdL/tmvg0ehNXOTD64+jknC4FDIUBY1qDfcikhqKhh89DodwdValulBJEiCFXAMmNBw==
+length: 4082
 -->
