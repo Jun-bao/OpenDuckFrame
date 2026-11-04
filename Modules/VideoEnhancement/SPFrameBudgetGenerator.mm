@@ -560,6 +560,12 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
         ? (1000000.0 * _activeFileRate.fps.den / _activeFileRate.fps.num) / rate
         : sourceInterval / (std::max(_activeFileRate.multiplier, 2) * rate);
     const int64_t runway = spBudgetRunwayUs(depth, (int64_t)llround(outputInterval)) - 10000;
+    if (_activeFileProvider) {
+        // A slow file model must not spend successive source-frame intervals
+        // blocking originals. Give this pair at most one output slot, within
+        // the queued runway; a late result is discarded by its pair state.
+        return std::max<int64_t>(0, std::min<int64_t>(runway, (int64_t)llround(outputInterval) - 2000));
+    }
     const double latency = _engine ? _engine.latencyEstimateSec : 0.15;
     const int64_t remaining = e.submitUs + (int64_t)(latency * 1e6) - spNowUs() + 15000;
     return std::max<int64_t>(0, std::min<int64_t>({runway, remaining, 150000}));
@@ -607,20 +613,18 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
             SPBudgetEntry &head = _ring.front();
             const bool hasPair = _ring.size() >= 2 && head.pair.eligible && !head.chainEnd;
             if (hasPair) {
-                if (_activeFileProvider && (head.pair.state == SPBudgetPairState::Idle || head.pair.state == SPBudgetPairState::InFlight)) {
-                    const uint64_t seq=head.seq;
-                    _cv.wait(lk, [&] { return _emitterQuit || _emitterPaused || _ring.empty() || _ring.front().seq!=seq ||
-                        !_activeFileProvider || (_ring.front().pair.state!=SPBudgetPairState::Idle && _ring.front().pair.state!=SPBudgetPairState::InFlight); });
-                    if (_emitterQuit) break;
-                    if (_emitterPaused || _ring.empty() || _ring.front().seq!=seq) { _emitterBusy=false;_cv.notify_all();continue; }
-                }
-                if (head.pair.state == SPBudgetPairState::InFlight) {
+                const bool waitingForFile = _activeFileProvider &&
+                    (head.pair.state == SPBudgetPairState::Idle || head.pair.state == SPBudgetPairState::InFlight);
+                if (waitingForFile || head.pair.state == SPBudgetPairState::InFlight) {
                     const int64_t waitUs = [self boundedWaitUsForEntry:head];
                     if (waitUs > 0) {
                         const uint64_t seq = head.seq;
                         _cv.wait_for(lk, std::chrono::microseconds(waitUs), [&] {
                             return _emitterQuit || _emitterPaused || _ring.empty() || _ring.front().seq != seq ||
-                                   _ring.front().pair.state != SPBudgetPairState::InFlight;
+                                   (waitingForFile ? (!_activeFileProvider ||
+                                       (_ring.front().pair.state != SPBudgetPairState::Idle &&
+                                        _ring.front().pair.state != SPBudgetPairState::InFlight)) :
+                                       _ring.front().pair.state != SPBudgetPairState::InFlight);
                         });
                         if (_emitterQuit) break;
                         if (_emitterPaused || _ring.empty() || _ring.front().seq != seq) {
@@ -635,7 +639,8 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
                     covered = true;
                     if (h.synth) { synth = h.synth; h.synth = nullptr; }
                 } else {
-                    if (h.pair.state == SPBudgetPairState::Planned || h.pair.state == SPBudgetPairState::InFlight) _pairsMissed++;
+                    if (h.pair.state == SPBudgetPairState::Planned || h.pair.state == SPBudgetPairState::InFlight ||
+                        (waitingForFile && h.pair.state == SPBudgetPairState::Idle)) _pairsMissed++;
                     h.pair.state = SPBudgetPairState::Skipped;
                 }
                 _coverageWindow.push_back(covered ? 1 : 0);
@@ -1600,6 +1605,9 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
         _fileProviderBusy=false;
         current=provider==_activeFileProvider;
         if(current && generation==_live.generation->load() && policy==_live.policyEpoch->load()) {
+            // A deadline can retire the pair before its callback. A current
+            // provider's real failure must still be reported and stop retries.
+            if(error){_fileProviderFailed=true;_publishedActive=NO;failed=YES;}
             for(auto &entry:_ring) {
                 if(entry.seq!=token || entry.generation!=generation || entry.epoch!=policy || entry.pair.state!=SPBudgetPairState::InFlight)continue;
                 size_t required=0;for(const auto &event:entry.scheduledBetween)if(event.action==SPScheduleAction::Interpolate)++required;
