@@ -6,6 +6,28 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>OpenDuckFrame</title>
         <item>
+            <title>0.1.3</title>
+            <pubDate>Wed, 04 Nov 2026 21:19:37 +0800</pubDate>
+            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
+            <sparkle:version>5</sparkle:version>
+            <sparkle:shortVersionString>0.1.3</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>OpenDuckFrame 0.1.3</h2>
+<ul>
+<li>优化本地 SDR 视频的 RIFE 插帧：复用相邻原帧输入与特征，减少重复色彩转换和计算。</li>
+<li>原始帧优先交付；性能不足时保留原视频播放节奏，减少等待造成的延迟。</li>
+<li>完善跳转、会话失效和失败回退后的缓存重建与回归检查。</li>
+</ul>
+<p>M5 Max、1080p 24 FPS、RIFE 4.25 fast X2 的单次原生播放核心对照中，有效呈现中位数由约 24.1 提升到 48.1 FPS，任务中位耗时减少约 38%。效果取决于设备与片源；M1 Pro 真机尚未验证。</p>
+<p>本版本为社区版，使用临时代码签名及签名验证的应用内更新，未经过 Apple 公证。需要 macOS 14 或更高版本及 Apple 芯片。</p>
+<h3>English</h3>
+<p>Improves local SDR RIFE interpolation by reusing adjacent source inputs and cached features. Originals are delivered before waiting for synthesis, with bounded waits when the model cannot keep up. Includes regression checks for seeks, cancelled sessions and stream failure recovery.</p>
+<p>A single M5 Max native playback-core comparison with 1080p 24 FPS input and RIFE 4.25 fast X2 measured about 24.1 to 48.1 effective presented FPS and a 38% reduction in median job time. Results vary by hardware and media; M1 Pro hardware has not been validated. This community build is ad-hoc signed, supports signed in-app updates, and is not Apple notarized.</p>
+]]></description>
+            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.1.3/OpenDuckFrame-0.1.3.zip" length="42465417" type="application/octet-stream" sparkle:edSignature="81F/lad1dj2FKawpyPbikObTYlYLDvxjXj6QKtwX2YhSz5LGuZp9KAWj5qAzD5v+7he3pj8hHz3M6KG0yP7tDA=="/>
+        </item>
+        <item>
             <title>0.1.2</title>
             <pubDate>Wed, 04 Nov 2026 19:09:32 +0800</pubDate>
             <link>https://github.com/Jun-bao/OpenDuckFrame</link>
@@ -60,36 +82,9 @@ It is <strong>not Apple notarized</strong>.</p>
 ]]></description>
             <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.1.1/OpenDuckFrame-0.1.1.zip" length="42463292" type="application/octet-stream" sparkle:edSignature="Wck6CrhX8KBm7DsijvgC5evMquoYjA/gzeT3vANGTXu+irJXMRmJ0SUQthNLk0UMdYELyvpTdH3kmMn7tjuiCg=="/>
         </item>
-        <item>
-            <title>0.1.0</title>
-            <pubDate>Tue, 03 Nov 2026 14:10:41 +0800</pubDate>
-            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
-            <sparkle:version>2</sparkle:version>
-            <sparkle:shortVersionString>0.1.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<meta charset="utf-8">
-<h2>OpenDuckFrame 0.1.0</h2>
-<p>First public Mac download, with signed in-app update checking.</p>
-<ul>
-<li>Enhance a window, display or local video with frame generation and scaling.</li>
-<li>Choose supported Apple and RIFE backends and save profiles for your content.</li>
-<li>Local playback, subtitles and Finder Quick Look previews.</li>
-<li>Check for updates from the OpenDuckFrame menu; automatic checking can be disabled.</li>
-</ul>
-<p>Requires an Apple silicon Mac and macOS 14 or later. Some backends require
-macOS 26 or later, supported hardware or additional models. Requested multipliers
-do not guarantee an achieved frame rate.</p>
-<p>This community build is ad-hoc signed and is <strong>not Apple notarized</strong>.
-macOS may block its first launch. If you trust the download, review the app under
-System Settings → Privacy &amp; Security and choose whether to allow it.
-No Apple security settings are changed by the installer.</p>
-]]></description>
-            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.1.0/OpenDuckFrame-0.1.0.zip" length="42462153" type="application/octet-stream" sparkle:edSignature="q1B+Ks3YKpGJsP3OKt4Ma2WmIrtY+gWdj0Ivqixq/Njvp4iP7tVymxQCqkuElIhWpB6Ed5kF14FSzyTFqeIvBw=="/>
-        </item>
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: BqHRG5+30cJfkN0/r1xOhR7RPgslYg00g1bxwX3kQ6iDWeJQdwFfAeBvSNQ7TnZO2M5UOqYjVWP/SxmUmOsdCQ==
-length: 5954
+edSignature: tRRrz3VVCMyy0Z73TTqGPAl8NGBlbRnJitXlAS+GZpCoiBH9zJHpxhA7jXUrilLx3CIB7puituVwq3X6xj36Cw==
+length: 6422
 -->
