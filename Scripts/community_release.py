@@ -98,8 +98,7 @@ def main():
                  SUPublicEDKey=key, SUEnableAutomaticChecks=True,
                  SUEnableSystemProfiling=False, SUVerifyUpdateBeforeExtraction=True,
                  SURequireSignedFeed=True, SUAutomaticallyUpdate=False,
-                 ODFRepositoryURL='https://github.com/' + repo,
-                 ODFFeedbackURL='https://github.com/' + repo + '/issues')
+                 ODFRepositoryURL='https://github.com/' + repo)
     write_plist(info, value)
     (staged / 'Contents/Resources/PRIVACY.md').write_bytes((ROOT / 'PRIVACY.md').read_bytes())
     for extension in (staged / 'Contents/PlugIns').glob('*.appex'):

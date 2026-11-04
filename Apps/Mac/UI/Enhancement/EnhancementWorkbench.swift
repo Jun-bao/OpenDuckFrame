@@ -1394,6 +1394,24 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         footer.addArrangedSubview(languageControl)
         footer.addArrangedSubview(heading(EnhancementText.t("Appearance", "外观")))
         footer.addArrangedSubview(appearanceControl)
+        let projectLinks = NSStackView()
+        projectLinks.orientation = .horizontal
+        projectLinks.distribution = .fillEqually
+        projectLinks.spacing = 4
+        for (title, key) in [(EnhancementText.t("Website", "官网"), "ODFWebsiteURL"),
+                             ("GitHub", "ODFRepositoryURL"),
+                             (EnhancementText.t("Feedback", "反馈"), "ODFFeedbackURL")] {
+            let link = NSButton(title: title, target: self, action: #selector(openProjectLink(_:)))
+            link.identifier = NSUserInterfaceItemIdentifier(key)
+            link.bezelStyle = .inline
+            link.isBordered = false
+            link.font = WorkbenchStyle.captionFont
+            link.contentTintColor = .secondaryLabelColor
+            projectLinks.addArrangedSubview(link)
+        }
+        projectLinks.widthAnchor.constraint(equalToConstant: 168).isActive = true
+        footer.setCustomSpacing(10, after: appearanceControl)
+        footer.addArrangedSubview(projectLinks)
         languageControl.widthAnchor.constraint(equalToConstant: 168).isActive = true
         appearanceControl.widthAnchor.constraint(equalToConstant: 168).isActive = true
         languageControl.selectedSegment = EnhancementText.chinese ? 0 : 1
@@ -3926,6 +3944,22 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         guard (countdown.active || filePreparing), let field = notification.object as? NSTextField,
               [widthField, heightField, fpsNum, fpsDen].contains(where: { $0 === field }) else { return }
         cancelCountdown()
+    }
+
+    @objc private func openProjectLink(_ sender: NSButton) {
+        guard let key = sender.identifier?.rawValue,
+              let value = Bundle.main.object(forInfoDictionaryKey: key) as? String,
+              var components = URLComponents(string: value), components.scheme == "https" else { return }
+        if key == "ODFFeedbackURL" {
+            var context = URLComponents()
+            context.queryItems = [
+                URLQueryItem(name: "version", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String),
+                URLQueryItem(name: "system", value: ProcessInfo.processInfo.operatingSystemVersionString),
+                URLQueryItem(name: "lang", value: EnhancementText.chinese ? "zh" : "en"),
+            ]
+            components.percentEncodedFragment = context.percentEncodedQuery
+        }
+        if let url = components.url { NSWorkspace.shared.open(url) }
     }
 
     @objc private func appearanceChanged() {

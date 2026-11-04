@@ -1,9 +1,9 @@
 # Privacy policy
 
-Effective date: November 3, 2026
+Effective date: November 4, 2026
 
 OpenDuckFrame does not use advertising SDKs, accounts, or analytics. It does not
-transmit the windows or displays you capture, the media you open, playback
+automatically transmit the windows or displays you capture, the media you open, playback
 history, subtitles, or language preferences to any server.
 
 ## Screen capture
@@ -53,6 +53,21 @@ not include this updater.
 The build scripts download checksum-pinned open-source dependencies when a
 developer compiles the app. That build-time activity is separate from the
 running application.
+
+## Optional feedback
+
+The Feedback link opens `https://openduckframe.cn/feedback/` in your browser.
+When opened from the workbench, the form receives the app and macOS versions
+locally through a URL fragment, which is not sent in the page request, and
+displays the versions that will be included. Only pressing **Send feedback** submits your message,
+optional contact email, the screenshot you explicitly attach, and those versions.
+These are stored in the developer's private Feishu table for troubleshooting,
+product improvements and necessary replies. They are not published to GitHub.
+The form never takes a screenshot automatically or reads media files, browsing
+content or application logs. Hide sensitive information before attaching an image.
+The website and its network providers receive normal connection information;
+the feedback service briefly uses the source address in memory to limit frequent
+submissions and does not add it to the feedback table.
 
 ## Changes
 
