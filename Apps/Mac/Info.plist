@@ -136,11 +136,11 @@
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>OpenDuckFrame generates subtitles from the audio of the media you open. Processing takes place on this Mac.</string>
 	<key>ODFFeedbackURL</key>
-	<string>https://github.com/Jun-bao/OpenDuckFrame/issues</string>
+	<string>https://openduckframe.cn/feedback/</string>
 	<key>ODFRepositoryURL</key>
 	<string>https://github.com/Jun-bao/OpenDuckFrame</string>
 	<key>ODFWebsiteURL</key>
-	<string></string>
+	<string>https://openduckframe.cn/</string>
 	<key>SPCandidateLabel</key>
 	<string>$(ODF_CANDIDATE_LABEL)</string>
 	<key>SPProductName</key>

@@ -184,9 +184,9 @@ targets:
         LSApplicationCategoryType: public.app-category.video
         NSHumanReadableCopyright: "Copyright © 2026 OpenDuckFrame contributors"
         # Help menu links; an empty value hides that item.
-        ODFWebsiteURL: ""
+        ODFWebsiteURL: "https://openduckframe.cn/"
         ODFRepositoryURL: "https://github.com/Jun-bao/OpenDuckFrame"
-        ODFFeedbackURL: "https://github.com/Jun-bao/OpenDuckFrame/issues"
+        ODFFeedbackURL: "https://openduckframe.cn/feedback/"
         NSSpeechRecognitionUsageDescription: "OpenDuckFrame generates subtitles from the audio of the media you open. Processing takes place on this Mac."
         NSScreenCaptureUsageDescription: "OpenDuckFrame shows and enhances the window or display you select. Capture stays on this Mac."
         # Folder and volume privacy prompts appear only when OpenDuckFrame scans the
