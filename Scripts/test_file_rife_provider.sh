@@ -1,6 +1,8 @@
 #!/bin/bash
 # Loads the actual debug code into a headless test process; no app/window launch.
 set -euo pipefail
+# Keep the parity reference stateless when the test disables its stream flag.
+export CHUANFLOW_RIFE_STREAM=0
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 PRODUCTS="${ODF_TEST_FRAMEWORKS_DIR:-$ROOT/.build/Build/Products/Debug}"
 APP="${ODF_TEST_RESOURCE_APP:-$ROOT/.build/Build/Products/Debug/OpenDuckFrame.app}"
