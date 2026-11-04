@@ -116,6 +116,20 @@ private final class SourceSizeControls {
   defaultPreset.rate = .multiplier(3); defaultPreset.scaleEnabled = true; defaultPreset.windowOutputMode = "viewer"
   applyDefaultPreset(&defaultPreset)
   precondition(hasDefaultEnhancement(defaultPreset))
+  for mode in ["viewer", "absolute", "relative"] {
+   var savedDefault = EnhancementProfile()
+   savedDefault.configID = "preset:default"; savedDefault.windowOutputMode = mode
+   savedDefault.sourceWindowPreset = 720; savedDefault.scaleEnabled = true
+   try EnhancementProfileStore.saveCurrent(savedDefault)
+   var expected = savedDefault; expected.windowOutputMode = "follow"
+   precondition(EnhancementProfileStore.load() == expected)
+   precondition(EnhancementProfileStore.loadPreset("preset:default") == expected)
+   var customViewer = savedDefault
+   customViewer.configName = "explicit-viewer"; customViewer.configID = "custom:explicit-viewer"
+   try EnhancementProfileStore.saveCurrent(customViewer)
+   precondition(EnhancementProfileStore.load() == customViewer)
+   precondition(EnhancementProfileStore.loadNamed("explicit-viewer") == customViewer)
+  }
   var userOverride = EnhancementProfile(); userOverride.interpolationEnabled = false; userOverride.rifeStreamEnabled = false
   try EnhancementProfileStore.save(userOverride)
   precondition(EnhancementProfileStore.load() == userOverride)

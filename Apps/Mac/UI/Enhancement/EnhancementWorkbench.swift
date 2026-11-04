@@ -655,8 +655,10 @@ enum EnhancementProfileStore {
     }
 
     static func load() -> EnhancementProfile {
-        guard let data = try? Data(contentsOf: fileURL()), let profile = decode(data, fallbackName: "默认"),
+        guard let data = try? Data(contentsOf: fileURL()), var profile = decode(data, fallbackName: "默认"),
               profile.soundMode == "sourceApplication" else { return EnhancementProfile() }
+        // Reopen the default preset source-aligned, including old auto-viewer state.
+        if resolvedID(profile) == "preset:default" { profile.windowOutputMode = "follow" }
         return profile
     }
 
@@ -706,7 +708,9 @@ enum EnhancementProfileStore {
     static func loadPreset(_ id: String) -> EnhancementProfile? {
         guard let preset = presets.first(where: { $0.id == id }),
               let data = try? Data(contentsOf: presetDirectory().appendingPathComponent(String(id.dropFirst(7)) + ".json")) else { return nil }
-        return decode(data, fallbackName: preset.name)
+        guard var profile = decode(data, fallbackName: preset.name) else { return nil }
+        if id == "preset:default" { profile.windowOutputMode = "follow" }
+        return profile
     }
 
     static func namedNames() -> [String] {
