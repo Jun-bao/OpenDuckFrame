@@ -12,6 +12,12 @@ import CoreVideo
         CaptureResizePolicy.target(screenRect: rect(w,h), contentRect: content, scaleFactor: scale)
     }
     static func main() {
+        // A newer idle screenRect timestamp cannot make an older complete frame fresh.
+        let complete = CompleteFrameGeometryReceipt(geometry: ["bufferWidth": 1280], host: 100)!
+        let idleScreenRectHost: UInt64 = 200
+        precondition(complete.host == 100 && idleScreenRectHost > complete.host)
+        precondition(CompleteFrameGeometryReceipt(geometry: nil, host: 200) == nil)
+        precondition(CompleteFrameGeometryReceipt(geometry: [:], host: 0) == nil)
         // Window generation accumulated activity, then switching to display
         // creates a new generation: no old resize counters may leak.
         var counters = CaptureResizeCounters()
@@ -62,6 +68,15 @@ import CoreVideo
                 precondition(cfg.width == 2560 && cfg.height == 1410)
                 precondition(cfg.pixelFormat == (biplanar ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_32BGRA))
                 precondition(cfg.queueDepth == 3 && !cfg.showsCursor && !cfg.capturesAudio && !cfg.scalesToFit)
+                if #available(macOS 14.0, *) {
+                    precondition(cfg.ignoreShadowsSingleWindow == SCStreamConfiguration().ignoreShadowsSingleWindow)
+                    let windowCfg = CaptureStreamConfiguration.make(width: 2560, height: 1410, biplanar: biplanar, capFPS: cap, window: true)
+                    precondition(windowCfg.ignoreShadowsSingleWindow == cfg.ignoreShadowsSingleWindow && windowCfg.preservesAspectRatio && !windowCfg.scalesToFit)
+                    if #available(macOS 14.2, *) {
+                        precondition(!windowCfg.includeChildWindows)
+                        precondition(cfg.includeChildWindows == SCStreamConfiguration().includeChildWindows)
+                    }
+                }
                 precondition(CMTimeCompare(cfg.minimumFrameInterval, cap == 0 ? .zero : CMTime(value:1,timescale:CMTimeScale(cap))) == 0)
                 precondition(cfg.colorMatrix == kCVImageBufferYCbCrMatrix_ITU_R_709_2 && cfg.colorSpaceName == CGColorSpace.itur_709)
             }

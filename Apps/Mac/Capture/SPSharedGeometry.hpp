@@ -13,6 +13,50 @@ struct GeometrySource {
     GeometryRect screenRect{}, contentRect{};
     double scaleFactor=0, contentScale=0;
 };
+// SCK contentRect is expressed in surface points; scaleFactor maps those
+// points to surface pixels. This validates visual sampling only, not input routing.
+inline bool validatedSurfaceCrop(const GeometrySource &s, uint64_t generation, int textureW, int textureH,
+                                 GeometryRect &crop, GeometryRect &rawCrop) {
+    if (s.generation != generation || !s.windowID || !s.pid || s.bufferWidth < 2 || s.bufferHeight < 2 ||
+        textureW < 2 || textureH < 2 || !validRect(s.contentRect) || !validRect(s.screenRect) ||
+        !std::isfinite(s.scaleFactor) || s.scaleFactor < 1 || s.scaleFactor > 4 ||
+        !std::isfinite(s.contentScale) || s.contentScale <= 0) return false;
+    auto r = s.contentRect;
+    double x = r.x*s.scaleFactor, y = r.y*s.scaleFactor;
+    double right = (r.x+r.width)*s.scaleFactor, bottom = (r.y+r.height)*s.scaleFactor;
+    constexpr double tolerance = 2.0;
+    if (x < -tolerance || y < -tolerance || right > s.bufferWidth+tolerance || bottom > s.bufferHeight+tolerance ||
+        right-x < 2 || bottom-y < 2) return false;
+    x=std::max(0.0,x); y=std::max(0.0,y); right=std::min((double)s.bufferWidth,right); bottom=std::min((double)s.bufferHeight,bottom);
+    rawCrop={x,y,right-x,bottom-y};
+    crop={x*textureW/s.bufferWidth,y*textureH/s.bufferHeight,(right-x)*textureW/s.bufferWidth,(bottom-y)*textureH/s.bufferHeight};
+    return validRect(crop);
+}
+
+inline bool surfaceCropMatchesViewport(GeometryRect raw, double width, double height) {
+    return validRect(raw) && width > 0 && height > 0 &&
+        std::abs(raw.width*height - raw.height*width) <= std::max(2.0, raw.width*height*0.002);
+}
+
+enum class SurfaceCropState { validated, invalidMetadata, targetAspectMismatch };
+inline OutputGeometry visualOutputGeometry(const GeometrySource *source, uint64_t generation,
+                                           int textureW, int textureH, double viewportW, double viewportH,
+                                           bool follow, SurfaceCropState &state) {
+    GeometryRect crop{}, raw{};
+    if (!source || !validatedSurfaceCrop(*source,generation,textureW,textureH,crop,raw)) {
+        state=SurfaceCropState::invalidMetadata;
+        return outputGeometry({0,0,viewportW,viewportH},{0,0,(double)textureW,(double)textureH},follow,1);
+    }
+    if (follow && !surfaceCropMatchesViewport(raw,viewportW,viewportH)) {
+        state=SurfaceCropState::targetAspectMismatch;
+        return outputGeometry({0,0,viewportW,viewportH},{0,0,(double)textureW,(double)textureH},true,1);
+    }
+    state=SurfaceCropState::validated;
+    auto geometry=outputGeometry({0,0,viewportW,viewportH},raw,false,1);
+    geometry.sourceCrop=crop;
+    return geometry;
+}
+
 inline bool operator==(const GeometrySource &a, const GeometrySource &b) {
     return a.generation==b.generation && a.windowID==b.windowID && a.pid==b.pid &&
         a.bufferWidth==b.bufferWidth && a.bufferHeight==b.bufferHeight &&

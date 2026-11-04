@@ -222,6 +222,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var videoSRPipelineContract: Bool {
         CommandLine.arguments.contains("--odf-video-sr-pipeline-contract")
     }
+    private var srInputPipelineContract: Bool { CommandLine.arguments.contains("--odf-sr-input-contract") }
     private var anime4KPipelineContract: Bool {
         CommandLine.arguments.contains("--odf-anime4k-pipeline-contract")
     }
@@ -230,7 +231,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
-        !enhancementSelfTest && !sessionContract && !engineProbe && !srPipelineContract && !videoSRPipelineContract && !anime4KPipelineContract && !cuganPipelineContract
+        !enhancementSelfTest && !sessionContract && !engineProbe && !srPipelineContract && !videoSRPipelineContract && !anime4KPipelineContract && !cuganPipelineContract && !srInputPipelineContract
     }
 
     @MainActor func applicationDidFinishLaunching(_ notification: Notification) {
@@ -262,6 +263,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 report["profileCodingRoundTrip"] = profileOK; report["legacyProfileMigration"] = legacyOK
                 report["ok"] = (report["ok"] as? Bool == true) && profileOK && legacyOK
                 if let result = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) { try? result.write(to: URL(fileURLWithPath: output)) }
+                exit((report["ok"] as? Bool) == true ? 0 : 1)
+            }
+            return
+        }
+        if srInputPipelineContract {
+            guard EnhancementProfileStore.testDirectory != nil else { fputs("--odf-sr-input-contract requires --odf-isolated-profile\n", stderr); exit(2) }
+            let output = args.firstIndex(of: "--odf-sr-input-contract").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil } ?? "/tmp/odf-sr-input-contract.json"
+            DispatchQueue.global(qos: .userInitiated).async {
+                var report = SPLiveProcessor.runSRInputPipelineContract() as? [String: Any] ?? [:]
+                let cases: [(Int32, Int32, Int32, Int, Int)] = [(2560,1410,720,1280,704), (2560,1440,720,1280,720), (640,360,720,640,360), (641,359,720,640,358), (2560,1410,0,2560,1410)]
+                let sizesOK = cases.allSatisfy { w,h,p,ew,eh in let s = SPLiveSRInputSize(w,h,p); return Int(s.width) == ew && Int(s.height) == eh }
+                var profile = EnhancementProfile(); profile.srInputPreset = 720; profile.sourceWindowPreset = 720; profile.configName = "sr-input-test"; profile.configID = "custom:sr-input-test"
+                let copy = profile
+                let data = try? JSONEncoder().encode(profile)
+                var legacyObject = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+                legacyObject.removeValue(forKey: "srInputPreset"); legacyObject.removeValue(forKey: "sourceWindowPreset")
+                let legacyData = try? JSONSerialization.data(withJSONObject: legacyObject)
+                var legacyExpected = profile; legacyExpected.srInputPreset = 0; legacyExpected.sourceWindowPreset = 0
+                let migrationOK = legacyData.flatMap { EnhancementProfileStore.decode($0, fallbackName: "") } == legacyExpected
+                var oldOnly = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+                oldOnly.removeValue(forKey: "sourceWindowPreset")
+                let oldOnlyData = try? JSONSerialization.data(withJSONObject: oldOnly)
+                var oldOnlyExpected = profile; oldOnlyExpected.sourceWindowPreset = 0
+                let windowMigrationOK = oldOnlyData.flatMap { EnhancementProfileStore.decode($0, fallbackName: "") } == oldOnlyExpected
+                var saveOK = false
+                do { try EnhancementProfileStore.save(profile); try EnhancementProfileStore.saveNamed(copy); saveOK = EnhancementProfileStore.load() == profile && EnhancementProfileStore.loadNamed("sr-input-test") == copy } catch { }
+                report["sizePolicy"] = sizesOK; report["profileMigration"] = migrationOK; report["legacyWindowResizeDefaultsOff"] = windowMigrationOK; report["profileSaveAndCopy"] = saveOK
+                report["ok"] = (report["ok"] as? Bool == true) && sizesOK && migrationOK && windowMigrationOK && saveOK
+                if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: URL(fileURLWithPath: output)) }
                 exit((report["ok"] as? Bool) == true ? 0 : 1)
             }
             return

@@ -34,6 +34,25 @@ enum AppLanguage { static var current: String? { nil }; static func effectiveLan
   oldProfile["windowOutputMode"] = "unknown"
   let unknownData = try JSONSerialization.data(withJSONObject:oldProfile)
   precondition(EnhancementProfileStore.decode(unknownData,fallbackName:"legacy")?.windowOutputMode == "follow")
+  for preset in [480, 720] {
+   for interpolation in [false, true] {
+    for scale in [false, true] {
+     var combination = EnhancementProfile()
+     combination.sourceWindowPreset = preset
+     combination.interpolationEnabled = interpolation
+     combination.scaleEnabled = scale
+     precondition(combination.sourceWindowResizeActive == scale)
+     let saved = try JSONEncoder().encode(combination)
+     let restored = EnhancementProfileStore.decode(saved, fallbackName:"test")!
+     precondition(restored.sourceWindowPreset == preset && restored.interpolationEnabled == interpolation && restored.sourceWindowResizeActive == scale)
+     var resumed = restored; resumed.scaleEnabled = true
+     precondition(resumed.sourceWindowResizeActive && resumed.sourceWindowPreset == preset)
+     resumed.sourceKind = "display"; precondition(!resumed.sourceWindowResizeActive)
+     resumed.sourceKind = "file"; precondition(!resumed.sourceWindowResizeActive)
+     resumed.sourceKind = "window"; resumed.sourceWindowPreset = 0; precondition(!resumed.sourceWindowResizeActive)
+    }
+   }
+  }
   oldProfile["windowOutputMode"] = "absolute"
   let absoluteData = try JSONSerialization.data(withJSONObject:oldProfile)
   precondition(EnhancementProfileStore.decode(absoluteData,fallbackName:"legacy")?.windowOutputMode == "absolute")
@@ -292,6 +311,15 @@ enum AppLanguage { static var current: String? { nil }; static func effectiveLan
   precondition(TargetOverlayPolicy.followsTarget(fullscreen:false,viewerFollowOverride:false))
   precondition(!TargetOverlayPolicy.followsTarget(fullscreen:true,viewerFollowOverride:false))
   precondition(TargetOverlayPolicy.followsTarget(fullscreen:true,viewerFollowOverride:true))
+  let savedViewer = "viewer"
+  var followOverride = true // Esc changes only session state, not the saved preference.
+  precondition(!TargetOverlayPolicy.activeWindowViewer(windowTarget:true,viewerSelected:savedViewer == "viewer",viewerFollowOverride:followOverride))
+  precondition(!TargetOverlayPolicy.usesFullscreen(windowTarget:true,explicitViewer:true,interactiveAvailable:false,diagnosticFullscreen:false,legacyFullscreen:false,viewerFollowOverride:followOverride))
+  followOverride = false // A successful new apply clears the override.
+  precondition(savedViewer == "viewer" && TargetOverlayPolicy.activeWindowViewer(windowTarget:true,viewerSelected:savedViewer == "viewer",viewerFollowOverride:followOverride))
+  precondition(TargetOverlayPolicy.usesFullscreen(windowTarget:true,explicitViewer:true,interactiveAvailable:false,diagnosticFullscreen:false,legacyFullscreen:false,viewerFollowOverride:followOverride))
+  precondition(TargetOverlayPolicy.usesFullscreen(windowTarget:true,explicitViewer:false,interactiveAvailable:true,diagnosticFullscreen:false,legacyFullscreen:false,viewerFollowOverride:true))
+  precondition(TargetOverlayPolicy.usesFullscreen(windowTarget:true,explicitViewer:true,interactiveAvailable:false,diagnosticFullscreen:true,legacyFullscreen:false,viewerFollowOverride:true))
   let cadenceScreens = [NSRect(x:0,y:0,width:1000,height:800), NSRect(x:1000,y:0,width:1000,height:800)]
   precondition(TargetOverlayPolicy.screenIndex(target:NSRect(x:700,y:50,width:400,height:300),screens:cadenceScreens)==0)
   precondition(TargetOverlayPolicy.screenIndex(target:NSRect(x:900,y:50,width:400,height:300),screens:cadenceScreens)==1)

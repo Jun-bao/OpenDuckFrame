@@ -1,6 +1,8 @@
 #import <Foundation/Foundation.h>
 #import <CoreVideo/CoreVideo.h>
 #import <mach/mach_time.h>
+#include <cmath>
+#include <initializer_list>
 #import "SPLivePixelProbe.hpp"
 
 static double SPPixelProbeCostMs(uint64_t started) {
@@ -38,6 +40,23 @@ static NSDictionary *SPPixelFingerprintBuffer(CVPixelBufferRef buffer) {
     size_t stride = bgra ? CVPixelBufferGetBytesPerRow(buffer) : CVPixelBufferGetBytesPerRowOfPlane(buffer, 0);
     sp::PixelFingerprint fingerprint;
     BOOL ok = sp::fingerprintPixels(base, stride, width, height, bgra ? 4 : 1, bgra ? 3 : 1, fingerprint);
+    // Explicit diagnostics only: a few column averages reveal surface padding
+    // without recording an image. BGRA luma and video-range Y use different scales.
+    NSMutableArray *columns = [NSMutableArray array];
+    if (base && width > 1 && height > 1) {
+        for (double fraction : {0.01, 0.50, 0.90, 0.94, 0.96, 0.99}) {
+            size_t x = (size_t)llround(fraction * (width-1)); double total=0; int count=0, minimum=255, maximum=0;
+            for (int i=0; i<32; ++i) {
+                size_t y=(size_t)((i+0.5)*height/32.0); if(y>=height)y=height-1;
+                const uint8_t *px=base+y*stride+x*(bgra ? 4 : 1);
+                int value=bgra ? (int)llround(0.114*px[0]+0.587*px[1]+0.299*px[2]) : px[0];
+                total+=value; minimum=MIN(minimum,value); maximum=MAX(maximum,value); count++;
+            }
+            [columns addObject:@{ @"xFraction":@(fraction), @"x":@(x), @"mean":@(total/count), @"min":@(minimum), @"max":@(maximum), @"samples":@(count) }];
+        }
+    }
+    result[@"columnLumaSamples"] = columns;
+    result[@"columnLumaScope"] = bgra ? @"BT.601-style luma estimate from BGRA bytes" : @"raw Y bytes; video/full range follows pixelFormat";
     CVPixelBufferUnlockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
     result[@"status"] = ok ? @"ok" : @"invalid_buffer_layout";
     result[@"sampleCount"] = @(fingerprint.samples);

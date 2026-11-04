@@ -349,7 +349,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         get { pauseLock.lock(); defer { pauseLock.unlock() }; return pauseValue }
         set {
             pauseLock.lock(); pauseValue = newValue; pauseLock.unlock()
-            if newValue { geometryLock.lock(); frameGeometryValue = nil; geometryLock.unlock() }
+            if newValue { geometryLock.lock(); frameGeometryReceipt = nil; geometryLock.unlock() }
         }
     }
     private(set) var running = false
@@ -363,6 +363,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     private let streamBinding = CaptureStreamBinding()
     private let queue = DispatchQueue(label: "app.openduckframe.capture", qos: .userInitiated)
     private var filter: SCContentFilter?
+    private var filterRectAtStart: CGRect?
     private var selectionRevision: UInt64 = 0
     private var streamUsesBiplanar = true
     private var confirmedResizeSize: CaptureResizePolicy.Size?
@@ -387,7 +388,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     private var screenRectValue: CGRect?
     private var screenRectHost: UInt64 = 0
     private var geometryTarget: CaptureTarget?
-    private var frameGeometryValue: [String: Any]?
+    private var frameGeometryReceipt: CompleteFrameGeometryReceipt?
     private var pickerArmed = false
     private var issuedGeneration: UInt64 = 0
     private var completeCount = 0
@@ -499,6 +500,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
 
     private func commit(filter: SCContentFilter, restartSize: CaptureResizePolicy.Size? = nil) {
         self.filter = filter
+        filterRectAtStart = filter.contentRect
         if #available(macOS 15.2, *) {
             if filter.style == .display, let display = filter.includedDisplays.first {
                 target = .display(id: display.displayID)
@@ -516,7 +518,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         screenRectGeneration = generation
         screenRectValue = nil
         screenRectHost = 0
-        frameGeometryValue = nil
+        frameGeometryReceipt = nil
         geometryTarget = target
         geometryLock.unlock()
         completeCount = 0
@@ -573,7 +575,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         stopResizeMonitoring(note: "stream stopped")
         let current = stream
         streamBinding.retire()
-        geometryLock.lock(); frameGeometryValue = nil; geometryLock.unlock()
+        geometryLock.lock(); frameGeometryReceipt = nil; geometryLock.unlock()
         stream = nil
         running = false
         current?.stopCapture { [weak self] error in
@@ -621,7 +623,8 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
 
     private func startStream(filter: SCContentFilter, width: Int, height: Int, biplanar: Bool, generation: UInt64) {
         requestedCaptureFPS = captureCapFPS == 30 || captureCapFPS == 60 ? captureCapFPS : 0
-        let configuration = CaptureStreamConfiguration.make(width: width, height: height, biplanar: biplanar, capFPS: captureCapFPS)
+        let isWindow = filter.style == .window
+        let configuration = CaptureStreamConfiguration.make(width: width, height: height, biplanar: biplanar, capFPS: captureCapFPS, window: isWindow)
         let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
         do {
             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
@@ -641,7 +644,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
                             self.startStream(filter: current, width: width, height: height, biplanar: false, generation: generation)
                         } else {
                             self.running = false
-                            self.geometryLock.lock(); self.frameGeometryValue = nil; self.geometryLock.unlock()
+                            self.geometryLock.lock(); self.frameGeometryReceipt = nil; self.geometryLock.unlock()
                             self.onDiagnostic?("start failed: \(error.localizedDescription)")
                             self.onStatus?("捕获没有开始：\(error.localizedDescription)", true)
                         }
@@ -657,7 +660,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
                 onDiagnostic?("addStreamOutput failed: \(error.localizedDescription); retry BGRA")
                 startStream(filter: filter, width: width, height: height, biplanar: false, generation: generation)
             } else {
-                geometryLock.lock(); frameGeometryValue = nil; geometryLock.unlock()
+                geometryLock.lock(); frameGeometryReceipt = nil; geometryLock.unlock()
                 onDiagnostic?("addStreamOutput failed: \(error.localizedDescription)")
                 onStatus?("捕获没有开始：\(error.localizedDescription)", true)
             }
@@ -665,9 +668,19 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     }
 
     private func publishResizeDiagnostics() {
-        let value: [String: Any] = ["requested": resizeCounters.requested, "completed": resizeCounters.completed,
+        func rectArray(_ r: CGRect?) -> Any { guard let r else { return NSNull() }; return [r.minX, r.minY, r.width, r.height] }
+        let isWindow = filter?.style == .window
+        let childWindowsRequested: Any
+        if #available(macOS 14.2, *), isWindow { childWindowsRequested = false }
+        else { childWindowsRequested = NSNull() }
+        let value: [String: Any] = ["includeChildWindowsRequested": childWindowsRequested,
+            "requested": resizeCounters.requested, "completed": resizeCounters.completed,
             "failed": resizeCounters.failed, "confirmed": resizeCounters.confirmed,
             "lastTarget": resizeLastTarget.map { [$0.width, $0.height] } as Any? ?? NSNull(),
+            "configured": resizePolicy.map { [$0.configured.width, $0.configured.height] } as Any? ?? NSNull(),
+            "filterContentAtStart": rectArray(filterRectAtStart), "filterContentCurrent": rectArray(filter?.contentRect),
+            "filterPointPixelScale": filter.map { Double($0.pointPixelScale) } as Any? ?? NSNull(),
+            "confirmationScope": "buffer dimensions only; content geometry not independently confirmed",
             "lastConfirmMs": resizeLastConfirmMs]
         resizeDiagnosticsLock.lock(); resizeDiagnosticsValue = ["resize": value, "resizeEvents": resizeEvents]; resizeDiagnosticsLock.unlock()
     }
@@ -703,7 +716,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             if self.resizeEvents.count > 16 { self.resizeEvents.removeFirst() }
             self.publishResizeDiagnostics()
             let config = CaptureStreamConfiguration.make(width: request.size.width, height: request.size.height,
-                biplanar: self.streamUsesBiplanar, capFPS: self.captureCapFPS)
+                biplanar: self.streamUsesBiplanar, capFPS: self.captureCapFPS, window: true)
             self.resizeObservationLock.lock()
             self.resizeWatch = (generation, request.size, start, false)
             self.resizeObservationLock.unlock()
@@ -785,7 +798,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         if let generation = streamBinding.snapshot(stream) {
             _ = streamBinding.withCurrent(stream, generation: generation) {
                 geometryLock.lock()
-                if screenRectGeneration == generation { frameGeometryValue = nil }
+                if screenRectGeneration == generation { frameGeometryReceipt = nil }
                 geometryLock.unlock()
                 onGeometry?(nil, generation)
             }
@@ -849,7 +862,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         if status == .blank || status == .suspended || status == .stopped {
             _ = streamBinding.withCurrent(stream, generation: generation) {
                 geometryLock.lock()
-                if screenRectGeneration == generation { frameGeometryValue = nil }
+                if screenRectGeneration == generation { frameGeometryReceipt = nil }
                 geometryLock.unlock()
                 onGeometry?(nil, generation)
             }
@@ -866,7 +879,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         guard !paused, let image = sampleBuffer.imageBuffer else {
             _ = streamBinding.withCurrent(stream, generation: generation) {
                 geometryLock.lock()
-                if screenRectGeneration == generation { frameGeometryValue = nil }
+                if screenRectGeneration == generation { frameGeometryReceipt = nil }
                 geometryLock.unlock()
             }
             if paused {
@@ -882,7 +895,8 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         guard streamBinding.withCurrent(stream, generation: generation, {
             geometryLock.lock()
             if screenRectGeneration == generation {
-                frameGeometryValue = !paused && CMSampleBufferIsValid(sampleBuffer) && CMSampleBufferDataIsReady(sampleBuffer) ? frameGeometry : nil
+                frameGeometryReceipt = observedStatus == .complete && !paused && CMSampleBufferIsValid(sampleBuffer) && CMSampleBufferDataIsReady(sampleBuffer)
+                    ? CompleteFrameGeometryReceipt(geometry: frameGeometry, host: captureHost) : nil
             }
             geometryLock.unlock()
             onGeometry?(frameGeometry, generation)
@@ -991,7 +1005,7 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             hostSpan = Double(lastHost - firstHost) * Double(info.numer) / Double(info.denom) / 1_000_000_000
         }
         geometryLock.lock()
-        let geometry = screenRectGeneration == currentGeneration ? frameGeometryValue : nil
+        let geometry = screenRectGeneration == currentGeneration ? frameGeometryReceipt?.geometry : nil
         geometryLock.unlock()
         var report: [String: Any] = [
             "generation": currentGeneration,
@@ -1126,6 +1140,12 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             "contentRect": [content.minX, content.minY, content.width, content.height],
             "scaleFactor": factor, "contentScale": contentScale]
         return value
+    }
+
+    func latestFrameGeometrySnapshot() -> (geometry: [String: Any], host: UInt64)? {
+        geometryLock.lock(); defer { geometryLock.unlock() }
+        guard screenRectGeneration == currentGeneration, let receipt = frameGeometryReceipt else { return nil }
+        return (receipt.geometry, receipt.host)
     }
 
     func latestScreenRect() -> CGRect? {

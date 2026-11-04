@@ -4,16 +4,28 @@ import CoreVideo
 @preconcurrency import ScreenCaptureKit
 
 enum CaptureStreamConfiguration {
-    static func make(width: Int, height: Int, biplanar: Bool, capFPS: Int) -> SCStreamConfiguration {
+    static func make(width: Int, height: Int, biplanar: Bool, capFPS: Int, window: Bool = false) -> SCStreamConfiguration {
         let c = SCStreamConfiguration()
         c.width = width; c.height = height
         c.pixelFormat = biplanar ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_32BGRA
+        if #available(macOS 14.2, *), window { c.includeChildWindows = false }
         c.queueDepth = 3
         CaptureRatePolicy.configure(c, capFPS: capFPS)
         c.showsCursor = false; c.capturesAudio = false
         c.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2
         c.colorSpaceName = CGColorSpace.itur_709
         return c
+    }
+}
+
+// Geometry and host are one complete-frame receipt. Idle screen-rect updates
+// never replace it, so callers cannot combine an old frame with a new host.
+struct CompleteFrameGeometryReceipt {
+    let geometry: [String: Any]
+    let host: UInt64
+    init?(geometry: [String: Any]?, host: UInt64) {
+        guard let geometry, host > 0 else { return nil }
+        self.geometry = geometry; self.host = host
     }
 }
 

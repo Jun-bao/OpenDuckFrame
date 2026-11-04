@@ -24,6 +24,10 @@ typedef NS_ENUM(NSInteger, SPLiveViewMode) {
     SPLiveViewCompare = 2,
 };
 
+/// Maximum-box preset: 0 keeps capture size, otherwise 480, 720 or 1080.
+FOUNDATION_EXPORT NSSize SPLiveSRInputSize(int width, int height, int preset);
+FOUNDATION_EXPORT BOOL SPLiveCanPrepareMetalFX(int width, int height);
+
 @interface SPLivePlanRequest : NSObject <NSCopying>
 @property (nonatomic) uint64_t requestID;
 @property (nonatomic) BOOL interpolationEnabled;
@@ -35,6 +39,13 @@ typedef NS_ENUM(NSInteger, SPLiveViewMode) {
 @property (nonatomic) BOOL scaleEnabled;
 @property (nonatomic) SPLiveScaleEngine scaleEngine;
 @property (nonatomic, copy) NSString *scaleQualityID;
+@property (nonatomic) int srInputPreset;
+/// Exact live-window source guard; all zero for ordinary capture.
+@property (nonatomic) int requiredSourceWidth;
+@property (nonatomic) int requiredSourceHeight;
+@property (nonatomic) uint32_t requiredSourceWindowID;
+@property (nonatomic) int32_t requiredSourcePID;
+@property (nonatomic) uint64_t requiredSourceAfterHost;
 @property (nonatomic) int outputWidth;
 @property (nonatomic) int outputHeight;
 @property (nonatomic) SPLiveViewMode viewMode;
@@ -192,6 +203,7 @@ typedef NS_ENUM(NSInteger, SPLiveViewMode) {
 + (NSDictionary<NSString *, id> *)runSessionContract;
 + (NSDictionary<NSString *, id> *)runSRPipelineContract;
 + (NSDictionary<NSString *, id> *)runVideoSRPipelineContract;
++ (NSDictionary<NSString *, id> *)runSRInputPipelineContract;
 + (NSDictionary<NSString *, id> *)runAnime4KPipelineContract;
 + (NSDictionary<NSString *, id> *)runRealCUGANPipelineContract;
 /// One real low-latency session and one real RIFE session. Not part of the short contract.
