@@ -6,6 +6,27 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>OpenDuckFrame</title>
         <item>
+            <title>0.2.0</title>
+            <pubDate>Wed, 04 Nov 2026 21:37:51 +0800</pubDate>
+            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
+            <sparkle:version>6</sparkle:version>
+            <sparkle:shortVersionString>0.2.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<meta charset="utf-8">
+<h2>OpenDuckFrame 0.2.0</h2>
+<ul>
+<li>For supported window sources, choose a source window size before scaling. The selected window is resized before capture; for the video itself to match the selected size, it must fill that window.</li>
+<li>Improve single-window capture when child windows extend beyond the selected window.</li>
+<li>Use frame generation and scaling separately or together, subject to the selected engines' compatibility.</li>
+<li>Press Esc to leave fullscreen viewer and return to the source-aligned view; apply again to re-enter.</li>
+</ul>
+<p>Window resizing requires Accessibility permission and a resizable window. Available engines and output sizes depend on the system and hardware; results depend on the source and engine.</p>
+<p>This community build is ad-hoc signed and is <strong>not Apple notarized</strong>. macOS may block its first launch. If you trust the download, review the app under System Settings → Privacy &amp; Security and choose whether to allow it.</p>
+]]></description>
+            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.2.0/OpenDuckFrame-0.2.0.zip" length="42509570" type="application/octet-stream" sparkle:edSignature="Wb3AzKTIh3OqPMt31e5/sf1G7hmI4zaLpVyMcV6o65xxFgA1R34wt71uIiVPDCHvBEzADTzg6OdJ4VLptaGlBw=="/>
+        </item>
+        <item>
             <title>0.1.3</title>
             <pubDate>Wed, 04 Nov 2026 21:19:37 +0800</pubDate>
             <link>https://github.com/Jun-bao/OpenDuckFrame</link>
@@ -54,37 +75,9 @@ It is <strong>not Apple notarized</strong>.</p>
 ]]></description>
             <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.1.2/OpenDuckFrame-0.1.2.zip" length="42463396" type="application/octet-stream" sparkle:edSignature="MunJ/wHoUMUdnG50VDYAek1qLFuTqRLm+ET/0U2YkEVtIOFe2CapdXGh5MwpyuYCshl/Y5aakQcVdsGT3efaDw=="/>
         </item>
-        <item>
-            <title>0.1.1</title>
-            <pubDate>Wed, 04 Nov 2026 15:41:13 +0800</pubDate>
-            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
-            <sparkle:version>3</sparkle:version>
-            <sparkle:shortVersionString>0.1.1</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<meta charset="utf-8">
-<h2>OpenDuckFrame 0.1.1</h2>
-<p>New installations and the built-in Default preset now start with the same
-frame-generation settings in source builds and official downloads:</p>
-<ul>
-<li>Frame generation enabled, using RIFE 4.25 at fast quality.</li>
-<li>Experimental RIFE stream cache enabled for live window and display capture.</li>
-<li>X2 multiplier and window output following the source.</li>
-<li>Scaling remains off until selected by the user.</li>
-</ul>
-<p>Existing saved profiles are retained. Selecting this configuration does not
-start capture or enhancement automatically. Other engines remain selectable;
-this release changes defaults and does not claim to fix their existing issues.</p>
-<p>新安装与内置“默认”预设统一采用 RIFE 4.25、fast、连续缓存、倍率 X2 和跟随来源。
-源码构建与官网下载使用相同默认值。已有保存配置继续保留。</p>
-<p>This community build uses an ad-hoc code signature and signed update metadata.
-It is <strong>not Apple notarized</strong>.</p>
-]]></description>
-            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.1.1/OpenDuckFrame-0.1.1.zip" length="42463292" type="application/octet-stream" sparkle:edSignature="Wck6CrhX8KBm7DsijvgC5evMquoYjA/gzeT3vANGTXu+irJXMRmJ0SUQthNLk0UMdYELyvpTdH3kmMn7tjuiCg=="/>
-        </item>
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: tRRrz3VVCMyy0Z73TTqGPAl8NGBlbRnJitXlAS+GZpCoiBH9zJHpxhA7jXUrilLx3CIB7puituVwq3X6xj36Cw==
-length: 6422
+edSignature: Is+z6HQcvXCq7G52nueXVx605r3uwhgsYnuK1hwWvRsC0oC01Z8I5WtBRSRiFmzxtjFDrifQQVv9AbE/tagDBA==
+length: 6389
 -->
