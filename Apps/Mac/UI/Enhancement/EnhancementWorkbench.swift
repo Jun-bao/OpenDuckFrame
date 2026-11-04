@@ -3833,7 +3833,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let chosenWindowPreset = [0,480,720,1080][max(0,min(3,sourceWindowPopup.indexOfSelectedItem))]
         let windowPresetChanged = sourceKindControl.selectedSegment == 0 && chosenWindowPreset != profile.sourceWindowPreset
         let windowResizeSelected = sourceKindControl.selectedSegment == 0 && scaleSwitch.state == .on && chosenWindowPreset > 0
-        if windowResizeSelected && windowPresetChanged && windowOutputPopup.indexOfSelectedItem == 0 { windowOutputPopup.selectItem(at: 1) }
         if windowResizeSelected && (windowPresetChanged || (selectedEngine == 1 && profile.scaleEngineID != "metalfx.spatial")) && selectedEngine == 1 {
             let w = chosenWindowPreset == 480 ? 854 : (chosenWindowPreset == 720 ? 1280 : 1920)
             selectOutputSize(w*2, chosenWindowPreset*2)

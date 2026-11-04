@@ -1,8 +1,44 @@
 enum AppLanguage { static var current: String? { nil }; static func effectiveLanguage(for code: String?) -> String? { "en" } }
 
+// Execute the production handler's size-selection section with control values,
+// without opening windows or writing a live profile.
+private struct SizePopup {
+ var indexOfSelectedItem: Int
+ mutating func selectItem(at index: Int) { indexOfSelectedItem = index }
+}
+private final class SourceSizeControls {
+ var scalePopup = SizePopup(indexOfSelectedItem: 1)
+ var sourceWindowPopup = SizePopup(indexOfSelectedItem: 2)
+ var windowOutputPopup = SizePopup(indexOfSelectedItem: 0)
+ var sourceKindControl = (selectedSegment: 0, unused: 0)
+ var scaleSwitch = (state: NSControl.StateValue.on, unused: 0)
+ var profile = EnhancementProfile()
+ var outputSize: (Int, Int)?
+ func selectOutputSize(_ width: Int, _ height: Int) { outputSize = (width,height) }
+ func changeSourceSize() {
+  // ACTUAL_SOURCE_WINDOW_CONTROL_CHANGE
+ }
+}
+
 
 @main struct TestRunner {
  @MainActor static func main() throws {
+  for mode in 0...3 {
+   let controls = SourceSizeControls()
+   controls.profile.sourceWindowPreset = 480
+   controls.windowOutputPopup.selectItem(at: mode)
+   controls.changeSourceSize()
+   precondition(controls.windowOutputPopup.indexOfSelectedItem == mode,
+     "Changing source size must preserve the user's output/input mode")
+   precondition(controls.outputSize?.0 == 2560 && controls.outputSize?.1 == 1440)
+  }
+  for source in 0...2 {
+   let controls = SourceSizeControls()
+   controls.sourceKindControl.selectedSegment = source
+   controls.scaleSwitch.state = .off
+   controls.changeSourceSize()
+   precondition(controls.windowOutputPopup.indexOfSelectedItem == 0 && controls.outputSize == nil)
+  }
   let p0Args = ["--odf-p0-controls", "--odf-r7-opaque"]
   precondition(P0DiagnosticPolicy.controlsEnabled(args:p0Args,isolated:true))
   precondition(!P0DiagnosticPolicy.controlsEnabled(args:p0Args,isolated:false))
