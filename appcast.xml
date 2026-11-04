@@ -6,6 +6,28 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>OpenDuckFrame</title>
         <item>
+            <title>0.2.1</title>
+            <pubDate>Wed, 04 Nov 2026 23:02:27 +0800</pubDate>
+            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
+            <sparkle:version>7</sparkle:version>
+            <sparkle:shortVersionString>0.2.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<meta charset="utf-8">
+<h2>OpenDuckFrame 0.2.1</h2>
+<ul>
+<li>默认配置使用“跟随来源”，恢复旧默认配置时也会纠正残留的全屏观看状态。</li>
+<li>修复修改“来源窗口尺寸”时自动切换到“全屏观看”、导致网页鼠标操作被阻挡的问题。</li>
+<li>来源窗口尺寸和超分输出尺寸继续按原规则生效；其他配置中明确保存的观看或交互模式保持原选择。</li>
+</ul>
+<p>使用“跟随来源”时，增强画面与原窗口对齐，可直接操作网页。需要全屏观看时仍可手动选择；全屏观看模式不转发鼠标输入。</p>
+<h3>English</h3>
+<p>The default preset now reopens in Follow source mode, including when an older default configuration retained Fullscreen viewer. Changing the source window size no longer silently selects Fullscreen viewer and blocks webpage clicks. Source resizing and scaler output-size behavior are preserved. Explicit modes in other saved configurations are preserved.</p>
+<p>This community build is ad-hoc signed, supports signed in-app updates, and is not Apple notarized. Requires macOS 14 or later on Apple silicon.</p>
+]]></description>
+            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.2.1/OpenDuckFrame-0.2.1.zip" length="42510545" type="application/octet-stream" sparkle:edSignature="TP4f+LiAqeEjdrDGqX6Nmk4W5wf/i0Ob9H97c3uNPcnLVQgaNZr41kQ7JozYKh/BcGHNAzva8kJWPgktbqBwDQ=="/>
+        </item>
+        <item>
             <title>0.2.0</title>
             <pubDate>Wed, 04 Nov 2026 21:37:51 +0800</pubDate>
             <link>https://github.com/Jun-bao/OpenDuckFrame</link>
@@ -48,36 +70,9 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
 ]]></description>
             <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.1.3/OpenDuckFrame-0.1.3.zip" length="42465417" type="application/octet-stream" sparkle:edSignature="81F/lad1dj2FKawpyPbikObTYlYLDvxjXj6QKtwX2YhSz5LGuZp9KAWj5qAzD5v+7he3pj8hHz3M6KG0yP7tDA=="/>
         </item>
-        <item>
-            <title>0.1.2</title>
-            <pubDate>Wed, 04 Nov 2026 19:09:32 +0800</pubDate>
-            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
-            <sparkle:version>4</sparkle:version>
-            <sparkle:shortVersionString>0.1.2</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<meta charset="utf-8">
-<h2>OpenDuckFrame 0.1.2</h2>
-<p>Fixes a local-video playback stall when frame generation cannot keep up.</p>
-<ul>
-<li>Original frames no longer wait indefinitely for the model.</li>
-<li>Missed interpolation deadlines keep the original picture; late results are discarded.</li>
-<li>Engine failures remain visible, and old results do not enter a newly selected video.</li>
-</ul>
-<p>Slow-model timing and file-playback regression checks passed. This release
-does not guarantee X2 output on slower hardware; M1 Pro physical-display and
-audio/video synchronization acceptance are still pending.</p>
-<p>修复本地视频开启插帧后，慢模型阻塞原片播放的问题。补帧赶不上时保留原画，
-迟到结果会被丢弃；真实引擎错误仍会报告。已完成限速模拟与相关回归，
-不代表算力不足时仍能达到所选倍率，M1 Pro 真机屏幕与音画同步尚未验收。</p>
-<p>This community build uses an ad-hoc code signature and signed update metadata.
-It is <strong>not Apple notarized</strong>.</p>
-]]></description>
-            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.1.2/OpenDuckFrame-0.1.2.zip" length="42463396" type="application/octet-stream" sparkle:edSignature="MunJ/wHoUMUdnG50VDYAek1qLFuTqRLm+ET/0U2YkEVtIOFe2CapdXGh5MwpyuYCshl/Y5aakQcVdsGT3efaDw=="/>
-        </item>
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: Is+z6HQcvXCq7G52nueXVx605r3uwhgsYnuK1hwWvRsC0oC01Z8I5WtBRSRiFmzxtjFDrifQQVv9AbE/tagDBA==
-length: 6389
+edSignature: 5rDCWdXw78WfRoEbxKbMEAP8szOMUeulYRFzblXZ/XCKUwUqv8yp2p1s5HgBJZWjMklaj56qOevZtNd1YzPLCw==
+length: 6487
 -->
