@@ -24,6 +24,12 @@ The workbench offers target-FPS and multiplier modes. X2 / X3 / X4 are requests;
 engine, frame budget, source cadence and display refresh rate determine actual
 presentation. RIFE stream caching is experimental.
 
+For local files, waiting for a model is bounded by the available playout
+runway and at most one output interval. Missed synthetic frames keep the
+original picture, and late results are discarded instead of delaying source
+playback. This fallback preserves playback cadence; it does not guarantee
+the requested multiplier on a slower device.
+
 ## Scaling and super resolution
 
 | Backend | Availability and scope |

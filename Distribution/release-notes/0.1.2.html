@@ -1,0 +1,16 @@
+<meta charset="utf-8">
+<h2>OpenDuckFrame 0.1.2</h2>
+<p>Fixes a local-video playback stall when frame generation cannot keep up.</p>
+<ul>
+<li>Original frames no longer wait indefinitely for the model.</li>
+<li>Missed interpolation deadlines keep the original picture; late results are discarded.</li>
+<li>Engine failures remain visible, and old results do not enter a newly selected video.</li>
+</ul>
+<p>Slow-model timing and file-playback regression checks passed. This release
+does not guarantee X2 output on slower hardware; M1 Pro physical-display and
+audio/video synchronization acceptance are still pending.</p>
+<p>修复本地视频开启插帧后，慢模型阻塞原片播放的问题。补帧赶不上时保留原画，
+迟到结果会被丢弃；真实引擎错误仍会报告。已完成限速模拟与相关回归，
+不代表算力不足时仍能达到所选倍率，M1 Pro 真机屏幕与音画同步尚未验收。</p>
+<p>This community build uses an ad-hoc code signature and signed update metadata.
+It is <strong>not Apple notarized</strong>.</p>

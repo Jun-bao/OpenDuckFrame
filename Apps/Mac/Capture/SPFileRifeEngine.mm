@@ -20,13 +20,21 @@ static CVPixelBufferRef SPFileRifeCreate(int w,int h,OSType format){
     uint64_t _epoch;
     BOOL _ready;
     int _width,_height;
+    CVPixelBufferRef _cachedSource,_cachedRGB;
+    int64_t _cachedPTS;
+    uint64_t _cachedIdentity,_nextIdentity;
 }
 - (instancetype)initWithModelID:(NSString *)modelID quality:(NSString *)quality {return [self initWithModelID:modelID quality:quality resourceBundle:NSBundle.mainBundle];}
 - (instancetype)initWithModelID:(NSString *)modelID quality:(NSString *)quality resourceBundle:(NSBundle *)bundle {
     if(!(self=[super init]))return nil;_resourceBundle=bundle;_modelID=[modelID copy];_quality=[quality copy];_queue=dispatch_queue_create("app.openduckframe.file-rife",DISPATCH_QUEUE_SERIAL);_busy.store(false);return self;
 }
-- (void)dealloc {[_bridge invalidate];if(_toRGB)CFRelease(_toRGB);if(_toNV12)CFRelease(_toNV12);}
-- (void)invalidate {@synchronized(self){_epoch++;_ready=NO;}[_bridge invalidate];}
+- (void)clearInputCache {
+    if(_cachedSource)CVPixelBufferRelease(_cachedSource);
+    if(_cachedRGB)CVPixelBufferRelease(_cachedRGB);
+    _cachedSource=NULL;_cachedRGB=NULL;_cachedIdentity=0;
+}
+- (void)dealloc {[_bridge invalidate];[self clearInputCache];if(_toRGB)CFRelease(_toRGB);if(_toNV12)CFRelease(_toNV12);}
+- (void)invalidate {@synchronized(self){_epoch++;_ready=NO;}[_bridge invalidate];dispatch_async(_queue,^{[self clearInputCache];});}
 - (void)prepareWithSample:(CVPixelBufferRef)sample completion:(void (^)(BOOL, NSString *))completion {
     if(!sample||!completion){if(completion)completion(NO,@"文件视频帧尚未就绪。");return;}
     CVPixelBufferRetain(sample);uint64_t seen;@synchronized(self){seen=_epoch;}
@@ -44,6 +52,8 @@ static CVPixelBufferRef SPFileRifeCreate(int w,int h,OSType format){
         NSError *error=nil;SPRifeBridge *bridge=[[SPRifeBridge alloc] initWithResourceBundle:self->_resourceBundle];
         BOOL prepared=[bridge prepareModelID:self->_modelID quality:self->_quality width:w height:h error:&error];
         if(!prepared){CVPixelBufferRelease(sample);completion(NO,error.localizedDescription?:@"RIFE 模型准备失败。");return;}
+        bridge.liveStreamEnabled=YES;
+        [self clearInputCache];
         if(VTPixelTransferSessionCreate(NULL,&self->_toRGB)!=noErr||VTPixelTransferSessionCreate(NULL,&self->_toNV12)!=noErr){[bridge invalidate];CVPixelBufferRelease(sample);completion(NO,@"RIFE 色彩转换准备失败。");return;}
         @synchronized(self){if(seen!=self->_epoch){[bridge invalidate];CVPixelBufferRelease(sample);completion(NO,@"准备已取消，原设置保持不变。");return;}self->_bridge=bridge;self->_width=w;self->_height=h;self->_ready=YES;}
         BOOL submitted=[self submitPrevious:sample current:sample previousPTSUs:0 currentPTSUs:33333 phases:@[@0.5] token:1 completion:^(uint64_t token,NSArray<SPOwnedPixelBuffer *> *out,double latency,NSError *failure){
@@ -59,7 +69,7 @@ static CVPixelBufferRef SPFileRifeCreate(int w,int h,OSType format){
     if(_busy.exchange(true))return NO;
     CVPixelBufferRetain(previous);CVPixelBufferRetain(current);
     dispatch_async(_queue,^{
-        void (^fail)(NSError *)=^(NSError *error){CVPixelBufferRelease(previous);CVPixelBufferRelease(current);self->_busy.store(false);completion(token,nil,0,error);};
+        void (^fail)(NSError *)=^(NSError *error){[self clearInputCache];CVPixelBufferRelease(previous);CVPixelBufferRelease(current);self->_busy.store(false);completion(token,nil,0,error);};
         OSType format=CVPixelBufferGetPixelFormatType(previous);
         CFTypeRef m1=CVBufferCopyAttachment(previous,kCVImageBufferYCbCrMatrixKey,NULL),m2=CVBufferCopyAttachment(current,kCVImageBufferYCbCrMatrixKey,NULL);
         CFTypeRef p1=CVBufferCopyAttachment(previous,kCVImageBufferColorPrimariesKey,NULL),p2=CVBufferCopyAttachment(current,kCVImageBufferColorPrimariesKey,NULL);
@@ -75,12 +85,20 @@ static CVPixelBufferRef SPFileRifeCreate(int w,int h,OSType format){
         if(!compatible||!SPConfigureFileColorTransfer(self->_toNV12,previous,YES)||
            VTSessionSetProperty(self->_toRGB,kVTPixelTransferPropertyKey_DestinationColorPrimaries,kCVImageBufferColorPrimaries_ITU_R_709_2)!=noErr||
            VTSessionSetProperty(self->_toRGB,kVTPixelTransferPropertyKey_DestinationTransferFunction,kCVImageBufferTransferFunction_ITU_R_709_2)!=noErr){fail(SPFileRifeError(1,@"RIFE 帧对的格式或色彩信息不兼容。"));return;}
-        CVPixelBufferRef a=SPFileRifeCreate(self->_width,self->_height,kCVPixelFormatType_32BGRA),b=SPFileRifeCreate(self->_width,self->_height,kCVPixelFormatType_32BGRA);
+        // Consecutive pairs share the same immutable original. Keep only that
+        // original and its converted input so the bridge can reuse its features.
+        // A seek, skipped source, or changed PTS starts a fresh stream pair.
+        const BOOL cached=self->_cachedSource==previous && self->_cachedPTS==previousPTSUs;
+        const uint64_t previousIdentity=cached?self->_cachedIdentity:++self->_nextIdentity;
+        const uint64_t currentIdentity=++self->_nextIdentity;
+        CVPixelBufferRef a=cached?CVPixelBufferRetain(self->_cachedRGB):SPFileRifeCreate(self->_width,self->_height,kCVPixelFormatType_32BGRA),b=SPFileRifeCreate(self->_width,self->_height,kCVPixelFormatType_32BGRA);
         if(!a||!b){if(a)CVPixelBufferRelease(a);if(b)CVPixelBufferRelease(b);fail(SPFileRifeError(2,@"RIFE 输入画面分配失败。"));return;}
         for(CVPixelBufferRef rgb:{a,b}){CVBufferSetAttachment(rgb,kCVImageBufferColorPrimariesKey,kCVImageBufferColorPrimaries_ITU_R_709_2,kCVAttachmentMode_ShouldPropagate);CVBufferSetAttachment(rgb,kCVImageBufferTransferFunctionKey,kCVImageBufferTransferFunction_ITU_R_709_2,kCVAttachmentMode_ShouldPropagate);}
-        if(VTPixelTransferSessionTransferImage(self->_toRGB,previous,a)!=noErr||VTPixelTransferSessionTransferImage(self->_toRGB,current,b)!=noErr){CVPixelBufferRelease(a);CVPixelBufferRelease(b);fail(SPFileRifeError(3,@"RIFE 输入格式转换失败。"));return;}
+        if((!cached&&VTPixelTransferSessionTransferImage(self->_toRGB,previous,a)!=noErr)||VTPixelTransferSessionTransferImage(self->_toRGB,current,b)!=noErr){CVPixelBufferRelease(a);CVPixelBufferRelease(b);fail(SPFileRifeError(3,@"RIFE 输入格式转换失败。"));return;}
         for(CVPixelBufferRef rgb:{a,b}){CVBufferSetAttachment(rgb,kCVImageBufferColorPrimariesKey,kCVImageBufferColorPrimaries_ITU_R_709_2,kCVAttachmentMode_ShouldPropagate);CVBufferSetAttachment(rgb,kCVImageBufferTransferFunctionKey,kCVImageBufferTransferFunction_ITU_R_709_2,kCVAttachmentMode_ShouldPropagate);CVBufferRemoveAttachment(rgb,kCVImageBufferYCbCrMatrixKey);}
-        BOOL accepted=[bridge submitPrevious:a current:b timesteps:phases token:token completion:^(uint64_t callbackToken,NSArray<SPOwnedPixelBuffer *> *outputs,double latency,NSError *error){
+        BOOL accepted=[bridge submitLivePrevious:a current:b previousID:previousIdentity currentID:currentIdentity
+            previousPTS:CMTimeMake(previousPTSUs,1000000) currentPTS:CMTimeMake(currentPTSUs,1000000)
+            generation:seen clockEpoch:seen timesteps:phases token:token completion:^(uint64_t callbackToken,NSArray<SPOwnedPixelBuffer *> *outputs,double latency,NSError *error){
             (void)callbackToken;dispatch_async(self->_queue,^{
                 NSMutableArray<SPOwnedPixelBuffer *> *converted=[NSMutableArray array];
                 NSError *failure=error;
@@ -94,6 +112,11 @@ static CVPixelBufferRef SPFileRifeCreate(int w,int h,OSType format){
                         if(result!=noErr){CVPixelBufferRelease(nv);failure=SPFileRifeError(5,@"RIFE 输出格式转换失败。");break;}
                         [converted addObject:[[SPOwnedPixelBuffer alloc] initWithBufferNoCopy:nv]];
                     }
+                }
+                [self clearInputCache];
+                if(!stale&&!failure&&converted.count==phases.count){
+                    self->_cachedSource=CVPixelBufferRetain(current);self->_cachedRGB=CVPixelBufferRetain(b);
+                    self->_cachedPTS=currentPTSUs;self->_cachedIdentity=currentIdentity;
                 }
                 CVPixelBufferRelease(a);CVPixelBufferRelease(b);CVPixelBufferRelease(previous);CVPixelBufferRelease(current);self->_busy.store(false);
                 if(stale)failure=SPFileRifeError(6,@"RIFE 结果属于旧会话。");

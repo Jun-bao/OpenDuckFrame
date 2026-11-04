@@ -66,6 +66,30 @@ enum AppLanguage { static var current: String? { nil }; static func effectiveLan
   try FileManager.default.createDirectory(at:temp,withIntermediateDirectories:true)
   defer { try? FileManager.default.removeItem(at:temp) }
   EnhancementProfileStore.testDirectory=temp
+  func hasDefaultEnhancement(_ p: EnhancementProfile) -> Bool {
+   p.interpolationEnabled && p.interpolationEngineID == "rife.metal" && p.modelID == "rife-v4.25" &&
+    p.interpolationQuality == "fast" && p.rifeStreamEnabled && p.rate == .multiplier(2) &&
+    !p.scaleEnabled && p.windowOutputMode == "follow"
+  }
+  precondition(hasDefaultEnhancement(EnhancementProfileStore.load()))
+  try Data("invalid".utf8).write(to: EnhancementProfileStore.fileURL())
+  precondition(hasDefaultEnhancement(EnhancementProfileStore.load()))
+  var defaultPreset = EnhancementProfile(); defaultPreset.interpolationEnabled = false
+  defaultPreset.interpolationEngineID = "apple.frc"; defaultPreset.interpolationQuality = "quality"
+  defaultPreset.modelID = "vt.frc.quality"; defaultPreset.rifeStreamEnabled = false
+  defaultPreset.rate = .multiplier(3); defaultPreset.scaleEnabled = true; defaultPreset.windowOutputMode = "viewer"
+  applyDefaultPreset(&defaultPreset)
+  precondition(hasDefaultEnhancement(defaultPreset))
+  var userOverride = EnhancementProfile(); userOverride.interpolationEnabled = false; userOverride.rifeStreamEnabled = false
+  try EnhancementProfileStore.save(userOverride)
+  precondition(EnhancementProfileStore.load() == userOverride)
+  var copiedConfig = EnhancementProfileStore.load(); copiedConfig.configName = "复制设置"; copiedConfig.configID = "custom:复制设置"
+  try EnhancementProfileStore.saveNamed(copiedConfig)
+  precondition(EnhancementProfileStore.loadNamed("复制设置") == copiedConfig && !copiedConfig.rifeStreamEnabled)
+  var legacy = try JSONSerialization.jsonObject(with: JSONEncoder().encode(userOverride)) as! [String: Any]
+  legacy.removeValue(forKey: "rifeStreamEnabled")
+  let decodedLegacy = EnhancementProfileStore.decode(try JSONSerialization.data(withJSONObject: legacy), fallbackName: "legacy")!
+  precondition(!decodedLegacy.rifeStreamEnabled && !decodedLegacy.interpolationEnabled)
   var native=EnhancementProfile(); native.interpolationEngineID="apple.lowlatency"; native.scaleEnabled=true; native.outputWidth=1920; native.outputHeight=1080
   applyNativeQualityPreset(&native)
   precondition(native.interpolationEnabled && native.interpolationEngineID == "apple.frc" && native.modelID == "vt.frc.quality" && native.interpolationQuality == "quality" && native.rate == .multiplier(2) && !native.scaleEnabled && native.outputWidth == 0 && native.outputHeight == 0)

@@ -579,10 +579,10 @@ struct EnhancementProfile: Codable, Equatable {
     var sourceKind = "window"
     var sourceTitle = ""
     var sourceBundleIdentifier = ""
-    var interpolationEnabled = false
-    var interpolationEngineID = "apple.frc"
-    var interpolationQuality = "normal"
-    var rifeStreamEnabled = false
+    var interpolationEnabled = true
+    var interpolationEngineID = "rife.metal"
+    var interpolationQuality = "fast"
+    var rifeStreamEnabled = true
     var rate = RateRequest.multiplier(2)
     var scaleEnabled = false
     var scaleEngineID = "lanczos"
@@ -602,12 +602,24 @@ struct EnhancementProfile: Codable, Equatable {
     var captureLimit = "auto"
     var configName = "默认"
     var configID: String? = nil
-    var modelID = "vt.frc.normal"
+    var modelID = "rife-v4.25"
     var recents: [RecentEnhancementSource] = []
 
     var sourceWindowResizeActive: Bool {
         sourceKind == "window" && scaleEnabled && sourceWindowPreset != 0
     }
+}
+
+private func applyDefaultPreset(_ profile: inout EnhancementProfile) {
+    let defaults = EnhancementProfile()
+    profile.interpolationEnabled = defaults.interpolationEnabled
+    profile.interpolationEngineID = defaults.interpolationEngineID
+    profile.interpolationQuality = defaults.interpolationQuality
+    profile.rifeStreamEnabled = defaults.rifeStreamEnabled
+    profile.modelID = defaults.modelID
+    profile.rate = defaults.rate
+    profile.scaleEnabled = defaults.scaleEnabled
+    profile.windowOutputMode = defaults.windowOutputMode
 }
 
 enum EnhancementProfileStore {
@@ -2160,12 +2172,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             profile.outputWidth = 1920
             profile.outputHeight = 1080
         default:
-            profile.interpolationEnabled = true
-            profile.interpolationEngineID = "apple.frc"
-            profile.interpolationQuality = "normal"
-            profile.modelID = "vt.frc.normal"
-            profile.rate = .multiplier(2)
-            profile.scaleEnabled = false
+            applyDefaultPreset(&profile)
         }
     }
 

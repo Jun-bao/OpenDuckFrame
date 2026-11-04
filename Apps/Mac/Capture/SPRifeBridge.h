@@ -24,7 +24,7 @@ static const NSInteger SPRifeBridgeErrorOutputPoolExhausted = 10;
              timesteps:(NSArray<NSNumber *> *)timesteps
                  token:(uint64_t)token
             completion:(SPFRCPhasesCompletion)completion;
-/// Live-only opt-in path. Identities and epochs identify immutable source frames.
+/// Streaming opt-in path. Identities and epochs identify immutable source frames.
 - (BOOL)submitLivePrevious:(CVPixelBufferRef)previous current:(CVPixelBufferRef)current
                previousID:(uint64_t)previousID currentID:(uint64_t)currentID
               previousPTS:(CMTime)previousPTS currentPTS:(CMTime)currentPTS

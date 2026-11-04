@@ -55,6 +55,7 @@ struct SPBudgetEntry {
     // File cadence adaptation: output schedule is attached to the original
     // pair and never uses a previously generated frame as model input.
     bool scheduledSource = true;
+    bool sourceEmitted = false;
     bool usesFileCadence = false;
     std::vector<SPFileCadenceEvent> scheduledBetween;
     std::vector<CVPixelBufferRef> generatedBetween;
@@ -503,7 +504,7 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
     }
     e.generatedBetween.clear();
     if (e.buffer) {
-        if (returning) { _returned.push_back({e.buffer, e.ptsUs, e.generation}); _returnedNonEmpty.store(true, std::memory_order_release); }
+        if (returning && !e.sourceEmitted) { _returned.push_back({e.buffer, e.ptsUs, e.generation}); _returnedNonEmpty.store(true, std::memory_order_release); }
         else CVPixelBufferRelease(e.buffer);
         e.buffer = nullptr;
     }
@@ -560,6 +561,12 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
         ? (1000000.0 * _activeFileRate.fps.den / _activeFileRate.fps.num) / rate
         : sourceInterval / (std::max(_activeFileRate.multiplier, 2) * rate);
     const int64_t runway = spBudgetRunwayUs(depth, (int64_t)llround(outputInterval)) - 10000;
+    if (_activeFileProvider) {
+        // A slow file model must not spend successive source-frame intervals
+        // blocking originals. Give this pair at most one output slot, within
+        // the queued runway; a late result is discarded by its pair state.
+        return std::max<int64_t>(0, std::min<int64_t>(runway, (int64_t)llround(outputInterval) - 2000));
+    }
     const double latency = _engine ? _engine.latencyEstimateSec : 0.15;
     const int64_t remaining = e.submitUs + (int64_t)(latency * 1e6) - spNowUs() + 15000;
     return std::max<int64_t>(0, std::min<int64_t>({runway, remaining, 150000}));
@@ -601,26 +608,47 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
                 continue;
             }
         }
+        // Publish the ready original before spending any budget on its model
+        // result. Retain the ring's copy for inference and comparison; reset
+        // must not reinject an original already owned by the output queue.
+        if (_activeFileProvider && _ring.front().usesFileCadence && _ring.front().scheduledSource &&
+            !_ring.front().sourceEmitted && _ring.size() >= 2 && _ring.front().pair.eligible && !_ring.front().chainEnd) {
+            const auto &head = _ring.front();
+            CVPixelBufferRef original = CVPixelBufferRetain(head.buffer);
+            const int64_t pts = head.ptsUs, generation = head.generation;
+            const uint64_t epoch = head.epoch, interrupt = head.interruptGeneration;
+            lk.unlock();
+            const PushResult result = _enqueue(original, pts, generation, NO, NO, NULL, pts, epoch, interrupt);
+            if (result != PushResult::Pushed) CVPixelBufferRelease(original);
+            lk.lock();
+            if (result == PushResult::Pushed) _ring.front().sourceEmitted = true;
+            else {
+                if (result == PushResult::Interrupted) _emitterPaused = true;
+                else {
+                    SPBudgetEntry closed = std::move(_ring.front()); _ring.pop_front();
+                    [self releaseEntryLocked:closed returning:NO];
+                }
+                _emitterBusy = false; _cv.notify_all(); continue;
+            }
+        }
         CVPixelBufferRef synth = nullptr;
         bool covered = false;
         {
             SPBudgetEntry &head = _ring.front();
             const bool hasPair = _ring.size() >= 2 && head.pair.eligible && !head.chainEnd;
             if (hasPair) {
-                if (_activeFileProvider && (head.pair.state == SPBudgetPairState::Idle || head.pair.state == SPBudgetPairState::InFlight)) {
-                    const uint64_t seq=head.seq;
-                    _cv.wait(lk, [&] { return _emitterQuit || _emitterPaused || _ring.empty() || _ring.front().seq!=seq ||
-                        !_activeFileProvider || (_ring.front().pair.state!=SPBudgetPairState::Idle && _ring.front().pair.state!=SPBudgetPairState::InFlight); });
-                    if (_emitterQuit) break;
-                    if (_emitterPaused || _ring.empty() || _ring.front().seq!=seq) { _emitterBusy=false;_cv.notify_all();continue; }
-                }
-                if (head.pair.state == SPBudgetPairState::InFlight) {
+                const bool waitingForFile = _activeFileProvider &&
+                    (head.pair.state == SPBudgetPairState::Idle || head.pair.state == SPBudgetPairState::InFlight);
+                if (waitingForFile || head.pair.state == SPBudgetPairState::InFlight) {
                     const int64_t waitUs = [self boundedWaitUsForEntry:head];
                     if (waitUs > 0) {
                         const uint64_t seq = head.seq;
                         _cv.wait_for(lk, std::chrono::microseconds(waitUs), [&] {
                             return _emitterQuit || _emitterPaused || _ring.empty() || _ring.front().seq != seq ||
-                                   _ring.front().pair.state != SPBudgetPairState::InFlight;
+                                   (waitingForFile ? (!_activeFileProvider ||
+                                       (_ring.front().pair.state != SPBudgetPairState::Idle &&
+                                        _ring.front().pair.state != SPBudgetPairState::InFlight)) :
+                                       _ring.front().pair.state != SPBudgetPairState::InFlight);
                         });
                         if (_emitterQuit) break;
                         if (_emitterPaused || _ring.empty() || _ring.front().seq != seq) {
@@ -635,7 +663,8 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
                     covered = true;
                     if (h.synth) { synth = h.synth; h.synth = nullptr; }
                 } else {
-                    if (h.pair.state == SPBudgetPairState::Planned || h.pair.state == SPBudgetPairState::InFlight) _pairsMissed++;
+                    if (h.pair.state == SPBudgetPairState::Planned || h.pair.state == SPBudgetPairState::InFlight ||
+                        (waitingForFile && h.pair.state == SPBudgetPairState::Idle)) _pairsMissed++;
                     h.pair.state = SPBudgetPairState::Skipped;
                 }
                 _coverageWindow.push_back(covered ? 1 : 0);
@@ -672,8 +701,9 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
 
         if (e.usesFileCadence) {
             CVPixelBufferRef base = CVPixelBufferRetain(e.buffer);
+            if (e.sourceEmitted) { CVPixelBufferRelease(e.buffer); e.buffer = nullptr; }
             PushResult sourceResult = PushResult::Pushed;
-            if (e.scheduledSource) {
+            if (e.scheduledSource && !e.sourceEmitted) {
                 sourceResult = _enqueue(e.buffer, e.ptsUs, e.generation, NO, NO, NULL, e.ptsUs, e.epoch, e.interruptGeneration);
                 if (sourceResult == PushResult::Pushed) e.buffer = nullptr;
             }
@@ -1600,6 +1630,9 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
         _fileProviderBusy=false;
         current=provider==_activeFileProvider;
         if(current && generation==_live.generation->load() && policy==_live.policyEpoch->load()) {
+            // A deadline can retire the pair before its callback. A current
+            // provider's real failure must still be reported and stop retries.
+            if(error){_fileProviderFailed=true;_publishedActive=NO;failed=YES;}
             for(auto &entry:_ring) {
                 if(entry.seq!=token || entry.generation!=generation || entry.epoch!=policy || entry.pair.state!=SPBudgetPairState::InFlight)continue;
                 size_t required=0;for(const auto &event:entry.scheduledBetween)if(event.action==SPScheduleAction::Interpolate)++required;

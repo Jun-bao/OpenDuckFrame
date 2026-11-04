@@ -82,7 +82,7 @@ final class SPRifeBridge: NSObject {
                 completion(token, nil, 0, Self.error(1, "RIFE 结果属于旧会话"))
                 return
             }
-            let started = CFAbsoluteTimeGetCurrent()
+            let started = ProcessInfo.processInfo.systemUptime
             let trace = ProcessInfo.processInfo.environment["CHUANFLOW_THROUGHPUT_TRACE"] == "1"
             let log = self.traceLog
             let signpost = trace ? OSSignpostID(log: log) : .invalid
@@ -101,9 +101,10 @@ final class SPRifeBridge: NSObject {
                     Self.attach709IfMissing(buffer)
                     return SPOwnedPixelBuffer(retaining: buffer)
                 }
-                completion(token, owned, max(0, CFAbsoluteTimeGetCurrent() - started), nil)
+                let elapsed = SPPerformanceSimulation.current.finish(started: started)
+                completion(token, owned, elapsed, nil)
             } catch {
-                completion(token, nil, max(0, CFAbsoluteTimeGetCurrent() - started), Self.explain(error))
+                completion(token, nil, max(0, ProcessInfo.processInfo.systemUptime - started), Self.explain(error))
             }
         }
         return true
@@ -126,7 +127,7 @@ final class SPRifeBridge: NSObject {
         guard let engine else { return false }
         exec.async {
             autoreleasepool {
-                let started = CFAbsoluteTimeGetCurrent()
+                let started = ProcessInfo.processInfo.systemUptime
                 let trace = ProcessInfo.processInfo.environment["CHUANFLOW_THROUGHPUT_TRACE"] == "1"
                 let log = self.traceLog
                 let signpost = trace ? OSSignpostID(log: log) : .invalid
@@ -148,7 +149,7 @@ final class SPRifeBridge: NSObject {
                     return try operation()
                 }
                 func recordTiming(_ bridge: SPRifeBridge) -> Double {
-                    let elapsed = max(0, CFAbsoluteTimeGetCurrent() - started)
+                    let elapsed = SPPerformanceSimulation.current.finish(started: started)
                     bridge.recordStreamTiming(totalMs: elapsed * 1000,
                                               convertMs: convertCalls > 0 ? Double(convertNs) / 1e6 : nil,
                                               pushMs: pushCalls > 0 ? Double(pushNs) / 1e6 : nil,
