@@ -6,6 +6,33 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>OpenDuckFrame</title>
         <item>
+            <title>0.1.2</title>
+            <pubDate>Wed, 04 Nov 2026 19:09:32 +0800</pubDate>
+            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
+            <sparkle:version>4</sparkle:version>
+            <sparkle:shortVersionString>0.1.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<meta charset="utf-8">
+<h2>OpenDuckFrame 0.1.2</h2>
+<p>Fixes a local-video playback stall when frame generation cannot keep up.</p>
+<ul>
+<li>Original frames no longer wait indefinitely for the model.</li>
+<li>Missed interpolation deadlines keep the original picture; late results are discarded.</li>
+<li>Engine failures remain visible, and old results do not enter a newly selected video.</li>
+</ul>
+<p>Slow-model timing and file-playback regression checks passed. This release
+does not guarantee X2 output on slower hardware; M1 Pro physical-display and
+audio/video synchronization acceptance are still pending.</p>
+<p>修复本地视频开启插帧后，慢模型阻塞原片播放的问题。补帧赶不上时保留原画，
+迟到结果会被丢弃；真实引擎错误仍会报告。已完成限速模拟与相关回归，
+不代表算力不足时仍能达到所选倍率，M1 Pro 真机屏幕与音画同步尚未验收。</p>
+<p>This community build uses an ad-hoc code signature and signed update metadata.
+It is <strong>not Apple notarized</strong>.</p>
+]]></description>
+            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.1.2/OpenDuckFrame-0.1.2.zip" length="42463396" type="application/octet-stream" sparkle:edSignature="MunJ/wHoUMUdnG50VDYAek1qLFuTqRLm+ET/0U2YkEVtIOFe2CapdXGh5MwpyuYCshl/Y5aakQcVdsGT3efaDw=="/>
+        </item>
+        <item>
             <title>0.1.1</title>
             <pubDate>Wed, 04 Nov 2026 15:41:13 +0800</pubDate>
             <link>https://github.com/Jun-bao/OpenDuckFrame</link>
@@ -63,6 +90,6 @@ No Apple security settings are changed by the installer.</p>
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: lPqoOMSlLyrdd9zjSIwKdL/tmvg0ehNXOTD64+jknC4FDIUBY1qDfcikhqKhh89DodwdValulBJEiCFXAMmNBw==
-length: 4082
+edSignature: BqHRG5+30cJfkN0/r1xOhR7RPgslYg00g1bxwX3kQ6iDWeJQdwFfAeBvSNQ7TnZO2M5UOqYjVWP/SxmUmOsdCQ==
+length: 5954
 -->
