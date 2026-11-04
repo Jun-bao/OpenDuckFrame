@@ -19,6 +19,12 @@ when macOS requests it. Video-file playback does not need capture permission.
 
 ## Start with a simple setup
 
+On a fresh installation, frame generation is enabled with RIFE 4.25, fast
+quality, RIFE stream cache enabled, and X2 rate. Window output follows the
+source, and scaling is off. The stream cache applies to live capture only.
+Existing saved settings are retained; a new named configuration copies the
+current settings.
+
 1. Select the source and output display.
 2. Start with one enhancement: frame generation at X2, or Lanczos / MetalFX
    scaling. Higher resolutions and multipliers require more processing time.

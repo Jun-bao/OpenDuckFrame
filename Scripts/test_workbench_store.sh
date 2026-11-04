@@ -12,5 +12,5 @@ prefix=source[:source.index('final class EnhancementWorkbenchController:')]
 test=(root/'Modules/VideoEnhancement/Tests/SPWorkbenchStoreTests.swift').read_text()
 pathlib.Path(sys.argv[2]).write_text(prefix+'\n'+test)
 PY
-xcrun swiftc -parse-as-library "$TEST_DIR/source.swift" -o "$TEST_DIR/test"
+xcrun swiftc -parse-as-library "$ROOT/Apps/Mac/UI/Enhancement/LiveFPSOverlay.swift" "$TEST_DIR/source.swift" -o "$TEST_DIR/test"
 "$TEST_DIR/test"
