@@ -55,6 +55,7 @@ struct SPBudgetEntry {
     // File cadence adaptation: output schedule is attached to the original
     // pair and never uses a previously generated frame as model input.
     bool scheduledSource = true;
+    bool sourceEmitted = false;
     bool usesFileCadence = false;
     std::vector<SPFileCadenceEvent> scheduledBetween;
     std::vector<CVPixelBufferRef> generatedBetween;
@@ -503,7 +504,7 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
     }
     e.generatedBetween.clear();
     if (e.buffer) {
-        if (returning) { _returned.push_back({e.buffer, e.ptsUs, e.generation}); _returnedNonEmpty.store(true, std::memory_order_release); }
+        if (returning && !e.sourceEmitted) { _returned.push_back({e.buffer, e.ptsUs, e.generation}); _returnedNonEmpty.store(true, std::memory_order_release); }
         else CVPixelBufferRelease(e.buffer);
         e.buffer = nullptr;
     }
@@ -607,6 +608,29 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
                 continue;
             }
         }
+        // Publish the ready original before spending any budget on its model
+        // result. Retain the ring's copy for inference and comparison; reset
+        // must not reinject an original already owned by the output queue.
+        if (_activeFileProvider && _ring.front().usesFileCadence && _ring.front().scheduledSource &&
+            !_ring.front().sourceEmitted && _ring.size() >= 2 && _ring.front().pair.eligible && !_ring.front().chainEnd) {
+            const auto &head = _ring.front();
+            CVPixelBufferRef original = CVPixelBufferRetain(head.buffer);
+            const int64_t pts = head.ptsUs, generation = head.generation;
+            const uint64_t epoch = head.epoch, interrupt = head.interruptGeneration;
+            lk.unlock();
+            const PushResult result = _enqueue(original, pts, generation, NO, NO, NULL, pts, epoch, interrupt);
+            if (result != PushResult::Pushed) CVPixelBufferRelease(original);
+            lk.lock();
+            if (result == PushResult::Pushed) _ring.front().sourceEmitted = true;
+            else {
+                if (result == PushResult::Interrupted) _emitterPaused = true;
+                else {
+                    SPBudgetEntry closed = std::move(_ring.front()); _ring.pop_front();
+                    [self releaseEntryLocked:closed returning:NO];
+                }
+                _emitterBusy = false; _cv.notify_all(); continue;
+            }
+        }
         CVPixelBufferRef synth = nullptr;
         bool covered = false;
         {
@@ -677,8 +701,9 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
 
         if (e.usesFileCadence) {
             CVPixelBufferRef base = CVPixelBufferRetain(e.buffer);
+            if (e.sourceEmitted) { CVPixelBufferRelease(e.buffer); e.buffer = nullptr; }
             PushResult sourceResult = PushResult::Pushed;
-            if (e.scheduledSource) {
+            if (e.scheduledSource && !e.sourceEmitted) {
                 sourceResult = _enqueue(e.buffer, e.ptsUs, e.generation, NO, NO, NULL, e.ptsUs, e.epoch, e.interruptGeneration);
                 if (sourceResult == PushResult::Pushed) e.buffer = nullptr;
             }

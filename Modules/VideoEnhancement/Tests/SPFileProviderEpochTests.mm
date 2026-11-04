@@ -40,6 +40,12 @@ int main(){@autoreleasepool{
     bool submitted=push(0,1)&&push(41667,1);if(three)submitted &=push(83334,1);for(int i=0;i<100&&gStarted.load()<1;i++)usleep(10000);bool oldStarted=gStarted.load()==1;
     bool sourceUnblocked=false;
     for(int i=0;i<20&&!sourceUnblocked;i++){{std::lock_guard<std::mutex> l(lock);sourceUnblocked=!gens.empty()&&gInflight.load()==1;}if(!sourceUnblocked)usleep(5000);}
+    [g applyModeReset:SPFrameInterpolationModeDoubleRate];
+    __block bool noDuplicateReturn=true;
+    [g drainReturnedFramesWithHandler:^(CVPixelBufferRef b,int64_t pts,int64_t gen){
+        if(gen==1&&pts==0)noDuplicateReturn=false;
+        CVPixelBufferRelease(b);
+    }];
     // Keep the old 300 ms job in flight across reset, then allow subsequent
     // jobs to finish within the playout budget. Success is still required.
     provider.delayMs=5;
@@ -64,6 +70,6 @@ int main(){@autoreleasepool{
     running.store(false);[g applyModeReset:SPFrameInterpolationModeOff];[g shutdown];
     bool threeGood=!three || (gThreeChecks.load()>=4 && gThreeFailures.load()==0 && chainResetSafe);
     bool lateIgnored=oldGenerated.load()==0;
-    bool ok=sourceUnblocked&&lateIgnored&&threeGood&&submitted&&oldStarted&&onlyNew&&activePair&&bounded&&explicitFailure;
-    printf("{\"ok\":%s,\"originalBeforeSlowCompletion\":%s,\"lateOldOutputDiscarded\":%s,\"oldInFlight\":%s,\"newGenerationOnly\":%s,\"newGenerationGenerated\":%s,\"oneInFlightAcrossSwitch\":%s,\"failureNoFRCFallback\":%s,\"threeSourceGenerationSafe\":%s,\"threeSourceChecks\":%d,\"chainResetSafe\":%s,\"scope\":\"delayed fake provider lifecycle; no real inference, drawable, file UI or audio\"}\n",ok?"true":"false",sourceUnblocked?"true":"false",lateIgnored?"true":"false",oldStarted?"true":"false",onlyNew?"true":"false",activePair?"true":"false",bounded?"true":"false",explicitFailure?"true":"false",threeGood?"true":"false",gThreeChecks.load(),chainResetSafe?"true":"false");return ok?0:1;
+    bool ok=noDuplicateReturn&&sourceUnblocked&&lateIgnored&&threeGood&&submitted&&oldStarted&&onlyNew&&activePair&&bounded&&explicitFailure;
+    printf("{\"ok\":%s,\"queuedSourceNotReturnedTwice\":%s,\"originalBeforeSlowCompletion\":%s,\"lateOldOutputDiscarded\":%s,\"oldInFlight\":%s,\"newGenerationOnly\":%s,\"newGenerationGenerated\":%s,\"oneInFlightAcrossSwitch\":%s,\"failureNoFRCFallback\":%s,\"threeSourceGenerationSafe\":%s,\"threeSourceChecks\":%d,\"chainResetSafe\":%s,\"scope\":\"delayed fake provider lifecycle; no real inference, drawable, file UI or audio\"}\n",ok?"true":"false",noDuplicateReturn?"true":"false",sourceUnblocked?"true":"false",lateIgnored?"true":"false",oldStarted?"true":"false",onlyNew?"true":"false",activePair?"true":"false",bounded?"true":"false",explicitFailure?"true":"false",threeGood?"true":"false",gThreeChecks.load(),chainResetSafe?"true":"false");return ok?0:1;
 }}
