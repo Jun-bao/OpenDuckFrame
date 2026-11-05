@@ -188,9 +188,17 @@ private final class SourceSizeControls {
   var gate=EnhancementCountdown();let first=gate.begin()!;precondition(gate.remaining==3 && gate.begin()==nil)
   precondition(gate.tick(first)==2);gate.cancel();precondition(gate.tick(first)==nil && !gate.active)
   let second=gate.begin()!;precondition(second != first && gate.tick(second)==2 && gate.tick(second)==1 && gate.tick(second)==0 && !gate.active)
+  let delayed=gate.begin(seconds:5)!;precondition(gate.remaining==5 && gate.tick(first)==nil)
+  for remaining in (0...4).reversed() { precondition(gate.tick(delayed)==remaining) }
+  precondition(!gate.active && gate.tick(delayed)==nil)
   let suite="odf-config-contract-"+UUID().uuidString
   let defaults=UserDefaults(suiteName:suite)!
   defer { defaults.removePersistentDomain(forName:suite) }
+  precondition(EnhancementDelayPreference.seconds(in:defaults)==5)
+  EnhancementDelayPreference.set(20,in:defaults)
+  precondition(EnhancementDelayPreference.seconds(in:UserDefaults(suiteName:suite)!)==20)
+  EnhancementDelayPreference.set(99,in:defaults);precondition(EnhancementDelayPreference.seconds(in:defaults)==20)
+  EnhancementDelayPreference.set(0,in:defaults);precondition(EnhancementDelayPreference.seconds(in:defaults)==1)
   EnhancementText.setLanguage("zh",in:defaults);precondition(EnhancementText.language(in:defaults))
   EnhancementText.setLanguage("en",in:defaults);precondition(!EnhancementText.language(in:UserDefaults(suiteName:suite)!))
   FPSPreference.set(true,in:defaults);precondition(FPSPreference.enabled(in:UserDefaults(suiteName:suite)!))
@@ -212,6 +220,17 @@ private final class SourceSizeControls {
   let floatingAux=cgWindow(202,77,7,500,300), transparentAux=cgWindow(203,77,0,300,200,true,0)
   let otherBrowserWindow=cgWindow(102,77,0,1000,700,true,0.65)
   let anotherAppWindow=cgWindow(301,88,0,1000,700)
+  // Choose the active app's foremost normal window, even if a previous source
+  // or a nonactivating countdown panel is ahead of it in the global list.
+  let countdownPanel=cgWindow(900,99,1000,2560,1440)
+  let transient=cgWindow(901,77,0,66,20)
+  precondition(TargetOverlayPolicy.focusedWindow([transient,otherBrowserWindow,targetWindow],frontPID:77,ownPID:99,focusedBounds:CGRect(x:10,y:20,width:1200,height:800))?.id==101)
+  precondition(TargetOverlayPolicy.focusedWindow([countdownPanel,floatingAux,transparentAux,otherBrowserWindow,targetWindow],frontPID:77,ownPID:99)?.id==102)
+  precondition(TargetOverlayPolicy.focusedWindow([targetWindow,anotherAppWindow],frontPID:88,ownPID:99)?.id==301)
+  precondition(TargetOverlayPolicy.focusedWindow([targetWindow],frontPID:99,ownPID:99)==nil)
+  precondition(TargetOverlayPolicy.focusedWindow([targetWindow],frontPID:nil,ownPID:99)==nil)
+  precondition(TargetOverlayPolicy.focusedWindow([targetWindow],frontPID:88,ownPID:99)==nil)
+  precondition(TargetOverlayPolicy.focusedWindow([cgWindow(101,77,0,1200,800,false)],frontPID:77,ownPID:99)==nil)
   func decision(_ windows:[[String:Any]],_ front:pid_t?=77)->TargetOverlayPolicy.WindowDecision {
    TargetOverlayPolicy.evaluateWindow(windows,orderedOnscreen:windows,id:101,owner:77,frontPID:front)
   }

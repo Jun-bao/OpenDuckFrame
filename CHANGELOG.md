@@ -2,6 +2,19 @@
 
 All notable public releases will be documented here.
 
+## 0.3.0 — 2026-11-06
+
+- Add delayed window enhancement: focus a window during the full-screen
+  countdown and start automatically when it ends. Settings preserve a 1–20
+  second countdown, with a 5 second default.
+- Add workbench language and appearance settings alongside the project links.
+- Reduce live RIFE target-FPS inference work by retaining source pictures,
+  scheduling interpolation from timestamps and admitting only jobs within the
+  output budget. Slow jobs fall back to source pictures without inflating the
+  motion-frame counter.
+- Validate 28→60 and 30→60 controlled model scheduling. These queue measurements
+  do not establish physical-display performance or compatibility with every app.
+
 ## 0.1.2 — 2026-11-04
 
 - Bound local-file frame-generation waits so a slow model no longer holds up

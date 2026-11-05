@@ -24,6 +24,13 @@ The workbench offers target-FPS and multiplier modes. X2 / X3 / X4 are requests;
 engine, frame budget, source cadence and display refresh rate determine actual
 presentation. RIFE stream caching is experimental.
 
+For live RIFE target-FPS mode, original pictures fill nearby output slots and
+only the remaining slots need model inference. Interpolation phases follow the
+source timestamps rather than a rounded integer multiplier. Jobs that cannot
+finish within their output budget are skipped; original-picture fallbacks keep
+playback moving, and repeated pictures do not count as new motion in the FPS
+overlay. Actual presentation remains limited by the Mac and display.
+
 For local files, waiting for a model is bounded by the available playout
 runway and at most one output interval. Missed synthetic frames keep the
 original picture, and late results are discarded instead of delaying source

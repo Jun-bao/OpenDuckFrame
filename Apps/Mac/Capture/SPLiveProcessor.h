@@ -222,6 +222,8 @@ FOUNDATION_EXPORT BOOL SPLiveCanPrepareMetalFX(int width, int height);
 + (NSDictionary<NSString *, id> *)runSourceSizeLifecycleContract;
 /// Deterministic source clock, phase deadlines and stale-work contract.
 + (NSDictionary<NSString *, id> *)runSourceClockSchedulingContract;
++ (NSDictionary<NSString *, id> *)runFixedRateContract;
++ (NSDictionary<NSString *, id> *)runFixedRateModelProbeWithBundle:(NSBundle *)bundle;
 + (NSDictionary<NSString *, id> *)runPendingReplacementContract;
 + (NSDictionary<NSString *, id> *)runRejectedPTSContract;
 + (NSDictionary<NSString *, id> *)runPresentationBudgetContract;

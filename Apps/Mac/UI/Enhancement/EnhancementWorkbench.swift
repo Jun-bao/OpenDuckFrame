@@ -171,9 +171,9 @@ struct EnhancementCountdown {
     private(set) var token: UInt64 = 0
     private(set) var remaining = 0
     var active: Bool { remaining > 0 }
-    mutating func begin() -> UInt64? {
+    mutating func begin(seconds: Int = 3) -> UInt64? {
         guard !active else { return nil }
-        token &+= 1; remaining = 3; return token
+        token &+= 1; remaining = seconds; return token
     }
     mutating func cancel() { token &+= 1; remaining = 0 }
     mutating func tick(_ candidate: UInt64) -> Int? {
@@ -187,6 +187,17 @@ enum FPSPreference {
     private static let key = "OpenDuckFrameShowFPS"
     static func enabled(in defaults: UserDefaults) -> Bool { defaults.bool(forKey: key) }
     static func set(_ value: Bool, in defaults: UserDefaults) { defaults.set(value, forKey: key) }
+}
+
+enum EnhancementDelayPreference {
+    private static let key = "OpenDuckFrameEnhancementDelaySeconds"
+    static func seconds(in defaults: UserDefaults) -> Int {
+        guard defaults.object(forKey: key) != nil else { return 5 }
+        return min(20, max(1, defaults.integer(forKey: key)))
+    }
+    static func set(_ seconds: Int, in defaults: UserDefaults) {
+        defaults.set(min(20, max(1, seconds)), forKey: key)
+    }
 }
 
 enum FPSPresentation {
@@ -384,6 +395,39 @@ enum TargetOverlayPolicy {
         return WindowMetadata(id: id, owner: owner, layer: layer,
                               onscreen: (item[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue ?? false,
                               alpha: alpha, bounds: bounds, name: item[kCGWindowName as String] as? String)
+    }
+    /// Core Graphics lists windows front to back. Limit selection to the active
+    /// app so a desktop or an app without a window cannot select a window behind it.
+    static func focusedWindow(_ ordered: [[String: Any]], frontPID: pid_t?, ownPID: pid_t, focusedBounds: CGRect? = nil) -> WindowMetadata? {
+        guard let frontPID, frontPID != ownPID else { return nil }
+        let candidates = ordered.compactMap(normalizeWindow).filter {
+            $0.owner == frontPID && $0.layer == 0 && $0.onscreen && ($0.alpha ?? 1) > 0
+        }
+        if let focusedBounds, let focused = candidates.first(where: {
+            abs($0.bounds.minX-focusedBounds.minX)<2 && abs($0.bounds.minY-focusedBounds.minY)<2 &&
+                abs($0.bounds.width-focusedBounds.width)<2 && abs($0.bounds.height-focusedBounds.height)<2
+        }) { return focused }
+        return candidates.first
+    }
+    // Read existing Accessibility access only; selection never requests a new
+    // permission. Window-server ordering remains the fallback when unavailable.
+    static func focusedWindowBounds(pid: pid_t) -> CGRect? {
+        guard AXIsProcessTrusted() else { return nil }
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.15)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &value) == .success,
+              let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        let window = unsafeDowncast(value, to: AXUIElement.self)
+        AXUIElementSetMessagingTimeout(window, 0.15)
+        var p: CFTypeRef?, s: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &p) == .success,
+              AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &s) == .success,
+              let p, let s, CFGetTypeID(p) == AXValueGetTypeID(), CFGetTypeID(s) == AXValueGetTypeID() else { return nil }
+        var point = CGPoint.zero, size = CGSize.zero
+        guard AXValueGetValue(unsafeDowncast(p, to: AXValue.self), .cgPoint, &point),
+              AXValueGetValue(unsafeDowncast(s, to: AXValue.self), .cgSize, &size) else { return nil }
+        return CGRect(origin: point, size: size)
     }
     static func evaluateWindow(_ allWindows: [[String: Any]], orderedOnscreen: [[String: Any]]?, id: CGWindowID, owner: pid_t, frontPID: pid_t?) -> WindowDecision {
         guard let rawTarget = allWindows.first(where: { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == id }) else {
@@ -1049,6 +1093,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let languageControl = NSSegmentedControl(labels: ["中文", "English", "More"], trackingMode: .selectOne, target: nil, action: nil)
     private let languageDetail = NSTextField(wrappingLabelWithString: "")
     private var settingsWindow: NSWindow?
+    private let enhancementDelayPopup = NSPopUpButton()
     private let configRows = NSStackView()
     private let captureCapPopup = NSPopUpButton()
     private let recentStack = NSStackView()
@@ -1123,6 +1168,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private var countdown = EnhancementCountdown()
     private var countdownTimer: Timer?
     private var countdownSourceGeneration: UInt64?
+    private var delayedWindowSelection = false
+    private var startImmediatelyAfterPreparation = false
+    private var screenCountdownPanels: [NSPanel] = []
+    private var screenCountdownLabels: [NSTextField] = []
     private let previewCountdown = NSTextField(labelWithString: "")
     private let outputCountdown = NSTextField(labelWithString: "")
 
@@ -1257,8 +1306,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func updateCountdownDisplay() {
-        let showing = countdown.active && !sourceWindowPreparing
+        let showing = countdown.active && !sourceWindowPreparing && !delayedWindowSelection && !startImmediatelyAfterPreparation
         let text = showing ? "\(countdown.remaining)" : ""
+        for label in screenCountdownLabels { label.stringValue = "\(countdown.remaining)" }
         for label in [previewCountdown, outputCountdown] {
             label.stringValue = text
             label.isHidden = !showing
@@ -1270,11 +1320,16 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         for player in NSApp.windows.compactMap({ $0.contentViewController as? PlayerViewController }) {
             player.setWorkbenchCountdown(text, enabled: showing && player === selected)
         }
-        if countdown.active { startButton?.title = sourceWindowPreparing ? EnhancementText.t("Preparing…", "准备中…") : text }
+        if delayedWindowSelection || startImmediatelyAfterPreparation { refreshActions() }
+        else if countdown.active { startButton?.title = sourceWindowPreparing ? EnhancementText.t("Preparing…", "准备中…") : text }
         else { refreshActions() }
     }
 
     private func cancelCountdown() {
+        let wasActive = countdown.active || delayedWindowSelection || startImmediatelyAfterPreparation
+        delayedWindowSelection = false
+        startImmediatelyAfterPreparation = false
+        hideScreenCountdown()
         if let player = fileOutputPlayer {
             fileOutputToken &+= 1
             fileOutputPlayer = nil
@@ -1290,7 +1345,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         sourceWindowPreparing = false
         sourceWindowConfirmedAfter = 0; sourceWindowConfirmedTarget = nil; sourceWindowConfirmedSelection = nil
-        guard countdown.active else { return }
+        guard wasActive else { return }
         recordPlanEvent("countdown_cancelled")
         countdown.cancel()
         countdownTimer?.invalidate()
@@ -1928,8 +1983,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         buttons.spacing = 8
         let pause = button(EnhancementText.t("Pause", "暂停"), #selector(pause))
         pauseButton = pause
-        let again = button(EnhancementText.t("Choose Again", "重选"), #selector(reselect))
-        let start = button(EnhancementText.t("Start Enhancement", "开始增强"), #selector(start), primary: true)
+        let start = button(EnhancementText.t("Delayed Enhancement", "延迟增强"), #selector(start), primary: true)
         let stop = button(EnhancementText.t("Stop", "停止"), #selector(stop), primary: true)
         startButton = start
         stopButton = stop
@@ -1963,7 +2017,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         row.addArrangedSubview(statusColumn)
         row.addArrangedSubview(NSView())
         buttons.addArrangedSubview(pause)
-        buttons.addArrangedSubview(again)
         buttons.addArrangedSubview(start)
         buttons.addArrangedSubview(stop)
         row.addArrangedSubview(buttons)
@@ -2689,7 +2742,13 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             (capture.running && (processor.resolvedPlan.interpolationActive || processor.resolvedPlan.scaleActive || (applied.sourceKind == "window" && applied.windowOutputMode != "follow")))
         startButton?.isHidden = false
         startButton?.isEnabled = !filePreparing
-        startButton?.title = filePreparing ? EnhancementText.t("Preparing…", "准备中…") : (countdown.active ? "\(countdown.remaining)" : (enhancing ? EnhancementText.t("Apply Changes", "应用更改") : EnhancementText.t("Start Enhancement", "开始增强")))
+        if delayedWindowSelection || startImmediatelyAfterPreparation {
+            startButton?.title = EnhancementText.t("Cancel", "取消")
+        } else if profile.sourceKind == "window" {
+            startButton?.title = EnhancementText.t("Delayed Enhancement", "延迟增强")
+        } else {
+            startButton?.title = filePreparing ? EnhancementText.t("Preparing…", "准备中…") : (countdown.active ? "\(countdown.remaining)" : (enhancing ? EnhancementText.t("Apply Changes", "应用更改") : EnhancementText.t("Start Enhancement", "开始增强")))
+        }
         stopButton?.isHidden = !enhancing && !filePreparing
     }
 
@@ -2934,7 +2993,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 guard generation == self.capture.currentGeneration else { return }
                 self.inputRouter?.stop(reason:"source_changed")
                 self.interactionArmed = false
-                if self.countdown.active && generation != self.countdownSourceGeneration { self.cancelCountdown() }
+                if self.countdown.active && !self.delayedWindowSelection && generation != self.countdownSourceGeneration { self.cancelCountdown() }
                 if let pending = self.pendingSourceGeneration, generation != pending {
                     self.recordPlanEvent("source_supersedes_request")
                     self.liveApply.cancel(); self.pendingApply = nil; self.pendingSourceGeneration = nil
@@ -2988,6 +3047,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         capture.onStatus = { [weak self] text, failed in
             DispatchQueue.main.async {
+                if failed { self?.cancelCountdown() }
                 self?.statusLabel.stringValue = EnhancementText.runtime(text)
                 self?.statusLabel.textColor = failed ? .systemRed : .labelColor
                 if !failed, let self, self.capture.running { self.rememberRunningSource() }
@@ -3270,6 +3330,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             "countdownActive": countdown.active,
             "countdownRemaining": countdown.remaining,
             "countdownToken": countdown.token,
+            "delayedWindowSelection": delayedWindowSelection,
+            "screenCountdownPanelCount": screenCountdownPanels.count,
+            "screenCountdownClickThrough": screenCountdownPanels.allSatisfy(\.ignoresMouseEvents),
+            "screenCountdownCanBecomeKey": screenCountdownPanels.contains(where: { $0.canBecomeKey }),
             "selectedConfigID": EnhancementProfileStore.resolvedID(profile),
             "showFPS": fpsSwitch.state == .on,
             "selectedEngine": profile.interpolationEngineID,
@@ -3352,7 +3416,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     @objc private func chooseWindow() { cancelCountdown(); inputRouter?.stop(reason:"source_changed"); interactionArmed = false; profile.sourceKind = "window"; capture.presentPicker(windows: true); persist() }
     @objc private func chooseDisplay() { cancelCountdown(); inputRouter?.stop(reason:"source_changed"); interactionArmed = false; profile.sourceKind = "display"; capture.presentPicker(windows: false); persist() }
-    @objc private func reselect() { if profile.sourceKind == "display" { chooseDisplay() } else { chooseWindow() } }
 
     @objc func chooseFile() {
         cancelCountdown()
@@ -3459,7 +3522,139 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     @objc private func start() {
+        if delayedWindowSelection || startImmediatelyAfterPreparation {
+            cancelCountdown()
+            statusLabel.stringValue = EnhancementText.t("Cancelled", "已取消")
+            statusLabel.textColor = .labelColor
+            return
+        }
+        if profile.sourceKind == "window" {
+            beginDelayedWindowSelection()
+        } else {
+            startSelectedSource()
+        }
+    }
+
+    private func hideScreenCountdown() {
+        for panel in screenCountdownPanels { panel.close() }
+        screenCountdownPanels.removeAll()
+        screenCountdownLabels.removeAll()
+    }
+
+    private func showScreenCountdown() {
+        hideScreenCountdown()
+        for screen in NSScreen.screens {
+            let panel = overlayPanel()
+            panel.level = .screenSaver
+            panel.backgroundColor = NSColor.black.withAlphaComponent(0.12)
+            panel.isOpaque = false
+            panel.sharingType = .none
+            panel.setFrame(screen.frame, display: false)
+            let host = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
+            let digit = NSTextField(labelWithString: "\(countdown.remaining)")
+            digit.font = .monospacedDigitSystemFont(ofSize: 96, weight: .semibold)
+            digit.textColor = .white
+            digit.alignment = .center
+            digit.wantsLayer = true
+            digit.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.72).cgColor
+            digit.layer?.cornerRadius = 16
+            digit.translatesAutoresizingMaskIntoConstraints = false
+            host.addSubview(digit)
+            NSLayoutConstraint.activate([
+                digit.centerXAnchor.constraint(equalTo: host.centerXAnchor),
+                digit.centerYAnchor.constraint(equalTo: host.centerYAnchor),
+                digit.widthAnchor.constraint(equalToConstant: 160),
+                digit.heightAnchor.constraint(equalToConstant: 132),
+            ])
+            panel.contentView = host
+            screenCountdownPanels.append(panel)
+            screenCountdownLabels.append(digit)
+            panel.orderFrontRegardless()
+        }
+    }
+
+    private func beginDelayedWindowSelection() {
         guard !countdown.active && !filePreparing else { return }
+        stop()
+        readControls()
+        let seconds = EnhancementDelayPreference.seconds(in: .standard)
+        guard let ticket = countdown.begin(seconds: seconds) else { return }
+        delayedWindowSelection = true
+        statusLabel.stringValue = String(format: EnhancementText.t("Switch to the window to enhance. It will be selected in %d seconds.", "请切到要增强的窗口，%d 秒后自动选定并增强。"), seconds)
+        statusLabel.textColor = .secondaryLabelColor
+        showScreenCountdown()
+        updateCountdownDisplay()
+        recordPlanEvent("focused_window_countdown_started", extra: ["delaySeconds": seconds])
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.delayedWindowSelection,
+                      let remaining = self.countdown.tick(ticket) else { return }
+                self.updateCountdownDisplay()
+                if remaining == 0 {
+                    self.countdownTimer?.invalidate(); self.countdownTimer = nil
+                    // Freeze identity at zero, before the asynchronous shareable-content lookup.
+                    let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                    let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+                    let focusedBounds = frontPID.flatMap { TargetOverlayPolicy.focusedWindowBounds(pid: $0) }
+                    let target = TargetOverlayPolicy.focusedWindow(windows, frontPID: frontPID, ownPID: ProcessInfo.processInfo.processIdentifier, focusedBounds: focusedBounds)
+                    self.hideScreenCountdown()
+                    self.selectFocusedWindow(target, ticket: ticket)
+                }
+            }
+        }
+        countdownTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func failDelayedSelection(_ message: String) {
+        cancelCountdown()
+        statusLabel.stringValue = message
+        statusLabel.textColor = .systemRed
+    }
+
+    private func selectFocusedWindow(_ target: TargetOverlayPolicy.WindowMetadata?, ticket: UInt64) {
+        guard let target else {
+            failDelayedSelection(EnhancementText.t("No active app window. Try again and switch to the window to enhance.", "未找到聚焦的应用窗口，请重试并切到要增强的窗口。"))
+            return
+        }
+        statusLabel.stringValue = EnhancementText.t("Preparing the active window…", "正在准备聚焦窗口…")
+        capture.refreshShareable { [weak self] result in
+            guard let self, self.delayedWindowSelection, self.countdown.token == ticket else { return }
+            switch result {
+            case .failure(let error):
+                self.failDelayedSelection(EnhancementText.t("Cannot capture the active window. Check Screen Recording permission: ", "无法采集聚焦窗口，请检查屏幕录制权限：") + error.localizedDescription)
+            case .success(let content):
+                guard let window = content.windows.first(where: { $0.windowID == target.id && $0.owningApplication?.processID == target.owner }) else {
+                    self.failDelayedSelection(EnhancementText.t("The active window is no longer available. Try again.", "聚焦窗口已不可用，请重试。"))
+                    return
+                }
+                self.recordPlanEvent("focused_window_selected", extra: ["windowID": target.id, "ownerPID": target.owner])
+                self.capture.start(filter: SCContentFilter(desktopIndependentWindow: window))
+                let generation = self.capture.currentGeneration
+                let started = ProcessInfo.processInfo.systemUptime
+                let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        guard let self, self.delayedWindowSelection, self.countdown.token == ticket else { return }
+                        guard self.capture.currentGeneration == generation else { self.cancelCountdown(); return }
+                        if ProcessInfo.processInfo.systemUptime - started > 10 {
+                            self.failDelayedSelection(EnhancementText.t("The active window did not provide a frame. Try again.", "聚焦窗口未提供有效画面，请重试。"))
+                            return
+                        }
+                        guard self.capture.running, self.capture.latestFrameGeometrySnapshot() != nil else { return }
+                        self.countdownTimer?.invalidate(); self.countdownTimer = nil
+                        self.delayedWindowSelection = false
+                        self.startSelectedSource(immediate: true)
+                    }
+                }
+                self.countdownTimer = timer
+                RunLoop.main.add(timer, forMode: .common)
+            }
+        }
+    }
+
+    private func startSelectedSource(immediate: Bool = false) {
+        guard !countdown.active && !filePreparing else { return }
+        refreshActions()
         readControls()
         let selectedFile = selectedFilePlayer()?.openMediaPath
         if profile.sourceKind == "file" {
@@ -3511,6 +3706,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             }
         }
         guard let ticket = countdown.begin() else { return }
+        startImmediatelyAfterPreparation = immediate
         let selectedKind = profile.sourceKind
         let selectedGeneration = capture.currentGeneration
         countdownSourceGeneration = selectedKind == "file" ? nil : selectedGeneration
@@ -3645,6 +3841,15 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private func beginStartCountdown(snapshot: EnhancementProfile, selectedKind: String, selectedGeneration: UInt64, selectedFile: String?, ticket: UInt64) {
         sourceWindowPreparing = false
+        if startImmediatelyAfterPreparation {
+            startImmediatelyAfterPreparation = false
+            countdown.cancel()
+            countdownSourceGeneration = nil
+            updateCountdownDisplay()
+            sourceWindowConfirmedTarget = nil; sourceWindowConfirmedSelection = nil
+            applyAfterCountdown(snapshot: snapshot)
+            return
+        }
         recordPlanEvent("countdown_started", extra: ["selectedEngine": snapshot.interpolationEngineID, "selectedModel": snapshot.modelID])
         statusLabel.stringValue = selectedKind == "file"
             ? EnhancementText.t("Starting in 3 seconds.", "3 秒后开始。")
@@ -3944,7 +4149,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     @objc private func pendingTextChanged(_ notification: Notification) {
-        guard (countdown.active || filePreparing), let field = notification.object as? NSTextField,
+        guard (countdown.active || delayedWindowSelection || filePreparing), let field = notification.object as? NSTextField,
               [widthField, heightField, fpsNum, fpsDen].contains(where: { $0 === field }) else { return }
         cancelCountdown()
     }
@@ -3967,7 +4172,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     @objc private func showSettings() {
         if settingsWindow == nil {
-            let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 360),
+            let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 420),
                                  styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
             panel.isReleasedWhenClosed = false
             let content = NSView()
@@ -3987,12 +4192,21 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             appearanceControl.segmentDistribution = .fillEqually
             languageDetail.font = .systemFont(ofSize: 11)
             languageDetail.textColor = .secondaryLabelColor
-            let stack = NSStackView(views: [brand, languageHeading, languageControl, languageDetail, appearanceHeading, appearanceControl])
+            for seconds in 1...20 {
+                enhancementDelayPopup.addItem(withTitle: "\(seconds) s")
+                enhancementDelayPopup.lastItem?.tag = seconds
+            }
+            enhancementDelayPopup.target = self
+            enhancementDelayPopup.action = #selector(enhancementDelayChanged)
+            enhancementDelayPopup.setAccessibilityLabel(EnhancementText.t("Countdown", "倒计时时间"))
+            let delayRow = row(EnhancementText.t("Countdown", "倒计时时间"), enhancementDelayPopup)
+            let stack = NSStackView(views: [brand, languageHeading, languageControl, languageDetail, appearanceHeading, appearanceControl, delayRow])
             stack.orientation = .vertical
             stack.alignment = .leading
             stack.spacing = 8
             stack.setCustomSpacing(24, after: brand)
             stack.setCustomSpacing(20, after: languageDetail)
+            stack.setCustomSpacing(20, after: appearanceControl)
             stack.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(stack)
             let links = NSStackView()
@@ -4018,6 +4232,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 languageControl.widthAnchor.constraint(equalTo: stack.widthAnchor),
                 languageDetail.widthAnchor.constraint(equalTo: stack.widthAnchor),
                 appearanceControl.widthAnchor.constraint(equalTo: stack.widthAnchor),
+                delayRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
                 links.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
                 links.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
                 links.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -22),
@@ -4029,8 +4244,14 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         settingsWindow?.title = EnhancementText.t("Settings", "设置")
         settingsWindow?.appearance = window?.appearance
         refreshSettingsLanguage()
+        enhancementDelayPopup.selectItem(withTag: EnhancementDelayPreference.seconds(in: .standard))
         settingsWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func enhancementDelayChanged() {
+        cancelCountdown()
+        EnhancementDelayPreference.set(enhancementDelayPopup.selectedTag(), in: .standard)
     }
 
     private func refreshSettingsLanguage() {
@@ -5186,7 +5407,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         syncRawCadenceEnvironment()
         targetContentRectVerified = state.contentRectVerified
         if state.onscreen { targetWasOnscreen = true }
-        if targetDecisionReason == "target_identity_changed_in_ordered_list" || (targetDecisionReason != "target_metadata_incomplete" && targetDecisionReason != "window_list_unavailable" && TargetOverlayPolicy.shouldCancel(exists: state.exists, onscreen: state.onscreen, wasOnscreen: targetWasOnscreen)) {
+        if !delayedWindowSelection && (targetDecisionReason == "target_identity_changed_in_ordered_list" || (targetDecisionReason != "target_metadata_incomplete" && targetDecisionReason != "window_list_unavailable" && TargetOverlayPolicy.shouldCancel(exists: state.exists, onscreen: state.onscreen, wasOnscreen: targetWasOnscreen))) {
             cancelCountdown()
         }
         if interactionArmed && (interactionRequestGeneration != capture.currentGeneration ||
@@ -5409,7 +5630,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             outputWindow?.orderOut(nil)
             viewerControlsPanel?.orderOut(nil)
         }
-        if countdown.active || fpsSwitch.state == .on {
+        let showTargetCountdown = countdown.active && !delayedWindowSelection && !startImmediatelyAfterPreparation && !sourceWindowPreparing
+        if showTargetCountdown || fpsSwitch.state == .on {
             hudHiddenReason = "none"
             let (fpsPanel, countdownPanel) = ensureTargetHUD()
             if fpsSwitch.state == .on {
@@ -5421,13 +5643,13 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 if fpsPanel.frame != fpsFrame { fpsPanel.setFrame(fpsFrame, display: true) }
                 if !fpsPanel.isVisible { fpsPanel.orderFrontRegardless() }
             } else { fpsPanel.orderOut(nil) }
-            if countdown.active {
+            if showTargetCountdown {
                 let timerFrame = NSRect(x: hudFrame.midX - 41, y: hudFrame.midY - 41, width: 82, height: 82)
                 if countdownPanel.frame != timerFrame { countdownPanel.setFrame(timerFrame, display: true) }
                 if !countdownPanel.isVisible { countdownPanel.orderFrontRegardless() }
             } else { countdownPanel.orderOut(nil) }
             let requestedFPSVisible = fpsSwitch.state != .on || fpsPanel.isVisible
-            let requestedCountdownVisible = !countdown.active || countdownPanel.isVisible
+            let requestedCountdownVisible = !showTargetCountdown || countdownPanel.isVisible
             if !requestedFPSVisible || !requestedCountdownVisible { hudHiddenReason = "panel_not_visible" }
         } else { targetHUD?.orderOut(nil); targetCountdownHUD?.orderOut(nil); hudHiddenReason = "hud_disabled" }
         outputPreview.refreshVisibilitySnapshot()
@@ -5474,7 +5696,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func excludedIDs() -> [Int] {
-        [window?.windowNumber, outputWindow?.windowNumber, targetHUD?.windowNumber, targetCountdownHUD?.windowNumber, viewerControlsPanel?.windowNumber].compactMap { $0 }.filter { $0 > 0 }
+        [window?.windowNumber, outputWindow?.windowNumber, targetHUD?.windowNumber, targetCountdownHUD?.windowNumber, viewerControlsPanel?.windowNumber].compactMap { $0 }.filter { $0 > 0 } + screenCountdownPanels.map(\.windowNumber)
     }
 
     private func applyAppearance() {

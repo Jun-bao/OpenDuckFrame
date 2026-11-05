@@ -4,6 +4,8 @@
 #include <string.h>
 
 #include <string>
+#include <cmath>
+#include <set>
 
 using sp::SPRational;
 using sp::SPRateKind;
@@ -461,6 +463,60 @@ static void testPhaseFloat() {
     }
 }
 
+static void testLiveSourceReuse() {
+    struct Case { int numerator, denominator, expectedSynthetic; bool jitter; };
+    for (auto test : std::vector<Case>{{24,1,360,false}, {28,1,320,false}, {30,1,300,false},
+                                      {30,1,300,true}, {28,1,320,true}, {60,1,0,false},
+                                      {120,1,0,false}, {30000,1001,-1,false}}) {
+        SPRateRequest request; request.kind=SPRateKind::FixedFPS; request.fps=sp::spMake(60,1); request.reuseSources=true;
+        auto scheduler=makeScheduler(request);
+        std::vector<SPRational> timestamps;
+        std::set<uint64_t> reused;
+        int output=0, generated=0, originals=0;
+        auto anchor=sp::spMake(2000001,1);
+        for (int i=0;i<=int(10.0*test.numerator/test.denominator)+3;++i) {
+            auto pts=sp::spMake((int64_t)i*test.denominator,test.numerator);
+            if (test.jitter && i>0) { auto delta=sp::spMake((int64_t)std::llround(1800000*std::sin(i*1.731)),1000000000); auto old=pts; sp::spAdd(old,delta,pts); }
+            auto local=pts; sp::spAdd(anchor,local,pts); timestamps.push_back(pts);
+            auto result=scheduler.push(frame(pts.num,pts.den,i+1,1));
+            expectReject(result.reject,SPScheduleReject::None,"live reuse accepted input");
+            for (auto event:result.events) {
+                sp::SPRational relative{}; sp::spSub(event.pts,anchor,relative);
+                if (sp::spCmp(relative,sp::spMake(0,1))<=0 || sp::spCmp(relative,sp::spMake(10,1))>0) continue;
+                ++output;
+                if (!same(relative,sp::spMake(output,60))) fail("live output clock drifted");
+                if (event.action==SPScheduleAction::PresentSource) {
+                    ++originals;
+                    if (!reused.insert(event.sourceIdentity).second) fail("live source reused twice");
+                    sp::SPRational error{}; sp::spSub(event.pts,timestamps[event.sourceIdentity-1],error);
+                    if (error.num<0) error.num=-error.num;
+                    if (sp::spCmp(error,sp::spMake(1,120))>0) fail("live source exceeded half-period error");
+                } else if (event.action==SPScheduleAction::Interpolate) {
+                    ++generated;
+                    const auto a=timestamps[event.frameA-1], b=timestamps[event.frameB-1];
+                    sp::SPRational into{},span{},phase{};sp::spSub(event.pts,a,into);sp::spSub(b,a,span);sp::spDiv(into,span,phase);
+                    if (!same(phase,event.phase) || sp::spCmp(phase,sp::spMake(0,1))<=0 || sp::spCmp(phase,sp::spMake(1,1))>=0) fail("live phase lost source timestamp");
+                } else fail("live normal cadence unexpectedly held");
+            }
+        }
+        if (output!=600 || originals+generated!=600) fail("live target grid count");
+        if (test.expectedSynthetic>=0 && generated!=test.expectedSynthetic) fail("live model generation count");
+        if (test.numerator==30000 && (generated<299 || generated>301)) fail("live NTSC source reuse");
+        printf("live reuse %d/%d ->60 jitter=%d: originals=%d generated=%d\n",test.numerator,test.denominator,test.jitter,originals,generated);
+    }
+    SPRateRequest request;request.kind=SPRateKind::FixedFPS;request.reuseSources=true;
+    auto live=makeScheduler(request);live.push(frame(0,1,1,1));
+    auto early=live.push(frame(31,1000,2,1));bool immediate=false;
+    for(auto e:early.events)if(e.action==SPScheduleAction::PresentSource && e.sourceIdentity==2 && same(e.pts,sp::spMake(1,30)))immediate=true;
+    if(!immediate)fail("captured source waited for a future input frame");
+    auto scheduler=makeScheduler(request);scheduler.push(frame(0,1,1,1));
+    auto cut=frame(1,24,2,1);cut.sceneCutBefore=true;
+    for(auto e:scheduler.push(cut).events) if(e.action==SPScheduleAction::Interpolate)fail("live reused across scene cut");
+    scheduler.noteBoundary();
+    for(auto e:scheduler.push(frame(1,12,3,1)).events)if(e.action==SPScheduleAction::Interpolate)fail("live reused across boundary");
+    for(auto e:scheduler.push(frame(1,1,4,1)).events)if(e.action==SPScheduleAction::Interpolate)fail("live reused across gap");
+}
+
 extern "C" int spRunRateScheduleTests(void) {
     gFailures = 0;
     testMultiplier30();
@@ -475,6 +531,7 @@ extern "C" int spRunRateScheduleTests(void) {
     testFixedGridFourPhases();
     testAbsoluteCapturePTS();
     testPhaseFloat();
+    testLiveSourceReuse();
     if (gFailures != 0) {
         fprintf(stderr, "%d schedule assertions failed\n", gFailures);
         return gFailures;

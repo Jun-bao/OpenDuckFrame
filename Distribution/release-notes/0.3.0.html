@@ -1,0 +1,13 @@
+<meta charset="utf-8">
+<h2>OpenDuckFrame 0.3.0</h2>
+<ul>
+<li>窗口模式改为“延迟增强”：点击后显示全屏倒计时，倒计时结束时自动选定当前聚焦的窗口并开始增强。</li>
+<li>设置中可调整倒计时时间，默认 5 秒，支持 1–20 秒；保留语言、外观与已保存配置。</li>
+<li>优化实时 RIFE 目标帧率模式：复用原始帧，根据源时间戳计算补帧位置，并按处理预算安排模型任务。模型超时会保留原画，重复画面不计入新增运动帧率。</li>
+<li>工作台提供独立设置窗口，以及官网、GitHub 和反馈入口。</li>
+</ul>
+<p>验证范围：受控 RIFE 模型与队列测试覆盖 28→60、30→60；不代表实际屏幕输出或所有 Mac 均可达到目标帧率。完整预算回归仍有 6 项在旧版同样失败的断言待修复；本次目标帧率专项测试通过。</p>
+<h3>English</h3>
+<p>Delayed enhancement selects the focused window when a full-screen countdown ends and starts automatically. Settings preserve a 1–20 second delay (5 seconds by default), language and appearance. Live RIFE target-FPS mode now reuses source pictures, derives interpolation phases from source timestamps and admits jobs within their output budget. Late jobs keep the source picture; repeated pictures do not inflate motion FPS.</p>
+<p>Controlled RIFE model and queue checks cover 28→60 and 30→60. These do not establish physical-display throughput or a target-FPS guarantee on every Mac. Six full-budget regression assertions also fail in the previous build and remain unresolved; the targeted fixed-rate checks pass.</p>
+<p>This community build is ad-hoc signed, supports signed in-app updates, and is not Apple notarized. Requires macOS 14 or later on Apple silicon.</p>

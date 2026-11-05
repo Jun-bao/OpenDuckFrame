@@ -13,6 +13,8 @@
 + (NSDictionary *)runStaticHoldContract;
 + (NSDictionary *)runSourceSizeLifecycleContract;
 + (NSDictionary *)runSourceClockSchedulingContract;
++ (NSDictionary *)runFixedRateContract;
++ (NSDictionary *)runFixedRateModelProbeWithBundle:(NSBundle *)bundle;
 + (NSDictionary *)runPendingReplacementContract;
 + (NSDictionary *)runRejectedPTSContract;
 + (NSDictionary *)runPresentationBudgetContract;
@@ -51,6 +53,14 @@ int main(int argc, const char **argv) {
         }
         __block NSDictionary *result = nil;
         dispatch_semaphore_t done=dispatch_semaphore_create(0);
+        if (argc == 4 && (strcmp(argv[3], "fixed-rate") == 0 || strcmp(argv[3], "fixed-model") == 0)) {
+            const BOOL model=strcmp(argv[3],"fixed-model")==0;
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0), ^{ result=model?[type runFixedRateModelProbeWithBundle:bundle]:[type runFixedRateContract]; dispatch_semaphore_signal(done); });
+            while (dispatch_semaphore_wait(done,DISPATCH_TIME_NOW) != 0) CFRunLoopRunInMode(kCFRunLoopDefaultMode,0.02,false);
+            NSData *json=[NSJSONSerialization dataWithJSONObject:result options:0 error:nil];
+            fwrite(json.bytes,1,json.length,stdout); putchar('\n');
+            [[NSProcessInfo processInfo] endActivity:activity]; return [result[@"ok"] boolValue] ? 0 : 1;
+        }
         if (argc == 4 && strcmp(argv[3], "p1-source-ack") == 0) {
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0), ^{ result=[type runP1SourceOnlyAckContract]; dispatch_semaphore_signal(done); });
             while (dispatch_semaphore_wait(done,DISPATCH_TIME_NOW) != 0) CFRunLoopRunInMode(kCFRunLoopDefaultMode,0.02,false);
