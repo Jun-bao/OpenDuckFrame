@@ -1046,7 +1046,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private var fpsOutputObservable = false
     private let viewMode = NSSegmentedControl(labels: ["E", "O", "C"], trackingMode: .selectOne, target: nil, action: nil)
     private let appearanceControl = NSSegmentedControl(labels: ["S", "L", "D"], trackingMode: .selectOne, target: nil, action: nil)
-    private let languageControl = NSSegmentedControl(labels: ["中文", "English"], trackingMode: .selectOne, target: nil, action: nil)
+    private let languageControl = NSSegmentedControl(labels: ["中文", "English", "More"], trackingMode: .selectOne, target: nil, action: nil)
+    private let languageDetail = NSTextField(wrappingLabelWithString: "")
+    private var settingsWindow: NSWindow?
     private let configRows = NSStackView()
     private let captureCapPopup = NSPopUpButton()
     private let recentStack = NSStackView()
@@ -1390,10 +1392,13 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         footer.alignment = .leading
         footer.spacing = 6
         footer.translatesAutoresizingMaskIntoConstraints = false
-        footer.addArrangedSubview(heading(EnhancementText.t("Language", "语言")))
-        footer.addArrangedSubview(languageControl)
-        footer.addArrangedSubview(heading(EnhancementText.t("Appearance", "外观")))
-        footer.addArrangedSubview(appearanceControl)
+        let settingsButton = NSButton(title: EnhancementText.t("Settings", "设置"), target: self, action: #selector(showSettings))
+        settingsButton.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
+        settingsButton.imagePosition = .imageLeading
+        settingsButton.alignment = .left
+        settingsButton.bezelStyle = .rounded
+        settingsButton.widthAnchor.constraint(equalToConstant: 168).isActive = true
+        footer.addArrangedSubview(settingsButton)
         let projectLinks = NSStackView()
         projectLinks.orientation = .horizontal
         projectLinks.distribution = .fillEqually
@@ -1410,10 +1415,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             projectLinks.addArrangedSubview(link)
         }
         projectLinks.widthAnchor.constraint(equalToConstant: 168).isActive = true
-        footer.setCustomSpacing(10, after: appearanceControl)
+        footer.setCustomSpacing(10, after: settingsButton)
         footer.addArrangedSubview(projectLinks)
-        languageControl.widthAnchor.constraint(equalToConstant: 168).isActive = true
-        appearanceControl.widthAnchor.constraint(equalToConstant: 168).isActive = true
         languageControl.selectedSegment = EnhancementText.chinese ? 0 : 1
         sidebar.content.addSubview(upper)
         sidebar.content.addSubview(footer)
@@ -3962,6 +3965,100 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         if let url = components.url { NSWorkspace.shared.open(url) }
     }
 
+    @objc private func showSettings() {
+        if settingsWindow == nil {
+            let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 360),
+                                 styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+            panel.isReleasedWhenClosed = false
+            let content = NSView()
+            let icon = NSImageView(image: NSApp.applicationIconImage)
+            icon.imageScaling = .scaleProportionallyUpOrDown
+            icon.widthAnchor.constraint(equalToConstant: 48).isActive = true
+            icon.heightAnchor.constraint(equalToConstant: 48).isActive = true
+            let name = NSTextField(labelWithString: "OpenDuckFrame")
+            name.font = .systemFont(ofSize: 17, weight: .semibold)
+            let brand = NSStackView(views: [icon, name])
+            brand.orientation = .horizontal
+            brand.alignment = .centerY
+            brand.spacing = 12
+            let languageHeading = heading(EnhancementText.t("Language", "语言"))
+            let appearanceHeading = heading(EnhancementText.t("Appearance", "外观"))
+            languageControl.segmentDistribution = .fillEqually
+            appearanceControl.segmentDistribution = .fillEqually
+            languageDetail.font = .systemFont(ofSize: 11)
+            languageDetail.textColor = .secondaryLabelColor
+            let stack = NSStackView(views: [brand, languageHeading, languageControl, languageDetail, appearanceHeading, appearanceControl])
+            stack.orientation = .vertical
+            stack.alignment = .leading
+            stack.spacing = 8
+            stack.setCustomSpacing(24, after: brand)
+            stack.setCustomSpacing(20, after: languageDetail)
+            stack.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(stack)
+            let links = NSStackView()
+            links.orientation = .horizontal
+            links.distribution = .fillEqually
+            links.translatesAutoresizingMaskIntoConstraints = false
+            for (title, key) in [(EnhancementText.t("Website", "官网"), "ODFWebsiteURL"),
+                                 ("GitHub", "ODFRepositoryURL"),
+                                 (EnhancementText.t("Feedback", "反馈"), "ODFFeedbackURL")] {
+                let link = NSButton(title: title, target: self, action: #selector(openProjectLink(_:)))
+                link.identifier = NSUserInterfaceItemIdentifier(key)
+                link.bezelStyle = .inline
+                link.isBordered = false
+                link.font = WorkbenchStyle.captionFont
+                link.contentTintColor = .secondaryLabelColor
+                links.addArrangedSubview(link)
+            }
+            content.addSubview(links)
+            NSLayoutConstraint.activate([
+                stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 24),
+                stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 28),
+                stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
+                languageControl.widthAnchor.constraint(equalTo: stack.widthAnchor),
+                languageDetail.widthAnchor.constraint(equalTo: stack.widthAnchor),
+                appearanceControl.widthAnchor.constraint(equalTo: stack.widthAnchor),
+                links.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+                links.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
+                links.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -22),
+            ])
+            panel.contentView = content
+            settingsWindow = panel
+            panel.center()
+        }
+        settingsWindow?.title = EnhancementText.t("Settings", "设置")
+        settingsWindow?.appearance = window?.appearance
+        refreshSettingsLanguage()
+        settingsWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func refreshSettingsLanguage() {
+        let code = AppLanguage.current
+        languageControl.setLabel(EnhancementText.t("More…", "更多…"), forSegment: 2)
+        languageControl.selectedSegment = code != nil && code != "en" && code != "zh-Hans" ? 2 : (EnhancementText.chinese ? 0 : 1)
+        let effective = AppLanguage.effectiveLanguage(for: code) ?? "en"
+        let name = AppLanguage.displayName(for: effective)
+        languageDetail.stringValue = EnhancementText.chinese
+            ? "播放器语言：\(name)。画质工作台支持中文和英文。"
+            : "Player language: \(name). The workbench supports Chinese and English."
+    }
+
+    @objc private func selectMoreLanguage(_ sender: NSMenuItem) {
+        let code = sender.representedObject as? String
+        let effective = AppLanguage.effectiveLanguage(for: code) ?? "en"
+        EnhancementText.setLanguage(effective.hasPrefix("zh") ? "zh" : "en", in: .standard)
+        applyPlayerLanguage(code)
+        translateWorkbench()
+        refreshSettingsLanguage()
+    }
+
+    private func applyPlayerLanguage(_ code: String?) {
+        let item = NSMenuItem()
+        item.representedObject = code
+        (NSApp.delegate as? AppDelegate)?.languageAction(item)
+    }
+
     @objc private func appearanceChanged() {
         cancelCountdown()
         readControls()
@@ -3970,7 +4067,32 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     @objc private func languageChanged() {
-        EnhancementText.setLanguage(languageControl.selectedSegment == 0 ? "zh" : "en", in: .standard)
+        if languageControl.selectedSegment == 2 {
+            let menu = NSMenu()
+            let system = NSMenuItem(title: L("settings.language.system"), action: #selector(selectMoreLanguage(_:)), keyEquivalent: "")
+            system.target = self
+            system.state = AppLanguage.current == nil ? .on : .off
+            menu.addItem(system)
+            menu.addItem(.separator())
+            for code in AppLanguage.supported where code != "en" && code != "zh-Hans" {
+                let item = NSMenuItem(title: AppLanguage.displayName(for: code), action: #selector(selectMoreLanguage(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = code
+                item.state = AppLanguage.current == code ? .on : .off
+                menu.addItem(item)
+            }
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: 0), in: languageControl)
+            refreshSettingsLanguage()
+            return
+        }
+        let chinese = languageControl.selectedSegment == 0
+        EnhancementText.setLanguage(chinese ? "zh" : "en", in: .standard)
+        applyPlayerLanguage(chinese ? "zh-Hans" : "en")
+        translateWorkbench()
+        refreshSettingsLanguage()
+    }
+
+    private func translateWorkbench() {
         func translate(_ text: String) -> String {
             EnhancementText.translated(text, chinese: EnhancementText.chinese)
         }
@@ -3996,6 +4118,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             for child in view.subviews { visit(child) }
         }
         if let root = window?.contentView { visit(root) }
+        if let root = settingsWindow?.contentView { visit(root) }
+        settingsWindow?.title = EnhancementText.t("Settings", "设置")
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
         window?.title = WorkbenchTitle.text(EnhancementText.t("Quality Workbench", "画质工作台"), version: version)
         outputWindow?.title = EnhancementText.t("Enhanced output", "增强输出")
@@ -5362,6 +5486,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             name = UserDefaults.standard.string(forKey: "AppleInterfaceStyle") == "Dark" ? .darkAqua : .aqua
         }
         window?.appearance = NSAppearance(named: name)
+        settingsWindow?.appearance = NSAppearance(named: name)
     }
 
     @discardableResult private func saveCurrentProfile() -> Bool {
