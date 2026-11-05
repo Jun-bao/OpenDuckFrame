@@ -1398,7 +1398,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         settingsButton.alignment = .left
         settingsButton.bezelStyle = .rounded
         settingsButton.widthAnchor.constraint(equalToConstant: 168).isActive = true
-        footer.addArrangedSubview(settingsButton)
         let projectLinks = NSStackView()
         projectLinks.orientation = .horizontal
         projectLinks.distribution = .fillEqually
@@ -1415,8 +1414,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             projectLinks.addArrangedSubview(link)
         }
         projectLinks.widthAnchor.constraint(equalToConstant: 168).isActive = true
-        footer.setCustomSpacing(10, after: settingsButton)
         footer.addArrangedSubview(projectLinks)
+        footer.setCustomSpacing(10, after: projectLinks)
+        footer.addArrangedSubview(settingsButton)
         languageControl.selectedSegment = EnhancementText.chinese ? 0 : 1
         sidebar.content.addSubview(upper)
         sidebar.content.addSubview(footer)
