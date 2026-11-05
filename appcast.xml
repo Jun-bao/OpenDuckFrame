@@ -6,6 +6,30 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>OpenDuckFrame</title>
         <item>
+            <title>0.3.0</title>
+            <pubDate>Fri, 06 Nov 2026 01:24:14 +0800</pubDate>
+            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
+            <sparkle:version>20</sparkle:version>
+            <sparkle:shortVersionString>0.3.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<meta charset="utf-8">
+<h2>OpenDuckFrame 0.3.0</h2>
+<ul>
+<li>窗口模式改为“延迟增强”：点击后显示全屏倒计时，倒计时结束时自动选定当前聚焦的窗口并开始增强。</li>
+<li>设置中可调整倒计时时间，默认 5 秒，支持 1–20 秒；保留语言、外观与已保存配置。</li>
+<li>优化实时 RIFE 目标帧率模式：复用原始帧，根据源时间戳计算补帧位置，并按处理预算安排模型任务。模型超时会保留原画，重复画面不计入新增运动帧率。</li>
+<li>工作台提供独立设置窗口，以及官网、GitHub 和反馈入口。</li>
+</ul>
+<p>验证范围：受控 RIFE 模型与队列测试覆盖 28→60、30→60；不代表实际屏幕输出或所有 Mac 均可达到目标帧率。完整预算回归仍有 6 项在旧版同样失败的断言待修复；本次目标帧率专项测试通过。</p>
+<h3>English</h3>
+<p>Delayed enhancement selects the focused window when a full-screen countdown ends and starts automatically. Settings preserve a 1–20 second delay (5 seconds by default), language and appearance. Live RIFE target-FPS mode now reuses source pictures, derives interpolation phases from source timestamps and admits jobs within their output budget. Late jobs keep the source picture; repeated pictures do not inflate motion FPS.</p>
+<p>Controlled RIFE model and queue checks cover 28→60 and 30→60. These do not establish physical-display throughput or a target-FPS guarantee on every Mac. Six full-budget regression assertions also fail in the previous build and remain unresolved; the targeted fixed-rate checks pass.</p>
+<p>This community build is ad-hoc signed, supports signed in-app updates, and is not Apple notarized. Requires macOS 14 or later on Apple silicon.</p>
+]]></description>
+            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.3.0/OpenDuckFrame-0.3.0.zip" length="42543924" type="application/octet-stream" sparkle:edSignature="+LgR2IhmytvG6rdToqNWAYu5NXJi01CHKWr0F0DDT5y5S2lZL4jDIflEo/cPr0DK44Nj1jOHjkv88OcmRj/7Ag=="/>
+        </item>
+        <item>
             <title>0.2.2</title>
             <pubDate>Wed, 04 Nov 2026 23:53:22 +0800</pubDate>
             <link>https://github.com/Jun-bao/OpenDuckFrame</link>
@@ -49,30 +73,9 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
 ]]></description>
             <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.2.1/OpenDuckFrame-0.2.1.zip" length="42510545" type="application/octet-stream" sparkle:edSignature="TP4f+LiAqeEjdrDGqX6Nmk4W5wf/i0Ob9H97c3uNPcnLVQgaNZr41kQ7JozYKh/BcGHNAzva8kJWPgktbqBwDQ=="/>
         </item>
-        <item>
-            <title>0.2.0</title>
-            <pubDate>Wed, 04 Nov 2026 21:37:51 +0800</pubDate>
-            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
-            <sparkle:version>6</sparkle:version>
-            <sparkle:shortVersionString>0.2.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<meta charset="utf-8">
-<h2>OpenDuckFrame 0.2.0</h2>
-<ul>
-<li>For supported window sources, choose a source window size before scaling. The selected window is resized before capture; for the video itself to match the selected size, it must fill that window.</li>
-<li>Improve single-window capture when child windows extend beyond the selected window.</li>
-<li>Use frame generation and scaling separately or together, subject to the selected engines' compatibility.</li>
-<li>Press Esc to leave fullscreen viewer and return to the source-aligned view; apply again to re-enter.</li>
-</ul>
-<p>Window resizing requires Accessibility permission and a resizable window. Available engines and output sizes depend on the system and hardware; results depend on the source and engine.</p>
-<p>This community build is ad-hoc signed and is <strong>not Apple notarized</strong>. macOS may block its first launch. If you trust the download, review the app under System Settings → Privacy &amp; Security and choose whether to allow it.</p>
-]]></description>
-            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.2.0/OpenDuckFrame-0.2.0.zip" length="42509570" type="application/octet-stream" sparkle:edSignature="Wb3AzKTIh3OqPMt31e5/sf1G7hmI4zaLpVyMcV6o65xxFgA1R34wt71uIiVPDCHvBEzADTzg6OdJ4VLptaGlBw=="/>
-        </item>
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: Cvem3Ra3g64g9RtVrniLp9q3Jkd+PkipWONG6kOXRG4qNh/iLIM6KFhBBN9w1KAZOTSFjiGTeJTjb9SAAoebCQ==
-length: 6490
+edSignature: TsLfWAUVlWWO72X6deeyoBIfP2vmSEUJAlEow0RCS8UJEpm+FlSc+TbOZYNuUVYe+T6u5McZ7gEoJtTWGE93Bw==
+length: 7264
 -->
