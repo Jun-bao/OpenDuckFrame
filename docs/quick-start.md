@@ -30,7 +30,7 @@ current settings.
    scaling. Higher resolutions and multipliers require more processing time.
 3. For a window, press **Delayed enhancement**, then focus the window you want
    to enhance before the countdown ends. The focused window is selected and
-   enhancement starts automatically. The countdown defaults to 5 seconds and
+   enhancement starts automatically. The countdown defaults to 3 seconds and
    can be set from 1 to 20 seconds in **Settings**. Display and video-file inputs
    keep **Start enhancement**. Compare **Original**, **Enhanced**, and
    **Comparison** views; use the FPS overlay to observe actual output.

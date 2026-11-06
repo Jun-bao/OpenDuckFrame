@@ -192,7 +192,7 @@ enum FPSPreference {
 enum EnhancementDelayPreference {
     private static let key = "OpenDuckFrameEnhancementDelaySeconds"
     static func seconds(in defaults: UserDefaults) -> Int {
-        guard defaults.object(forKey: key) != nil else { return 5 }
+        guard defaults.object(forKey: key) != nil else { return 3 }
         return min(20, max(1, defaults.integer(forKey: key)))
     }
     static func set(_ seconds: Int, in defaults: UserDefaults) {

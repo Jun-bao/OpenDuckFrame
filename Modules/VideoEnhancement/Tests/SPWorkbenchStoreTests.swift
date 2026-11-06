@@ -194,7 +194,7 @@ private final class SourceSizeControls {
   let suite="odf-config-contract-"+UUID().uuidString
   let defaults=UserDefaults(suiteName:suite)!
   defer { defaults.removePersistentDomain(forName:suite) }
-  precondition(EnhancementDelayPreference.seconds(in:defaults)==5)
+  precondition(EnhancementDelayPreference.seconds(in:defaults)==3)
   EnhancementDelayPreference.set(20,in:defaults)
   precondition(EnhancementDelayPreference.seconds(in:UserDefaults(suiteName:suite)!)==20)
   EnhancementDelayPreference.set(99,in:defaults);precondition(EnhancementDelayPreference.seconds(in:defaults)==20)
