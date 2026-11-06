@@ -338,6 +338,16 @@ changed from a 2560×1440/120 Hz display to a 1920×1080/60 Hz display. This is
 an environment blocker for a new comparable 120 FPS run, not an explanation
 for earlier failures. No performance result is assigned to that setup failure.
 
+R17 repeats the unchanged R13 probe binary and old renderer in the current
+60 Hz environment, without capture, inference or the new clock. Its immutable
+1920×1080 buffers and 120/s supply remain unchanged: 4,800 admitted IDs resolve
+to 2,400 zero-time callbacks and 2,400 superseded IDs, with no positive actual
+time. The panel/layer report opaque, visible and exposed. Thus the new clock
+is not necessary to reproduce the current zero-time observation; an exclusive
+environment cause is still unproven. This is neither a 60/s-supply test nor a
+physical 120 Hz acceptance result. Zero actual time alone does not establish
+that the screen was black.
+
 ## Frozen-target mathematics and opt-in time contract
 
 The CPU audit preserves every R10 frame ID, outcome, context and target. Under
@@ -402,3 +412,16 @@ the implementation contract, not a real-capture FPS gain. Release and separate
 Debug candidates build and bundle successfully; the R13-bound Debug binary is
 kept unchanged. A comparable physical 120 Hz run of this candidate is still
 pending, and full product acceptance remains open.
+
+R16 additionally exercises actual ScreenCaptureKit capture and RIFE in a
+960×572 own-window cohort, with isolated capture cap30, X2 and the opt-in clock
+on the current 60 Hz display. All 1,514 observed job plans have bound matching
+contexts and exact PTS fractions; affine error is zero or half a host tick.
+All 1,513 consecutive B-to-A endpoint reuses match, and all 1,514 observed
+submit/completion/enqueue targets remain identical. Actual presentation does
+not pass: 3,029 ready frames include 1,543 zero-time, 1,479 superseded, four
+invisible and three unlocated terminal outcomes, with no positive actual
+times. The three early collection gaps are retained; they are not assigned
+to stopping. A later source-selection configuration failure is excluded from
+own-window and quality conclusions. This validates the observed real-model
+time-contract chain, not visible throughput, image quality or 120 FPS.
