@@ -961,6 +961,45 @@ enum WorkbenchTitle {
     }
 }
 
+// Keep selection menus anchored below the control rather than centered on
+// the selected item, while retaining NSPopUpButton's selection and actions.
+@MainActor private final class AnchoredPopUpButton: NSPopUpButton {
+    private func showAnchoredMenu() {
+        guard isEnabled else { return }
+        let choices = NSMenu()
+        choices.autoenablesItems = false
+        choices.minimumWidth = bounds.width
+        for (index, original) in itemArray.enumerated() {
+            guard let item = original.copy() as? NSMenuItem else { continue }
+            item.target = self
+            item.action = #selector(selectAnchoredItem(_:))
+            item.representedObject = index
+            item.state = index == indexOfSelectedItem ? .on : .off
+            choices.addItem(item)
+        }
+        let bottom = isFlipped ? bounds.maxY : bounds.minY
+        choices.popUp(positioning: nil, at: NSPoint(x: bounds.minX, y: bottom), in: self)
+    }
+
+    @objc private func selectAnchoredItem(_ item: NSMenuItem) {
+        guard let index = item.representedObject as? Int else { return }
+        selectItem(at: index)
+        if let action { NSApp.sendAction(action, to: target, from: self) }
+    }
+
+    override func mouseDown(with event: NSEvent) { showAnchoredMenu() }
+    override func performClick(_ sender: Any?) { showAnchoredMenu() }
+    override func keyDown(with event: NSEvent) {
+        if [36, 49, 76, 125].contains(event.keyCode) { showAnchoredMenu() }
+        else { super.keyDown(with: event) }
+    }
+    override func accessibilityPerformPress() -> Bool {
+        guard isEnabled else { return false }
+        DispatchQueue.main.async { [weak self] in self?.showAnchoredMenu() }
+        return true
+    }
+}
+
 final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate, NSTextFieldDelegate {
     /// Capture callbacks call only the processor's queueing entry points.
     private final class CaptureProcessorSink: @unchecked Sendable {
@@ -1046,7 +1085,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private var appleVideoSRFactor = 4
     private var anime4KCandidate = false
     private var cuganCandidate = false
-    private let sizePopup = NSPopUpButton()
+    private let sizePopup = AnchoredPopUpButton()
     private let srInputPopup = NSPopUpButton()
     private let srInputHelp = NSButton(title: "", target: nil, action: nil)
     private let sourceWindowPopup = NSPopUpButton()
@@ -1142,7 +1181,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let stageHost = NSView()
     private let sourceHost = NSView()
     private let libraryHost = NSView()
-    private let enginePopup = NSPopUpButton()
+    private let enginePopup = AnchoredPopUpButton()
     private let sourceKindControl = NSSegmentedControl(labels: ["窗口", "显示器", "视频文件"], trackingMode: .selectOne, target: nil, action: nil)
     private let phaseLabel = NSTextField(wrappingLabelWithString: "")
     private let compatibilityButton = NSButton(title: "改用 Apple 帧率转换", target: nil, action: nil)
