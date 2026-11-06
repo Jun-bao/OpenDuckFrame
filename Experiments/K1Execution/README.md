@@ -1,6 +1,6 @@
 # Product-runtime execution and IO experiments
 
-This directory contains the 2026-11-06 diagnostics for the actual RifeMetal
+This directory contains the 2026-11-06–07 diagnostics for the actual RifeMetal
 product runtime. The adopted change is stream IO: GPU input edge padding and
 directly cropped GPU output. The original model, weights, accumulated-mask
 update, internal padded geometry, downsample sampler, cache rotation, and
@@ -307,3 +307,98 @@ Separate validation entry points are:
 
 Keep these validation results and the frozen live logs separate from native
 hash parity and offscreen cost. Full real-playback acceptance remains failed.
+
+### Controls after R10
+
+R12b removes interpolation and scaling and captures a 1920×1080 source whose
+content advances at 119.769 Hz. Capture completion is only 64.171/s, accepted
+ready output 63.857/s, and actual presentation 60.828/s. Of 2,235 ready frames,
+2,129 are visible, 94 have zero actual time and 12 are superseded. This exposes
+a source-to-capture supply gap without model work. Its passthrough path has
+zero playout delay, so it is not a same-delay model-speed comparison with R10.
+The precise capture/compositor cause remains unresolved.
+
+R13 drives the actual built presenter directly with immutable 1920×1080
+buffers, fixed 120 Hz IDs/PTS, a 40 ms logical delay and admission 20 ms before
+each target. On a verified physical 120 Hz display it delivers 4,793/40 s =
+119.825/s; three zero-time and four superseded frames close the 4,800-frame
+cohort. No capture or model runs. This proves conditional presenter capacity,
+not complete product performance. The old target +2 ms/not-early numerator
+is still 0/4,800, with one early frame retained.
+
+R14 suppresses the workbench preview only while the opaque output viewer
+fully covers it. Preview drawing stops as intended, but actual delivery is
+2,017/35 s = 57.629/s. The 4,166 ready frames close to 2,017 visible, 1,421
+zero-time, 720 superseded and eight queue-full outcomes. The experiment is
+reverted; it provides no adoption benefit or proof of a second-view cause.
+
+A later presenter-plus-capture control (R15) stops at source-geometry setup,
+before starting its producer or capture stream. At that point the system has
+changed from a 2560×1440/120 Hz display to a 1920×1080/60 Hz display. This is
+an environment blocker for a new comparable 120 FPS run, not an explanation
+for earlier failures. No performance result is assigned to that setup failure.
+
+## Frozen-target mathematics and opt-in time contract
+
+The CPU audit preserves every R10 frame ID, outcome, context and target. Under
+the conditional assumptions of media-order delivery, at least 1/120 s between
+distinct physical deliveries, and each old closed target-to-target+2 ms
+window, exact dynamic programming can match at most **3,582/4,197** targets.
+At least **615** omissions are therefore unavoidable under those assumptions.
+The stronger constant-period/constant-phase result is conditional as well;
+neither bound explains all observed zero-time or late outcomes. The +2 ms
+window is a retained diagnostic, not a newly established user requirement.
+
+For 2,099 paired outputs, the old synthetic target differs by up to ±1.5 ms
+from interpolation between its two source targets. The recorded model alpha
+is absent; the audit derives `alpha_time` from exact media PTS and does not
+invent a model input. With the observed nominal 16.667 ms SDK prediction lead
+and 1 ms guard, 587 synthetic frames lack enough renderer-admission lead for
+that narrow window. This conditional count overlaps other failures and must
+not be added to the 615 bound. Being model-ready before the logical target
+alone does not establish readiness before the required submission cutoff.
+
+Reproduce the audit against an externally supplied frozen cohort export:
+
+```sh
+"$PYTHON" -B Experiments/K1Execution/analyze_frozen_timeline.py \
+  --input "$FROZEN_COHORT_PLAN" --output "$NEW_OUTPUT_ROOT/frozen-timeline"
+"$PYTHON" -B -m unittest discover -s Experiments/K1Execution/tests \
+  -p test_frozen_timeline.py
+```
+
+The tool requires NumPy, records input/tool hashes and exact rational
+parameters, and rejects an existing output directory. Its CPU tests use
+independent exhaustive scheduling oracles. SDK timestamps remain predictions,
+not physical actual times; observed actual outcomes are reported separately.
+
+The candidate flag `--odf-rife-pair-affine-clock` freezes each accepted source
+endpoint before its scheduler emits phases. For a valid same-context pair,
+it selects `round(T_A + alpha_time * (T_B - T_A))` once and carries that frozen
+snapshot through admission, deferred retries, model completion and enqueue.
+The preceding B endpoint is reused as the next A. Missing, unordered or stale
+endpoints retain the legacy fallback; stale work is retired rather than
+rebound. RIFE timesteps, pixels, weights, selection guard and latency cap are
+unchanged.
+
+This is a **default-off diagnostic candidate**, restricted to RIFE multiplier
+mode and the existing R8 diagnostics gate. Enable it only with
+`--odf-r8-quality-diagnostics --odf-pixel-diagnostics` plus absolute isolated
+`--odf-isolated-profile` and `--odf-live-log` paths. Fixed-FPS, hold and other
+engine paths retain their previous behavior. `pairAffineSourceFrozen`,
+`pairAffinePlan`, `pairAffineSourceEnqueue` and job `pairAffineTargets` retain
+both selected and legacy candidate targets, endpoint context, frozen delay,
+and exact PTS fraction. The new mapping changes the target definition; it
+must not be presented as passing the unchanged old target metric.
+
+Validation includes Debug and optimized
+[CPU clock contracts](../../Modules/VideoEnhancement/Tests/SPRifePairAffineClockTests.cpp),
+and the built-product `source-clock` headless test with the flag off, with its
+gate absent, and with the complete opt-in gate. The latter exercises accepted
+sources, the scheduler/event handler and completion/enqueue using simulated
+model outputs. Seven related repair/geometry/fixed-rate/PTS cases and the
+actual offscreen renderer/resource-lifetime probe pass. These checks establish
+the implementation contract, not a real-capture FPS gain. Release and separate
+Debug candidates build and bundle successfully; the R13-bound Debug binary is
+kept unchanged. A comparable physical 120 Hz run of this candidate is still
+pending, and full product acceptance remains open.

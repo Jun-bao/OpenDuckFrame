@@ -11,6 +11,7 @@
 #import "SPRifeBridge.h"
 #import "SPRateSchedule.hpp"
 #import "SPLiveDisplayQueue.h"
+#import "SPRifePairAffineClock.hpp"
 #import "SPFPSMeter.hpp"
 #import "SPPresentationBudget.hpp"
 #import "SPRateBudget.hpp"
@@ -72,6 +73,9 @@ static BOOL SPR8Enabled(void) {
 }
 static BOOL SPR8FixtureEnabled(void) {
     return SPR8Enabled() && [NSProcessInfo.processInfo.arguments containsObject:@"--odf-r8-fixture-diagnostics"];
+}
+static BOOL SPRifePairAffineClockEnabled(void) {
+    return SPR8Enabled() && [NSProcessInfo.processInfo.arguments containsObject:@"--odf-rife-pair-affine-clock"];
 }
 static int SPR8DecodeFixture(CVPixelBufferRef buffer) {
     if (!buffer) return -1;
@@ -1780,6 +1784,7 @@ struct SPLiveHeld {
     sp::SPRational pts{};
     int pins = 0;
     uint64_t previousIdentity = 0;
+    sp::RifeSourceClockTarget pairClockSource{};
 };
 
 struct SPLiveInbound {
@@ -1801,6 +1806,7 @@ struct SPLiveJob {
     sp::SPRational pts[3]{};
     sp::SPRational phase[3]{};
     int64_t targetHost[3]{};
+    sp::RifePairClockTarget pairClock[3]{};
     uint64_t clockEpoch = 0;
     int count = 0;
     uint64_t frameA = 0;
@@ -1896,6 +1902,48 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     slot.original = nullptr;
 }
 
+static NSDictionary *SPRifeSourceClockValue(const sp::RifeSourceClockTarget &target) {
+    return @{ @"frozen":@(target.frozen), @"targetHost":@(target.targetHost), @"frozenDelayHost":@(target.delayHost),
+        @"ptsNum":@(target.pts.num), @"ptsDen":@(target.pts.den), @"generation":@(target.context.generation),
+        @"configVersion":@(target.context.config), @"measurementEpoch":@(target.context.measurement), @"clockEpoch":@(target.context.clock) };
+}
+static NSDictionary *SPRifePairClockValue(const sp::RifePairClockTarget &target, uint64_t frameA, uint64_t frameB) {
+    NSString *binding=@"unbound-missing-endpoint";
+    switch(target.binding) {
+        case sp::RifePairClockBinding::bound: binding=@"bound"; break;
+        case sp::RifePairClockBinding::contextMismatch: binding=@"unbound-context"; break;
+        case sp::RifePairClockBinding::unorderedEndpoints: binding=@"unbound-endpoint-order"; break;
+        case sp::RifePairClockBinding::invalidPhase: binding=@"unbound-phase"; break;
+        case sp::RifePairClockBinding::overflow: binding=@"unbound-overflow"; break;
+        case sp::RifePairClockBinding::frozenOnly: binding=@"unbound-external-frozen-deadline"; break;
+        case sp::RifePairClockBinding::missingEndpoint: break;
+    }
+    return @{ @"frameA":@(frameA), @"frameB":@(frameB), @"ptsNum":@(target.pts.num), @"ptsDen":@(target.pts.den),
+        @"generation":@(target.context.generation), @"configVersion":@(target.context.config),
+        @"measurementEpoch":@(target.context.measurement), @"clockEpoch":@(target.context.clock),
+        @"binding":binding, @"alphaTimeNum":target.alphaTimeValid ? @(target.alphaTime.num) : (id)NSNull.null,
+        @"alphaTimeDen":target.alphaTimeValid ? @(target.alphaTime.den) : (id)NSNull.null,
+        @"legacyCandidateTargetHost":target.legacyTargetHost>0 ? @(target.legacyTargetHost) : (id)NSNull.null,
+        @"legacyFrozenDelayHost":target.legacyTargetHost>0 ? @(target.legacyDelayHost) : (id)NSNull.null,
+        @"endpointA":SPRifeSourceClockValue(target.endpointA), @"endpointB":SPRifeSourceClockValue(target.endpointB),
+        @"selectedTargetHost":@(target.selectedTargetHost), @"frozenDeadlineOverride":@(target.deadlineOverride),
+        @"selectedMinusLegacyHost":target.legacyTargetHost>0 ? @(target.selectedTargetHost-target.legacyTargetHost) : (id)NSNull.null,
+        @"metricScope":@"opt-in target remapping; legacy candidate and selected target must be evaluated separately" };
+}
+static NSArray *SPRifeJobPairClockValues(const SPLiveJob *job) {
+    NSMutableArray *values=[NSMutableArray array];
+    for(int i=0;i<job->count;++i) if(job->pairClock[i].recorded)
+        [values addObject:SPRifePairClockValue(job->pairClock[i],job->frameA,job->frameB)];
+    return values;
+}
+
+@interface SPLiveProcessor (SPRifePairClockPrivate)
+- (void)submitEventGroup:(const std::vector<sp::SPScheduleOutput> &)events generation:(uint64_t)generation
+    frozenDeadline:(int64_t)frozenDeadline frozenPairClock:(const sp::RifePairClockTarget *)frozenPairClock;
+- (BOOL)deferRifeEvent:(const sp::SPScheduleOutput &)event generation:(uint64_t)generation
+    deadline:(int64_t)deadline retryHost:(int64_t)retryHost frozenPairClock:(const sp::RifePairClockTarget *)frozenPairClock;
+@end
+
 @implementation SPLiveProcessor {
     dispatch_queue_t _q;
     SPLivePlanRequest *_request;
@@ -1939,6 +1987,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     BOOL _haveRifeDeferred;
     sp::SPScheduleOutput _rifeDeferredEvent;
     int64_t _rifeDeferredDeadline;
+    sp::RifePairClockTarget _rifeDeferredPairClock;
     int64_t _rifeDeferredRetryHost;
     uint64_t _rifeDeferredGeneration, _rifeDeferredClockEpoch;
     uint64_t _rifeDeferredAccepted, _rifeDeferredExpired, _rifeDeferredStale, _rifeDeferredCapacityDrops;
@@ -2824,6 +2873,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"centerSamples": @(_centerSamples),
         @"queueByteBudget": @([self r8QueueByteBudget]),
         @"r8QualityDiagnostic": @(SPR8Enabled()),
+        @"rifePairAffineClock": @([self usesRifePairAffineClock]),
         @"r8ExperimentActive": @([self r8CanExperiment]),
         @"r8AdmissionLimit": @([self r8AdmissionLimit]),
         @"r8SessionsRequested": @(SPR8Option(@"--odf-r8-sessions", 2, @[@1,@2,@3,@4])),
@@ -3022,14 +3072,21 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     [self erasePending:_rifeDeferredEvent.pts];
     _haveRifeDeferred = NO;
     _rifeDeferredRetryHost = 0;
+    _rifeDeferredPairClock = {};
 }
 
 - (BOOL)deferRifeEvent:(const sp::SPScheduleOutput &)event generation:(uint64_t)generation
                deadline:(int64_t)deadline retryHost:(int64_t)retryHost {
+    return [self deferRifeEvent:event generation:generation deadline:deadline retryHost:retryHost frozenPairClock:nullptr];
+}
+
+- (BOOL)deferRifeEvent:(const sp::SPScheduleOutput &)event generation:(uint64_t)generation
+    deadline:(int64_t)deadline retryHost:(int64_t)retryHost frozenPairClock:(const sp::RifePairClockTarget *)frozenPairClock {
     auto a=_held.find(event.frameA), b=_held.find(event.frameB);
     if (_haveRifeDeferred || a==_held.end() || b==_held.end() || deadline<=SPHostNow() ||
         (_haveLastPts && sp::spCmp(event.pts,_lastPresentedPts)<=0)) return NO;
     _haveRifeDeferred=YES; _rifeDeferredEvent=event; _rifeDeferredDeadline=deadline;
+    _rifeDeferredPairClock = frozenPairClock ? *frozenPairClock : sp::RifePairClockTarget{};
     _rifeDeferredGeneration=generation; _rifeDeferredClockEpoch=_clockEpoch; _rifeDeferredRetryHost=retryHost; _rifeDeferredAccepted++;
     a->second.pins++; b->second.pins++;
     SPPendingPhase phase; phase.pts=event.pts; phase.targetHost=deadline; phase.generation=generation;
@@ -3039,7 +3096,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 
 - (void)expireDeferredRifeAt:(int64_t)now {
     if (!_haveRifeDeferred) return;
-    if (_rifeDeferredGeneration != _sourceGeneration || _rifeDeferredClockEpoch != _clockEpoch) {
+    if (_rifeDeferredGeneration != _sourceGeneration || _rifeDeferredClockEpoch != _clockEpoch ||
+        (_rifeDeferredPairClock.recorded && !sp::sameRifePairClockContext(_rifeDeferredPairClock.context,[self rifePairClockContext]))) {
         [self clearDeferredRife]; return;
     }
     BOOL stale = _haveLastPts && sp::spCmp(_rifeDeferredEvent.pts, _lastPresentedPts) <= 0;
@@ -3063,8 +3121,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     auto event = _rifeDeferredEvent;
     int64_t deadline = _rifeDeferredDeadline;
     uint64_t generation = _rifeDeferredGeneration;
+    const auto frozenPairClock = _rifeDeferredPairClock;
     [self clearDeferredRife];
-    [self submitEventGroup:{event} generation:generation frozenDeadline:deadline];
+    [self submitEventGroup:{event} generation:generation frozenDeadline:deadline
+        frozenPairClock:frozenPairClock.recorded ? &frozenPairClock : nullptr];
 }
 
 - (void)resetAsyncScaleOnQueue {
@@ -4869,6 +4929,65 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     return _anchorHost + SPRationalToHost(delta) + _delayHost;
 }
 
+- (BOOL)usesRifePairAffineClock {
+    return SPRifePairAffineClockEnabled() && _request.interpolationEnabled &&
+        [_request.engineID isEqualToString:@"rife.metal"] && _request.rateKind == SPLiveRateMultiplier;
+}
+
+- (sp::RifePairClockContext)rifePairClockContext {
+    return {_sourceGeneration, _configVersion, _measurementEpoch, _clockEpoch};
+}
+
+// The caller has observed this accepted real source before entering here. The
+// endpoint is immutable; B remains the same endpoint when it becomes the next A.
+- (void)freezeRifeSourceClockIdentity:(uint64_t)identity generation:(uint64_t)generation {
+    auto found=_held.find(identity);
+    if(generation!=_sourceGeneration || found==_held.end() || found->second.pairClockSource.frozen) return;
+    int64_t delay=_delayHost, candidate=[self targetHostForPTS:found->second.pts];
+    if(!sp::freezeRifeSourceClockTarget(found->second.pairClockSource,[self rifePairClockContext],found->second.pts,candidate,delay)) return;
+    NSDictionary *value=@{ @"sourceIdentity":@(identity), @"source":SPRifeSourceClockValue(found->second.pairClockSource) };
+    [self recordR7JobEvent:@"pairAffineSourceFrozen" detail:value];
+    if(_testCapturePlayout) {
+        if(!_testTimingTrace) _testTimingTrace=[NSMutableArray array];
+        if(_testTimingTrace.count<80) { NSMutableDictionary *trace=[value mutableCopy]; trace[@"kind"]=@"pairAffineSourceFrozen"; [_testTimingTrace addObject:trace]; }
+    }
+}
+
+- (sp::RifePairClockTarget)rifePairClockTargetForEvent:(const sp::SPScheduleOutput &)event {
+    int64_t delay=_delayHost, candidate=[self targetHostForPTS:event.pts];
+    auto a=_held.find(event.frameA), b=_held.find(event.frameB);
+    return sp::rifePairClockTarget([self rifePairClockContext],event.pts,candidate,delay,
+        a==_held.end() ? nullptr : &a->second.pairClockSource,
+        b==_held.end() ? nullptr : &b->second.pairClockSource);
+}
+
+- (void)recordRifePairClockPlan:(NSArray *)targets {
+    NSDictionary *value=@{ @"targets":targets, @"rifePairAffineClock":@YES };
+    [self recordR7JobEvent:@"pairAffinePlan" detail:value];
+    if(!_r8OutputTimeline) _r8OutputTimeline=[NSMutableArray array];
+    NSMutableDictionary *event=[value mutableCopy]; event[@"kind"]=@"pairAffinePlan"; event[@"host"]=@(SPHostNow());
+    [_r8OutputTimeline addObject:event];
+    if(_r8OutputTimeline.count>512) [_r8OutputTimeline removeObjectAtIndex:0];
+}
+
+- (void)recordRifeSourceEnqueueClock:(uint64_t)identity pts:(sp::SPRational)pts selected:(int64_t)selected stage:(NSString *)stage {
+    auto source=_held.find(identity);
+    if(source==_held.end()) return;
+    const int64_t delay=_delayHost, legacy=[self targetHostForPTS:pts];
+    NSDictionary *value=@{ @"sourceIdentity":@(identity),@"ptsNum":@(pts.num),@"ptsDen":@(pts.den),
+        @"generation":@(_sourceGeneration),@"configVersion":@(_configVersion),@"measurementEpoch":@(_measurementEpoch),@"clockEpoch":@(_clockEpoch),
+        @"captureHost":@(source->second.host),@"candidateStage":stage,
+        @"legacyCandidateTargetHost":@(legacy),@"legacyCandidateDelayHost":@(delay),
+        @"canonicalSource":SPRifeSourceClockValue(source->second.pairClockSource),
+        @"selectedTargetHost":@(selected>0 ? selected : legacy),
+        @"selectedMinusLegacyHost":@((selected>0 ? selected : legacy)-legacy) };
+    [self recordR7JobEvent:@"pairAffineSourceEnqueue" detail:value];
+    if(!_r8OutputTimeline) _r8OutputTimeline=[NSMutableArray array];
+    NSMutableDictionary *event=[value mutableCopy]; event[@"kind"]=@"pairAffineSourceEnqueue"; event[@"host"]=@(SPHostNow());
+    [_r8OutputTimeline addObject:event];
+    if(_r8OutputTimeline.count>512) [_r8OutputTimeline removeObjectAtIndex:0];
+}
+
 - (void)noteSourceClock:(sp::SPRational)pts host:(int64_t)host {
     if (host <= 0) host = SPHostNow();
     BOOL traceHadAnchor = _haveAnchor;
@@ -5482,6 +5601,11 @@ presentationHost:(int64_t)presentationHost
         }
     }
     if (!held) [self observeSourceIdentity:identity];
+    int64_t pairClockDeadline=0;
+    if([self usesRifePairAffineClock] && !held && !retimed &&
+        found->second.pairClockSource.frozen && sp::spCmp(pts,found->second.pairClockSource.pts)==0 &&
+        sp::sameRifePairClockContext(found->second.pairClockSource.context,[self rifePairClockContext]))
+        pairClockDeadline=found->second.pairClockSource.targetHost;
     // Distil and low-prescale retain their existing independent policy. RIFE
     // sources always share the deadline queue with its synthetic phases.
     if (!force && (_distil || (_lowLatency && _lowPrescaleSlowMode)) && _resolved.interpolationActive && _sessionReady && _lastEnhanced && _request.viewMode != SPLiveViewOriginal) { _sourcePolicyDrops++; return; }
@@ -5497,7 +5621,9 @@ presentationHost:(int64_t)presentationHost
     if (!bgra) { _sourceConversionDrops++; return; }
     if ([self requestUsesAsyncScale:_request] && _sessionReady && (_appleSR || _videoSR || _animeSR || _cuganSR)) {
         CVPixelBufferRef original = _request.viewMode != SPLiveViewEnhanced ? [self scaleBuffer:bgra with:_baselineScaler] : NULL;
-        [self enqueueAsyncScale:bgra original:original pts:pts synthetic:NO held:held captureHost:host generation:generation deadlineHost:0];
+        if([self usesRifePairAffineClock] && !held && !retimed)
+            [self recordRifeSourceEnqueueClock:identity pts:pts selected:pairClockDeadline stage:@"source-enqueue-before-async-scale"];
+        [self enqueueAsyncScale:bgra original:original pts:pts synthetic:NO held:held captureHost:host generation:generation deadlineHost:pairClockDeadline];
         return;
     }
     CVPixelBufferRef scaleInput = [self scaleBuffer:bgra with:_request.scaleEnabled ? _srInputScaler : nil];
@@ -5512,7 +5638,13 @@ presentationHost:(int64_t)presentationHost
     if (!enhanced) enhanced = original ? CVPixelBufferRetain(original) : NULL;
     if (!original && enhanced) original = CVPixelBufferRetain(enhanced);
     if (nativeDirect) _nativeBGRADirectFrames++;
-    [self enqueueReadyEnhanced:enhanced original:original pts:pts synthetic:NO held:held captureHost:host generation:generation deadlineHost:nativeDirect ? SPHostNow() : 0];
+    if([self usesRifePairAffineClock] && !held && !retimed) {
+        int64_t sourceDeadline=nativeDirect ? SPHostNow() : pairClockDeadline;
+        [self recordRifeSourceEnqueueClock:identity pts:pts selected:sourceDeadline stage:@"source-enqueue-ready"];
+        [self enqueueReadyEnhanced:enhanced original:original pts:pts synthetic:NO held:held captureHost:host generation:generation deadlineHost:sourceDeadline];
+    } else {
+        [self enqueueReadyEnhanced:enhanced original:original pts:pts synthetic:NO held:held captureHost:host generation:generation deadlineHost:nativeDirect ? SPHostNow() : 0];
+    }
 }
 
 // Reserve a cheap, owned source image at each model deadline. On-time model
@@ -5563,6 +5695,11 @@ presentationHost:(int64_t)presentationHost
 }
 
 - (void)submitEventGroup:(const std::vector<sp::SPScheduleOutput> &)events generation:(uint64_t)generation frozenDeadline:(int64_t)frozenDeadline {
+    [self submitEventGroup:events generation:generation frozenDeadline:frozenDeadline frozenPairClock:nullptr];
+}
+
+- (void)submitEventGroup:(const std::vector<sp::SPScheduleOutput> &)events generation:(uint64_t)generation
+    frozenDeadline:(int64_t)frozenDeadline frozenPairClock:(const sp::RifePairClockTarget *)frozenPairClock {
     // A phase depends on frame B; observe its real source clock before its
     // deadline is calculated, including callers which submit a pair directly.
     if (!events.empty() && generation == _sourceGeneration) [self observeSourceIdentity:events.front().frameB];
@@ -5580,11 +5717,23 @@ presentationHost:(int64_t)presentationHost
     BOOL wantLow = [_request.engineID isEqualToString:@"apple.lowlatency"];
     BOOL wantRife = [_request.engineID isEqualToString:@"rife.metal"];
     BOOL wantDistil = [_request.engineID isEqualToString:@"distildrba.coreml"];
+    sp::RifePairClockTarget pairClock[3]{};
+    const BOOL pairAffine=[self usesRifePairAffineClock];
+    if(pairAffine) {
+        NSMutableArray *targets=[NSMutableArray array];
+        for(size_t i=0;i<MIN((size_t)3,events.size());++i) {
+            pairClock[i]=frozenDeadline>0 && i==0
+                ? sp::reuseRifePairClockTarget(frozenPairClock,[self rifePairClockContext],events[i].pts,frozenDeadline)
+                : [self rifePairClockTargetForEvent:events[i]];
+            [targets addObject:SPRifePairClockValue(pairClock[i],events[i].frameA,events[i].frameB)];
+        }
+        [self recordRifePairClockPlan:targets];
+    }
     BOOL haveEngine = wantLow ? (_lowLatency != nil) : (wantRife ? (_rife != nil) : (wantDistil ? (_distil != nil) : (_engine != nil)));
     BOOL slowPair=wantLow && _lowPrescaleSlowMode;
     if (wantRife && haveEngine && !events.empty()) {
         int64_t now = SPHostNow();
-        int64_t deadline = frozenDeadline > 0 ? frozenDeadline : [self targetHostForPTS:events.front().pts];
+        int64_t deadline = frozenDeadline > 0 ? frozenDeadline : (pairAffine ? pairClock[0].selectedTargetHost : [self targetHostForPTS:events.front().pts]);
         BOOL changingRate = [self rateBudgetEnabled] &&
             (_rateBudgetPassthrough || _rateBudget.snapshot().effectiveMultiplier != _effectiveMultiplier);
         size_t count = MIN((size_t)32, _frcNs.size());
@@ -5713,7 +5862,8 @@ presentationHost:(int64_t)presentationHost
     for (int i = 0; i < job->count; ++i) {
         job->pts[i] = events[(size_t)i].pts;
         job->phase[i] = events[(size_t)i].phase;
-        job->targetHost[i] = frozenDeadline > 0 && i == 0 ? frozenDeadline : [self targetHostForPTS:job->pts[i]];
+        job->pairClock[i] = pairClock[i];
+        job->targetHost[i] = frozenDeadline > 0 && i == 0 ? frozenDeadline : (pairAffine ? pairClock[i].selectedTargetHost : [self targetHostForPTS:job->pts[i]]);
     }
     job->frameA = events.front().frameA;
     job->frameB = events.front().frameB;
@@ -5808,6 +5958,10 @@ presentationHost:(int64_t)presentationHost
             @"captureHost": @(job->captureHost), @"generation": @(generation), @"config": @(_configVersion),
             @"clockEpoch": @(job->clockEpoch), @"measurementEpoch": @(job->measurementEpoch), @"deadlineHost": @(job->targetHost[0]),
             @"deadlineSlackMs": @(job->targetHost[0] ? (double)SPHostToNs(job->targetHost[0] - submittedHost) / 1e6 : 0) };
+        if(job->pairClock[0].recorded) {
+            NSMutableDictionary *detail=[_r7LastJobSubmitted mutableCopy];
+            detail[@"pairAffineTargets"]=SPRifeJobPairClockValues(job); _r7LastJobSubmitted=detail;
+        }
         [self recordR7JobEvent:@"submitted" detail:_r7LastJobSubmitted];
         for (int phaseIndex = 0; phaseIndex < job->count; ++phaseIndex) {
             const auto &event = events[(size_t)phaseIndex];
@@ -5859,6 +6013,10 @@ presentationHost:(int64_t)presentationHost
         @"callbackHost": @(job->callbackHost),
         @"callbackDeliveryMs": @(job->callbackHost ? (double)SPHostToNs(completedHost - job->callbackHost) / 1e6 : -1),
         @"captureToReadyMs": @(job->captureHost ? (double)SPHostToNs(completedHost - job->captureHost) / 1e6 : -1) };
+    if(job->pairClock[0].recorded) {
+        NSMutableDictionary *detail=[_r7LastJobCompleted mutableCopy];
+        detail[@"pairAffineTargets"]=SPRifeJobPairClockValues(job); _r7LastJobCompleted=detail;
+    }
     [self recordR7JobEvent:@"completed" detail:_r7LastJobCompleted];
     (void)token;
     BOOL releasedCapacity = job->inflightEpoch == _inflightEpoch && _inflight > 0;
@@ -5899,6 +6057,14 @@ presentationHost:(int64_t)presentationHost
         if (releasedCapacity) [self resumeDeferredRife];
         [self trimHeld]; delete job; return;
     }
+    if(job->pairClock[0].recorded && !sp::sameRifePairClockContext(job->pairClock[0].context,[self rifePairClockContext])) {
+        [self recordR7JobEvent:@"pairAffineContextRetired" detail:@{ @"id":@(job->diagnosticID), @"targets":SPRifeJobPairClockValues(job) }];
+        _pending.erase(std::remove_if(_pending.begin(),_pending.end(),[&](const SPPendingPhase &phase) {
+            return phase.jobID==job->diagnosticID && phase.clockEpoch==job->clockEpoch && phase.measurementEpoch==job->measurementEpoch;
+        }),_pending.end());
+        if(releasedCapacity) [self resumeDeferredRife];
+        [self trimHeld]; delete job; return;
+    }
     if (_probeWindowOpen && job->count > 0) {
         BOOL measured = NO;
         for (int i = 0; i < job->count; ++i) {
@@ -5919,7 +6085,8 @@ presentationHost:(int64_t)presentationHost
             sp::SPScheduleOutput event; event.action=sp::SPScheduleAction::Interpolate;
             event.frameA=job->frameA; event.frameB=job->frameB; event.pts=job->pts[0]; event.phase=job->phase[0];
             BOOL deferred=job->count==1 && retry<job->targetHost[0] &&
-                [self deferRifeEvent:event generation:job->generation deadline:job->targetHost[0] retryHost:retry];
+                [self deferRifeEvent:event generation:job->generation deadline:job->targetHost[0] retryHost:retry
+                    frozenPairClock:job->pairClock[0].recorded ? &job->pairClock[0] : nullptr];
             if (deferred) {
                 _rifePoolRetryAdmissions++;
                 int64_t next=_slots.empty()?retry:MIN(retry,_slots.front().targetHost);
@@ -6039,6 +6206,7 @@ presentationHost:(int64_t)presentationHost
 // ordered operation. Shared with the deterministic production-path contract.
 - (void)handleAcceptedInput:(uint64_t)identity events:(const std::vector<sp::SPScheduleOutput> &)events generation:(uint64_t)generation {
     [self observeSourceIdentity:identity];
+    if([self usesRifePairAffineClock]) [self freezeRifeSourceClockIdentity:identity generation:generation];
     [self handleEvents:events generation:generation];
 }
 
@@ -7165,10 +7333,88 @@ presentationHost:(int64_t)presentationHost
     [stale adoptSourceGeneration:2];
     dispatch_sync(stale->_q, ^{ sourceReset=stale->_sourceGeneration==2 && !stale->_havePreviousSourcePts && !stale->_haveAnchor; });
     [stale stop]; if(buffer)CVPixelBufferRelease(buffer);
-    BOOL ok=allRates && holdOK && retired && lateRejected && fpsReset && sourceReset;
+    // This uses actual accepted-source/event handling and actual completion to
+    // enqueue. No RIFE object/model is created; inference outputs are simulated.
+    SPLiveProcessor *rifeClock=[[SPLiveProcessor alloc] init];
+    __block NSDictionary *rifeResult=nil; __block BOOL rifeOK=NO;
+    CVPixelBufferRef rifeBuffer=SPCreateBuffer(32,32,kCVPixelFormatType_32BGRA);
+    dispatch_sync(rifeClock->_q, ^{
+        auto p=rifeClock;
+        p->_request.interpolationEnabled=YES; p->_request.engineID=@"rife.metal";
+        p->_request.rateKind=SPLiveRateMultiplier; p->_request.multiplier=2;
+        p->_testCapturePlayout=YES; p->_width=32; p->_height=32; [p resetSchedulerOnQueue];
+        p->_delayHost=SPRationalToHost(sp::spMake(40,1000));
+        int64_t base=SPHostNow()+SPRationalToHost(sp::spMake(2,1));
+        for(uint64_t identity=41;identity<=43;++identity) {
+            p->_held[identity].pts=sp::spMake((int64_t)identity-41,60);
+            p->_held[identity].host=base+SPRationalToHost(p->_held[identity].pts);
+        }
+        if(rifeBuffer) p->_held[42].source=CVPixelBufferRetain(rifeBuffer);
+        auto accept=[&](uint64_t identity) {
+            sp::SPScheduleInput input; input.identity=identity; input.pts=p->_held[identity].pts; input.generation=p->_configVersion;
+            auto result=p->_scheduler.push(input);
+            if(result.reject==sp::SPScheduleReject::None) [p handleAcceptedInput:identity events:result.events generation:p->_sourceGeneration];
+            return result;
+        };
+        auto first=accept(41), second=accept(42);
+        BOOL enabled=[p usesRifePairAffineClock];
+        if(!enabled) {
+            rifeOK=!p->_held[41].pairClockSource.frozen && !p->_held[42].pairClockSource.frozen;
+            rifeResult=@{ @"ok":@(rifeOK),@"enabled":@NO,@"defaultPathLeavesEndpointsUnfrozen":@(rifeOK) }; return;
+        }
+        sp::SPScheduleOutput midpoint;
+        for(auto event:second.events) if(event.action==sp::SPScheduleAction::Interpolate) midpoint=event;
+        auto frozen=[p rifePairClockTargetForEvent:midpoint];
+        const auto b=p->_held[42].pairClockSource;
+        BOOL sourceBUsesCanonical=NO;
+        for(const auto &slot:p->_slots) if(!slot.synthetic && sp::spCmp(slot.pts,p->_held[42].pts)==0)
+            sourceBUsesCanonical=slot.targetHost==b.targetHost;
+        BOOL sourceOrder=first.reject==sp::SPScheduleReject::None && second.reject==sp::SPScheduleReject::None &&
+            p->_held[41].pairClockSource.frozen && b.frozen && frozen.binding==sp::RifePairClockBinding::bound;
+        BOOL frozenBeforePlan=NO; NSUInteger freezeIndex=NSNotFound,planIndex=NSNotFound;
+        for(NSUInteger i=0;i<p->_testTimingTrace.count;++i) {
+            NSDictionary *trace=p->_testTimingTrace[i];
+            if([trace[@"kind"] isEqual:@"pairAffineSourceFrozen"] && [trace[@"sourceIdentity"] unsignedLongLongValue]==42) freezeIndex=i;
+            if([trace[@"kind"] isEqual:@"phasePlan"]) planIndex=i;
+        }
+        frozenBeforePlan=freezeIndex!=NSNotFound && planIndex!=NSNotFound && freezeIndex<planIndex;
+        accept(43);
+        BOOL reusedA=p->_held[42].pairClockSource.targetHost==b.targetHost && p->_held[42].pairClockSource.delayHost==b.delayHost;
+        ++p->_measurementEpoch;
+        auto stale=[p rifePairClockTargetForEvent:midpoint];
+        BOOL staleFallback=stale.binding==sp::RifePairClockBinding::contextMismatch && stale.selectedTargetHost==stale.legacyTargetHost;
+        --p->_measurementEpoch;
+        BOOL deferred=[p deferRifeEvent:midpoint generation:p->_sourceGeneration deadline:frozen.selectedTargetHost
+            retryHost:SPHostNow()+SPRationalToHost(sp::spMake(5,1000)) frozenPairClock:&frozen];
+        p->_delayHost=SPRationalToHost(sp::spMake(84,1000));
+        const auto retry=p->_rifeDeferredPairClock;
+        [p clearDeferredRife];
+        [p submitEventGroup:{midpoint} generation:p->_sourceGeneration frozenDeadline:frozen.selectedTargetHost frozenPairClock:&retry];
+        NSDictionary *retried=[p->_r8OutputTimeline.lastObject[@"targets"] firstObject];
+        BOOL retryStable=deferred && [retried[@"selectedTargetHost"] longLongValue]==frozen.selectedTargetHost &&
+            [retried[@"legacyFrozenDelayHost"] longLongValue]==frozen.legacyDelayHost &&
+            [retried[@"legacyCandidateTargetHost"] longLongValue]==frozen.legacyTargetHost;
+        SPLiveJob *job=new SPLiveJob(); job->count=1; job->frameA=41; job->frameB=42;
+        job->generation=p->_sourceGeneration; job->configVersion=p->_configVersion;
+        job->clockEpoch=p->_clockEpoch; job->measurementEpoch=p->_measurementEpoch; job->inflightEpoch=p->_inflightEpoch;
+        job->pts[0]=midpoint.pts; job->phase[0]=midpoint.phase; job->targetHost[0]=frozen.selectedTargetHost; job->pairClock[0]=frozen;
+        SPOwnedPixelBuffer *box=rifeBuffer ? [[SPOwnedPixelBuffer alloc] initWithBufferNoCopy:CVPixelBufferRetain(rifeBuffer)] : nil;
+        [p finishJob:job token:0 outputs:box ? @[box] : @[] latency:0 error:nil];
+        BOOL completionFrozen=NO;
+        for(const auto &slot:p->_slots) if(slot.synthetic && sp::spCmp(slot.pts,midpoint.pts)==0)
+            completionFrozen=slot.targetHost==frozen.selectedTargetHost;
+        rifeOK=sourceOrder && frozenBeforePlan && sourceBUsesCanonical && reusedA && staleFallback && retryStable && completionFrozen;
+        rifeResult=@{ @"ok":@(rifeOK),@"enabled":@YES,@"acceptedSourcesFrozenBeforePhases":@(sourceOrder&&frozenBeforePlan),
+            @"previousBReusedAsA":@(reusedA),@"staleContextFallsBack":@(staleFallback),@"deferredWholeSnapshotReused":@(retryStable),
+            @"sourceBUsesSameCanonicalTarget":@(sourceBUsesCanonical),
+            @"completionPreservesSelectedTarget":@(completionFrozen),@"target":SPRifePairClockValue(frozen,41,42) };
+    });
+    [rifeClock stop]; if(rifeBuffer)CVPixelBufferRelease(rifeBuffer);
+    BOOL ok=allRates && holdOK && retired && lateRejected && fpsReset && sourceReset && rifeOK;
     return @{ @"ok":@(ok), @"multipliers":rates, @"fixedFPSHoldUsesRealSourceClock":@(holdOK),
         @"oldClockJobRetiredWithoutTouchingNewPending":@(retired), @"lateFrozenDeadlineRejected":@(lateRejected),
         @"recomputedDeadlineWouldBeFuture":@(recomputedWouldBeFuture), @"fpsWindowResetOnReanchor":@(fpsReset), @"sourceGenerationReset":@(sourceReset),
+        @"rifePairAffineClock":rifeResult ?: @{},
         @"scope":@"deterministic source clock and actual scheduler/event handler with simulated completion and synthetic buffer; no real inference, capture, window or physical FPS" };
 }
 
