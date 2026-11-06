@@ -191,6 +191,7 @@ enum FPSPreference {
 
 enum EnhancementDelayPreference {
     private static let key = "OpenDuckFrameEnhancementDelaySeconds"
+    static let presets = [3, 5, 10]
     static func seconds(in defaults: UserDefaults) -> Int {
         guard defaults.object(forKey: key) != nil else { return 3 }
         return min(20, max(1, defaults.integer(forKey: key)))
@@ -1093,7 +1094,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let languageControl = NSSegmentedControl(labels: ["中文", "English", "More"], trackingMode: .selectOne, target: nil, action: nil)
     private let languageDetail = NSTextField(wrappingLabelWithString: "")
     private var settingsWindow: NSWindow?
-    private let enhancementDelayPopup = NSPopUpButton()
+    private var settingsStack: NSStackView?
+    private let enhancementDelayControl = NSSegmentedControl(labels: ["3 s", "5 s", "10 s", "Custom"], trackingMode: .selectOne, target: nil, action: nil)
+    private let enhancementDelayField = NSTextField(string: "3")
+    private let enhancementDelayStepper = NSStepper()
+    private let enhancementDelayCustomRow = NSStackView()
+    private var enhancementDelayCustomSelected = false
     private let configRows = NSStackView()
     private let captureCapPopup = NSPopUpButton()
     private let recentStack = NSStackView()
@@ -2460,7 +2466,19 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         return false // Other key-view navigation remains with AppKit.
     }
 
+    func controlTextDidChange(_ notification: Notification) {
+        if let field = notification.object as? NSTextField, field === enhancementDelayField,
+           let seconds = Int(field.stringValue), (1...20).contains(seconds) {
+            enhancementDelayStepper.integerValue = seconds
+        }
+    }
+
     func controlTextDidEndEditing(_ notification: Notification) {
+        if let field = notification.object as? NSTextField, field === enhancementDelayField {
+            let seconds = Int(field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) ?? EnhancementDelayPreference.seconds(in: .standard)
+            saveEnhancementDelay(seconds)
+            return
+        }
         if let field = notification.object as? NSTextField, field === widthField || field === heightField {
             let previous = dimensionEditOriginal.removeValue(forKey: ObjectIdentifier(field))
             let fallback = field === widthField ? profile.outputWidth : profile.outputHeight
@@ -4172,7 +4190,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     @objc private func showSettings() {
         if settingsWindow == nil {
-            let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 420),
+            let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 400),
                                  styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
             panel.isReleasedWhenClosed = false
             let content = NSView()
@@ -4186,33 +4204,84 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             brand.orientation = .horizontal
             brand.alignment = .centerY
             brand.spacing = 12
-            let languageHeading = heading(EnhancementText.t("Language", "语言"))
-            let appearanceHeading = heading(EnhancementText.t("Appearance", "外观"))
-            languageControl.segmentDistribution = .fillEqually
-            appearanceControl.segmentDistribution = .fillEqually
+
+            func group(_ body: NSView) -> NSBox {
+                let box = NSBox()
+                box.boxType = .custom
+                box.titlePosition = .noTitle
+                box.borderWidth = 0
+                box.isTransparent = false
+                box.cornerRadius = 10
+                box.fillColor = NSColor(name: nil) { appearance in
+                    appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                        ? NSColor.white.withAlphaComponent(0.06)
+                        : NSColor.black.withAlphaComponent(0.05)
+                }
+                body.translatesAutoresizingMaskIntoConstraints = false
+                box.contentView!.addSubview(body)
+                NSLayoutConstraint.activate([
+                    body.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 14),
+                    body.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -14),
+                    body.topAnchor.constraint(equalTo: box.topAnchor, constant: 14),
+                    body.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -14),
+                ])
+                return box
+            }
+            for control in [enhancementDelayControl, languageControl, appearanceControl] {
+                control.segmentDistribution = .fillEqually
+                control.segmentStyle = .rounded
+                control.selectedSegmentBezelColor = .controlAccentColor
+                control.heightAnchor.constraint(equalToConstant: 28).isActive = true
+            }
+            enhancementDelayControl.target = self
+            enhancementDelayControl.action = #selector(enhancementDelayChanged)
+            enhancementDelayControl.setAccessibilityLabel(EnhancementText.t("Countdown", "倒计时时间"))
+            enhancementDelayField.alignment = .right
+            enhancementDelayField.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+            enhancementDelayField.widthAnchor.constraint(equalToConstant: 48).isActive = true
+            enhancementDelayField.delegate = self
+            enhancementDelayStepper.minValue = 1
+            enhancementDelayStepper.maxValue = 20
+            enhancementDelayStepper.increment = 1
+            enhancementDelayStepper.target = self
+            enhancementDelayStepper.action = #selector(enhancementDelayStepped)
+            let customLabel = NSTextField(labelWithString: EnhancementText.t("Seconds (1–20)", "秒数（1–20）"))
+            customLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            enhancementDelayCustomRow.orientation = .horizontal
+            enhancementDelayCustomRow.alignment = .centerY
+            enhancementDelayCustomRow.spacing = 8
+            for view in [customLabel, enhancementDelayField, enhancementDelayStepper] {
+                enhancementDelayCustomRow.addArrangedSubview(view)
+            }
+            let delayBody = NSStackView(views: [heading(EnhancementText.t("Countdown", "倒计时时间")), enhancementDelayControl, enhancementDelayCustomRow])
+            delayBody.orientation = .vertical
+            delayBody.alignment = .leading
+            delayBody.spacing = 10
+            delayBody.detachesHiddenViews = true
+            enhancementDelayControl.widthAnchor.constraint(equalTo: delayBody.widthAnchor).isActive = true
+            enhancementDelayCustomRow.widthAnchor.constraint(equalTo: delayBody.widthAnchor).isActive = true
+            let delayGroup = group(delayBody)
+
             languageDetail.font = .systemFont(ofSize: 11)
             languageDetail.textColor = .secondaryLabelColor
-            for seconds in 1...20 {
-                enhancementDelayPopup.addItem(withTitle: "\(seconds) s")
-                enhancementDelayPopup.lastItem?.tag = seconds
-            }
-            enhancementDelayPopup.target = self
-            enhancementDelayPopup.action = #selector(enhancementDelayChanged)
-            enhancementDelayPopup.setAccessibilityLabel(EnhancementText.t("Countdown", "倒计时时间"))
-            let delayRow = row(EnhancementText.t("Countdown", "倒计时时间"), enhancementDelayPopup)
-            let stack = NSStackView(views: [brand, languageHeading, languageControl, languageDetail, appearanceHeading, appearanceControl, delayRow])
-            stack.orientation = .vertical
-            stack.alignment = .leading
-            stack.spacing = 8
-            stack.setCustomSpacing(24, after: brand)
-            stack.setCustomSpacing(20, after: languageDetail)
-            stack.setCustomSpacing(20, after: appearanceControl)
-            stack.translatesAutoresizingMaskIntoConstraints = false
-            content.addSubview(stack)
+            let languageRow = row(EnhancementText.t("Language", "语言"), languageControl)
+            (languageRow as? NSStackView)?.distribution = .fill
+            let languageBody = NSStackView(views: [languageRow, languageDetail])
+            languageBody.orientation = .vertical
+            languageBody.alignment = .leading
+            languageBody.spacing = 8
+            languageBody.detachesHiddenViews = true
+            languageRow.widthAnchor.constraint(equalTo: languageBody.widthAnchor).isActive = true
+            languageDetail.widthAnchor.constraint(equalTo: languageBody.widthAnchor).isActive = true
+            let languageGroup = group(languageBody)
+            let appearanceRow = row(EnhancementText.t("Appearance", "外观"), appearanceControl)
+            (appearanceRow as? NSStackView)?.distribution = .fill
+            let appearanceGroup = group(appearanceRow)
+            let divider = NSBox()
+            divider.boxType = .separator
             let links = NSStackView()
             links.orientation = .horizontal
             links.distribution = .fillEqually
-            links.translatesAutoresizingMaskIntoConstraints = false
             for (title, key) in [(EnhancementText.t("Website", "官网"), "ODFWebsiteURL"),
                                  ("GitHub", "ODFRepositoryURL"),
                                  (EnhancementText.t("Feedback", "反馈"), "ODFFeedbackURL")] {
@@ -4220,42 +4289,92 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 link.identifier = NSUserInterfaceItemIdentifier(key)
                 link.bezelStyle = .inline
                 link.isBordered = false
-                link.font = WorkbenchStyle.captionFont
-                link.contentTintColor = .secondaryLabelColor
+                link.font = .systemFont(ofSize: 12)
+                link.contentTintColor = .linkColor
                 links.addArrangedSubview(link)
             }
-            content.addSubview(links)
+            let stack = NSStackView(views: [brand, delayGroup, languageGroup, appearanceGroup, divider, links])
+            stack.orientation = .vertical
+            stack.alignment = .leading
+            stack.spacing = 12
+            stack.setCustomSpacing(20, after: brand)
+            stack.setCustomSpacing(24, after: appearanceGroup)
+            stack.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(stack)
             NSLayoutConstraint.activate([
                 stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 24),
                 stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 28),
                 stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
-                languageControl.widthAnchor.constraint(equalTo: stack.widthAnchor),
-                languageDetail.widthAnchor.constraint(equalTo: stack.widthAnchor),
-                appearanceControl.widthAnchor.constraint(equalTo: stack.widthAnchor),
-                delayRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
-                links.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
-                links.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
-                links.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -22),
             ])
+            for view in [delayGroup, languageGroup, appearanceGroup, divider, links] {
+                view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            }
             panel.contentView = content
+            settingsStack = stack
             settingsWindow = panel
-            panel.center()
         }
         settingsWindow?.title = EnhancementText.t("Settings", "设置")
         settingsWindow?.appearance = window?.appearance
         refreshSettingsLanguage()
-        enhancementDelayPopup.selectItem(withTag: EnhancementDelayPreference.seconds(in: .standard))
+        let seconds = EnhancementDelayPreference.seconds(in: .standard)
+        enhancementDelayCustomSelected = !EnhancementDelayPreference.presets.contains(seconds)
+        refreshEnhancementDelayControls()
+        settingsWindow?.center()
         settingsWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    @objc private func enhancementDelayChanged() {
+    private func fitSettingsWindow() {
+        guard let panel = settingsWindow, let stack = settingsStack else { return }
+        panel.contentView?.layoutSubtreeIfNeeded()
+        let height = ceil(stack.fittingSize.height) + 44
+        var frame = panel.frameRect(forContentRect: NSRect(x: 0, y: 0, width: 440, height: height))
+        frame.origin = NSPoint(x: panel.frame.minX, y: panel.frame.maxY - frame.height)
+        panel.setFrame(frame, display: true)
+    }
+
+    private func refreshEnhancementDelayControls() {
+        let seconds = EnhancementDelayPreference.seconds(in: .standard)
+        enhancementDelayControl.selectedSegment = enhancementDelayCustomSelected ? 3 : (EnhancementDelayPreference.presets.firstIndex(of: seconds) ?? 3)
+        enhancementDelayField.stringValue = String(seconds)
+        enhancementDelayStepper.integerValue = seconds
+        enhancementDelayCustomRow.isHidden = !enhancementDelayCustomSelected
+        fitSettingsWindow()
+    }
+
+    private func saveEnhancementDelay(_ seconds: Int) {
         cancelCountdown()
-        EnhancementDelayPreference.set(enhancementDelayPopup.selectedTag(), in: .standard)
+        EnhancementDelayPreference.set(seconds, in: .standard)
+        refreshEnhancementDelayControls()
+    }
+
+    @objc private func enhancementDelayChanged() {
+        let index = enhancementDelayControl.selectedSegment
+        settingsWindow?.makeFirstResponder(nil)
+        enhancementDelayCustomSelected = index == 3
+        if enhancementDelayCustomSelected {
+            refreshEnhancementDelayControls()
+            settingsWindow?.makeFirstResponder(enhancementDelayField)
+            enhancementDelayField.selectText(nil)
+        } else if EnhancementDelayPreference.presets.indices.contains(index) {
+            saveEnhancementDelay(EnhancementDelayPreference.presets[index])
+        }
+    }
+
+    @objc private func enhancementDelayStepped() {
+        saveEnhancementDelay(enhancementDelayStepper.integerValue)
     }
 
     private func refreshSettingsLanguage() {
         let code = AppLanguage.current
+        for (index, seconds) in EnhancementDelayPreference.presets.enumerated() {
+            enhancementDelayControl.setLabel(EnhancementText.t("\(seconds) s", "\(seconds) 秒"), forSegment: index)
+        }
+        enhancementDelayControl.setLabel(EnhancementText.t("Custom", "自定义"), forSegment: 3)
+        enhancementDelayControl.setAccessibilityLabel(EnhancementText.t("Countdown", "倒计时时间"))
+        enhancementDelayField.setAccessibilityLabel(EnhancementText.t("Custom countdown in seconds, 1 to 20", "自定义倒计时秒数，1 到 20"))
+        enhancementDelayStepper.setAccessibilityLabel(EnhancementText.t("Adjust countdown", "调整倒计时秒数"))
+        languageDetail.isHidden = code == nil || code == "en" || code == "zh-Hans"
         languageControl.setLabel(EnhancementText.t("More…", "更多…"), forSegment: 2)
         languageControl.selectedSegment = code != nil && code != "en" && code != "zh-Hans" ? 2 : (EnhancementText.chinese ? 0 : 1)
         let effective = AppLanguage.effectiveLanguage(for: code) ?? "en"
@@ -4263,6 +4382,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         languageDetail.stringValue = EnhancementText.chinese
             ? "播放器语言：\(name)。画质工作台支持中文和英文。"
             : "Player language: \(name). The workbench supports Chinese and English."
+        fitSettingsWindow()
     }
 
     @objc private func selectMoreLanguage(_ sender: NSMenuItem) {

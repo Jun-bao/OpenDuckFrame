@@ -195,6 +195,10 @@ private final class SourceSizeControls {
   let defaults=UserDefaults(suiteName:suite)!
   defer { defaults.removePersistentDomain(forName:suite) }
   precondition(EnhancementDelayPreference.seconds(in:defaults)==3)
+  EnhancementDelayPreference.set(7,in:defaults)
+  precondition(EnhancementDelayPreference.seconds(in:UserDefaults(suiteName:suite)!)==7)
+  EnhancementDelayPreference.set(5,in:defaults)
+  precondition(EnhancementDelayPreference.seconds(in:UserDefaults(suiteName:suite)!)==5)
   EnhancementDelayPreference.set(20,in:defaults)
   precondition(EnhancementDelayPreference.seconds(in:UserDefaults(suiteName:suite)!)==20)
   EnhancementDelayPreference.set(99,in:defaults);precondition(EnhancementDelayPreference.seconds(in:defaults)==20)
