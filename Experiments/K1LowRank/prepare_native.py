@@ -64,7 +64,8 @@ let package = Package(name: "K1NativeLab", platforms: [.macOS(.v13)], products: 
     text = builder.read_text()
     a, b = text.index(start), text.index(end)
     text = text[:a] + '''            let scaled: MPSGraphTensor
-            if let ranks = LowRankGraphContract.ranks[weights.graphID], prefix == "block3." || prefix == "block4." {
+            if let ranks = LowRankGraphContract.ranks[weights.graphID],
+               (prefix == "block3." || prefix == "block4."), ranks[prefix == "block3." ? 0 : 1] > 0 {
                 let r = ranks[prefix == "block3." ? 0 : 1]
                 let down = try loadConst(name: "convblock.\\(j).conv_a.weight")
                 let up = try loadConst(name: "convblock.\\(j).conv_b.weight")

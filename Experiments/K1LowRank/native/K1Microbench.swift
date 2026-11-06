@@ -34,7 +34,7 @@ public enum K1Microbench {
             for j in 0..<depth {
                 let p = "block\(stage).convblock.\(j)."
                 let branch: MPSGraphTensor
-                if let ranks = LowRankGraphContract.ranks[store.graphID] {
+                if let ranks = LowRankGraphContract.ranks[store.graphID], ranks[stage - 3] > 0 {
                     let zero = g.constant(0, shape: [NSNumber(value: ranks[stage - 3])], dataType: .float16)
                     let down = g.rifeConv2D(input: x, weight: try weight(p + "conv_a.weight"), bias: zero, stride: 1, padding: 1)
                     branch = g.rifeConv2D(input: down, weight: try weight(p + "conv_b.weight"), bias: try weight(p + "conv_b.bias"), stride: 1, padding: 0)

@@ -22,9 +22,13 @@ from torch.nn import functional as F
 GRAPHS = {
     "odf-ifnet425-b3r32-b4r16-betafold-v1": (32, 16),
     "odf-ifnet425-b3r64-b4r32-betafold-diag-v1": (64, 32),
+    "odf-ifnet425-b3r32-b4dense-betafold-v1": (32, 0),
+    "odf-ifnet425-b3dense-b4r16-betafold-v1": (0, 16),
+    "odf-ifnet425-dense-folded-probe-v1": (0, 0),
 }
 STUDENT = next(iter(GRAPHS))
 DIAGNOSTIC = list(GRAPHS)[1]
+MATERIALIZED = list(GRAPHS)[4]
 
 
 def load_lab(root):
@@ -41,7 +45,7 @@ def schema(rmw, graph):
     shapes = {}
     for name, shape in rmw.state_schema().items():
         stage = int(name[5]) if name.startswith("block") else -1
-        if stage in (3, 4) and ".convblock." in name:
+        if stage in (3, 4) and ranks[stage - 3] > 0 and ".convblock." in name:
             if name.endswith(".conv.weight"):
                 p = name.removesuffix("conv.weight")
                 c, r = shape[0], ranks[stage - 3]
@@ -70,16 +74,53 @@ def factorize(weight, bias, beta, rank):
     }
 
 
-def initialize(rmw, source, graph):
+def factorize_response(weight, bias, beta, rank, covariance, ridge_relative=1e-5):
+    """Fixed-bias rank-r optimum for Q + ridge*I; diagnostics use actual Q.
+
+    Q is the uncentered second moment of zero-padded input patches, not a
+    centered covariance. FP16 storage error is included in response diagnostics.
+    """
+    c = weight.shape[0]
+    effective = beta.reshape(c, 1).double() * weight.reshape(c, -1).double()
+    folded_bias = beta.reshape(c).double() * bias.double()
+    q = covariance.double()
+    ridge = float(q.trace() / q.shape[0]) * ridge_relative
+    if ridge <= 0:
+        raise ValueError("calibration has no positive response energy")
+    eigenvalues, eigenvectors = torch.linalg.eigh(q)
+    regularized = eigenvalues.clamp_min(0) + ridge
+    root = (eigenvectors * regularized.sqrt()) @ eigenvectors.T
+    inverse_root = (eigenvectors * regularized.rsqrt()) @ eigenvectors.T
+    u, s, vh = torch.linalg.svd(effective @ root, full_matrices=False)
+    a = ((s[:rank].sqrt()[:, None] * vh[:rank]) @ inverse_root).reshape(rank, c, 3, 3)
+    b = (u[:, :rank] * s[:rank].sqrt()).reshape(c, rank, 1, 1)
+    approximate = b.half().double().reshape(c, rank) @ a.half().double().reshape(rank, -1)
+    delta = effective - approximate
+    denominator = torch.trace(effective @ q @ effective.T)
+    return a, b, folded_bias, dict(
+        ridge_relative=ridge_relative, ridge_absolute=ridge,
+        q_min_eigenvalue=float(eigenvalues.min()),
+        regularized_condition_number=float(regularized.max() / regularized.min()),
+        response_relative_mse_fp16_weights=float(torch.trace(delta @ q @ delta.T) / denominator),
+        response_error_scope="linear branch with fixed exact folded bias; exported bias quantization assessed end to end",
+    )
+
+
+def initialize(rmw, source, graph, covariances=None):
+    if graph == MATERIALIZED:
+        raise ValueError("materialized probe requires existing exported factors; use materialize.py")
     if source.model != "rife-v4.25":
         raise ValueError("This graph is bound to 4.25 with replace-mask semantics")
     state = {n: t.clone() for n, t in source.state_dict.items()}
     rows = []
     for stage, rank in zip((3, 4), GRAPHS[graph]):
+        if rank == 0:
+            continue  # retain this stage's original dense weights and beta
         for layer in range(8):
             p = f"block{stage}.convblock.{layer}."
-            a, b, bias, row = factorize(state.pop(p + "conv.weight"),
-                                       state.pop(p + "conv.bias"), state.pop(p + "beta"), rank)
+            args = (state.pop(p + "conv.weight"), state.pop(p + "conv.bias"), state.pop(p + "beta"), rank)
+            a, b, bias, row = (factorize(*args) if covariances is None else
+                               factorize_response(*args, covariances[p[:-1]]))
             state.update({p + "conv_a.weight": a, p + "conv_b.weight": b, p + "conv_b.bias": bias})
             rows.append(dict(layer=p[:-1], rank=rank, **row))
     expected = schema(rmw, graph)
@@ -150,6 +191,8 @@ def reference(ifnet, graph, state):
 
     net = LowRankStudent()
     for stage, rank in zip((3, 4), GRAPHS[graph]):
+        if rank == 0:
+            continue
         block = getattr(net, f"block{stage}")
         block.convblock = nn.Sequential(*(LowRankResConv((64, 32)[stage - 3], rank) for _ in range(8)))
     net.load_state_dict(state, strict=True)
@@ -168,6 +211,8 @@ def main():
     source = rmw.read_rmw(args.source)
     args.output.mkdir(parents=True, exist_ok=True)
     for graph in GRAPHS:
+        if graph == MATERIALIZED:
+            continue
         state, rows = initialize(rmw, source, graph)
         path = args.output / (graph + ".rmw")
         header = export_rmw(rmw, graph, state, path)

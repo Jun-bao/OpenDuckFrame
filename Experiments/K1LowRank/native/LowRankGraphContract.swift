@@ -1,11 +1,14 @@
 import Foundation
 
-/// Two fixed topologies: the candidate and a full-rank numerical diagnostic.
+/// Fixed experiment topologies; zero denotes an unchanged dense stage.
 /// No arbitrary graph, model alias, rank, beta or mask-policy inference.
 enum LowRankGraphContract {
     static let ranks = [
         "odf-ifnet425-b3r32-b4r16-betafold-v1": [32, 16],
         "odf-ifnet425-b3r64-b4r32-betafold-diag-v1": [64, 32],
+        "odf-ifnet425-b3r32-b4dense-betafold-v1": [32, 0],
+        "odf-ifnet425-b3dense-b4r16-betafold-v1": [0, 16],
+        "odf-ifnet425-dense-folded-probe-v1": [0, 0],
     ]
 
     static func schema(graph: String) -> [RifeWeightHeader.TensorEntry] {
@@ -29,7 +32,7 @@ enum LowRankGraphContract {
             append(p + "conv0.1.0.bias", [c])
             for j in 0..<8 {
                 let r = p + "convblock.\(j)."
-                if i >= 3 {
+                if i >= 3 && rank[i - 3] > 0 {
                     append(r + "conv_a.weight", [3, 3, c, rank[i - 3]])
                     append(r + "conv_b.weight", [1, 1, rank[i - 3], c])
                     append(r + "conv_b.bias", [c])

@@ -18,8 +18,15 @@ private func pixelHash(_ frame: CVPixelBuffer) -> String {
 /// A predetermined random schedule; no candidate selection occurs in this runner.
 func runControlled(config: [String: Any], outputDir: URL) throws -> [String: Any] {
     let width = config["width"] as! Int, height = config["height"] as! Int
-    let first = try pixelBuffer(path: config["first"] as! String, width: width, height: height)
-    let second = try pixelBuffer(path: config["second"] as! String, width: width, height: height)
+    let cases = config["cases"] as? [[String: Any]] ?? [
+        ["id": "default", "first": config["first"]!, "second": config["second"]!]
+    ]
+    var inputs: [String: (CVPixelBuffer, CVPixelBuffer)] = [:]
+    for item in cases {
+        inputs[item["id"] as! String] = (
+            try pixelBuffer(path: item["first"] as! String, width: width, height: height),
+            try pixelBuffer(path: item["second"] as! String, width: width, height: height))
+    }
     let variants = config["variants"] as! [[String: Any]]
     let schedule = config["schedule"] as! [[String: Any]]
     let count = config["frames_per_arm"] as! Int, warmup = config["warmup_per_arm"] as! Int
@@ -55,6 +62,8 @@ func runControlled(config: [String: Any], outputDir: URL) throws -> [String: Any
     defer { try? journalHandle.close() }
     var lastBlock = -1
     for cell in schedule {
+        let caseID = cell["case_id"] as? String ?? "default"
+        let (first, second) = inputs[caseID]!
         let block = cell["block"] as! Int, alpha = Float(cell["alpha"] as! Double)
         let cadence = cell["cadence"] as! String
         let periodMS = cell["period_ms"] as! Double
@@ -95,7 +104,7 @@ func runControlled(config: [String: Any], outputDir: URL) throws -> [String: Any
                 }
                 samples.append(sample)
             }
-            let row: [String: Any] = ["block": block, "cadence": cadence, "alpha": alpha,
+            let row: [String: Any] = ["block": block, "case_id": caseID, "cadence": cadence, "alpha": alpha,
                 "variant": id, "defer_commits": variant["defer_commits"]!, "samples": samples,
                 "native_leaky": variant["native_leaky"] as? Bool ?? false,
                 "last_output_sha256": pixelHash(output!), "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
