@@ -1134,7 +1134,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let sourceMetaLabel = NSTextField(labelWithString: "")
     private var startButton: NSButton?
     private var stopButton: NSButton?
-    private var pauseButton: NSButton?
     private var sourceActionButton: NSButton?
     private var emptySourceButton: NSButton?
     private var activeSourceTitle = ""
@@ -1529,9 +1528,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let stripSpacer = NSView()
         stripSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         stripRow.addArrangedSubview(stripSpacer)
-        let chooseSource = button(EnhancementText.t("Change", "更换"), #selector(chooseCurrentKind))
-        sourceActionButton = chooseSource
-        stripRow.addArrangedSubview(chooseSource)
         stripColumn.addArrangedSubview(stripRow)
         sourceKindControl.widthAnchor.constraint(equalTo: stripColumn.widthAnchor).isActive = true
         stripRow.widthAnchor.constraint(equalTo: stripColumn.widthAnchor).isActive = true
@@ -1987,8 +1983,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let buttons = NSStackView()
         buttons.orientation = .horizontal
         buttons.spacing = 8
-        let pause = button(EnhancementText.t("Pause", "暂停"), #selector(pause))
-        pauseButton = pause
+        let changeSource = button(EnhancementText.t("Change Window", "更换窗口"), #selector(chooseCurrentKind))
+        sourceActionButton = changeSource
         let start = button(EnhancementText.t("Delayed Enhancement", "延迟增强"), #selector(start), primary: true)
         let stop = button(EnhancementText.t("Stop", "停止"), #selector(stop), primary: true)
         startButton = start
@@ -2022,7 +2018,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         row.spacing = 12
         row.addArrangedSubview(statusColumn)
         row.addArrangedSubview(NSView())
-        buttons.addArrangedSubview(pause)
+        buttons.addArrangedSubview(changeSource)
         buttons.addArrangedSubview(start)
         buttons.addArrangedSubview(stop)
         row.addArrangedSubview(buttons)
@@ -2743,13 +2739,19 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         sourceLabel.textColor = .labelColor
         sourceStripLabel.textColor = .labelColor
         let choose: String
+        let change: String
         switch sourceKindControl.selectedSegment {
-        case 1: choose = EnhancementText.t("Choose Display", "选择显示器")
-        case 2: choose = EnhancementText.t("Choose File", "选择文件")
-        default: choose = EnhancementText.t("Choose Window", "选择窗口")
+        case 1:
+            choose = EnhancementText.t("Choose Display", "选择显示器")
+            change = EnhancementText.t("Change Display", "更换显示器")
+        case 2:
+            choose = EnhancementText.t("Choose File", "选择文件")
+            change = EnhancementText.t("Change Video", "更换视频")
+        default:
+            choose = EnhancementText.t("Choose Window", "选择窗口")
+            change = EnhancementText.t("Change Window", "更换窗口")
         }
-        let selectedKind = ["window", "display", "file"][max(0, min(2, sourceKindControl.selectedSegment))]
-        sourceActionButton?.title = !activeSourceTitle.isEmpty && activeSourceKind == selectedKind ? EnhancementText.t("Change", "更换") : choose
+        sourceActionButton?.title = change
         emptySourceButton?.title = choose
         emptyOverlay.isHidden = capture.running
     }
@@ -2919,7 +2921,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                         self.statusLabel.stringValue = EnhancementText.runtime(player.workbenchFileLanczosStatus)
                         self.statusLabel.textColor = .systemRed
                     }
-                    self.pauseButton?.title = player.workbenchIsPlaying ? EnhancementText.t("Pause", "暂停") : EnhancementText.t("Resume", "继续")
                     self.refreshActions()
                 }
             }
@@ -3970,7 +3971,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         (outputWindow as? TargetPanel)?.viewerKeyboard = false
         liveApply.cancel(); pendingApply = nil; pendingSourceGeneration = nil
         capture.paused = false
-        pauseButton?.title = EnhancementText.t("Pause", "暂停")
         outputWarmupToken &+= 1
         outputMinimumCaptureHost = 0
         outputWindow?.orderOut(nil)
@@ -3988,42 +3988,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         refreshActions()
         refreshPlanLabel()
         refreshInteractionStatus()
-    }
-
-    @objc private func pause() {
-        cancelCountdown()
-        inputRouter?.stop(reason:"paused")
-        interactionArmed = false
-        if profile.sourceKind == "file", let player = selectedFilePlayer() {
-            player.workbenchTogglePlayback()
-            pauseButton?.title = player.workbenchIsPlaying ? EnhancementText.t("Pause", "暂停") : EnhancementText.t("Resume", "继续")
-            return
-        }
-        let resuming = capture.paused
-        outputMinimumCaptureHost = resuming ? Int64(mach_absolute_time()) : 0
-        capture.paused.toggle()
-        outputWarmupToken &+= 1
-        outputWarmupStartedAt = 0
-        outputWarmupWarningShown = false
-        if capture.paused {
-            viewerActive = false; viewerReturnPID = nil
-            (outputWindow as? TargetPanel)?.viewerKeyboard = false
-            outputWindow?.orderOut(nil); targetHUD?.orderOut(nil)
-            targetCountdownHUD?.orderOut(nil); viewerControlsPanel?.orderOut(nil)
-            outputPreview.refreshVisibilitySnapshot()
-        }
-        lastStats = [:]
-        lastStatsReceipt = 0
-        processor.resetFPSObservations()
-        pauseButton?.title = capture.paused ? EnhancementText.t("Resume", "继续") : EnhancementText.t("Pause", "暂停")
-        statusLabel.stringValue = capture.paused
-            ? EnhancementText.t("Paused. Capture stays connected.", "已暂停，捕获仍连接")
-            : EnhancementText.t("Resumed", "已继续")
-        statusLabel.textColor = .labelColor
-        updateTargetPanels()
-        updateFPSOverlay()
-        refreshInteractionStatus()
-        recordPlanEvent(capture.paused ? "pause" : "resume")
     }
 
     @objc private func showLibrary() { showPage(2) }
