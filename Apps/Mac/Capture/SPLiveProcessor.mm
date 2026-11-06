@@ -33,6 +33,7 @@
 #include <cstring>
 #include <cfloat>
 #include <atomic>
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <deque>
@@ -714,13 +715,55 @@ static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) 
             frame.frameID, (bool)frame.counts, (bool)frame.redraw};
 }
 
+// Only the current prospective slot owns a drawable. Deferred timer blocks
+// retain a weak view and token, never the update or an obsolete drawable.
+@interface SPProspectiveDisplaySlot : NSObject {
+@public
+    sp::DisplaySlotWindow timing;
+}
+@property(nonatomic, strong) id<CAMetalDrawable> drawable;
+@property(nonatomic) double deadline;
+@property(nonatomic) double displayTime;
+@property(nonatomic) int64_t callbackHost;
+@end
+@implementation SPProspectiveDisplaySlot
+@end
+
+enum class SPDisplayTimerOutcome : uint8_t { selected, noFrame, waiting, staleToken, noCurrentSlot, retired, gpuBusy, expiredConsume, expiredReplaced };
+struct SPDisplayTimerTrace {
+    sp::DisplaySlotWindow armed{};
+    uint64_t observedToken = 0, frameID = 0;
+    int64_t handlerEntryNs = 0, lockAcquiredNs = 0;
+    SPDisplayTimerOutcome outcome = SPDisplayTimerOutcome::noCurrentSlot;
+};
+static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
+    switch (outcome) {
+        case SPDisplayTimerOutcome::selected: return @"selected";
+        case SPDisplayTimerOutcome::noFrame: return @"no-frame";
+        case SPDisplayTimerOutcome::waiting: return @"premature-wake-rearmed";
+        case SPDisplayTimerOutcome::staleToken: return @"stale-token";
+        case SPDisplayTimerOutcome::noCurrentSlot: return @"no-current-slot";
+        case SPDisplayTimerOutcome::retired: return @"retired-context";
+        case SPDisplayTimerOutcome::gpuBusy: return @"gpu-busy";
+        case SPDisplayTimerOutcome::expiredConsume: return @"expired-consume";
+        case SPDisplayTimerOutcome::expiredReplaced: return @"expired-callback-replaced";
+    }
+}
+
 @interface SPLivePreviewView () <CAMetalDisplayLinkDelegate>
 - (void)updateDisplayLinkConfiguration;
 - (void)setPresentationClockEpoch:(uint64_t)clockEpoch;
-- (void)prepareWarmSurface:(SPDisplayFrameRequest *)frame;
+- (void)prepareWarmSurface:(SPDisplayFrameRequest *)frame targetSize:(CGSize)size;
+- (sp::DisplaySlotContext)displaySlotContext;
+- (void)armDisplaySlotLocked:(uint64_t)token;
+- (void)parkDisplaySlotTimerLocked;
+- (void)recordDisplayTimerTraceLocked:(SPDisplayTimerTrace)trace;
+- (void)consumeDisplaySlot:(sp::DisplaySlotWindow)armedSlot;
+- (int64_t)presentationPreparationLeadNs;
+- (NSDictionary *)displaySlotDiagnostics;
 - (void)discardOutdatedPresentations;
 - (void)reportPendingPresentation:(SPDisplayFrameRequest *)frame reason:(NSString *)reason;
-- (void)renderPendingPresentation:(SPDisplayFrameRequest *)frame update:(CAMetalDisplayLinkUpdate *)update callbackHost:(int64_t)callbackHost;
+- (void)renderPendingPresentation:(SPDisplayFrameRequest *)frame slot:(SPProspectiveDisplaySlot *)slot selectionHost:(int64_t)selectionHost;
 - (void)observeSourceGeometry:(NSDictionary *)value generation:(uint64_t)generation;
 @end
 
@@ -730,6 +773,15 @@ static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) 
     id<MTLDevice> _device;
     id<MTLCommandQueue> _commandQueue;
     CAMetalDisplayLink *_displayLink;
+    dispatch_queue_t _renderQueue;
+    dispatch_source_t _displaySlotTimer;
+    std::array<SPDisplayTimerTrace, 64> _displayTimerTrace;
+    uint64_t _displayTimerTraceCount;
+    std::atomic<uint64_t> _displaySlotExpiredInConsume, _displaySlotExpiredByCallback;
+    SPProspectiveDisplaySlot *_prospectiveSlot;
+    uint64_t _nextDisplaySlotToken;
+    std::atomic<int64_t> _displayPreparationLeadNs;
+    std::atomic<uint64_t> _displaySlotExpired, _displaySlotRetired, _displaySlotBusy, _displaySlotNoFrame;
     std::mutex _presentationMutex;
     NSMutableArray<SPDisplayFrameRequest *> *_pendingPresentations;
     sp::SPRational _lastSubmittedPresentationPTS;
@@ -773,6 +825,20 @@ static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) 
     _surfaceToken.store(0);
     _inflightDraws.store(0);
     _geometryVerifiedHost = 0;
+    _nextDisplaySlotToken = 0;
+    _displayPreparationLeadNs.store(16000000);
+    _displaySlotExpired.store(0); _displaySlotRetired.store(0); _displaySlotBusy.store(0); _displaySlotNoFrame.store(0);
+    _renderQueue = dispatch_queue_create("app.openduckframe.display-slot-render",
+        dispatch_queue_attr_make_with_autorelease_frequency(
+            dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0),
+            DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM));
+    _displayTimerTraceCount = 0;
+    _displaySlotExpiredInConsume.store(0); _displaySlotExpiredByCallback.store(0);
+    _displaySlotTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, DISPATCH_TIMER_STRICT, _renderQueue);
+    if (_displaySlotTimer) {
+        dispatch_source_set_timer(_displaySlotTimer, DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 50000);
+        dispatch_resume(_displaySlotTimer); // activated once; later arms/parks never suspend it
+    }
     _pendingPresentations = [NSMutableArray array];
     _haveSubmittedPresentationPTS = false;
     self.wantsLayer = YES;
@@ -802,7 +868,7 @@ static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) 
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         _pipeline = [_device newRenderPipelineStateWithDescriptor:desc error:NULL];
     }
-    if (_pipeline) {
+    if (_pipeline && _displaySlotTimer) {
         _displayLink = [[CAMetalDisplayLink alloc] initWithMetalLayer:_metalLayer];
         _displayLink.delegate = self;
         _displayLink.preferredFrameLatency = 1;
@@ -814,6 +880,7 @@ static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) 
 
 - (void)dealloc {
     [_displayLink invalidate];
+    if (_displaySlotTimer) dispatch_source_cancel(_displaySlotTimer);
     if (_cache) CFRelease(_cache);
 }
 
@@ -1197,7 +1264,10 @@ static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) 
     frame.captureGeometry = captureGeometry;
     if (warmSurface) {
         if (_warmSurfacePending.exchange(true)) { if (reason) *reason = @"display-warm-inflight"; return NO; }
-        dispatch_async(dispatch_get_main_queue(), ^{ [self prepareWarmSurface:frame]; });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            CGSize size = self->_metalLayer.drawableSize;
+            dispatch_async(self->_renderQueue, ^{ [self prepareWarmSurface:frame targetSize:size]; });
+        });
         return YES; // GPU surface preparation only; never a physical presentation success
     }
     std::lock_guard<std::mutex> lock(_presentationMutex);
@@ -1227,7 +1297,10 @@ static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) 
     _displayLink.paused = !_drawableVisible.load() || _generation.load() == 0;
     if (!_drawableVisible.load()) {
         NSArray<SPDisplayFrameRequest *> *discarded;
-        { std::lock_guard<std::mutex> lock(_presentationMutex); discarded = [_pendingPresentations copy]; [_pendingPresentations removeAllObjects]; }
+        { std::lock_guard<std::mutex> lock(_presentationMutex);
+          discarded = [_pendingPresentations copy]; [_pendingPresentations removeAllObjects];
+          if (_prospectiveSlot) { _displaySlotRetired.fetch_add(1); _prospectiveSlot = nil; }
+          [self parkDisplaySlotTimerLocked]; }
         for (SPDisplayFrameRequest *frame in discarded) [self reportPendingPresentation:frame reason:@"display-invisible"];
     }
 }
@@ -1251,6 +1324,10 @@ static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) 
     NSMutableArray<SPDisplayFrameRequest *> *discarded = [NSMutableArray array];
     {
         std::lock_guard<std::mutex> lock(_presentationMutex);
+        if (_prospectiveSlot && !sp::sameDisplaySlotContext(_prospectiveSlot->timing.context, [self displaySlotContext])) {
+            _displaySlotRetired.fetch_add(1); _prospectiveSlot = nil;
+            [self parkDisplaySlotTimerLocked];
+        }
         for (NSInteger i = (NSInteger)_pendingPresentations.count - 1; i >= 0; --i) {
             SPDisplayFrameRequest *frame = _pendingPresentations[(NSUInteger)i];
             if (frame.generation != _generation.load() || frame.config != _diagnosticConfig.load() || frame.epoch != _diagnosticEpoch.load() || frame.clockEpoch != _presentationClockEpoch.load()) {
@@ -1265,7 +1342,7 @@ static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) 
 
 // A transparent output may receive no display-link updates. Prepare one
 // bounded offscreen surface for its existing token handshake; never present it.
-- (void)prepareWarmSurface:(SPDisplayFrameRequest *)frame {
+- (void)prepareWarmSurface:(SPDisplayFrameRequest *)frame targetSize:(CGSize)size {
     @autoreleasepool {
         if (frame.generation != _generation.load() || frame.config != _diagnosticConfig.load() ||
             frame.epoch != _diagnosticEpoch.load() || frame.clockEpoch != _presentationClockEpoch.load() ||
@@ -1277,7 +1354,6 @@ static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) 
         CVMetalTextureRef aRef = [self createTexture:primary];
         CVMetalTextureRef bRef = frame.mode == SPLiveViewCompare ? [self createTexture:secondary] : NULL;
         id<MTLTexture> a = aRef ? CVMetalTextureGetTexture(aRef) : nil, b = bRef ? CVMetalTextureGetTexture(bRef) : nil;
-        CGSize size = _metalLayer.drawableSize;
         MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
             width:MAX((NSUInteger)1,(NSUInteger)size.width) height:MAX((NSUInteger)1,(NSUInteger)size.height) mipmapped:NO];
         desc.usage = MTLTextureUsageRenderTarget;
@@ -1320,19 +1396,142 @@ static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) 
     }
 }
 
+- (sp::DisplaySlotContext)displaySlotContext {
+    return {_generation.load(), _diagnosticConfig.load(), _diagnosticEpoch.load(), _presentationClockEpoch.load()};
+}
+
+- (int64_t)presentationPreparationLeadNs { return _displayPreparationLeadNs.load(); }
+
+- (void)recordDisplayTimerTraceLocked:(SPDisplayTimerTrace)trace {
+    _displayTimerTrace[_displayTimerTraceCount % _displayTimerTrace.size()] = trace;
+    ++_displayTimerTraceCount;
+}
+
+- (NSDictionary *)displaySlotDiagnostics {
+    std::array<SPDisplayTimerTrace, 64> history;
+    uint64_t total; NSUInteger pendingFrames; bool pendingSlot;
+    {
+        std::lock_guard<std::mutex> lock(_presentationMutex);
+        history = _displayTimerTrace; total = _displayTimerTraceCount;
+        pendingFrames = _pendingPresentations.count; pendingSlot = _prospectiveSlot != nil;
+    }
+    // Build diagnostic objects outside the deadline-sensitive publication lock.
+    NSUInteger count = (NSUInteger)MIN(total, (uint64_t)history.size());
+    NSMutableArray *events = [NSMutableArray arrayWithCapacity:count];
+    for (NSUInteger i = 0; i < count; ++i) {
+        const auto &trace = history[(total - count + i) % history.size()];
+        NSString *expiredOrigin = trace.outcome == SPDisplayTimerOutcome::expiredConsume ? @"consume" :
+            (trace.outcome == SPDisplayTimerOutcome::expiredReplaced ? @"callback-replaced" : nil);
+        [events addObject:@{ @"handlerToken": @(trace.armed.token), @"observedToken": @(trace.observedToken),
+            @"generation": @(trace.armed.context.generation), @"configVersion": @(trace.armed.context.config),
+            @"measurementEpoch": @(trace.armed.context.measurementEpoch), @"clockEpoch": @(trace.armed.context.clockEpoch),
+            @"plannedSelectionNs": @(trace.armed.deadlineNs - sp::displaySelectionGuardNs),
+            @"deadlineNs": @(trace.armed.deadlineNs), @"scheduledDisplayNs": @(trace.armed.displayNs),
+            @"handlerEntryNs": trace.handlerEntryNs ? @(trace.handlerEntryNs) : (id)[NSNull null],
+            @"lockAcquiredNs": trace.lockAcquiredNs ? @(trace.lockAcquiredNs) : (id)[NSNull null],
+            @"frameID": trace.frameID ? @(trace.frameID) : (id)[NSNull null],
+            @"outcome": SPDisplayTimerOutcomeName(trace.outcome), @"expiredOrigin": expiredOrigin ?: (id)[NSNull null] }];
+    }
+    return @{ @"pendingSlots": @(pendingSlot), @"slotCapacity": @1,
+        @"pendingFrames": @(pendingFrames), @"frameCapacity": @(sp::displayQueueCapacity),
+        @"expiredSlotsLifetime": @(_displaySlotExpired.load()),
+        @"expiredInConsumeLifetime": @(_displaySlotExpiredInConsume.load()),
+        @"expiredByCallbackLifetime": @(_displaySlotExpiredByCallback.load()),
+        @"retiredSlotsLifetime": @(_displaySlotRetired.load()), @"busySlotsLifetime": @(_displaySlotBusy.load()),
+        @"noFrameSlotsLifetime": @(_displaySlotNoFrame.load()), @"preparationLeadNs": @(_displayPreparationLeadNs.load()),
+        @"selectionGuardNs": @(sp::displaySelectionGuardNs), @"timerLeewayNs": @50000, @"timerStrict": @YES,
+        @"timerTraceCapacity": @(history.size()), @"timerTraceTotal": @(total), @"timerTrace": events,
+        @"timerTraceNote": @"bounded slot observations; handler entry includes OS wake and render-queue scheduling, lock acquisition separately includes mutex wait" };
+}
+
+// All arm/park calls own presentationMutex. Publication and arming are one
+// transaction; an old callback cannot rearm after a newer ticket was published.
+- (void)parkDisplaySlotTimerLocked {
+    if (_displaySlotTimer) dispatch_source_set_timer(_displaySlotTimer, DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 50000);
+}
+
+- (void)armDisplaySlotLocked:(uint64_t)token {
+    if (!_prospectiveSlot || !sp::canArmDisplaySlot(_prospectiveSlot->timing, token, [self displaySlotContext])) return;
+    const sp::DisplaySlotWindow armedSlot = _prospectiveSlot->timing;
+    int64_t delayNs = MAX((int64_t)0, armedSlot.deadlineNs - sp::displaySelectionGuardNs - (int64_t)(CACurrentMediaTime() * 1e9));
+    __weak SPLivePreviewView *weakSelf = self;
+    dispatch_source_set_event_handler(_displaySlotTimer, ^{ [weakSelf consumeDisplaySlot:armedSlot]; });
+    dispatch_source_set_timer(_displaySlotTimer, dispatch_time(DISPATCH_TIME_NOW, delayNs), DISPATCH_TIME_FOREVER, 50000);
+}
+
 - (void)metalDisplayLink:(CAMetalDisplayLink *)link needsUpdate:(CAMetalDisplayLinkUpdate *)update {
     @autoreleasepool {
         int64_t callbackHost = SPHostNow();
-        if (link != _displayLink || !_drawableVisible.load()) return;
-        // Never block this callback on a semaphore, nextDrawable or another queue.
-        if (_inflightDraws.load() >= 2 || !std::isfinite(update.targetTimestamp) ||
-            !std::isfinite(update.targetPresentationTimestamp) || CACurrentMediaTime() >= update.targetTimestamp) return;
-        [self discardOutdatedPresentations];
+        double deadline = update.targetTimestamp, displayTime = update.targetPresentationTimestamp;
+        int64_t nowNs = (int64_t)(CACurrentMediaTime() * 1e9);
+        if (link != _displayLink || !_drawableVisible.load() || !_generation.load() ||
+            !std::isfinite(deadline) || !std::isfinite(displayTime) || displayTime <= deadline ||
+            deadline * 1e9 <= nowNs) return;
+        SPProspectiveDisplaySlot *slot = [SPProspectiveDisplaySlot new];
+        slot.drawable = update.drawable; slot.deadline = deadline; slot.displayTime = displayTime; slot.callbackHost = callbackHost;
+        {
+            std::lock_guard<std::mutex> lock(_presentationMutex);
+            auto context = [self displaySlotContext];
+            if (_prospectiveSlot && !sp::canReplaceDisplaySlot(_prospectiveSlot->timing, context, nowNs)) {
+                _displaySlotBusy.fetch_add(1); return; // preserve an older slot that is still usable
+            }
+            if (_prospectiveSlot) {
+                if (sp::sameDisplaySlotContext(_prospectiveSlot->timing.context, context)) {
+                    _displaySlotExpired.fetch_add(1); _displaySlotExpiredByCallback.fetch_add(1);
+                    [self recordDisplayTimerTraceLocked:{_prospectiveSlot->timing, _prospectiveSlot->timing.token, 0, 0,
+                        (int64_t)(CACurrentMediaTime() * 1e9), SPDisplayTimerOutcome::expiredReplaced}];
+                } else _displaySlotRetired.fetch_add(1);
+            }
+            slot->timing = {++_nextDisplaySlotToken, context, (int64_t)(deadline * 1e9), (int64_t)(displayTime * 1e9)};
+            _prospectiveSlot = slot;
+            _displayPreparationLeadNs.store(sp::displayPreparationLeadNs(slot->timing));
+            [self armDisplaySlotLocked:slot->timing.token];
+        }
+    }
+}
+
+- (void)consumeDisplaySlot:(sp::DisplaySlotWindow)armedSlot {
+    @autoreleasepool {
+        int64_t handlerEntryNs = (int64_t)(CACurrentMediaTime() * 1e9);
+        int64_t selectionHost = SPHostNow();
+        const uint64_t token = armedSlot.token;
+        SPProspectiveDisplaySlot *slot;
         SPDisplayFrameRequest *frame = nil;
         NSMutableArray<SPDisplayFrameRequest *> *stale = [NSMutableArray array];
         NSMutableArray<SPDisplayFrameRequest *> *superseded = [NSMutableArray array];
         {
             std::lock_guard<std::mutex> lock(_presentationMutex);
+            int64_t lockAcquiredNs = (int64_t)(CACurrentMediaTime() * 1e9);
+            slot = _prospectiveSlot;
+            SPDisplayTimerTrace trace{armedSlot, slot ? slot->timing.token : 0, 0, handlerEntryNs, lockAcquiredNs, SPDisplayTimerOutcome::noCurrentSlot};
+            if (!slot) { [self recordDisplayTimerTraceLocked:trace]; return; }
+            auto decision = sp::displaySlotDecision(slot->timing, token, [self displaySlotContext], lockAcquiredNs);
+            if (decision == sp::DisplaySlotDecision::staleToken) {
+                trace.outcome = SPDisplayTimerOutcome::staleToken; [self recordDisplayTimerTraceLocked:trace]; return;
+            }
+            if (decision == sp::DisplaySlotDecision::waiting) {
+                trace.outcome = SPDisplayTimerOutcome::waiting; [self recordDisplayTimerTraceLocked:trace];
+                [self armDisplaySlotLocked:token]; return; // helper does not acquire this mutex again
+            }
+            _prospectiveSlot = nil; // local ownership lasts only through this selection/render work item
+            [self parkDisplaySlotTimerLocked];
+            if (decision == sp::DisplaySlotDecision::expired) {
+                _displaySlotExpired.fetch_add(1); _displaySlotExpiredInConsume.fetch_add(1);
+                trace.outcome = SPDisplayTimerOutcome::expiredConsume; [self recordDisplayTimerTraceLocked:trace]; return;
+            }
+            if (decision == sp::DisplaySlotDecision::retired || !_drawableVisible.load()) {
+                _displaySlotRetired.fetch_add(1); trace.outcome = SPDisplayTimerOutcome::retired; [self recordDisplayTimerTraceLocked:trace]; return;
+            }
+            if (_inflightDraws.load() >= 2) {
+                _displaySlotBusy.fetch_add(1); trace.outcome = SPDisplayTimerOutcome::gpuBusy; [self recordDisplayTimerTraceLocked:trace]; return;
+            }
+            for (NSInteger i = (NSInteger)_pendingPresentations.count - 1; i >= 0; --i) {
+                SPDisplayFrameRequest *pending = _pendingPresentations[(NSUInteger)i];
+                if (pending.generation != slot->timing.context.generation || pending.config != slot->timing.context.config ||
+                    pending.epoch != slot->timing.context.measurementEpoch || pending.clockEpoch != slot->timing.context.clockEpoch) {
+                    [stale addObject:pending]; [_pendingPresentations removeObjectAtIndex:(NSUInteger)i];
+                }
+            }
             for (NSInteger i = (NSInteger)_pendingPresentations.count - 1; i >= 0; --i) {
                 SPDisplayFrameRequest *pending = _pendingPresentations[(NSUInteger)i];
                 int comparison = _haveSubmittedPresentationPTS ? sp::spCmp({pending.ptsNum,pending.ptsDen}, _lastSubmittedPresentationPTS) : 1;
@@ -1342,24 +1541,31 @@ static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) 
             }
             std::vector<sp::DisplayQueueFrame> timings;
             for (SPDisplayFrameRequest *pending in _pendingPresentations) timings.push_back(SPDisplayFrameTiming(pending));
-            auto selected = sp::chooseDisplayFrame(timings, (int64_t)(update.targetPresentationTimestamp * 1e9));
+            auto selected = sp::chooseDisplayFrame(timings, (int64_t)(slot.displayTime * 1e9));
             if (selected < timings.size()) {
                 frame = _pendingPresentations[selected];
                 for (NSUInteger index = 0; index < selected; ++index) [superseded addObject:_pendingPresentations[index]];
                 [_pendingPresentations removeObjectsInRange:NSMakeRange(0, selected + 1)];
             }
+            trace.frameID = frame ? frame.frameID : 0;
+            trace.outcome = frame ? SPDisplayTimerOutcome::selected : SPDisplayTimerOutcome::noFrame;
+            [self recordDisplayTimerTraceLocked:trace];
         }
+        int64_t callbackHost = slot.callbackHost;
         for (SPDisplayFrameRequest *discarded in stale) [self reportPendingPresentation:discarded reason:@"display-stale-pts"];
         for (SPDisplayFrameRequest *discarded in superseded) [self reportPendingPresentation:discarded reason:@"display-slot-superseded"
-            details:@{ @"displayLinkCallbackHost": @(callbackHost), @"displayLinkTargetTimestamp": @(update.targetTimestamp),
-                @"displayLinkTargetPresentationTimestamp": @(update.targetPresentationTimestamp),
-                @"scheduledMinusLogicalTargetNs": discarded.logicalTargetHost > 0 ? @((int64_t)(update.targetPresentationTimestamp * 1e9) - SPHostToNs(discarded.logicalTargetHost)) : (id)[NSNull null] }];
-        if (frame) [self renderPendingPresentation:frame update:update callbackHost:callbackHost];
+            details:@{ @"displayLinkCallbackHost": @(callbackHost), @"displayLinkTargetTimestamp": @(slot.deadline),
+                @"displayLinkTargetPresentationTimestamp": @(slot.displayTime),
+                @"scheduledMinusLogicalTargetNs": discarded.logicalTargetHost > 0 ? @((int64_t)(slot.displayTime * 1e9) - SPHostToNs(discarded.logicalTargetHost)) : (id)[NSNull null] }];
+        if (frame) [self renderPendingPresentation:frame slot:slot selectionHost:selectionHost];
+        else _displaySlotNoFrame.fetch_add(1);
     }
 }
 
-- (void)renderPendingPresentation:(SPDisplayFrameRequest *)frame update:(CAMetalDisplayLinkUpdate *)update callbackHost:(int64_t)callbackHost {
-    const double presentDeadline = update.targetTimestamp, scheduledDisplayTime = update.targetPresentationTimestamp;
+- (void)renderPendingPresentation:(SPDisplayFrameRequest *)frame slot:(SPProspectiveDisplaySlot *)slot selectionHost:(int64_t)selectionHost {
+    const double presentDeadline = slot.deadline, scheduledDisplayTime = slot.displayTime;
+    const int64_t callbackHost = slot.callbackHost;
+    const uint64_t slotToken = slot->timing.token;
     uint64_t seen = frame.generation, seenConfig = frame.config, seenEpoch = frame.epoch, seenClock = frame.clockEpoch;
     uint64_t seenSurfaceToken = frame.surfaceToken, frameID = frame.frameID;
     int64_t captureHost = frame.captureHost, ptsNum = frame.ptsNum, ptsDen = frame.ptsDen;
@@ -1377,10 +1583,12 @@ static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) 
     int enhancedWidth = enhanced ? (int)CVPixelBufferGetWidth(enhanced) : 0, enhancedHeight = enhanced ? (int)CVPixelBufferGetHeight(enhanced) : 0;
     int originalWidth = original ? (int)CVPixelBufferGetWidth(original) : 0, originalHeight = original ? (int)CVPixelBufferGetHeight(original) : 0;
     int64_t drawableWaitNs = 0;
-    id<CAMetalDrawable> drawable = update.drawable;
+    id<CAMetalDrawable> drawable = slot.drawable;
     struct SPDrawNote {
         std::atomic<long long> gpuHost{0};
         std::atomic<long long> commitHost{0};
+        std::atomic<long long> scheduledHost{0};
+        std::atomic<double> scheduledMedia{0};
         std::atomic<double> presentRequestMedia{0};
     };
     auto note = std::make_shared<SPDrawNote>();
@@ -1390,8 +1598,11 @@ static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) 
             @"frameID": @(frameID), @"ptsNum": @(ptsNum), @"ptsDen": @(ptsDen), @"synthetic": @(synthetic), @"clockEpoch": @(seenClock),
             @"logicalTargetHost": @(presentationHost), @"presentationEnqueueHost": @(frame.enqueueHost),
             @"presentationQueueStartHost": @(callbackHost), @"displayLinkCallbackHost": @(callbackHost),
+            @"displaySelectionHost": @(selectionHost), @"displaySlotToken": @(slotToken),
             @"displayLinkTargetTimestamp": @(presentDeadline), @"displayLinkTargetPresentationTimestamp": @(scheduledDisplayTime),
-            @"metalCommitHost": @(note->commitHost.load()), @"presentRequestMediaTime": @(note->presentRequestMedia.load()) });
+            @"metalCommitHost": @(note->commitHost.load()), @"metalScheduledHost": @(note->scheduledHost.load()),
+            @"metalScheduledMediaTime": @(note->scheduledMedia.load()),
+            @"presentRequestMethod": @"command-buffer-ordinary", @"presentRequestMediaTime": @(note->presentRequestMedia.load()) });
     };
     void (^releaseTicket)(void) = ^{ self->_inflightDraws.fetch_sub(1); };
     CVMetalTextureRef aRef = [self createTexture:primary];
@@ -1494,7 +1705,11 @@ static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) 
             @"drawableWaitNs": @(drawableWaitNs),
             @"presentationEnqueueHost": @(frame.enqueueHost),
             @"presentationQueueStartHost": @(callbackHost),
+            @"displaySelectionHost": @(selectionHost), @"displaySlotToken": @(slotToken),
             @"metalCommitHost": @(note->commitHost.load()),
+            @"metalScheduledHost": @(note->scheduledHost.load()),
+            @"metalScheduledMediaTime": @(note->scheduledMedia.load()),
+            @"presentRequestMethod": @"command-buffer-ordinary",
             @"displayLinkCallbackHost": @(callbackHost),
             @"displayLinkTargetTimestamp": @(presentDeadline),
             @"displayLinkTargetPresentationTimestamp": @(scheduledDisplayTime),
@@ -1529,7 +1744,8 @@ static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) 
         });
     }];
     // The update's present deadline differs from its future display target.
-    // Submit first, then ordinary present; timed presents assert for these drawables.
+    // Ordinary command-buffer presentation waits for GPU scheduling before
+    // invoking drawable.present(). Timed presents assert for these drawables.
     {
         std::lock_guard<std::mutex> generationLock(_generationMutex);
         std::lock_guard<std::mutex> pendingLock(_presentationMutex);
@@ -1537,12 +1753,17 @@ static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) 
             (seenConfig != _diagnosticConfig.load() ? @"configuration" : (seenEpoch != _diagnosticEpoch.load() ? @"epoch" :
                 (seenClock != _presentationClockEpoch.load() ? @"clock-retired" : nil)));
         if (!invalid && CACurrentMediaTime() >= presentDeadline) invalid = @"display-submit-deadline";
+        if (invalid) { [command commit]; reportFailure(invalid); return; }
+        [command addScheduledHandler:^(id<MTLCommandBuffer> scheduled) {
+            (void)scheduled;
+            note->scheduledHost.store(SPHostNow());
+            note->scheduledMedia.store(CACurrentMediaTime());
+        }];
+        // This records wrapper registration, not the private present call.
+        note->presentRequestMedia.store(CACurrentMediaTime());
+        [command presentDrawable:drawable];
         note->commitHost.store(SPHostNow());
         [command commit];
-        if (!invalid && CACurrentMediaTime() >= presentDeadline) invalid = @"display-submit-deadline";
-        if (invalid) { reportFailure(invalid); return; }
-        note->presentRequestMedia.store(CACurrentMediaTime());
-        [drawable present];
         _lastSubmittedPresentationPTS = {ptsNum,ptsDen}; _haveSubmittedPresentationPTS = true;
     }
     if (_cache) CVMetalTextureCacheFlush(_cache, 0);
@@ -2577,6 +2798,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"playheadP95ms": @(SPPercentileMs(_playheadNs)),
         @"drawableWaitP95ms": @(SPPercentileMs(_drawableWaitNs)),
         @"presentationDriver": @"CAMetalDisplayLink",
+        @"presentationSlots": @{ @"preview": [self.preview displaySlotDiagnostics] ?: @{}, @"output": [self.outputPreview displaySlotDiagnostics] ?: @{} },
         @"presentationAdmissionToCallbackP95ms": @(SPPercentileMs(_presentationAdmissionToCallbackNs)),
         @"metalCommitToDisplayP95ms": @(SPPercentileMs(_metalCommitToDisplayNs)),
         @"displayScheduledTargetOffsetP95ms": @(SPPercentileMs(_displayScheduledTargetOffsetNs)),
@@ -4078,7 +4300,13 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             @"presentationEnqueueHost": info[@"presentationEnqueueHost"] ?: @0,
             @"presentationQueueStartHost": info[@"presentationQueueStartHost"] ?: @0,
             @"metalCommitHost": info[@"metalCommitHost"] ?: @0,
+            @"metalScheduledHost": info[@"metalScheduledHost"] ?: @0,
+            @"metalScheduledMediaTime": info[@"metalScheduledMediaTime"] ?: @0,
+            @"presentRequestMethod": info[@"presentRequestMethod"] ?: @"drawable-immediate",
+            @"gpuHost": info[@"gpuHost"] ?: @0,
             @"displayLinkCallbackHost": info[@"displayLinkCallbackHost"] ?: @0,
+            @"displaySelectionHost": info[@"displaySelectionHost"] ?: @0,
+            @"displaySlotToken": info[@"displaySlotToken"] ?: @0,
             @"displayLinkTargetTimestamp": info[@"displayLinkTargetTimestamp"] ?: @0,
             @"displayLinkTargetPresentationTimestamp": info[@"displayLinkTargetPresentationTimestamp"] ?: @0,
             @"logicalTargetHost": info[@"logicalTargetHost"] ?: @0,
@@ -4843,7 +5071,9 @@ presentationHost:(int64_t)presentationHost
     int64_t slop = SPRationalToHost(sp::spMake(1, 1000));
     // Hand ready buffers to the bounded display-link queue ahead of time.
     // This lead does not change logical targets or due-merge eligibility.
-    int64_t prepareLead = [self requestUsesLatestPresentation:_request] ? 0 : SPRationalToHost(sp::spMake(16, 1000));
+    SPLivePreviewView *timedView = self.outputPreview.windowVisibleSnapshot ? self.outputPreview : self.preview;
+    int64_t observedLeadNs = MAX((int64_t)16000000, [timedView presentationPreparationLeadNs]);
+    int64_t prepareLead = [self requestUsesLatestPresentation:_request] ? 0 : SPRationalToHost(sp::spMake(observedLeadNs, 1000000000));
     while (!_slots.empty()) {
         int64_t earliest = 0;
         if ([self waitForPendingBefore:_slots.front().pts now:now earliest:&earliest]) {

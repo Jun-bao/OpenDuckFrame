@@ -5707,7 +5707,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             if case .window = target { followsWindow = !fullscreen }
             else { followsWindow = false }
             outputFollowsWindow = followsWindow
-            let opaque = interactionAvailable ? false : (windowTarget ? r7Flag("--odf-r7-opaque") : true)
+            // Fullscreen viewing already fills the output; avoid transparent-window composition.
+            let opaque = interactionAvailable ? false : (explicitViewer || (windowTarget ? r7Flag("--odf-r7-opaque") : true))
             panel.isOpaque = opaque
             panel.backgroundColor = opaque ? .black : .clear
             outputPreview.layer?.isOpaque = opaque

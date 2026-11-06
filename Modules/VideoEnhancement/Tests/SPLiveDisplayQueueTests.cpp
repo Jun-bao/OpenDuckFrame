@@ -47,6 +47,38 @@ int main() {
     require(scheduled > pending[0].logicalTargetNs + 2000000, "late scheduled slot was relabelled on time");
     pending[0].logicalTargetNs = tick * 10;
     require(chooseDisplayFrame(pending, tick * 5) == pending.size(), "later PTS overtook a future head frame");
+    // Absolute media time, not callback-relative time or source-PTS rebasing.
+    const int64_t absolute = 1139402000000000LL;
+    DisplaySlotContext context{7, 5, 4, 11};
+    DisplaySlotWindow slot{42, context, absolute + 8000000, absolute + 25000000};
+    require(displayPreparationLeadNs(slot) == 19000000, "prepare lead used callback-to-display horizon");
+    require(displaySlotDecision(slot,42,context,absolute) == DisplaySlotDecision::waiting, "selected at callback instead of near deadline");
+    std::vector<DisplayQueueFrame> arriving;
+    arriving.push_back({{10,120},absolute+17000000,1,true});
+    // This frame is delivered after the callback, within its live submit window.
+    arriving.push_back({{11,120},absolute+25000000,2,true});
+    const int64_t selectionTime = slot.deadlineNs - displaySelectionGuardNs;
+    require(displaySlotDecision(slot,42,context,selectionTime-1) == DisplaySlotDecision::waiting, "late-ready frame consumed before decision guard");
+    require(displaySlotDecision(slot,42,context,selectionTime) == DisplaySlotDecision::ready &&
+            chooseDisplayFrame(arriving,slot.displayNs) == 1, "callback cutoff lost a frame ready before deadline");
+    require(displaySlotDecision(slot,42,context,absolute+8000000) == DisplaySlotDecision::expired, "expired deadline could claim submission success");
+    require(!canReplaceDisplaySlot(slot,context,absolute+7000000), "new update displaced a viable old slot");
+    require(canReplaceDisplaySlot(slot,context,absolute+8000000), "expired drawable ticket was retained");
+    auto retired = context; retired.clockEpoch++;
+    require(displaySlotDecision(slot,42,retired,absolute+7000000) == DisplaySlotDecision::retired, "old clock consumed a deferred drawable");
+    require(canReplaceDisplaySlot(slot,retired,absolute+1000000), "retired clock blocked new ticket");
+    slot.token = 43; slot.context = retired;
+    require(displaySlotDecision(slot,42,retired,absolute+7000000) == DisplaySlotDecision::staleToken, "old timer consumed a replacement slot");
+    require(!canArmDisplaySlot(slot,42,retired), "a delayed old arm overwrote the replacement slot timer");
+    require(canArmDisplaySlot(slot,43,retired), "current token could not arm its timer");
+    require(!canArmDisplaySlot(slot,43,context), "retired clock rearmed a current-context timer");
+    for (int boundary = 0; boundary < 3; ++boundary) {
+        auto changed = retired;
+        if (boundary == 0) changed.generation++;
+        else if (boundary == 1) changed.config++;
+        else changed.measurementEpoch++;
+        require(displaySlotDecision(slot,43,changed,absolute+7000000) == DisplaySlotDecision::retired, "context change did not retire the pending ticket");
+    }
     std::puts("display-link pending queue assertions passed (CPU only)");
     return 0;
 }

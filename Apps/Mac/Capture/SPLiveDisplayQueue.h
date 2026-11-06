@@ -16,6 +16,48 @@ struct DisplayQueueFrame {
 };
 
 constexpr std::size_t displayQueueCapacity = 4;
+
+struct DisplaySlotContext {
+    uint64_t generation = 0, config = 0, measurementEpoch = 0, clockEpoch = 0;
+};
+
+inline bool sameDisplaySlotContext(DisplaySlotContext a, DisplaySlotContext b) {
+    return a.generation == b.generation && a.config == b.config &&
+        a.measurementEpoch == b.measurementEpoch && a.clockEpoch == b.clockEpoch;
+}
+
+struct DisplaySlotWindow {
+    uint64_t token = 0;
+    DisplaySlotContext context{};
+    int64_t deadlineNs = 0, displayNs = 0;
+};
+
+constexpr int64_t displaySelectionGuardNs = 1000000;
+enum class DisplaySlotDecision { staleToken, retired, waiting, ready, expired };
+
+inline bool canArmDisplaySlot(DisplaySlotWindow slot, uint64_t token, DisplaySlotContext current) {
+    return token && slot.token == token && sameDisplaySlotContext(slot.context, current);
+}
+
+inline DisplaySlotDecision displaySlotDecision(DisplaySlotWindow slot, uint64_t token,
+                                               DisplaySlotContext current, int64_t nowNs) {
+    if (!token || slot.token != token) return DisplaySlotDecision::staleToken;
+    if (!sameDisplaySlotContext(slot.context, current)) return DisplaySlotDecision::retired;
+    if (nowNs >= slot.deadlineNs) return DisplaySlotDecision::expired;
+    return nowNs < slot.deadlineNs - displaySelectionGuardNs ? DisplaySlotDecision::waiting : DisplaySlotDecision::ready;
+}
+
+inline bool canReplaceDisplaySlot(DisplaySlotWindow slot, DisplaySlotContext current, int64_t nowNs) {
+    return !slot.token || !sameDisplaySlotContext(slot.context, current) || nowNs >= slot.deadlineNs;
+}
+
+inline int64_t displayPreparationLeadNs(DisplaySlotWindow slot) {
+    // Preparation only: preserve the old floor and add handoff room to the
+    // observed display-minus-submission-deadline interval, never to callback time.
+    const int64_t observed = slot.displayNs > slot.deadlineNs ? slot.displayNs - slot.deadlineNs + 2000000 : 0;
+    return observed > 16000000 ? observed : 16000000;
+}
+
 enum class DisplayAdmission { accepted, invalidPTS, stalePTS, duplicatePTS, redrawNotCurrent, full };
 
 inline DisplayAdmission admitDisplayFrame(const std::vector<DisplayQueueFrame> &pending,

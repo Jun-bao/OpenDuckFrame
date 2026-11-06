@@ -42,9 +42,9 @@ explicit finite step/time budgets, and the shared GPU lock. These gates did
 not pass for C16/C24, so training was not started. No trained checkpoint or
 experimental fusion/tail/narrow graph enters production.
 
-### Complete K1 cost
+### Complete K1 cost (offscreen)
 
-The primary comparison in `io-fast-cost/analysis.json` is continuous
+The prespecified experimental primary in `io-fast-cost/analysis.json` is continuous
 `d0 - io`, with equal clip and phase weight. It contains 20 whole temporal
 blocks: five development clips, four passes. Each block contains all three
 fixed phases (`0.25`, `0.5`, `0.75`), continuous and 30 Hz cadences, and
@@ -64,6 +64,11 @@ sustained playback sequences or independent acceptance sessions.
 | Continuous `0.5`, provided-output API | 4.142145246 ms | 2.919931875 ms | 29.5068% |
 | Continuous `0.75`, returning API | 5.454333160 ms | 2.965866037 ms | 45.6237% |
 | Diagnostic: 30 Hz, three phases equally weighted | 7.097827225 ms | 4.904987703 ms | 30.8945% |
+
+For the main product X2 path, the relevant measured IO improvement is
+**29.5068%** for the single-`0.5` provided-output call. **38.7322%** is the
+equally weighted three-phase experimental result. Neither percentage is a
+live FPS improvement or evidence of 120 FPS delivery.
 
 The primary saved time is `1.9542155125 ms`. Its approximate 95% whole-block
 bootstrap interval is `[1.6884431024305555, 2.2363153223784717] ms`; the
@@ -220,11 +225,85 @@ create an external path-binding copy and retain the exact case IDs, input
 hashes, phases, target sets, flags, and schedule; preserve the archived files.
 No local absolute paths or raw inputs belong in this repository.
 
-## Live acceptance remains separate
+## Frozen live evidence: full playback acceptance failed
 
-These measurements establish the stated runtime IO cost and hash results in
-their recorded scope. At this documentation stage, real capture/presentation
-acceptance still has a late-frame issue under investigation. This README does
-not declare live presentation deadlines, sustained playback, or the complete
-application accepted. Retain live logs and failures separately from these
-offscreen runtime results.
+R8 and R9 used a **960×572** source. R9 was an isolated opaque-viewer
+experiment: its independently counted actual presentations were **3,860 in
+38.000593 s = 101.577/s**, with source content at **59.9988/s**. This is a
+different input geometry and cannot be used as a same-input comparison with
+R10.
+
+R10 used the production viewer opacity behavior, effective without the
+`r7Opaque` diagnostic flag. Capture, processing, and presented output were
+all verified at **1920×1080**, with **X2 / RIFE 4.25 Fast**. Its reported
+35-second window had source content at **60.013/s**, capture at **59.943/s**,
+and **2,195 independently counted actual presentations = 62.715/s**.
+
+The separate linked ready-frame cohort accounts for all **4,197** frames:
+
+| Ready-frame disposition | Count |
+| --- | ---: |
+| Visible presentations | 2,194 |
+| `zeroTime` | 1,064 |
+| Superseded | 939 |
+| Total ready | 4,197 |
+
+The independent actual count and the linked ready-frame cohort are reported
+separately; do not substitute 2,195 for the cohort's 2,194 visible frames.
+All model-generated outputs were ready before their targets, but readiness did not
+establish visible or timely delivery. Under the unchanged original logical
+target +2 ms definition, only **249 of 1,126 visible synthetic frames** were
+on time; using all **2,099 ready synthetic frames** as the denominator leaves
+the same numerator, **249/2,099**. The **four early source frames** under the
+original source-target definition remain recorded failures. R10 does not
+pass the original on-time or 120 FPS delivery criteria.
+
+The separate 1920×1080 fixed-120 cohort (`generation=2`, `config=6`,
+`measurementEpoch=6`) runs for 35.0007 seconds with source content 59.970 Hz
+and accepted capture 59.799/s. It has 2,322 positive actual presentations
+(66.342/s); the existing held/reuse-filtered physical counter has 2,215
+(63.284/s). The 107-source-callback difference remains an accounting gap:
+only 62 duplicate fixture IDs were observed, and the per-frame timeline does
+not expose the complete held/filter state. Neither rate passes 120 FPS.
+
+Its 6,125 candidate frame IDs include 1,926 source fallbacks replaced by
+synthetics with identical PTS and logical target. The resulting 4,199 unique
+output targets account for 2,322 visible, 1,386 zero-time, 489 superseded,
+and two queue-full outcomes. These fallbacks are not 1,926 extra failed
+targets. All 1,674 completed model jobs meet their job deadlines, while 180
+pending-expiry events and three queue drops remain recorded separately;
+job readiness does not prove every phase reached early preparation. The
+unchanged logical +2 ms and not-early synthetic numerator is 481/1,160
+visible synthetics. No early actual callbacks occur in this window.
+
+A single-variable follow-up advances selection guard from 1 to 2 ms without
+moving logical targets or increasing latency. It increases the scheduled
+registration margin but reduces actual delivery to 2,004/35.0001 seconds
+(57.257/s). Its 4,156 ready frames account for 2,004 visible, 1,566 zero-time,
+580 superseded, and six queue-full outcomes. Source content remains 59.984 Hz,
+with accepted capture 59.371/s. This separate-window comparison does not
+establish an isolated causal percentage, but it provides no adoption benefit;
+production retains the 1 ms guard. Its failed log is retained; no further
+guard increase is adopted.
+
+The production presenter uses the display-link path and a strict one-shot
+timer with **50 µs leeway**. Slot tokens and generation/configuration/
+measurement/clock context guards reject stale consumption or rearming of a
+replacement slot. Offscreen first-draw warm-up primes resources; it is not
+physical-presentation evidence. The standalone viewer is opaque in
+production, while follow/interactive modes retain their existing opacity
+rules.
+
+Separate validation entry points are:
+
+- [CPU display-queue tests](../../Modules/VideoEnhancement/Tests/SPLiveDisplayQueueTests.cpp):
+  standalone CPU-only assertions for PTS ordering, original frozen targets,
+  slot eligibility, token replacement, and context retirement.
+- [Renderer/resource-lifetime probe](../../Modules/VideoEnhancement/Tests/SPLivePresenterResourceTests.mm):
+  a standalone probe taking the built candidate library as its one argument;
+  it invokes `runOffscreenDrawAndLifetimeProbe` and preserves the public
+  presentation-selector check. Its offscreen draw/lifetime result does not
+  close the live presentation gate.
+
+Keep these validation results and the frozen live logs separate from native
+hash parity and offscreen cost. Full real-playback acceptance remains failed.
