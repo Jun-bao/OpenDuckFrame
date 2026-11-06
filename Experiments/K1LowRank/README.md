@@ -102,3 +102,62 @@ screen does not authorize adoption: independent video quality, training when
 justified, K=2..4, state reuse and actual product presentation remain separate.
 If complete K=1 savings are not demonstrated, keep the recorded failure and
 investigate execution overhead before spending on large training runs.
+
+## Execution diagnostics and randomized comparisons
+
+The continuation adds three tools, all confined to the generated experimental
+package. The app and its dependency checkout remain separate.
+
+- `K1ProfileBuffer` observes underlying buffers across `commitAndContinue` and
+  records host encoding checkpoints. It does not add commits or waits. Only
+  `profile` mode enables it. Observed buffer intervals are residency envelopes;
+  their union is not active shader time, and the collector does not establish
+  exhaustive coverage of work outside the supplied wrapper.
+- The `defer_commits` prototype defers intermediate MPS submissions until the
+  ordinary final commit. It changes a scheduling contract and is a diagnostic
+  intervention, with no claim of general MPS compatibility. **The measured
+  prototype was slower and is not selected for product use.**
+- `native_leaky` replaces the expanded max/min/multiply/add activation with
+  `leakyReLU(alphaTensor:)`, using the same FP16 slope tensor. `activation` mode
+  compares all 65,536 input bit patterns in one isolated shape. The measured
+  finite inputs matched; 1,024 nonfinite patterns differed. Whole-network
+  outputs are checked separately. **No net speed benefit was established, so
+  this variant is also not selected.**
+
+Prepare a fresh native directory with the current `prepare_native.py` and build
+it as above. Both experimental interventions default to off. For each new
+comparison, keep a new output directory and reuse the original inputs:
+
+```sh
+CONTROL_ROOT=/path/to/new-controlled-results
+python3 -u -B Experiments/K1LowRank/run_controlled.py \
+  --native-bin "$BUILD_ROOT/release/k1-bench" --native-source "$NATIVE_ROOT" \
+  --prior-results "$RESULT_ROOT" --output "$CONTROL_ROOT/submission" \
+  --gpu-lock "$GPU_LOCK" --intervention submission
+python3 -B Experiments/K1LowRank/analyze_controlled.py \
+  --result "$CONTROL_ROOT/submission/controlled.json" \
+  --output "$CONTROL_ROOT/submission/analysis.json"
+```
+
+For the separate activation experiment, pass `--intervention native-leaky` to
+both scripts and use another output directory. Its preregistered primary is
+D0-expanded minus D0-native at 30 Hz. The submission experiment's primary
+remains default D0 minus default Ds; a secondary arm cannot replace it.
+
+Each default experiment uses 12 time blocks × three alpha values × two cadences
+× four arms × 20 streamed frames = 5,760 measured calls. Cells and arm order are
+randomized before acquisition. Inputs alternate A/B with one new Head per push.
+Each arm has its own nominal 30 Hz arrival timeline; overruns retain their lag
+and do not move the following arrivals. The arrival budget is not a product
+presentation deadline. `arms.jsonl` preserves completed arms if a run fails.
+
+Analysis resamples whole blocks jointly, preserving arm/alpha covariance;
+frames and buffers are not independent statistical units. A length-three
+circular moving-block analysis is a sensitivity check, not a coverage
+guarantee. Relative saving is a ratio of means. Last-frame hashes compare the
+same weights under the two execution policies, not the student against D0.
+
+The two short windows did not establish repeatable low-rank speed benefit.
+They are reported separately because graph residency and execution history
+differ; their intervals are not pooled. These results do not justify model
+training, state reuse or application integration under the original gates.

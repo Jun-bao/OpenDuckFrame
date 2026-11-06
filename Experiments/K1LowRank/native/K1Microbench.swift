@@ -59,7 +59,7 @@ public enum K1Microbench {
 
         func run() throws -> [String: Double] {
             let started = DispatchTime.now().uptimeNanoseconds
-            let command = MPSCommandBuffer(commandBuffer: queue.makeCommandBuffer()!)
+            let command = K1CommandBuffers.make(queue.makeCommandBuffer()!)
             _ = executable.encode(to: command, inputs: [input], results: [output], executionDescriptor: nil)
             let last = command.commandBuffer
             command.commit()

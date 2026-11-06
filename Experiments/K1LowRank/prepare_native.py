@@ -32,10 +32,11 @@ def main():
     source_files = {str(p.relative_to(args.source)): digest(p) for root in ("Sources/RifeMetal", "Sources/RifeMetalCore", "Plugins")
                     for p in (args.source / root).rglob("*") if p.is_file()}
     here = Path(__file__).resolve().parent
-    for name in ("LowRankGraphContract.swift", "K1Microbench.swift"):
+    for name in ("LowRankGraphContract.swift", "K1Microbench.swift", "K1ProfileBuffer.swift", "K1ActivationAudit.swift"):
         shutil.copyfile(here / "native" / name, args.output / "Sources/RifeMetalCore" / name)
     (args.output / "Sources/k1-bench").mkdir()
-    shutil.copyfile(here / "native/main.swift", args.output / "Sources/k1-bench/main.swift")
+    for name in ("main.swift", "K1ControlledBench.swift"):
+        shutil.copyfile(here / "native" / name, args.output / "Sources/k1-bench" / name)
     package = '''// swift-tools-version: 5.10
 import PackageDescription
 let package = Package(name: "K1NativeLab", platforms: [.macOS(.v13)], products: [
@@ -82,24 +83,49 @@ let package = Package(name: "K1NativeLab", platforms: [.macOS(.v13)], products: 
     builder.write_text(text)
     graph = args.output / "Sources/RifeMetalCore/IFNetGraph.swift"
     replace_once(graph, 'public final class IFNetGraph {', '''public final class IFNetGraph {
-    public private(set) var k1LastBufferTiming: [String: Double] = [:]''')
+    public private(set) var k1LastBufferTiming: [String: Double] = [:]
+    public private(set) var k1LastProfile: [String: Any] = [:]''')
     replace_once(graph, '''            mpsCB.commit()
             mpsCB.waitUntilCompleted()
-        }  // end per-timestep loop''', '''            let timedBuffer = mpsCB.commandBuffer
+        }  // end per-timestep loop''', '''            mpsCB.k1Mark("encode_end")
+            let timedBuffer = mpsCB.commandBuffer
             mpsCB.commit()
             mpsCB.waitUntilCompleted()
             guard timedBuffer.status == .completed else {
                 throw IFNetError.commandBufferFailed(String(describing: timedBuffer.error))
             }
             k1LastBufferTiming = ["last_command_buffer_gpu_ms": (timedBuffer.gpuEndTime - timedBuffer.gpuStartTime) * 1000]
+            k1LastProfile = mpsCB.k1ProfileSnapshot()
         }  // end per-timestep loop''')
+    text = graph.read_text().replace('MPSCommandBuffer(commandBuffer: ', 'K1CommandBuffers.make(')
+    # Only host markers: leave the original graph and submission boundaries intact.
+    prefix, tail = text.split('    public func runStream(', 1)
+    tail = tail.replace('            for i in 0..<scaleList.count {', '''            for i in 0..<scaleList.count {
+                mpsCB.k1Mark("stage_\\(i)_start")''', 1)
+    tail = tail.replace('                let isLastStage = (i == scaleList.count - 1)', '''                mpsCB.k1Mark("stage_\\(i)_network_and_accumulation_encoded")
+                let isLastStage = (i == scaleList.count - 1)''', 1)
+    tail = tail.replace('                if isLastStage { continue }', '''                if isLastStage {
+                    mpsCB.k1Mark("stage_\\(i)_end")
+                    continue
+                }''', 1)
+    tail = tail.replace('                warped1IntTD = stageWarped1TD\n            }', '''                warped1IntTD = stageWarped1TD
+                mpsCB.k1Mark("stage_\\(i)_end")
+            }''', 1)
+    graph.write_text(prefix + '    public func runStream(' + tail)
+    helpers = args.output / "Sources/RifeMetalCore/GraphHelpers.swift"
+    replace_once(helpers, '        let zero = constant(0.0, dataType: input.dataType)', '''        if K1BenchmarkGraph.nativeLeakyReLU {
+            let slope = constant(negativeSlope, dataType: input.dataType)
+            return leakyReLU(with: input, alphaTensor: slope, name: name)
+        }
+        let zero = constant(0.0, dataType: input.dataType)''')
     stream = args.output / "Sources/RifeMetal/RifeStream.swift"
     replace_once(stream, 'public final class RifeStream: @unchecked Sendable {', '''public final class RifeStream: @unchecked Sendable {
-    public var k1LastBufferTiming: [String: Double] { graph.k1LastBufferTiming }''')
+    public var k1LastBufferTiming: [String: Double] { graph.k1LastBufferTiming }
+    public var k1LastProfile: [String: Any] { graph.k1LastProfile }''')
     manifest = dict(source=str(args.source.resolve()), input_files_sha256=source_files,
                     generated_by_sha256=digest(Path(__file__)),
                     changed_files_sha256={str(p.relative_to(args.output)): digest(p)
-                                          for p in (store, builder, graph, stream, args.output / "Package.swift")},
+                                          for p in (store, builder, graph, stream, helpers, args.output / "Package.swift")},
                     note="Isolated experiment; full host call time is primary. Last command buffer GPU interval is not labeled full pipeline GPU time.")
     (args.output / "source-origin.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps(dict(native_source=str(args.output), copied_files=len(source_files))))
