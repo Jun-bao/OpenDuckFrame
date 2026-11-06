@@ -1857,18 +1857,31 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             let stack = NSStackView()
             stack.orientation = .vertical
             stack.alignment = .leading
-            stack.spacing = 8
+            stack.spacing = 10
+            stack.detachesHiddenViews = true
             return stack
         }
+        func formRow(_ title: String, _ control: NSView) -> NSView {
+            let view = row(title, control)
+            (view as? NSStackView)?.distribution = .fill
+            return view
+        }
         func card(_ content: NSStackView) -> NSView {
-            let plate = Plate()
+            let plate = NSBox()
+            plate.boxType = .custom
+            plate.titlePosition = .noTitle
+            plate.isTransparent = false
+            plate.cornerRadius = 12
+            plate.borderWidth = 0.6
+            plate.borderColor = .separatorColor
+            plate.fillColor = .controlBackgroundColor
             content.translatesAutoresizingMaskIntoConstraints = false
-            plate.addSubview(content)
+            plate.contentView!.addSubview(content)
             NSLayoutConstraint.activate([
-                content.leadingAnchor.constraint(equalTo: plate.leadingAnchor, constant: 12),
-                content.trailingAnchor.constraint(equalTo: plate.trailingAnchor, constant: -12),
-                content.topAnchor.constraint(equalTo: plate.topAnchor, constant: 12),
-                content.bottomAnchor.constraint(equalTo: plate.bottomAnchor, constant: -12),
+                content.leadingAnchor.constraint(equalTo: plate.leadingAnchor, constant: 14),
+                content.trailingAnchor.constraint(equalTo: plate.trailingAnchor, constant: -14),
+                content.topAnchor.constraint(equalTo: plate.topAnchor, constant: 14),
+                content.bottomAnchor.constraint(equalTo: plate.bottomAnchor, constant: -14),
             ])
             return plate
         }
@@ -1877,7 +1890,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             header.orientation = .horizontal
             header.alignment = .centerY
             header.spacing = 8
-            header.addArrangedSubview(NSTextField(labelWithString: title))
+            header.addArrangedSubview(heading(title))
             header.addArrangedSubview(toggle)
             let spacer = NSView()
             spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -1886,8 +1899,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         let scale = column()
         scale.addArrangedSubview(cardHeader(EnhancementText.t("Scale", "缩放 / 超分"), scaleSwitch))
-        scale.addArrangedSubview(row(EnhancementText.t("Technology", "技术"), scalePopup))
-        let qualityRow = row(EnhancementText.t("Denoising", "降噪"), scaleQualityPopup)
+        scale.addArrangedSubview(formRow(EnhancementText.t("Technology", "技术"), scalePopup))
+        let qualityRow = formRow(EnhancementText.t("Denoising", "降噪"), scaleQualityPopup)
         scaleQualityRow = qualityRow
         scale.addArrangedSubview(qualityRow)
         srInputHelp.bezelStyle = .helpButton
@@ -1896,24 +1909,27 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         srInputControls.orientation = .horizontal
         srInputControls.alignment = .centerY
         srInputControls.spacing = 4
-        let srRow = row(EnhancementText.t("SR input size", "超分输入尺寸"), srInputControls)
+        srInputControls.distribution = .fill
+        srInputHelp.setContentHuggingPriority(.required, for: .horizontal)
+        let srRow = formRow(EnhancementText.t("SR input size", "超分输入尺寸"), srInputControls)
         srInputRow = srRow; scale.addArrangedSubview(srRow)
         sourceWindowHelp.bezelStyle = .helpButton
         sourceWindowHelp.setAccessibilityLabel(EnhancementText.t("Source window size help", "来源窗口尺寸帮助"))
         sourceWindowHelp.toolTip = EnhancementText.t("The selected window is resized before capture. The video must fill that window for the video itself to be 720p; browser toolbars and borders are not video. Requires Accessibility permission and a resizable window. Try 720p first; final clarity depends on the source and engine.", "开始时会调整所选来源窗口，再采集画面。视频须铺满该窗口，视频本身才可能是720p；浏览器工具栏和边框不是视频。需要辅助功能权限且窗口可调整大小。建议先从720p试起，最终清晰度取决于片源与引擎。")
-        let sourceControls = NSStackView(views: [sourceWindowPopup, sourceWindowHelp]); sourceControls.orientation = .horizontal; sourceControls.alignment = .centerY; sourceControls.spacing = 4
-        let windowRow = row(EnhancementText.t("Source window", "来源窗口尺寸"), sourceControls)
+        let sourceControls = NSStackView(views: [sourceWindowPopup, sourceWindowHelp]); sourceControls.orientation = .horizontal; sourceControls.alignment = .centerY; sourceControls.spacing = 4; sourceControls.distribution = .fill
+        sourceWindowHelp.setContentHuggingPriority(.required, for: .horizontal)
+        let windowRow = formRow(EnhancementText.t("Source window", "来源窗口尺寸"), sourceControls)
         sourceWindowRow = windowRow; scale.addArrangedSubview(windowRow)
         sourceWindowHint.stringValue = EnhancementText.t("Use a dedicated or picture-in-picture video window; the video must fill the captured window.", "请使用独立或画中画视频窗口；视频须铺满采集画面。")
         sourceWindowHint.textColor = .secondaryLabelColor
         scale.addArrangedSubview(sourceWindowHint)
-        scale.addArrangedSubview(row(EnhancementText.t("Output size", "输出尺寸"), sizePopup))
-        scale.addArrangedSubview(row("W×H", pair(widthField, heightField)))
+        scale.addArrangedSubview(formRow(EnhancementText.t("Output size", "输出尺寸"), sizePopup))
+        scale.addArrangedSubview(formRow("W×H", pair(widthField, heightField)))
 
         let frames = column()
         frames.addArrangedSubview(cardHeader(EnhancementText.t("Frame generation", "帧生成"), interpolationSwitch))
-        frames.addArrangedSubview(row(EnhancementText.t("Engine", "引擎"), enginePopup))
-        let frameQuality = row(EnhancementText.t("Quality", "质量"), qualityPopup)
+        frames.addArrangedSubview(formRow(EnhancementText.t("Engine", "引擎"), enginePopup))
+        let frameQuality = formRow(EnhancementText.t("Quality", "质量"), qualityPopup)
         interpolationQualityRow = frameQuality
         frames.addArrangedSubview(frameQuality)
         frames.addArrangedSubview(rifeStreamCheck)
@@ -1926,7 +1942,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         frames.addArrangedSubview(compatibilityButton)
         frames.addArrangedSubview(rateMode)
         frames.addArrangedSubview(fpsPopup)
-        let customRate = row("n/d", pair(fpsNum, fpsDen))
+        let customRate = formRow("n/d", pair(fpsNum, fpsDen))
         customRateRow = customRate
         frames.addArrangedSubview(customRate)
         frames.addArrangedSubview(multiplierControl)
@@ -1983,7 +1999,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let buttons = NSStackView()
         buttons.orientation = .horizontal
         buttons.spacing = 8
-        let changeSource = button(EnhancementText.t("Change Window", "更换窗口"), #selector(chooseCurrentKind))
+        let changeSource = button(EnhancementText.t("Change Window", "更换窗口"), #selector(changeWindow))
         sourceActionButton = changeSource
         let start = button(EnhancementText.t("Delayed Enhancement", "延迟增强"), #selector(start), primary: true)
         let stop = button(EnhancementText.t("Stop", "停止"), #selector(stop), primary: true)
@@ -2199,6 +2215,14 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         processor.setViewMode(mode)
     }
 
+    @objc private func changeWindow() {
+        if sourceKindControl.selectedSegment != 0 {
+            sourceKindControl.selectedSegment = 0
+            sourceKindChanged()
+        }
+        chooseWindow()
+    }
+
     @objc private func chooseCurrentKind() {
         switch sourceKindControl.selectedSegment {
         case 1: chooseDisplay()
@@ -2213,6 +2237,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         readControls()
         updateAppleSRCapability()
         refreshSourceBar()
+        refreshActions()
         persist()
         refreshPlanLabel()
         refreshInteractionStatus()
@@ -2739,19 +2764,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         sourceLabel.textColor = .labelColor
         sourceStripLabel.textColor = .labelColor
         let choose: String
-        let change: String
         switch sourceKindControl.selectedSegment {
-        case 1:
-            choose = EnhancementText.t("Choose Display", "选择显示器")
-            change = EnhancementText.t("Change Display", "更换显示器")
-        case 2:
-            choose = EnhancementText.t("Choose File", "选择文件")
-            change = EnhancementText.t("Change Video", "更换视频")
-        default:
-            choose = EnhancementText.t("Choose Window", "选择窗口")
-            change = EnhancementText.t("Change Window", "更换窗口")
+        case 1: choose = EnhancementText.t("Choose Display", "选择显示器")
+        case 2: choose = EnhancementText.t("Choose File", "选择文件")
+        default: choose = EnhancementText.t("Choose Window", "选择窗口")
         }
-        sourceActionButton?.title = change
+        sourceActionButton?.title = EnhancementText.t("Change Window", "更换窗口")
         emptySourceButton?.title = choose
         emptyOverlay.isHidden = capture.running
     }
