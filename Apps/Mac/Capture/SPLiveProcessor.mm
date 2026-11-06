@@ -10,6 +10,7 @@
 #import "SPDistilDRBA.h"
 #import "SPRifeBridge.h"
 #import "SPRateSchedule.hpp"
+#import "SPLiveDisplayQueue.h"
 #import "SPFPSMeter.hpp"
 #import "SPPresentationBudget.hpp"
 #import "SPRateBudget.hpp"
@@ -679,7 +680,47 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
     return YES;
 }
 
-@interface SPLivePreviewView ()
+// Own pixel buffers from admission until rejection or GPU completion. Pending
+// requests never reserve drawable/GPU tickets and remain strictly bounded.
+@interface SPDisplayFrameRequest : NSObject
+@property(nonatomic, assign) CVPixelBufferRef enhanced;
+@property(nonatomic, assign) CVPixelBufferRef original;
+@property(nonatomic) SPLiveViewMode mode;
+@property(nonatomic) int64_t captureHost;
+@property(nonatomic) uint64_t generation;
+@property(nonatomic) uint64_t config;
+@property(nonatomic) uint64_t epoch;
+@property(nonatomic) uint64_t clockEpoch;
+@property(nonatomic) uint64_t surfaceToken;
+@property(nonatomic) int64_t ptsNum;
+@property(nonatomic) int64_t ptsDen;
+@property(nonatomic) BOOL synthetic;
+@property(nonatomic) uint64_t frameID;
+@property(nonatomic) BOOL counts;
+@property(nonatomic) BOOL redraw;
+@property(nonatomic) int64_t logicalTargetHost;
+@property(nonatomic) int64_t enqueueHost;
+@property(nonatomic, copy) NSDictionary *captureGeometry;
+@end
+@implementation SPDisplayFrameRequest
+- (void)dealloc {
+    if (_enhanced) CVPixelBufferRelease(_enhanced);
+    if (_original) CVPixelBufferRelease(_original);
+}
+@end
+
+static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) {
+    return {{frame.ptsNum, frame.ptsDen}, frame.logicalTargetHost > 0 ? SPHostToNs(frame.logicalTargetHost) : 0,
+            frame.frameID, (bool)frame.counts, (bool)frame.redraw};
+}
+
+@interface SPLivePreviewView () <CAMetalDisplayLinkDelegate>
+- (void)updateDisplayLinkConfiguration;
+- (void)setPresentationClockEpoch:(uint64_t)clockEpoch;
+- (void)prepareWarmSurface:(SPDisplayFrameRequest *)frame;
+- (void)discardOutdatedPresentations;
+- (void)reportPendingPresentation:(SPDisplayFrameRequest *)frame reason:(NSString *)reason;
+- (void)renderPendingPresentation:(SPDisplayFrameRequest *)frame update:(CAMetalDisplayLinkUpdate *)update callbackHost:(int64_t)callbackHost;
 - (void)observeSourceGeometry:(NSDictionary *)value generation:(uint64_t)generation;
 @end
 
@@ -688,7 +729,11 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
     CALayer *_sourceCover;
     id<MTLDevice> _device;
     id<MTLCommandQueue> _commandQueue;
-    dispatch_queue_t _presentQueue;
+    CAMetalDisplayLink *_displayLink;
+    std::mutex _presentationMutex;
+    NSMutableArray<SPDisplayFrameRequest *> *_pendingPresentations;
+    sp::SPRational _lastSubmittedPresentationPTS;
+    bool _haveSubmittedPresentationPTS;
     id<MTLRenderPipelineState> _pipeline;
     CVMetalTextureCacheRef _cache;
     std::atomic<uint64_t> _generation;
@@ -702,6 +747,8 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
     std::atomic<uint32_t> _diagnosticDisplayID;
     std::atomic<uint64_t> _diagnosticConfig;
     std::atomic<uint64_t> _diagnosticEpoch;
+    std::atomic<uint64_t> _presentationClockEpoch;
+    std::atomic<bool> _warmSurfacePending;
     std::atomic<uint64_t> _surfaceToken;
     std::atomic<int> _inflightDraws;
     std::mutex _geometryMutex;
@@ -721,9 +768,13 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
     _diagnosticDisplayID.store(0);
     _diagnosticConfig.store(0);
     _diagnosticEpoch.store(0);
+    _presentationClockEpoch.store(0);
+    _warmSurfacePending.store(false);
     _surfaceToken.store(0);
     _inflightDraws.store(0);
     _geometryVerifiedHost = 0;
+    _pendingPresentations = [NSMutableArray array];
+    _haveSubmittedPresentationPTS = false;
     self.wantsLayer = YES;
     _device = MTLCreateSystemDefaultDevice();
     _metalLayer = [CAMetalLayer layer];
@@ -740,8 +791,6 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
     _sourceCover.hidden = YES;
     [_metalLayer addSublayer:_sourceCover];
     _commandQueue = [_device newCommandQueue];
-    _presentQueue = dispatch_queue_create("app.openduckframe.live-present",
-                                          dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
     if (_device) CVMetalTextureCacheCreate(kCFAllocatorDefault, NULL, _device, NULL, &_cache);
     id<MTLLibrary> library = [_device newDefaultLibrary];
     id<MTLFunction> vertex = [library newFunctionWithName:@"spPresentVertex"];
@@ -753,10 +802,18 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         _pipeline = [_device newRenderPipelineStateWithDescriptor:desc error:NULL];
     }
+    if (_pipeline) {
+        _displayLink = [[CAMetalDisplayLink alloc] initWithMetalLayer:_metalLayer];
+        _displayLink.delegate = self;
+        _displayLink.preferredFrameLatency = 1;
+        _displayLink.paused = YES;
+        [_displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    }
     return self;
 }
 
 - (void)dealloc {
+    [_displayLink invalidate];
     if (_cache) CFRelease(_cache);
 }
 
@@ -783,6 +840,7 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
     _drawableVisible.store(drawable);
     _exposed.store(visible && window.alphaValue >= 0.99);
     _diagnosticDisplayID.store([window.screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue]);
+    [self updateDisplayLinkConfiguration];
     if (!drawable || window.alphaValue < 0.99) {
         std::lock_guard<std::mutex> lock(_geometryMutex);
         _sharedGeometry.observeTarget({}, false);
@@ -802,9 +860,16 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
         // queued adoption can never roll the view back after a newer source.
         if (generation && generation < _highestGeneration) return;
         if (generation > _highestGeneration) _highestGeneration = generation;
+        std::lock_guard<std::mutex> pendingLock(_presentationMutex);
         old = _generation.exchange(generation);
+        if (generation != old) _haveSubmittedPresentationPTS = false;
     }
-    if (generation != old) { std::lock_guard<std::mutex> lock(_geometryMutex); _sharedGeometry.invalidate(); }
+    if (generation != old) {
+        { std::lock_guard<std::mutex> lock(_geometryMutex); _sharedGeometry.invalidate(); }
+        [self discardOutdatedPresentations];
+        if (NSThread.isMainThread) [self updateDisplayLinkConfiguration];
+        else dispatch_async(dispatch_get_main_queue(), ^{ [self updateDisplayLinkConfiguration]; });
+    }
     if (!generation || generation == old) return;
     void (^cover)(void) = ^{ [self applySourceCoverForGeneration:generation]; };
     if (NSThread.isMainThread) cover(); else dispatch_async(dispatch_get_main_queue(), cover);
@@ -830,10 +895,28 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
 - (BOOL)sourceCoverVisibleForTesting { return !_sourceCover.hidden; }
 
 - (void)setDiagnosticsConfig:(uint64_t)config epoch:(uint64_t)epoch {
-    uint64_t oldConfig = _diagnosticConfig.exchange(config), oldEpoch = _diagnosticEpoch.exchange(epoch);
-    if (oldConfig != config || oldEpoch != epoch) {
-        std::lock_guard<std::mutex> lock(_geometryMutex); _sharedGeometry.invalidate();
+    uint64_t oldConfig, oldEpoch;
+    {
+        std::lock_guard<std::mutex> generationLock(_generationMutex);
+        std::lock_guard<std::mutex> pendingLock(_presentationMutex);
+        oldConfig = _diagnosticConfig.exchange(config); oldEpoch = _diagnosticEpoch.exchange(epoch);
+        if (oldConfig != config || oldEpoch != epoch) _haveSubmittedPresentationPTS = false;
     }
+    if (oldConfig != config || oldEpoch != epoch) {
+        { std::lock_guard<std::mutex> lock(_geometryMutex); _sharedGeometry.invalidate(); }
+        [self discardOutdatedPresentations];
+    }
+}
+
+- (void)setPresentationClockEpoch:(uint64_t)clockEpoch {
+    bool changed;
+    {
+        std::lock_guard<std::mutex> generationLock(_generationMutex);
+        std::lock_guard<std::mutex> pendingLock(_presentationMutex);
+        changed = _presentationClockEpoch.exchange(clockEpoch) != clockEpoch;
+        if (changed) _haveSubmittedPresentationPTS = false;
+    }
+    if (changed) { [self invalidateSharedGeometry]; [self discardOutdatedPresentations]; }
 }
 
 - (void)observeSourceGeometry:(NSDictionary *)value generation:(uint64_t)generation {
@@ -1059,209 +1142,410 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
                  counts:(BOOL)counts
          captureGeometry:(NSDictionary *)captureGeometry
                  reason:(NSString **)reason {
-    if (generation != _generation) { if (reason) *reason = @"generation"; return NO; }
-    if (!_pipeline) { if (reason) *reason = @"pipeline"; return NO; }
+    return [self presentEnhanced:enhanced original:original mode:mode captureHost:captureHost
+                     generation:generation ptsNum:ptsNum ptsDen:ptsDen synthetic:synthetic
+                        frameID:frameID counts:counts captureGeometry:captureGeometry
+               presentationHost:0 reason:reason];
+}
+
+- (BOOL)presentEnhanced:(CVPixelBufferRef)enhanced
+               original:(CVPixelBufferRef)original
+                   mode:(SPLiveViewMode)mode
+            captureHost:(int64_t)captureHost
+             generation:(uint64_t)generation
+                 ptsNum:(int64_t)ptsNum
+                 ptsDen:(int64_t)ptsDen
+              synthetic:(BOOL)synthetic
+                frameID:(uint64_t)frameID
+                 counts:(BOOL)counts
+         captureGeometry:(NSDictionary *)captureGeometry
+       presentationHost:(int64_t)presentationHost
+                 reason:(NSString **)reason {
+    return [self presentEnhanced:enhanced original:original mode:mode captureHost:captureHost generation:generation
+                          ptsNum:ptsNum ptsDen:ptsDen synthetic:synthetic frameID:frameID counts:counts
+                 captureGeometry:captureGeometry presentationHost:presentationHost redraw:NO reason:reason];
+}
+
+- (BOOL)presentEnhanced:(CVPixelBufferRef)enhanced
+               original:(CVPixelBufferRef)original
+                   mode:(SPLiveViewMode)mode
+            captureHost:(int64_t)captureHost
+             generation:(uint64_t)generation
+                 ptsNum:(int64_t)ptsNum
+                 ptsDen:(int64_t)ptsDen
+              synthetic:(BOOL)synthetic
+                frameID:(uint64_t)frameID
+                 counts:(BOOL)counts
+         captureGeometry:(NSDictionary *)captureGeometry
+       presentationHost:(int64_t)presentationHost
+                 redraw:(BOOL)redraw
+                 reason:(NSString **)reason {
+    if (generation != _generation.load()) { if (reason) *reason = @"generation"; return NO; }
+    if (!_pipeline || !_displayLink) { if (reason) *reason = @"pipeline"; return NO; }
     CVPixelBufferRef primary = mode == SPLiveViewOriginal ? (original ?: enhanced) : enhanced;
-    CVPixelBufferRef secondary = original ?: enhanced;
     if (!primary) { if (reason) *reason = @"input"; return NO; }
-    BOOL windowVisible = _windowVisible.load();
-    BOOL occluded = windowVisible && !_drawableVisible.load();
-    BOOL exposed = _exposed.load();
-    BOOL fillTarget = _followTargetContent.load() && mode != SPLiveViewCompare;
-    uint32_t diagnosticDisplayID = _diagnosticDisplayID.load();
-    if (!counts && (!windowVisible || occluded)) return YES;
-    int pending = _inflightDraws.load();
-    if (pending >= 3) { if (reason) *reason = @"inflight"; return NO; }
-    _inflightDraws.fetch_add(1);
-    if (enhanced) CVPixelBufferRetain(enhanced);
-    if (original) CVPixelBufferRetain(original);
-    uint64_t seen = generation;
-    // Bind each drawable to the plan that submitted it. The notification can
-    // arrive after a new plan has already replaced the view's diagnostics.
-    uint64_t seenConfig = _diagnosticConfig.load();
-    uint64_t seenEpoch = _diagnosticEpoch.load();
-    uint64_t seenSurfaceToken = _surfaceToken.load();
-    void (^reportFailure)(NSString *) = ^(NSString *why) {
-        if (counts && self.presentationFailure) self.presentationFailure(@{ @"reason": why, @"generation": @(seen),
-            @"configVersion": @(seenConfig), @"measurementEpoch": @(seenEpoch), @"frameID": @(frameID) });
-    };
-    struct SPDrawNote {
-        std::atomic<int> ticket;
-        std::atomic<long long> gpuHost;
-        std::atomic<int> refs;
-    };
-    auto *note = new SPDrawNote();
-    note->ticket.store(0);
-    note->gpuHost.store(0);
-    note->refs.store(2);
-    SPLivePreviewView *view = self;
-    void (^releaseTicket)(void) = ^{
-        if (note->ticket.exchange(1) == 0) view->_inflightDraws.fetch_sub(1);
-    };
-    void (^releaseNote)(void) = ^{
-        if (note->refs.fetch_sub(1) == 1) delete note;
-    };
-    void (^abandon)(void) = ^{
-        releaseTicket();
-        delete note;
-    };
-    int width = (int)CVPixelBufferGetWidth(primary);
-    int height = (int)CVPixelBufferGetHeight(primary);
-    int enhancedWidth = enhanced ? (int)CVPixelBufferGetWidth(enhanced) : 0;
-    int enhancedHeight = enhanced ? (int)CVPixelBufferGetHeight(enhanced) : 0;
-    int originalWidth = original ? (int)CVPixelBufferGetWidth(original) : 0;
-    int originalHeight = original ? (int)CVPixelBufferGetHeight(original) : 0;
-    dispatch_async(_presentQueue, ^{
-        if (seen != self->_generation || seenConfig != self->_diagnosticConfig.load() || seenEpoch != self->_diagnosticEpoch.load()) {
-            reportFailure(seen != self->_generation ? @"generation" : (seenConfig != self->_diagnosticConfig.load() ? @"configuration" : @"epoch"));
-            abandon();
-            if (enhanced) CVPixelBufferRelease(enhanced);
-            if (original) CVPixelBufferRelease(original);
-            return;
+    BOOL warmSurface = _surfaceToken.load() != 0 && _windowVisible.load() && !_exposed.load();
+    if (!warmSurface && (!_windowVisible.load() || !_drawableVisible.load())) { if (reason) *reason = @"display-invisible"; return NO; }
+    SPDisplayFrameRequest *frame = [SPDisplayFrameRequest new];
+    frame.enhanced = enhanced ? CVPixelBufferRetain(enhanced) : NULL;
+    frame.original = original ? CVPixelBufferRetain(original) : NULL;
+    frame.mode = mode; frame.captureHost = captureHost; frame.generation = generation;
+    frame.config = _diagnosticConfig.load(); frame.epoch = _diagnosticEpoch.load(); frame.clockEpoch = _presentationClockEpoch.load();
+    frame.surfaceToken = _surfaceToken.load(); frame.ptsNum = ptsNum; frame.ptsDen = ptsDen;
+    frame.synthetic = synthetic; frame.frameID = frameID; frame.counts = counts; frame.redraw = redraw;
+    frame.logicalTargetHost = presentationHost; frame.enqueueHost = SPHostNow();
+    frame.captureGeometry = captureGeometry;
+    if (warmSurface) {
+        if (_warmSurfacePending.exchange(true)) { if (reason) *reason = @"display-warm-inflight"; return NO; }
+        dispatch_async(dispatch_get_main_queue(), ^{ [self prepareWarmSurface:frame]; });
+        return YES; // GPU surface preparation only; never a physical presentation success
+    }
+    std::lock_guard<std::mutex> lock(_presentationMutex);
+    if (generation != _generation.load() || frame.config != _diagnosticConfig.load() || frame.epoch != _diagnosticEpoch.load() || frame.clockEpoch != _presentationClockEpoch.load()) {
+        if (reason) *reason = @"display-context-changed"; return NO;
+    }
+    std::vector<sp::DisplayQueueFrame> timings;
+    for (SPDisplayFrameRequest *pending in _pendingPresentations) timings.push_back(SPDisplayFrameTiming(pending));
+    auto decision = sp::admitDisplayFrame(timings, SPDisplayFrameTiming(frame), _haveSubmittedPresentationPTS, _lastSubmittedPresentationPTS);
+    if (decision != sp::DisplayAdmission::accepted) {
+        if (reason) *reason = decision == sp::DisplayAdmission::full ? @"display-queue-full" :
+            (decision == sp::DisplayAdmission::duplicatePTS ? @"display-duplicate-pts" :
+             (decision == sp::DisplayAdmission::invalidPTS ? @"display-invalid-pts" :
+              (decision == sp::DisplayAdmission::redrawNotCurrent ? @"display-redraw-not-current" : @"display-stale-pts")));
+        return NO;
+    }
+    [_pendingPresentations insertObject:frame atIndex:sp::displayFrameInsertionIndex(timings, SPDisplayFrameTiming(frame))];
+    return YES; // admitted only; success is still counted exclusively by addPresentedHandler
+}
+
+- (void)updateDisplayLinkConfiguration {
+    NSAssert(NSThread.isMainThread, @"display-link configuration belongs to its main run loop");
+    double maximum = self.window.screen.maximumFramesPerSecond ?: NSScreen.mainScreen.maximumFramesPerSecond;
+    if (maximum <= 0) maximum = 60;
+    float preferred = (float)MAX(1, maximum);
+    _displayLink.preferredFrameRateRange = CAFrameRateRangeMake(preferred, preferred, preferred);
+    _displayLink.paused = !_drawableVisible.load() || _generation.load() == 0;
+    if (!_drawableVisible.load()) {
+        NSArray<SPDisplayFrameRequest *> *discarded;
+        { std::lock_guard<std::mutex> lock(_presentationMutex); discarded = [_pendingPresentations copy]; [_pendingPresentations removeAllObjects]; }
+        for (SPDisplayFrameRequest *frame in discarded) [self reportPendingPresentation:frame reason:@"display-invisible"];
+    }
+}
+
+- (void)reportPendingPresentation:(SPDisplayFrameRequest *)frame reason:(NSString *)reason {
+    [self reportPendingPresentation:frame reason:reason details:nil];
+}
+
+- (void)reportPendingPresentation:(SPDisplayFrameRequest *)frame reason:(NSString *)reason details:(NSDictionary *)details {
+    if (!frame.counts || !self.presentationFailure) return;
+    NSMutableDictionary *info = [@{
+        @"reason": reason, @"generation": @(frame.generation), @"configVersion": @(frame.config),
+        @"measurementEpoch": @(frame.epoch), @"clockEpoch": @(frame.clockEpoch), @"frameID": @(frame.frameID),
+        @"ptsNum": @(frame.ptsNum), @"ptsDen": @(frame.ptsDen), @"synthetic": @(frame.synthetic),
+        @"logicalTargetHost": @(frame.logicalTargetHost), @"presentationEnqueueHost": @(frame.enqueueHost) } mutableCopy];
+    if (details) [info addEntriesFromDictionary:details];
+    self.presentationFailure(info);
+}
+
+- (void)discardOutdatedPresentations {
+    NSMutableArray<SPDisplayFrameRequest *> *discarded = [NSMutableArray array];
+    {
+        std::lock_guard<std::mutex> lock(_presentationMutex);
+        for (NSInteger i = (NSInteger)_pendingPresentations.count - 1; i >= 0; --i) {
+            SPDisplayFrameRequest *frame = _pendingPresentations[(NSUInteger)i];
+            if (frame.generation != _generation.load() || frame.config != _diagnosticConfig.load() || frame.epoch != _diagnosticEpoch.load() || frame.clockEpoch != _presentationClockEpoch.load()) {
+                [discarded addObject:frame]; [_pendingPresentations removeObjectAtIndex:(NSUInteger)i];
+            }
         }
-        int64_t drawableWaitStart = SPHostNow();
-        id<CAMetalDrawable> drawable = [self->_metalLayer nextDrawable];
-        int64_t drawableWaitNs = SPHostToNs(SPHostNow() - drawableWaitStart);
+    }
+    for (SPDisplayFrameRequest *frame in discarded) [self reportPendingPresentation:frame reason:
+        frame.generation != _generation.load() ? @"generation" : (frame.config != _diagnosticConfig.load() ? @"configuration" :
+            (frame.epoch != _diagnosticEpoch.load() ? @"epoch" : @"clock-retired"))];
+}
+
+// A transparent output may receive no display-link updates. Prepare one
+// bounded offscreen surface for its existing token handshake; never present it.
+- (void)prepareWarmSurface:(SPDisplayFrameRequest *)frame {
+    @autoreleasepool {
+        if (frame.generation != _generation.load() || frame.config != _diagnosticConfig.load() ||
+            frame.epoch != _diagnosticEpoch.load() || frame.clockEpoch != _presentationClockEpoch.load() ||
+            frame.surfaceToken != _surfaceToken.load()) {
+            _warmSurfacePending.store(false); [self reportPendingPresentation:frame reason:@"display-warm-context-changed"]; return;
+        }
+        CVPixelBufferRef primary = frame.mode == SPLiveViewOriginal ? (frame.original ?: frame.enhanced) : frame.enhanced;
+        CVPixelBufferRef secondary = frame.original ?: frame.enhanced;
         CVMetalTextureRef aRef = [self createTexture:primary];
-        CVMetalTextureRef bRef = mode == SPLiveViewCompare ? [self createTexture:secondary] : NULL;
-        id<MTLTexture> a = aRef ? CVMetalTextureGetTexture(aRef) : nil;
-        id<MTLTexture> b = bRef ? CVMetalTextureGetTexture(bRef) : nil;
-        if (!drawable || !a || !self->_pipeline) {
-            reportFailure(!drawable ? @"drawable" : (!a ? @"texture" : @"pipeline"));
-            if (aRef) CFRelease(aRef);
-            if (bRef) CFRelease(bRef);
-            abandon();
-            if (enhanced) CVPixelBufferRelease(enhanced);
-            if (original) CVPixelBufferRelease(original);
-            return;
-        }
-        id<MTLCommandBuffer> command = [self->_commandQueue commandBuffer];
-        if (!command) {
-            reportFailure(@"command");
-            if (aRef) CFRelease(aRef);
-            if (bRef) CFRelease(bRef);
-            abandon();
-            if (enhanced) CVPixelBufferRelease(enhanced);
-            if (original) CVPixelBufferRelease(original);
-            return;
+        CVMetalTextureRef bRef = frame.mode == SPLiveViewCompare ? [self createTexture:secondary] : NULL;
+        id<MTLTexture> a = aRef ? CVMetalTextureGetTexture(aRef) : nil, b = bRef ? CVMetalTextureGetTexture(bRef) : nil;
+        CGSize size = _metalLayer.drawableSize;
+        MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+            width:MAX((NSUInteger)1,(NSUInteger)size.width) height:MAX((NSUInteger)1,(NSUInteger)size.height) mipmapped:NO];
+        desc.usage = MTLTextureUsageRenderTarget;
+        SPProbeDrawable *surface = [SPProbeDrawable new]; surface.texture = [_device newTextureWithDescriptor:desc];
+        id<MTLCommandBuffer> command = [_commandQueue commandBuffer];
+        if (!a || !surface.texture || !command) {
+            if (aRef) CFRelease(aRef); if (bRef) CFRelease(bRef);
+            _warmSurfacePending.store(false); [self reportPendingPresentation:frame reason:@"display-warm-surface"]; return;
         }
         MTLRenderPassDescriptor *clear = [MTLRenderPassDescriptor renderPassDescriptor];
-        clear.colorAttachments[0].texture = drawable.texture;
-        clear.colorAttachments[0].loadAction = MTLLoadActionClear;
-        clear.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+        clear.colorAttachments[0].texture = surface.texture; clear.colorAttachments[0].loadAction = MTLLoadActionClear;
         clear.colorAttachments[0].storeAction = MTLStoreActionStore;
-        id<MTLRenderCommandEncoder> enc = [command renderCommandEncoderWithDescriptor:clear];
-        [enc endEncoding];
-        CGSize size = CGSizeMake(drawable.texture.width, drawable.texture.height);
-        float fw = (float)CVPixelBufferGetWidth(primary);
-        float fh = (float)CVPixelBufferGetHeight(primary);
-        sp::GeometrySource diagnosticGeometry{};
-        sp::SurfaceCropState cropState{};
-        BOOL diagnosticSource = SPSourceGeometryValue(captureGeometry, diagnosticGeometry);
-        sp::visualOutputGeometry(diagnosticSource ? &diagnosticGeometry : nullptr, seen, (int)fw, (int)fh, size.width, size.height, fillTarget, cropState);
-        NSString *cropStatus = cropState == sp::SurfaceCropState::validated ? @"metadata-valid-unapplied" : (cropState == sp::SurfaceCropState::targetAspectMismatch ? @"target-aspect-mismatch-unapplied" : @"metadata-unavailable-unapplied");
-        sp::SharedGeometry geometryCandidate{};
-        sp::GeometrySource sourceGeometry{};
-        if (counts && mode != SPLiveViewCompare && SPSourceGeometryValue(captureGeometry, sourceGeometry)) {
-            std::lock_guard<std::mutex> lock(self->_geometryMutex);
-            geometryCandidate=self->_sharedGeometry.candidate(sourceGeometry, seen, seenConfig, seenEpoch, diagnosticDisplayID,
-                (int)size.width, (int)size.height, (int)fw, (int)fh, fillTarget);
-        }
-        // If this drawable cannot be tied to the current verified geometry,
-        // no earlier mapping may remain active while it is being presented.
-        if (counts && !geometryCandidate.valid) [self invalidateSharedGeometry];
-        id imageRectPixels = [NSNull null];
-        if (mode != SPLiveViewCompare) {
-            auto geometry = sp::outputGeometry({0,0,size.width,size.height},{0,0,fw,fh},fillTarget,1);
-            if (geometry.valid) imageRectPixels = @[@(geometry.image.x), @(geometry.image.y), @(geometry.image.width), @(geometry.image.height)];
-        }
-        if (mode == SPLiveViewCompare && b) {
-            MTLViewport left = {0, 0, size.width * 0.5, size.height, 0, 1};
-            MTLViewport right = {size.width * 0.5, 0, size.width * 0.5, size.height, 0, 1};
-            [self drawTexture:a frameWidth:fw frameHeight:fh viewport:left buffer:command drawable:drawable fill:NO];
-            [self drawTexture:b frameWidth:(float)CVPixelBufferGetWidth(secondary)
-                  frameHeight:(float)CVPixelBufferGetHeight(secondary)
-                     viewport:right buffer:command drawable:drawable fill:NO];
-        } else {
-            MTLViewport full = {0, 0, size.width, size.height, 0, 1};
-            [self drawTexture:a frameWidth:fw frameHeight:fh viewport:full buffer:command drawable:drawable fill:fillTarget
-                      geometry:geometryCandidate.valid ? &geometryCandidate.render : nullptr];
-        }
-        [command addCompletedHandler:^(id<MTLCommandBuffer> done) {
-            if (done.status != MTLCommandBufferStatusCompleted) reportFailure(@"gpu");
-            note->gpuHost.store((long long)SPHostNow());
-            if (aRef) CFRelease(aRef);
-            if (bRef) CFRelease(bRef);
-            if (enhanced) CVPixelBufferRelease(enhanced);
-            if (original) CVPixelBufferRelease(original);
-            if (seenSurfaceToken && self.surfaceReady) {
-                self.surfaceReady(@{ @"generation": @(seen), @"configVersion": @(seenConfig), @"captureHost": @(captureHost),
-                    @"measurementEpoch": @(seenEpoch), @"surfaceToken": @(seenSurfaceToken),
-                    @"counts": @(counts), @"windowVisible": @(windowVisible),
-                    @"gpuCompleted": @(done.status == MTLCommandBufferStatusCompleted), @"viewMode": @(mode),
-                    @"enhancedWidth": @(enhancedWidth), @"enhancedHeight": @(enhancedHeight),
-                    @"originalWidth": @(originalWidth), @"originalHeight": @(originalHeight) });
-            }
-            releaseTicket();
-            releaseNote();
+        [[command renderCommandEncoderWithDescriptor:clear] endEncoding];
+        MTLViewport full = {0,0,(double)surface.texture.width,(double)surface.texture.height,0,1};
+        if (frame.mode == SPLiveViewCompare && b) {
+            MTLViewport left = full, right = full; left.width *= .5; right.width *= .5; right.originX = left.width;
+            [self drawTexture:a frameWidth:CVPixelBufferGetWidth(primary) frameHeight:CVPixelBufferGetHeight(primary)
+                viewport:left buffer:command drawable:(id<CAMetalDrawable>)surface fill:NO];
+            [self drawTexture:b frameWidth:CVPixelBufferGetWidth(secondary) frameHeight:CVPixelBufferGetHeight(secondary)
+                viewport:right buffer:command drawable:(id<CAMetalDrawable>)surface fill:NO];
+        } else [self drawTexture:a frameWidth:CVPixelBufferGetWidth(primary) frameHeight:CVPixelBufferGetHeight(primary)
+            viewport:full buffer:command drawable:(id<CAMetalDrawable>)surface fill:_followTargetContent.load()];
+        _inflightDraws.fetch_add(1);
+        [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+            if (aRef) CFRelease(aRef); if (bRef) CFRelease(bRef);
+            self->_inflightDraws.fetch_sub(1); self->_warmSurfacePending.store(false);
+            if (frame.clockEpoch != self->_presentationClockEpoch.load()) return;
+            if (completed.status != MTLCommandBufferStatusCompleted) [self reportPendingPresentation:frame reason:@"display-warm-gpu"];
+            if (self.surfaceReady) self.surfaceReady(@{
+                @"generation": @(frame.generation), @"configVersion": @(frame.config), @"measurementEpoch": @(frame.epoch),
+                @"clockEpoch": @(frame.clockEpoch), @"surfaceToken": @(frame.surfaceToken), @"captureHost": @(frame.captureHost),
+                @"frameID": @(frame.frameID), @"counts": @(frame.counts), @"windowVisible": @(self->_windowVisible.load()),
+                @"gpuCompleted": @(completed.status == MTLCommandBufferStatusCompleted), @"surfacePreparationOnly": @YES,
+                @"viewMode": @(frame.mode), @"enhancedWidth": @(frame.enhanced ? CVPixelBufferGetWidth(frame.enhanced) : 0),
+                @"enhancedHeight": @(frame.enhanced ? CVPixelBufferGetHeight(frame.enhanced) : 0),
+                @"originalWidth": @(frame.original ? CVPixelBufferGetWidth(frame.original) : 0),
+                @"originalHeight": @(frame.original ? CVPixelBufferGetHeight(frame.original) : 0) });
         }];
-        if (seen != self->_generation.load()) {
-            reportFailure(@"generation");
-            releaseNote(); // no presented handler will own the second reference
-            [command commit];
-            return;
-        }
-        [drawable addPresentedHandler:^(id<MTLDrawable> presentedDrawable) {
-            long long gpuHost = note->gpuHost.load();
-            releaseNote();
-            BOOL geometryActivated = NO;
-            if (geometryCandidate.valid && counts && windowVisible && exposed && !occluded && presentedDrawable.presentedTime > 0 &&
-                seen==self->_generation.load() && seenConfig==self->_diagnosticConfig.load() && seenEpoch==self->_diagnosticEpoch.load()) {
-                std::lock_guard<std::mutex> lock(self->_geometryMutex);
-                if (seen==self->_generation.load() && seenConfig==self->_diagnosticConfig.load() && seenEpoch==self->_diagnosticEpoch.load() &&
-                    self->_geometryVerifiedHost>0 && SPHostToNs(SPHostNow()-self->_geometryVerifiedHost)<=350000000LL)
-                    geometryActivated=self->_sharedGeometry.activate(geometryCandidate.version,frameID,captureHost);
-            }
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self revealSourceGeneration:seen];
-            });
-            if (!self.presented) return;
-            self.presented(@{
-                @"captureHost": @(captureHost),
-                @"presentedHost": @(SPHostNow()),
-                @"presentedTime": @(presentedDrawable.presentedTime),
-                @"handlerMediaTime": @(CACurrentMediaTime()),
-                @"drawableWaitNs": @(drawableWaitNs),
-                @"gpuHost": @(gpuHost),
-                @"occluded": @(occluded),
-                @"windowVisible": @(windowVisible),
-                @"exposed": @(exposed),
-                @"generation": @(seen),
-                @"configVersion": @(seenConfig),
-                @"measurementEpoch": @(seenEpoch),
-                @"ptsNum": @(ptsNum),
-                @"ptsDen": @(ptsDen),
-                @"synthetic": @(synthetic),
-                @"viewMode": @(mode),
-                @"frameID": @(frameID),
-                @"counts": @(counts),
-                @"width": @(width),
-                @"height": @(height),
-                @"drawableWidth": @((int)size.width),
-                @"drawableHeight": @((int)size.height),
-                @"outputImageRectPixels": imageRectPixels,
-                @"surfaceGeometryAssessment": cropStatus,
-                @"outputDisplayID": diagnosticDisplayID ? @(diagnosticDisplayID) : (id)[NSNull null],
-                @"geometryVersion": geometryActivated ? @(geometryCandidate.version) : (id)[NSNull null],
-                @"enhancedCenter": @(-1),
-                @"originalCenter": @(-1),
-            });
-        }];
-        [command presentDrawable:drawable];
         [command commit];
-        if (self->_cache) CVMetalTextureCacheFlush(self->_cache, 0);
-    });
-    return YES;
+    }
+}
+
+- (void)metalDisplayLink:(CAMetalDisplayLink *)link needsUpdate:(CAMetalDisplayLinkUpdate *)update {
+    @autoreleasepool {
+        int64_t callbackHost = SPHostNow();
+        if (link != _displayLink || !_drawableVisible.load()) return;
+        // Never block this callback on a semaphore, nextDrawable or another queue.
+        if (_inflightDraws.load() >= 2 || !std::isfinite(update.targetTimestamp) ||
+            !std::isfinite(update.targetPresentationTimestamp) || CACurrentMediaTime() >= update.targetTimestamp) return;
+        [self discardOutdatedPresentations];
+        SPDisplayFrameRequest *frame = nil;
+        NSMutableArray<SPDisplayFrameRequest *> *stale = [NSMutableArray array];
+        NSMutableArray<SPDisplayFrameRequest *> *superseded = [NSMutableArray array];
+        {
+            std::lock_guard<std::mutex> lock(_presentationMutex);
+            for (NSInteger i = (NSInteger)_pendingPresentations.count - 1; i >= 0; --i) {
+                SPDisplayFrameRequest *pending = _pendingPresentations[(NSUInteger)i];
+                int comparison = _haveSubmittedPresentationPTS ? sp::spCmp({pending.ptsNum,pending.ptsDen}, _lastSubmittedPresentationPTS) : 1;
+                if (_haveSubmittedPresentationPTS && (comparison < 0 || (comparison == 0 && !pending.redraw))) {
+                    [stale addObject:pending]; [_pendingPresentations removeObjectAtIndex:(NSUInteger)i];
+                }
+            }
+            std::vector<sp::DisplayQueueFrame> timings;
+            for (SPDisplayFrameRequest *pending in _pendingPresentations) timings.push_back(SPDisplayFrameTiming(pending));
+            auto selected = sp::chooseDisplayFrame(timings, (int64_t)(update.targetPresentationTimestamp * 1e9));
+            if (selected < timings.size()) {
+                frame = _pendingPresentations[selected];
+                for (NSUInteger index = 0; index < selected; ++index) [superseded addObject:_pendingPresentations[index]];
+                [_pendingPresentations removeObjectsInRange:NSMakeRange(0, selected + 1)];
+            }
+        }
+        for (SPDisplayFrameRequest *discarded in stale) [self reportPendingPresentation:discarded reason:@"display-stale-pts"];
+        for (SPDisplayFrameRequest *discarded in superseded) [self reportPendingPresentation:discarded reason:@"display-slot-superseded"
+            details:@{ @"displayLinkCallbackHost": @(callbackHost), @"displayLinkTargetTimestamp": @(update.targetTimestamp),
+                @"displayLinkTargetPresentationTimestamp": @(update.targetPresentationTimestamp),
+                @"scheduledMinusLogicalTargetNs": discarded.logicalTargetHost > 0 ? @((int64_t)(update.targetPresentationTimestamp * 1e9) - SPHostToNs(discarded.logicalTargetHost)) : (id)[NSNull null] }];
+        if (frame) [self renderPendingPresentation:frame update:update callbackHost:callbackHost];
+    }
+}
+
+- (void)renderPendingPresentation:(SPDisplayFrameRequest *)frame update:(CAMetalDisplayLinkUpdate *)update callbackHost:(int64_t)callbackHost {
+    const double presentDeadline = update.targetTimestamp, scheduledDisplayTime = update.targetPresentationTimestamp;
+    uint64_t seen = frame.generation, seenConfig = frame.config, seenEpoch = frame.epoch, seenClock = frame.clockEpoch;
+    uint64_t seenSurfaceToken = frame.surfaceToken, frameID = frame.frameID;
+    int64_t captureHost = frame.captureHost, ptsNum = frame.ptsNum, ptsDen = frame.ptsDen;
+    int64_t presentationHost = frame.logicalTargetHost;
+    BOOL synthetic = frame.synthetic, counts = frame.counts;
+    SPLiveViewMode mode = frame.mode;
+    NSDictionary *captureGeometry = frame.captureGeometry;
+    CVPixelBufferRef enhanced = frame.enhanced, original = frame.original;
+    CVPixelBufferRef primary = mode == SPLiveViewOriginal ? (original ?: enhanced) : enhanced;
+    CVPixelBufferRef secondary = original ?: enhanced;
+    BOOL windowVisible = _windowVisible.load(), occluded = windowVisible && !_drawableVisible.load(), exposed = _exposed.load();
+    BOOL fillTarget = _followTargetContent.load() && mode != SPLiveViewCompare;
+    uint32_t diagnosticDisplayID = _diagnosticDisplayID.load();
+    int width = (int)CVPixelBufferGetWidth(primary), height = (int)CVPixelBufferGetHeight(primary);
+    int enhancedWidth = enhanced ? (int)CVPixelBufferGetWidth(enhanced) : 0, enhancedHeight = enhanced ? (int)CVPixelBufferGetHeight(enhanced) : 0;
+    int originalWidth = original ? (int)CVPixelBufferGetWidth(original) : 0, originalHeight = original ? (int)CVPixelBufferGetHeight(original) : 0;
+    int64_t drawableWaitNs = 0;
+    id<CAMetalDrawable> drawable = update.drawable;
+    struct SPDrawNote {
+        std::atomic<long long> gpuHost{0};
+        std::atomic<long long> commitHost{0};
+        std::atomic<double> presentRequestMedia{0};
+    };
+    auto note = std::make_shared<SPDrawNote>();
+    void (^reportFailure)(NSString *) = ^(NSString *why) {
+        if (counts && self.presentationFailure) self.presentationFailure(@{
+            @"reason": why, @"generation": @(seen), @"configVersion": @(seenConfig), @"measurementEpoch": @(seenEpoch),
+            @"frameID": @(frameID), @"ptsNum": @(ptsNum), @"ptsDen": @(ptsDen), @"synthetic": @(synthetic), @"clockEpoch": @(seenClock),
+            @"logicalTargetHost": @(presentationHost), @"presentationEnqueueHost": @(frame.enqueueHost),
+            @"presentationQueueStartHost": @(callbackHost), @"displayLinkCallbackHost": @(callbackHost),
+            @"displayLinkTargetTimestamp": @(presentDeadline), @"displayLinkTargetPresentationTimestamp": @(scheduledDisplayTime),
+            @"metalCommitHost": @(note->commitHost.load()), @"presentRequestMediaTime": @(note->presentRequestMedia.load()) });
+    };
+    void (^releaseTicket)(void) = ^{ self->_inflightDraws.fetch_sub(1); };
+    CVMetalTextureRef aRef = [self createTexture:primary];
+    CVMetalTextureRef bRef = mode == SPLiveViewCompare ? [self createTexture:secondary] : NULL;
+    id<MTLTexture> a = aRef ? CVMetalTextureGetTexture(aRef) : nil;
+    id<MTLTexture> b = bRef ? CVMetalTextureGetTexture(bRef) : nil;
+    if (!drawable || !a || !self->_pipeline) {
+        reportFailure(!drawable ? @"drawable" : (!a ? @"texture" : @"pipeline"));
+        if (aRef) CFRelease(aRef);
+        if (bRef) CFRelease(bRef);
+        return;
+    }
+    id<MTLCommandBuffer> command = [self->_commandQueue commandBuffer];
+    if (!command) {
+        reportFailure(@"command");
+        if (aRef) CFRelease(aRef);
+        if (bRef) CFRelease(bRef);
+        return;
+    }
+    MTLRenderPassDescriptor *clear = [MTLRenderPassDescriptor renderPassDescriptor];
+    clear.colorAttachments[0].texture = drawable.texture;
+    clear.colorAttachments[0].loadAction = MTLLoadActionClear;
+    clear.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    clear.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> enc = [command renderCommandEncoderWithDescriptor:clear];
+    [enc endEncoding];
+    CGSize size = CGSizeMake(drawable.texture.width, drawable.texture.height);
+    float fw = (float)CVPixelBufferGetWidth(primary);
+    float fh = (float)CVPixelBufferGetHeight(primary);
+    sp::GeometrySource diagnosticGeometry{};
+    sp::SurfaceCropState cropState{};
+    BOOL diagnosticSource = SPSourceGeometryValue(captureGeometry, diagnosticGeometry);
+    sp::visualOutputGeometry(diagnosticSource ? &diagnosticGeometry : nullptr, seen, (int)fw, (int)fh, size.width, size.height, fillTarget, cropState);
+    NSString *cropStatus = cropState == sp::SurfaceCropState::validated ? @"metadata-valid-unapplied" : (cropState == sp::SurfaceCropState::targetAspectMismatch ? @"target-aspect-mismatch-unapplied" : @"metadata-unavailable-unapplied");
+    sp::SharedGeometry geometryCandidate{};
+    sp::GeometrySource sourceGeometry{};
+    if (counts && mode != SPLiveViewCompare && SPSourceGeometryValue(captureGeometry, sourceGeometry)) {
+        std::lock_guard<std::mutex> lock(self->_geometryMutex);
+        geometryCandidate=self->_sharedGeometry.candidate(sourceGeometry, seen, seenConfig, seenEpoch, diagnosticDisplayID,
+            (int)size.width, (int)size.height, (int)fw, (int)fh, fillTarget);
+    }
+    // If this drawable cannot be tied to the current verified geometry,
+    // no earlier mapping may remain active while it is being presented.
+    if (counts && !geometryCandidate.valid) [self invalidateSharedGeometry];
+    id imageRectPixels = [NSNull null];
+    if (mode != SPLiveViewCompare) {
+        auto geometry = sp::outputGeometry({0,0,size.width,size.height},{0,0,fw,fh},fillTarget,1);
+        if (geometry.valid) imageRectPixels = @[@(geometry.image.x), @(geometry.image.y), @(geometry.image.width), @(geometry.image.height)];
+    }
+    if (mode == SPLiveViewCompare && b) {
+        MTLViewport left = {0, 0, size.width * 0.5, size.height, 0, 1};
+        MTLViewport right = {size.width * 0.5, 0, size.width * 0.5, size.height, 0, 1};
+        [self drawTexture:a frameWidth:fw frameHeight:fh viewport:left buffer:command drawable:drawable fill:NO];
+        [self drawTexture:b frameWidth:(float)CVPixelBufferGetWidth(secondary)
+              frameHeight:(float)CVPixelBufferGetHeight(secondary)
+                 viewport:right buffer:command drawable:drawable fill:NO];
+    } else {
+        MTLViewport full = {0, 0, size.width, size.height, 0, 1};
+        [self drawTexture:a frameWidth:fw frameHeight:fh viewport:full buffer:command drawable:drawable fill:fillTarget
+                  geometry:geometryCandidate.valid ? &geometryCandidate.render : nullptr];
+    }
+    self->_inflightDraws.fetch_add(1);
+    [command addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (done.status != MTLCommandBufferStatusCompleted) reportFailure(@"gpu");
+        note->gpuHost.store((long long)SPHostNow());
+        if (aRef) CFRelease(aRef);
+        if (bRef) CFRelease(bRef);
+        uint64_t completedFrameID = frame.frameID; // retains the admitted buffers through GPU completion
+        if (seenSurfaceToken && self.surfaceReady && seenClock == self->_presentationClockEpoch.load()) {
+            self.surfaceReady(@{ @"generation": @(seen), @"configVersion": @(seenConfig), @"captureHost": @(captureHost),
+                @"measurementEpoch": @(seenEpoch), @"clockEpoch": @(seenClock), @"surfaceToken": @(seenSurfaceToken), @"frameID": @(completedFrameID),
+                @"counts": @(counts), @"windowVisible": @(windowVisible),
+                @"gpuCompleted": @(done.status == MTLCommandBufferStatusCompleted), @"viewMode": @(mode),
+                @"enhancedWidth": @(enhancedWidth), @"enhancedHeight": @(enhancedHeight),
+                @"originalWidth": @(originalWidth), @"originalHeight": @(originalHeight) });
+        }
+        releaseTicket();
+    }];
+    [drawable addPresentedHandler:^(id<MTLDrawable> presentedDrawable) {
+        long long gpuHost = note->gpuHost.load();
+        BOOL physicallyPresented = std::isfinite(presentedDrawable.presentedTime) && presentedDrawable.presentedTime > 0;
+        if (!physicallyPresented) reportFailure(@"display-not-presented");
+        BOOL geometryActivated = NO;
+        if (geometryCandidate.valid && counts && windowVisible && exposed && !occluded && presentedDrawable.presentedTime > 0 &&
+            seen==self->_generation.load() && seenConfig==self->_diagnosticConfig.load() && seenEpoch==self->_diagnosticEpoch.load() && seenClock==self->_presentationClockEpoch.load()) {
+            std::lock_guard<std::mutex> lock(self->_geometryMutex);
+            if (seen==self->_generation.load() && seenConfig==self->_diagnosticConfig.load() && seenEpoch==self->_diagnosticEpoch.load() && seenClock==self->_presentationClockEpoch.load() &&
+                self->_geometryVerifiedHost>0 && SPHostToNs(SPHostNow()-self->_geometryVerifiedHost)<=350000000LL)
+                geometryActivated=self->_sharedGeometry.activate(geometryCandidate.version,frameID,captureHost);
+        }
+        if (physicallyPresented) dispatch_async(dispatch_get_main_queue(), ^{
+            [self revealSourceGeneration:seen];
+        });
+        if (!self.presented) return;
+        self.presented(@{
+            @"captureHost": @(captureHost),
+            @"presentedHost": @(SPHostNow()),
+            @"presentedTime": @(presentedDrawable.presentedTime),
+            @"handlerMediaTime": @(CACurrentMediaTime()),
+            @"drawableWaitNs": @(drawableWaitNs),
+            @"presentationEnqueueHost": @(frame.enqueueHost),
+            @"presentationQueueStartHost": @(callbackHost),
+            @"metalCommitHost": @(note->commitHost.load()),
+            @"displayLinkCallbackHost": @(callbackHost),
+            @"displayLinkTargetTimestamp": @(presentDeadline),
+            @"displayLinkTargetPresentationTimestamp": @(scheduledDisplayTime),
+            @"logicalTargetHost": @(presentationHost),
+            @"scheduledMinusLogicalTargetNs": presentationHost > 0 ? @((int64_t)(scheduledDisplayTime * 1e9) - SPHostToNs(presentationHost)) : (id)[NSNull null],
+            @"actualMinusScheduledDisplayNs": physicallyPresented ? @((int64_t)((presentedDrawable.presentedTime - scheduledDisplayTime) * 1e9)) : (id)[NSNull null],
+            @"actualMinusLogicalTargetNs": physicallyPresented && presentationHost > 0 ? @((int64_t)(presentedDrawable.presentedTime * 1e9) - SPHostToNs(presentationHost)) : (id)[NSNull null],
+            @"presentRequestMediaTime": @(note->presentRequestMedia.load()),
+            @"gpuHost": @(gpuHost),
+            @"occluded": @(occluded),
+            @"windowVisible": @(windowVisible),
+            @"exposed": @(exposed),
+            @"generation": @(seen),
+            @"configVersion": @(seenConfig),
+            @"measurementEpoch": @(seenEpoch), @"clockEpoch": @(seenClock),
+            @"ptsNum": @(ptsNum),
+            @"ptsDen": @(ptsDen),
+            @"synthetic": @(synthetic),
+            @"viewMode": @(mode),
+            @"frameID": @(frameID),
+            @"counts": @(counts && physicallyPresented),
+            @"width": @(width),
+            @"height": @(height),
+            @"drawableWidth": @((int)size.width),
+            @"drawableHeight": @((int)size.height),
+            @"outputImageRectPixels": imageRectPixels,
+            @"surfaceGeometryAssessment": cropStatus,
+            @"outputDisplayID": diagnosticDisplayID ? @(diagnosticDisplayID) : (id)[NSNull null],
+            @"geometryVersion": geometryActivated ? @(geometryCandidate.version) : (id)[NSNull null],
+            @"enhancedCenter": @(-1),
+            @"originalCenter": @(-1),
+        });
+    }];
+    // The update's present deadline differs from its future display target.
+    // Submit first, then ordinary present; timed presents assert for these drawables.
+    {
+        std::lock_guard<std::mutex> generationLock(_generationMutex);
+        std::lock_guard<std::mutex> pendingLock(_presentationMutex);
+        NSString *invalid = seen != _generation.load() ? @"generation" :
+            (seenConfig != _diagnosticConfig.load() ? @"configuration" : (seenEpoch != _diagnosticEpoch.load() ? @"epoch" :
+                (seenClock != _presentationClockEpoch.load() ? @"clock-retired" : nil)));
+        if (!invalid && CACurrentMediaTime() >= presentDeadline) invalid = @"display-submit-deadline";
+        note->commitHost.store(SPHostNow());
+        [command commit];
+        if (!invalid && CACurrentMediaTime() >= presentDeadline) invalid = @"display-submit-deadline";
+        if (invalid) { reportFailure(invalid); return; }
+        note->presentRequestMedia.store(CACurrentMediaTime());
+        [drawable present];
+        _lastSubmittedPresentationPTS = {ptsNum,ptsDen}; _haveSubmittedPresentationPTS = true;
+    }
+    if (_cache) CVMetalTextureCacheFlush(_cache, 0);
 }
 
 @end
@@ -1475,6 +1759,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     BOOL _lastSynthetic;
     sp::SPRational _lastRedrawPts;
     int64_t _lastRedrawGeometryHost;
+    int64_t _lastRedrawTargetHost;
     uint64_t _nextFrameID;
     uint64_t _outputSurfaceToken;
     int64_t _outputSurfaceMinimumCaptureHost;
@@ -1611,6 +1896,9 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     std::vector<int64_t> _queueNs;
     std::vector<int64_t> _playheadNs;
     std::vector<int64_t> _drawableWaitNs;
+    std::vector<int64_t> _presentationAdmissionToCallbackNs;
+    std::vector<int64_t> _metalCommitToDisplayNs;
+    std::vector<int64_t> _displayScheduledTargetOffsetNs;
     std::vector<int64_t> _presentGapNs;
     std::vector<int64_t> _presentMediaLagNs;
     std::vector<int64_t> _gpuToDisplayNs;
@@ -2288,6 +2576,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"queueP95ms": @(SPPercentileMs(_queueNs)),
         @"playheadP95ms": @(SPPercentileMs(_playheadNs)),
         @"drawableWaitP95ms": @(SPPercentileMs(_drawableWaitNs)),
+        @"presentationDriver": @"CAMetalDisplayLink",
+        @"presentationAdmissionToCallbackP95ms": @(SPPercentileMs(_presentationAdmissionToCallbackNs)),
+        @"metalCommitToDisplayP95ms": @(SPPercentileMs(_metalCommitToDisplayNs)),
+        @"displayScheduledTargetOffsetP95ms": @(SPPercentileMs(_displayScheduledTargetOffsetNs)),
         @"notifyGapP95ms": @(SPPercentileMs(_presentGapNs)),
         @"presentGapP95ms": @(SPPercentileMs(_presentGapNs)),
         @"presentMediaLagP95ms": @(SPPercentileMs(_presentMediaLagNs)),
@@ -2916,7 +3208,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         self->_request.viewMode = mode;
         if (!self->_lastEnhanced && !self->_lastOriginal) return;
         [self showPair:self->_lastEnhanced original:self->_lastOriginal pts:self->_lastRedrawPts
-             synthetic:self->_lastSynthetic captureHost:0 geometryHost:self->_lastRedrawGeometryHost frameID:0 redraw:YES];
+             synthetic:self->_lastSynthetic captureHost:0 geometryHost:self->_lastRedrawGeometryHost frameID:0 presentationHost:self->_lastRedrawTargetHost redraw:YES];
     });
 }
 
@@ -3609,10 +3901,24 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 }
 
 - (void)recordPresentationFailure:(NSString *)reason endpoint:(NSString *)endpoint generation:(uint64_t)generation config:(uint64_t)config epoch:(uint64_t)epoch frame:(uint64_t)frame {
+    [self recordPresentationFailure:reason endpoint:endpoint generation:generation config:config epoch:epoch frame:frame details:nil];
+}
+
+- (void)recordPresentationFailure:(NSString *)reason endpoint:(NSString *)endpoint generation:(uint64_t)generation config:(uint64_t)config epoch:(uint64_t)epoch frame:(uint64_t)frame details:(NSDictionary *)details {
     NSString *key = [NSString stringWithFormat:@"%@.%@", endpoint, reason ?: @"unknown"];
-    NSDictionary *sample = @{ @"reason": reason ?: @"unknown", @"endpoint": endpoint, @"frameID": @(frame),
-        @"generation": @(generation), @"configVersion": @(config), @"measurementEpoch": @(epoch), @"observedHost": @(SPHostNow()) };
+    NSMutableDictionary *sample = [@{ @"reason": reason ?: @"unknown", @"endpoint": endpoint, @"frameID": @(frame),
+        @"generation": @(generation), @"configVersion": @(config), @"measurementEpoch": @(epoch), @"observedHost": @(SPHostNow()) } mutableCopy];
     auto mark = _marks.find(frame);
+    if (mark != _marks.end()) {
+        sample[@"logicalTargetHost"] = @(mark->second.targetHost);
+    }
+    if (details) [sample addEntriesFromDictionary:details];
+    if (SPR8FixtureEnabled() && [endpoint isEqualToString:@"output"]) {
+        if (!_r8OutputTimeline) _r8OutputTimeline = [NSMutableArray array];
+        sample[@"kind"] = @"presentationFailure";
+        [_r8OutputTimeline addObject:[sample copy]];
+        if (_r8OutputTimeline.count > 512) [_r8OutputTimeline removeObjectAtIndex:0];
+    }
     if (mark != _marks.end() && mark->second.jobID) [self recordR7JobEvent:@"presentationFailure" detail:@{
         @"id": @(mark->second.jobID), @"frameID": @(frame), @"reason": reason ?: @"unknown",
         @"endpoint": endpoint ?: @"unknown", @"generation": @(generation), @"config": @(config),
@@ -3633,7 +3939,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     void (^failure)(NSString *, NSDictionary *) = ^(NSString *endpoint, NSDictionary *info) {
         dispatch_async(strong->_q, ^{ [strong recordPresentationFailure:info[@"reason"] endpoint:endpoint
             generation:[info[@"generation"] unsignedLongLongValue] config:[info[@"configVersion"] unsignedLongLongValue]
-            epoch:[info[@"measurementEpoch"] unsignedLongLongValue] frame:[info[@"frameID"] unsignedLongLongValue]]; });
+            epoch:[info[@"measurementEpoch"] unsignedLongLongValue] frame:[info[@"frameID"] unsignedLongLongValue] details:info]; });
     };
     self.preview.presentationFailure = ^(NSDictionary *info) { failure(@"preview", info); };
     self.outputPreview.presentationFailure = ^(NSDictionary *info) { failure(@"output", info); };
@@ -3764,11 +4070,22 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         if (!_r8OutputTimeline) _r8OutputTimeline = [NSMutableArray array];
         [_r8OutputTimeline addObject:@{ @"kind": @"presented", @"frameID": info[@"frameID"] ?: @0,
             @"generation": info[@"generation"] ?: @0, @"configVersion": info[@"configVersion"] ?: @0,
-            @"measurementEpoch": info[@"measurementEpoch"] ?: @0,
+            @"measurementEpoch": info[@"measurementEpoch"] ?: @0, @"clockEpoch": info[@"clockEpoch"] ?: @0,
             @"presentedTime": info[@"presentedTime"] ?: @0, @"counts": info[@"counts"] ?: @NO,
             @"windowVisible": info[@"windowVisible"] ?: @NO, @"exposed": info[@"exposed"] ?: @NO,
             @"occluded": info[@"occluded"] ?: @NO, @"synthetic": info[@"synthetic"] ?: @NO,
             @"callbackHost": info[@"presentedHost"] ?: @0, @"handlerMediaTime": info[@"handlerMediaTime"] ?: @0,
+            @"presentationEnqueueHost": info[@"presentationEnqueueHost"] ?: @0,
+            @"presentationQueueStartHost": info[@"presentationQueueStartHost"] ?: @0,
+            @"metalCommitHost": info[@"metalCommitHost"] ?: @0,
+            @"displayLinkCallbackHost": info[@"displayLinkCallbackHost"] ?: @0,
+            @"displayLinkTargetTimestamp": info[@"displayLinkTargetTimestamp"] ?: @0,
+            @"displayLinkTargetPresentationTimestamp": info[@"displayLinkTargetPresentationTimestamp"] ?: @0,
+            @"logicalTargetHost": info[@"logicalTargetHost"] ?: @0,
+            @"scheduledMinusLogicalTargetNs": info[@"scheduledMinusLogicalTargetNs"] ?: [NSNull null],
+            @"actualMinusScheduledDisplayNs": info[@"actualMinusScheduledDisplayNs"] ?: [NSNull null],
+            @"actualMinusLogicalTargetNs": info[@"actualMinusLogicalTargetNs"] ?: [NSNull null],
+            @"presentRequestMediaTime": info[@"presentRequestMediaTime"] ?: @0,
             @"drawablePixels": @[info[@"drawableWidth"] ?: @0, info[@"drawableHeight"] ?: @0],
             @"outputImageRectPixels": info[@"outputImageRectPixels"] ?: [NSNull null],
             @"outputDisplayID": info[@"outputDisplayID"] ?: [NSNull null], @"geometryVersion": info[@"geometryVersion"] ?: [NSNull null] }];
@@ -3779,7 +4096,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     NSString *ignored = ![info[@"counts"] boolValue] ? @"redrawOrUnscored" :
         ([info[@"generation"] unsignedLongLongValue] != _sourceGeneration ? @"generation" :
          (configVersion != 0 && configVersion != _configVersion ? @"configuration" :
-          (epoch != 0 && epoch != _measurementEpoch ? @"epoch" : nil)));
+          (epoch != 0 && epoch != _measurementEpoch ? @"epoch" :
+           (info[@"clockEpoch"] && [info[@"clockEpoch"] unsignedLongLongValue] != _clockEpoch ? @"clock" : nil))));
     if (ignored) {
         if ([info[@"endpoint"] isEqual:@"output"] && _pixelPendingOutput &&
             [info[@"frameID"] unsignedLongLongValue] == [_pixelPendingOutput[@"frameID"] unsignedLongLongValue]) {
@@ -3895,6 +4213,17 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     int64_t presentedHost = [info[@"presentedHost"] longLongValue];
     int64_t latencyNs = (captureHost > 0 && presentedHost > captureHost) ? SPHostToNs(presentedHost - captureHost) : -1;
     if ([info[@"occluded"] boolValue]) _occludedPresents += 1;
+    int64_t admissionHost = [info[@"presentationEnqueueHost"] longLongValue];
+    int64_t queueStartHost = [info[@"presentationQueueStartHost"] longLongValue];
+    if (admissionHost > 0 && queueStartHost >= admissionHost)
+        SPPushSample(_presentationAdmissionToCallbackNs, SPHostToNs(queueStartHost - admissionHost));
+    int64_t commitHost = [info[@"metalCommitHost"] longLongValue];
+    double scheduledDisplay = [info[@"displayLinkTargetPresentationTimestamp"] doubleValue];
+    if (presentTime > 0 && commitHost > 0 && presentTime * 1e9 >= SPHostToNs(commitHost))
+        SPPushSample(_metalCommitToDisplayNs, (int64_t)(presentTime * 1e9) - SPHostToNs(commitHost));
+    id scheduleOffset = info[@"scheduledMinusLogicalTargetNs"];
+    if (scheduledDisplay > 0 && [scheduleOffset isKindOfClass:NSNumber.class])
+        SPPushSample(_displayScheduledTargetOffsetNs, [scheduleOffset longLongValue]);
     int64_t drawableWait = [info[@"drawableWaitNs"] longLongValue];
     if (drawableWait > 0) SPPushSample(_drawableWaitNs, drawableWait);
     int64_t gpuHost = [info[@"gpuHost"] longLongValue];
@@ -3969,13 +4298,14 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     _slots.clear();
 }
 
-- (void)rememberPair:(CVPixelBufferRef)enhanced original:(CVPixelBufferRef)original pts:(sp::SPRational)pts synthetic:(BOOL)synthetic geometryHost:(int64_t)geometryHost {
+- (void)rememberPair:(CVPixelBufferRef)enhanced original:(CVPixelBufferRef)original pts:(sp::SPRational)pts synthetic:(BOOL)synthetic geometryHost:(int64_t)geometryHost targetHost:(int64_t)targetHost {
     if (_lastEnhanced) CVPixelBufferRelease(_lastEnhanced);
     if (_lastOriginal) CVPixelBufferRelease(_lastOriginal);
     _lastEnhanced = enhanced ? CVPixelBufferRetain(enhanced) : nullptr;
     _lastOriginal = original ? CVPixelBufferRetain(original) : nullptr;
     _lastRedrawPts = pts;
     _lastRedrawGeometryHost = geometryHost;
+    _lastRedrawTargetHost = targetHost;
     _lastSynthetic = synthetic;
 }
 
@@ -4104,6 +4434,9 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     _queueNs.clear();
     _playheadNs.clear();
     _drawableWaitNs.clear();
+    _presentationAdmissionToCallbackNs.clear();
+    _metalCommitToDisplayNs.clear();
+    _displayScheduledTargetOffsetNs.clear();
     _presentGapNs.clear();
     _presentMediaLagNs.clear();
     _gpuToDisplayNs.clear();
@@ -4171,6 +4504,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 // model/SR work remains bounded and its callback is rejected by clockEpoch.
 - (void)retireClockTimeline {
     ++_clockEpoch;
+    [self.preview setPresentationClockEpoch:_clockEpoch];
+    [self.outputPreview setPresentationClockEpoch:_clockEpoch];
     _fpsMeter.resetOutput();
     _fpsObservationEpoch += 1;
     for (const auto &pending : _pending) {
@@ -4447,9 +4782,12 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
      captureHost:(int64_t)captureHost
     geometryHost:(int64_t)geometryHost
          frameID:(uint64_t)frameID
+presentationHost:(int64_t)presentationHost
           redraw:(BOOL)redraw {
     [self.preview setDiagnosticsConfig:_configVersion epoch:_measurementEpoch];
     [self.outputPreview setDiagnosticsConfig:_configVersion epoch:_measurementEpoch];
+    [self.preview setPresentationClockEpoch:_clockEpoch];
+    [self.outputPreview setPresentationClockEpoch:_clockEpoch];
     BOOL outputVisible = self.outputPreview.windowVisibleSnapshot;
     if (_scoreOutput != outputVisible) { _fpsMeter.resetOutput(); _fpsObservationEpoch += 1; _presentationGeometry.reset(); }
     _scoreOutput = outputVisible;
@@ -4461,8 +4799,9 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         BOOL accepted = [self.preview presentEnhanced:enhanced original:original mode:_request.viewMode
                                           captureHost:captureHost generation:generation
                                                ptsNum:pts.num ptsDen:pts.den synthetic:synthetic
-                                              frameID:frameID counts:previewCounts captureGeometry:nil reason:&reason];
-        if (!accepted && previewCounts) { _renderDrops += 1; [self recordPresentationFailure:reason endpoint:@"preview" generation:generation config:_configVersion epoch:_measurementEpoch frame:frameID]; }
+                                              frameID:frameID counts:previewCounts captureGeometry:nil presentationHost:presentationHost redraw:redraw reason:&reason];
+        if (!accepted && previewCounts) { _renderDrops += 1; [self recordPresentationFailure:reason endpoint:@"preview" generation:generation config:_configVersion epoch:_measurementEpoch frame:frameID
+            details:@{ @"ptsNum": @(pts.num), @"ptsDen": @(pts.den), @"logicalTargetHost": @(presentationHost), @"synthetic": @(synthetic) }]; }
     }
     if (self.outputPreview) {
         if (SPR8FixtureEnabled() && outputCounts) {
@@ -4473,6 +4812,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             [_r8OutputTimeline addObject:@{ @"kind": @"submitted", @"frameID": @(frameID),
                 @"generation": @(generation), @"configVersion": @(_configVersion), @"measurementEpoch": @(_measurementEpoch),
                 @"captureHost": @(captureHost), @"submitHost": @(SPHostNow()), @"clockEpoch": @(_clockEpoch),
+                @"logicalTargetHost": @(presentationHost),
                 @"geometryVersion": [NSNull null], @"ptsNum": @(pts.num), @"ptsDen": @(pts.den),
                 @"synthetic": @(synthetic), @"decoded": @(code >= 0), @"frameNumber": @(code), @"motion": motion }];
             if (_r8OutputTimeline.count > 512) [_r8OutputTimeline removeObjectAtIndex:0];
@@ -4483,7 +4823,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         BOOL accepted = [self.outputPreview presentEnhanced:enhanced original:original mode:_request.viewMode
                                                 captureHost:captureHost generation:generation
                                                      ptsNum:pts.num ptsDen:pts.den synthetic:synthetic
-                                                    frameID:frameID counts:outputCounts captureGeometry:_geometryInputs[@(captureHost)] reason:&reason];
+                                                    frameID:frameID counts:outputCounts captureGeometry:_geometryInputs[@(captureHost)] presentationHost:presentationHost redraw:redraw reason:&reason];
         if (_pixelPendingOutput && [_pixelPendingOutput[@"frameID"] unsignedLongLongValue] == frameID) {
             NSMutableDictionary *submitted = [_pixelPendingOutput mutableCopy];
             submitted[@"submissionState"] = accepted ? @"accepted" : @"rejected";
@@ -4491,7 +4831,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             _pixelLastOutputSubmitted = [submitted copy];
             _pixelPendingOutput = accepted ? _pixelLastOutputSubmitted : nil;
         }
-        if (!accepted && outputCounts) { _renderDrops += 1; [self recordPresentationFailure:reason endpoint:@"output" generation:generation config:_configVersion epoch:_measurementEpoch frame:frameID]; }
+        if (!accepted && outputCounts) { _renderDrops += 1; [self recordPresentationFailure:reason endpoint:@"output" generation:generation config:_configVersion epoch:_measurementEpoch frame:frameID
+            details:@{ @"ptsNum": @(pts.num), @"ptsDen": @(pts.den), @"logicalTargetHost": @(presentationHost), @"synthetic": @(synthetic) }]; }
     }
 }
 
@@ -4500,14 +4841,17 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     [self expireDeferredRifeAt:now];
     if (_haveRifeDeferred && _rifeDeferredRetryHost > 0 && _rifeDeferredRetryHost <= now) [self resumeDeferredRife];
     int64_t slop = SPRationalToHost(sp::spMake(1, 1000));
+    // Hand ready buffers to the bounded display-link queue ahead of time.
+    // This lead does not change logical targets or due-merge eligibility.
+    int64_t prepareLead = [self requestUsesLatestPresentation:_request] ? 0 : SPRationalToHost(sp::spMake(16, 1000));
     while (!_slots.empty()) {
         int64_t earliest = 0;
         if ([self waitForPendingBefore:_slots.front().pts now:now earliest:&earliest]) {
             [self armClockAt:earliest];
             return;
         }
-        if (_slots.front().targetHost > now + slop) {
-            [self armClockAt:_slots.front().targetHost];
+        if (_slots.front().targetHost > now + slop + prepareLead) {
+            [self armClockAt:_slots.front().targetHost - prepareLead];
             return;
         }
         while (_slots.size() > 1 && _slots[1].targetHost <= now + slop) {
@@ -4521,8 +4865,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             _slots.erase(_slots.begin());
         }
         if (_slots.empty()) break;
-        if (_slots.front().targetHost > now + slop) {
-            [self armClockAt:_slots.front().targetHost];
+        if (_slots.front().targetHost > now + slop + prepareLead) {
+            [self armClockAt:_slots.front().targetHost - prepareLead];
             return;
         }
         SPPlaySlot slot = _slots.front();
@@ -4541,7 +4885,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             continue;
         }
         [self showPair:slot.enhanced original:slot.original pts:slot.pts synthetic:slot.synthetic
-           captureHost:slot.captureHost geometryHost:slot.geometryHost frameID:slot.frameID redraw:NO];
+           captureHost:slot.captureHost geometryHost:slot.geometryHost frameID:slot.frameID
+       presentationHost:slot.targetHost redraw:NO];
         if (slot.fixedFallback) {
             _fixedFallbackPresented++;
             for (const auto &pending : _pending) if (sp::spCmp(pending.pts, slot.pts) == 0) {
@@ -4555,7 +4900,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             auto mark = _marks.find(slot.frameID);
             if (mark != _marks.end() && mark->second.held) _testHoldPlayout.push_back(slot.pts);
         }
-        [self rememberPair:slot.enhanced original:slot.original pts:slot.pts synthetic:slot.synthetic geometryHost:slot.geometryHost];
+        [self rememberPair:slot.enhanced original:slot.original pts:slot.pts synthetic:slot.synthetic geometryHost:slot.geometryHost targetHost:slot.targetHost];
         _lastPresentedPts = slot.pts;
         _haveLastPts = YES;
         SPReleaseSlot(slot);
@@ -4563,7 +4908,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             [self armClockAt:now + SPRationalToHost(sp::spMake(1, 10))];
             return;
         }
-        [self armClockAt:_slots.front().targetHost];
+        [self armClockAt:_slots.front().targetHost - prepareLead];
         return;
     }
     [self armClockAt:now + SPRationalToHost(sp::spMake(1, 10))];
