@@ -1,0 +1,113 @@
+--- a/Sources/RifeMetalCore/IFNetGraph.swift
++++ b/Sources/RifeMetalCore/IFNetGraph.swift
+@@ -1,3 +1,4 @@
++// OpenDuckFrame modification: GPU stream edge padding and direct cropped output.
+ import Foundation
+ import Metal
+ import MetalPerformanceShaders
+@@ -27,8 +28,11 @@
+     private let internalHeight: Int
+     private let internalScale: Double
+     private let scaleList: [Int]
+-    // 仅 Balanced 融合裁剪；空阶段模型仍使用完整尺寸的转换回退。
+-    package var supportsCroppedOutput: Bool { internalScale == 0.5 && !scaleList.isEmpty }
++    // Fast and Balanced can crop at the final GPU writer; empty-stage models retain the full-size fallback.
++    package var supportsCroppedOutput: Bool { (internalScale == 0.25 || internalScale == 0.5) && !scaleList.isEmpty }
++    package var usesDirectCroppedReturn: Bool { supportsCroppedOutput }
++    package var supportsGPUInputPadding: Bool { true }
++    private let paddedFrameConvert: PaddedFrameConvert
+     private let textureCache: CVMetalTextureCache
+ 
+     /// Pre-allocated buffer/texture pool — eliminates per-call GPU heap traffic.
+@@ -80,6 +84,7 @@
+         self.internalHeight = intH
+         self.internalScale = internalScale
+         self.scaleList = weights.header.scaleList
++        self.paddedFrameConvert = try PaddedFrameConvert(device: context.device)
+ 
+         var cache: CVMetalTextureCache?
+         let err = CVMetalTextureCacheCreate(
+@@ -898,10 +903,8 @@
+             guard let enc = mpsCB.commandBuffer.makeComputeCommandEncoder() else {
+                 throw IFNetError.commandBufferFailed("encodeFrame BGRA→RGB: makeComputeCommandEncoder failed")
+             }
+-            enc.setComputePipelineState(conv.bgraToRGB)
+-            enc.setTexture(frameTex, index: 0)
+-            enc.setBuffer(imgFullBufOut, offset: 0, index: 0)
+-            dispatch2D(enc, conv.bgraToRGB, gridW: width, gridH: height)
++            paddedFrameConvert.encode(into: enc, input: frameTex, output: imgFullBufOut,
++                                      width: width, height: height)
+             enc.endEncoding()
+         }
+ 
+@@ -1049,10 +1052,8 @@
+                 throw IFNetError.commandBufferFailed("input convert: makeComputeCommandEncoder failed")
+             }
+             // BGRA → RGB on curr only.
+-            enc.setComputePipelineState(conv.bgraToRGB)
+-            enc.setTexture(currTex, index: 0)
+-            enc.setBuffer(currImgFullBuf, offset: 0, index: 0)
+-            dispatch2D(enc, conv.bgraToRGB, gridW: width, gridH: height)
++            paddedFrameConvert.encode(into: enc, input: currTex, output: currImgFullBuf,
++                                      width: width, height: height)
+ 
+             // RGB-buf → RGBA texture for BOTH prev and curr (pool textures are scratch,
+             // refreshed every call regardless of which side the underlying buf came from).
+--- a/Sources/RifeMetal/RifeStream.swift
++++ b/Sources/RifeMetal/RifeStream.swift
+@@ -1,3 +1,4 @@
++// OpenDuckFrame modification: preserve stream state while moving padding/cropping to the GPU.
+ import Foundation
+ import CoreVideo
+ import Metal
+@@ -85,7 +86,7 @@
+             // Pad input if needed.
+             let needsPad = (paddedW != width) || (paddedH != height)
+             let paddedFrame: CVPixelBuffer
+-            if needsPad {
++            if needsPad && !(graph.supportsGPUInputPadding && fmt == kCVPixelFormatType_32BGRA && CVPixelBufferGetIOSurface(frame) != nil) {
+                 paddedFrame = try paddedInput(frame)
+             } else {
+                 paddedFrame = frame
+@@ -109,11 +110,12 @@
+                 }
+             }
+ 
+-            // Allocate padded output buffers.
++            let directCrop = needsPad && graph.usesDirectCroppedReturn
++            // Allocate caller-visible dimensions when the final GPU writer supports cropping.
+             var outBuffers: [CVPixelBuffer] = []
+             for _ in timesteps {
+                 let outBuf = try PixelBufferConvert.makeOutputPixelBuffer(
+-                    width: paddedW, height: paddedH)
++                    width: directCrop ? width : paddedW, height: directCrop ? height : paddedH)
+                 outBuffers.append(outBuf)
+             }
+ 
+@@ -122,7 +124,7 @@
+                                    outputs: outBuffers)
+ 
+             // Crop outputs back to caller-visible dims if we padded.
+-            if needsPad {
++            if needsPad && !directCrop {
+                 var cropped: [CVPixelBuffer] = []
+                 for paddedOut in outBuffers {
+                     cropped.append(try interpolator.cropPixelBufferForStream(
+@@ -182,7 +184,7 @@
+ 
+             let needsPad = (paddedW != width) || (paddedH != height)
+             let paddedFrame: CVPixelBuffer
+-            if needsPad {
++            if needsPad && !(graph.supportsGPUInputPadding && fmt == kCVPixelFormatType_32BGRA && CVPixelBufferGetIOSurface(frame) != nil) {
+                 paddedFrame = try paddedInput(frame)
+             } else {
+                 paddedFrame = frame
+@@ -207,7 +209,7 @@
+                 try interpolator.cropPixelBufferForStream(paddedOut, into: output)
+             } else {
+                 // Fast path: GPU writes directly into caller's output.
+-                // Balanced 的可绑定 BGRA 输出直接裁剪写入，其他档位和缓冲保留原路径。
++                // Fast/Balanced crop directly into bindable BGRA outputs; other tiers and buffers retain the original path.
+                 try runStreamAndRotate(curr: paddedFrame,
+                                        timesteps: [0.5],
+                                        outputs: [output])

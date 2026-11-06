@@ -19,6 +19,9 @@ XCODEGEN="${XCODEGEN:-/opt/homebrew/bin/xcodegen}"
 [ -x "$XCODEGEN" ] || XCODEGEN="$(command -v xcodegen 2>/dev/null || true)"
 [ -n "$XCODEGEN" ] && [ -x "$XCODEGEN" ] || { echo "xcodegen is required" >&2; exit 1; }
 
+echo "==> Preparing pinned RifeMetal stream runtime"
+./Scripts/prepare_rife_runtime.sh
+
 # Every dependency recipe validates its lock, recipe inputs, patches, and
 # toolchain. A matching stamp is a cheap no-op; existence alone is never enough.
 # The FFmpeg recipe ensures and fingerprints dav1d and Speex itself. Avoid

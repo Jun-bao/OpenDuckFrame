@@ -1,9 +1,7 @@
 name: OpenDuckFrame
 packages:
   RifeMetal:
-    url: https://github.com/cinemore/rife-metal.git
-    # Tag v0.1.8 is commit 06c9fc236c47a51ed08bf534854d4c67ae3eeefc.
-    exactVersion: 0.1.8
+    path: ../../ThirdParty/rife-metal/runtime
 include:
   - path: project.sparkle.yml
     enable: ${ODF_ENABLE_SPARKLE}
@@ -366,6 +364,8 @@ targets:
       - path: ../../Modules/MediaCore/Shaders/Video.metal
       - path: ../../ThirdParty/Licenses
         type: folder
+        buildPhase: resources
+      - path: ../../ThirdParty/rife-metal/runtime/source-origin.json
         buildPhase: resources
     preBuildScripts:
       - name: Generate Shader Header

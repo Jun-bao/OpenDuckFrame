@@ -92,6 +92,10 @@ also publishes a local `OpenDuckFrame.app` at the repository root. Local builds 
 ad-hoc signing. Developer ID signing, notarization and App Store packaging have
 their own [release workflow](RELEASING.md).
 
+RifeMetal is prepared from a pinned source archive with the local stream IO
+patch before project generation. See [the runtime recipe](ThirdParty/rife-metal/README.md)
+for provenance, licenses and the generated package boundary.
+
 Edit [`Apps/Mac/project.yml`](Apps/Mac/project.yml), not the generated Xcode project.
 Optional experimental runtimes are not built by default; see [the feature guide](docs/features.md#optional-runtimes).
 
