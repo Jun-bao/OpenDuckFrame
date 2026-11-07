@@ -8,3 +8,4 @@
 ThirdParty/Licenses/** -whitespace
 # Unified diffs require a leading space on blank context lines.
 Scripts/patches/*.patch whitespace=-blank-at-eol
+ThirdParty/rife-metal/*.patch whitespace=-blank-at-eol

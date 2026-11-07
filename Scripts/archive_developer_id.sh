@@ -169,6 +169,7 @@ echo "==> Building pinned subtitle dependencies"
 echo "==> Building pinned Sparkle framework and release tools"
 "$ROOT/Scripts/build_sparkle.sh"
 echo "==> Generating direct-distribution Xcode project"
+"$ROOT/Scripts/prepare_rife_runtime.sh"
 ODF_ENABLE_SPARKLE=true \
 ODF_SPARKLE_FEED_URL="$SPARKLE_FEED_URL" \
 ODF_SPARKLE_PUBLIC_ED_KEY="$SPARKLE_PUBLIC_ED_KEY" \

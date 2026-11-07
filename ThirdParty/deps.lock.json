@@ -104,6 +104,21 @@
       "archive": "speex-1.2.1.tar.gz",
       "source_dir": "speex-1.2.1",
       "sha256": "4b44d4f2b38a370a2d98a78329fefc56a0cf93d1c1be70029217baae6628feea"
+    },
+    "rife-metal": {
+      "version": "0.1.8",
+      "commit": "ac6408022eb6bc1a53181f5b2716a9f5ded507c2",
+      "url": "https://codeload.github.com/cinemore/rife-metal/tar.gz/ac6408022eb6bc1a53181f5b2716a9f5ded507c2",
+      "archive": "ac6408022eb6bc1a53181f5b2716a9f5ded507c2.tar.gz",
+      "source_dir": "rife-metal-ac6408022eb6bc1a53181f5b2716a9f5ded507c2",
+      "sha256": "f916255f1344bca52b92c9e3e6ba23a31b7261579e87b1ac9537536a089cd3b7",
+      "weight_sha256": "ef29a643a76a9202600458a23dddce16919337ef01743d0fbe817684ec990f74",
+      "patches": [
+        {
+          "path": "ThirdParty/rife-metal/stream-io.patch",
+          "sha256": "266892943b1369b1af95ef2306bee126473a4d5ec35186628e11fb4b12a030b4"
+        }
+      ]
     }
   }
 }

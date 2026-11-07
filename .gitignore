@@ -59,3 +59,5 @@ ThirdParty/subtitles-build/
 ThirdParty/subtitles-min/
 # Self-built Sparkle artifacts; Scripts/build_sparkle.sh recreates them.
 ThirdParty/sparkle-min/
+# Generated from the pinned RifeMetal archive and the local stream IO patch.
+/ThirdParty/rife-metal/runtime/
