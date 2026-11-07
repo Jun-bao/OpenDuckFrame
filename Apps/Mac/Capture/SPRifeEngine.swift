@@ -24,6 +24,7 @@ final class SPRifeBridge: NSObject {
     private var epoch: UInt64 = 0
     private var loadedModelID = ""
     private var loadedQuality = "fast"
+    private var loadedExperiment: [String: Any] = [:]
     // Only touched on exec. Retaining the source prevents pixel-buffer pool reuse.
     private var stream: RifeStream?
     private var streamEpoch: UInt64 = 0
@@ -47,7 +48,13 @@ final class SPRifeBridge: NSObject {
     func prepare(modelID: String, quality: String, width: Int32, height: Int32) throws {
         let tier = Self.tier(quality)
         let url = try Self.url(for: modelID, bundle: resourceBundle)
-        let engine = try RifeInterpolator(configuration: RifeConfiguration(modelURL: url, qualityTier: tier, preferredDevice: nil))
+        let experiment = try SPRifeExperiments.resolve(modelID: modelID, originalURL: url, bundle: resourceBundle)
+        let options = experiment.map {
+            RifeExperimentOptions(gpuIO: $0.selection.ioOptimized, replaceMask: $0.selection.replaceMask)
+        } ?? RifeExperimentOptions()
+        let engine = try RifeInterpolator(configuration: RifeConfiguration(
+            modelURL: experiment?.url ?? url, qualityTier: tier, preferredDevice: nil,
+            experimentOptions: options))
         let previousNV = try Self.nv12(width: Int(width), height: Int(height), luma: 32)
         let currentNV = try Self.nv12(width: Int(width), height: Int(height), luma: 180)
         let previous = try ownedBGRA(previousNV)
@@ -62,6 +69,7 @@ final class SPRifeBridge: NSObject {
         interpolator = engine
         loadedModelID = modelID
         loadedQuality = tier.rawValue
+        loadedExperiment = experiment?.diagnostics ?? [:]
         state.unlock()
     }
 
@@ -329,7 +337,8 @@ final class SPRifeBridge: NSObject {
         }
         let convertTiming = summary(convert), pushTiming = summary(push)
         let environment = ProcessInfo.processInfo.environment["CHUANFLOW_RIFE_STREAM"] == "1"
-        return ["requested": liveStreamEnabled, "effective": liveStreamEnabled || environment,
+        state.lock(); let experiment = loadedExperiment; state.unlock()
+        let result: [String: Any] = ["requested": liveStreamEnabled, "effective": liveStreamEnabled || environment,
                 "enableSource": liveStreamEnabled ? "request" : (environment ? "environment" : "disabled"),
                 "hits": counts["hits", default: 0], "misses": counts["misses", default: 0],
                 "resets": counts["resets", default: 0], "pressureResets": counts["pressureResets", default: 0], "fallbackSucceeded": counts["fallbackSucceeded", default: 0],
@@ -338,6 +347,7 @@ final class SPRifeBridge: NSObject {
                 "convertMedianMs": convertTiming.median, "convertP95Ms": convertTiming.p95,
                 "pushMedianMs": pushTiming.median, "pushP95Ms": pushTiming.p95,
                 "rifeRecentJobs": jobs]
+        return result.merging(experiment) { _, current in current }
     }
 
     @objc func invalidate() {

@@ -674,7 +674,9 @@ enum EnhancementProfileStore {
         if let testDirectory { return testDirectory.appendingPathComponent("EnhancementProfile.json") }
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        return base.appendingPathComponent("OpenDuckFrame/EnhancementProfile.json")
+        let directory = Bundle.main.object(forInfoDictionaryKey: "ODFExperimentTrial") as? Bool == true
+            ? "OpenDuckFrame/ExperimentComparison" : "OpenDuckFrame"
+        return base.appendingPathComponent(directory, isDirectory: true).appendingPathComponent("EnhancementProfile.json")
     }
 
     static func decode(_ data: Data, fallbackName: String) -> EnhancementProfile? {
@@ -1134,6 +1136,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let languageDetail = NSTextField(wrappingLabelWithString: "")
     private var settingsWindow: NSWindow?
     private var settingsStack: NSStackView?
+    private var experimentComparisonPanel: ExperimentComparisonPanel?
+    private var experimentPanelAutoOpened = false
     private let enhancementDelayControl = NSSegmentedControl(labels: ["3 s", "5 s", "10 s", "Custom"], trackingMode: .selectOne, target: nil, action: nil)
     private let enhancementDelayField = NSTextField(string: "3")
     private let enhancementDelayStepper = NSStepper()
@@ -1231,6 +1235,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         window.minSize = NSSize(width: 1100, height: 760)
         super.init(window: window)
         profile.configID = EnhancementProfileStore.resolvedID(profile)
+        if SPRifeExperiments.available { useRifeComparisonProfile() }
         window.delegate = self
         window.contentView = build()
         window.initialFirstResponder = sourceKindControl
@@ -1404,6 +1409,11 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         window?.center()
         NSApp.activate(ignoringOtherApps: true)
         startLiveLogIfNeeded()
+        if SPRifeExperiments.available, !experimentPanelAutoOpened,
+           CommandLine.arguments.contains("--odf-experiment-comparison") {
+            experimentPanelAutoOpened = true
+            showExperimentComparison()
+        }
     }
 
     func showPlaybackFailure(_ message: String) {
@@ -1415,6 +1425,54 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     func showNotice(_ message: String) {
         statusLabel.stringValue = message
         statusLabel.textColor = .labelColor
+    }
+
+    @objc private func showExperimentComparison() {
+        guard SPRifeExperiments.available else { return }
+        if experimentComparisonPanel == nil {
+            experimentComparisonPanel = ExperimentComparisonPanel(selectionChanged: { [weak self] selection in
+                self?.selectExperimentComparison(selection)
+            }, switchBuild: { [weak self] in
+                guard let self else { throw CancellationError() }
+                self.readControls()
+                self.stop()
+                guard self.saveCurrentProfile() else {
+                    throw NSError(domain: "OpenDuckFrame.ExperimentComparison", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: self.statusLabel.stringValue])
+                }
+                try await SPRifeExperiments.switchBuild()
+            })
+        }
+        experimentComparisonPanel?.window?.appearance = window?.appearance
+        experimentComparisonPanel?.present()
+    }
+
+    private func selectExperimentComparison(_ selection: SPRifeExperimentSelection) {
+        guard SPRifeExperiments.available else { return }
+        readControls()
+        stop()
+        SPRifeExperiments.selection = selection
+        useRifeComparisonProfile()
+        loadControls()
+        guard saveCurrentProfile() else {
+            experimentComparisonPanel?.showStatus(statusLabel.stringValue, error: true)
+            return
+        }
+        let message = EnhancementText.t(
+            "Options saved for RIFE 4.25. Enhancement stopped; click Start Enhancement to apply them.",
+            "方案已保存为 RIFE 4.25。增强已停止，请点击开始增强后应用。")
+        showNotice(message)
+        experimentComparisonPanel?.showStatus(message)
+    }
+
+    private func useRifeComparisonProfile() {
+        profile.interpolationEnabled = true
+        profile.interpolationEngineID = "rife.metal"
+        profile.modelID = "rife-v4.25"
+        profile.rifeStreamEnabled = true
+        if !["fast", "balanced", "hq"].contains(profile.interpolationQuality) {
+            profile.interpolationQuality = "fast"
+        }
     }
 
     private func build() -> NSView {
@@ -1515,6 +1573,16 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         projectLinks.widthAnchor.constraint(equalToConstant: 168).isActive = true
         footer.addArrangedSubview(projectLinks)
         footer.setCustomSpacing(10, after: projectLinks)
+        if SPRifeExperiments.available {
+            let comparison = NSButton(title: EnhancementText.t("Compare Options", "方案对比"), target: self, action: #selector(showExperimentComparison))
+            comparison.identifier = NSUserInterfaceItemIdentifier("experiments.comparison.open")
+            comparison.image = NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: nil)
+            comparison.imagePosition = .imageLeading
+            comparison.alignment = .left
+            comparison.bezelStyle = .rounded
+            comparison.widthAnchor.constraint(equalToConstant: 168).isActive = true
+            footer.addArrangedSubview(comparison)
+        }
         footer.addArrangedSubview(settingsButton)
         languageControl.selectedSegment = EnhancementText.chinese ? 0 : 1
         sidebar.content.addSubview(upper)
@@ -4495,6 +4563,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         if !lastStats.isEmpty { updateStatsText(lastStats) }
         refreshPlanLabel()
         refreshInteractionStatus()
+        experimentComparisonPanel?.refresh()
     }
 
     @objc private func motionChanged() {
@@ -5851,6 +5920,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         window?.appearance = NSAppearance(named: name)
         settingsWindow?.appearance = NSAppearance(named: name)
+        experimentComparisonPanel?.window?.appearance = NSAppearance(named: name)
     }
 
     @discardableResult private func saveCurrentProfile() -> Bool {

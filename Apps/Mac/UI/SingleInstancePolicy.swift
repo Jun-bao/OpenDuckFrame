@@ -3,6 +3,18 @@ import Foundation
 // Election never depends on mutable AppKit launch state: a relay can itself
 // finish launching while it is still handing off to the actual primary.
 enum SingleInstancePolicy {
+    /// Private comparison builds must neither hand off to nor replace the
+    /// normal player. Each compiled trial has its own application lifetime.
+    static func namespace(experimentTrial: Bool, bundleID: String?) -> String {
+        guard experimentTrial, let bundleID else { return "" }
+        return String(bundleID.filter { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "." || $0 == "-") })
+    }
+
+    static func namespace(bundle: Bundle) -> String {
+        namespace(experimentTrial: bundle.object(forInfoDictionaryKey: "ODFExperimentTrial") as? Bool == true,
+                  bundleID: bundle.bundleIdentifier)
+    }
+
     static func matchesProductMetadata(_ product: String?, _ executable: String?) -> Bool {
         product == "OpenDuckFrame" && executable == "OpenDuckFrame"
     }

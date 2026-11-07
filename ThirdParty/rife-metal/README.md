@@ -23,12 +23,21 @@ The production patch changes stream IO only:
 `PaddedFrameConvert.swift` and `PaddedFrameConvert.metal` are the canonical
 helper sources, also used by the experiment harness. The internal padded
 dimensions, downsample sampler, IFNet, accumulated mask, original weights,
-cache rotation, timesteps, and fallback behavior are retained. Experimental
-fusion, tail trimming, graph variants, training, and diagnostic options are
-not included in the generated runtime.
+cache rotation, timesteps, and fallback behavior are retained.
+
+`experiment-options.patch` and the repository-owned option/graph-contract
+helpers add immutable per-interpolator trial options. The default keeps GPU
+I/O enabled and accumulated masks. An explicit configuration can use the CPU
+I/O reference or replace masks instead, and can load the canonical accumulated
+r32/r16 RMW2 graph. RMW1 and the original 4.25/4.26 weights retain their loader.
+The normal application does not expose these choices; only a locally packaged
+comparison app marked `ODFExperimentTrial` provides the comparison panel.
+Experimental warp fusion, tail trimming and training are not enabled here.
 
 `runtime/source-origin.json` records the upstream commit/version and hashes
 of the patch, helpers, patched Swift files, package manifest, original model,
-and license notices. It contains no local machine paths. The upstream
+and license notices, including the repository-owned experiment patch and
+helpers. All are included in the preparation recipe hash. It contains no
+local machine paths. The upstream
 [Apache-2.0 license](LICENSE) and [Practical-RIFE MIT notice](THIRD-PARTY.md)
 are preserved in this directory and in the generated package.
