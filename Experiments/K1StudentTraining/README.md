@@ -182,13 +182,66 @@ Trained weights and logs remain research evidence; no production model was
 replaced. Independent holdouts remain sealed, and whole-application 120 FPS
 acceptance remains outstanding.
 
+## Post-training kernel attribution
+
+The uniform half-rank training is not extended and does not consume independent
+holdouts. The next bounded diagnostic investigates actual GPU work and CPU gaps
+before proposing any new fused kernel. It does not modify production graphs.
+
+`prepare_trace.py` copies the already prepared student runtime and adds
+whole-K1 Points of Interest around the original host timestamps. Its first
+launch-mode Metal System Trace attempt returned code 54: the target was killed
+at the 30-second limit, the expected native output directory was absent, and
+there were no K1 intervals or GPU rows attributed to that target. The trace
+reported `Data stream: Time Mapping`. Early target stderr was not separately
+captured; the root cause is undetermined. No kernel-performance conclusion can
+be drawn from that attempt.
+
+`prepare_attach_trace.py` instead starts normally and preserves both model
+streams in one process. Each warms 32 calls before a durable READY marker and a
+CPU gate. After attach starts, the controller waits two seconds and opens the
+gate; each arm rewarms eight calls before its 100 recorded calls. The target
+owns the existing GPU flock throughout. START/READY/DONE progress and the final
+controlled report are flushed and fsynced. Separate preflight/trace outputs
+retain stdout and stderr. The first Swift build exposed a `Darwin.flock` name
+collision; the C symbol bridge fixes it without changing the lock protocol.
+
+Both untraced preflights complete and match all old output hashes. The subsequent
+Fast and Balanced captures each contain 200 complete labelled intervals, with
+target GPU work overlapping every interval, complete reports, and matching
+preflight output hashes. Both native targets and recorders exit successfully.
+The Time Mapping issue remains in both traces, without preventing this interval
+alignment. Acquisition stops after these two valid captures; the unused
+contingency trace is not run.
+
+| Preset/arm | GPU active union share | Target GPU envelope gaps | CPU encoding wall share |
+|---|---:|---:|---:|
+| Fast D0 | 72.31% | 4.14% | 65.03% |
+| Fast student | 73.58% | 3.17% | 71.11% |
+| Balanced D0 | 86.75% | 1.31% | 38.26% |
+| Balanced student | 86.06% | 1.80% | 42.05% |
+
+These are means of per-call shares. GPU intervals are unioned before clipping
+to K1. Encoding is an API wall interval, overlaps GPU work, and is not CPU
+on-core time; the columns must not be added. Gaps denote absent observed target
+GPU work inside its envelope, not device-wide idle. Fast traced host means
+exceed preflight by 12.20%/10.31%, so only shares are interpreted. Balanced
+deviations are 8.01%/7.68%, within the registered 10% boundary.
+
+The exported GPU/encoder/object labels expose generic command buffers and
+compute commands. MPS hardware intervals expose graph addresses, without a
+reliable mapping to the 16 residual layers or a semantic nonconvolution
+partition. Per-layer dense/factor GPU timing and the largest D0 nonconvolution
+segment remain unresolved. These captures therefore do not justify a new fused
+kernel or establish that CPU encoding erased faster factor kernels.
+
 ## Checks
 
 CPU tests cover the model/schema/freeze, data split/provenance, native loader,
 numerical comparison helpers, budget cancellation, valid-region loss and
 effective-batch gradients. They do not stand in for real training, exported
 native validation, inference-cost evidence or actual application playback.
-The final CPU suite passed all 47 tests with the existing lab reference path
+The final CPU suite, including both tracing preparers, passed all 57 tests with the existing lab reference path
 provided through the environment:
 
 ```sh
