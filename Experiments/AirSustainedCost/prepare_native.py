@@ -67,6 +67,7 @@ def prepare(source: Path, output: Path) -> dict[str, object]:
     target.mkdir()
     shutil.copyfile(here / "native/sustained.swift", target / "main.swift")
     shutil.copyfile(here / "native/GapFill.swift", target / "GapFill.swift")
+    shutil.copyfile(here / "native/RealWorkFill.swift", target / "RealWorkFill.swift")
     resources = target / "Resources"
     resources.mkdir()
     shader_build = output / "GapFillShaderBuild"
@@ -95,6 +96,7 @@ def prepare(source: Path, output: Path) -> dict[str, object]:
         "preparerSHA256": sha(Path(__file__)),
         "driverSHA256": sha(here / "native/sustained.swift"),
         "gapFillDriverSHA256": sha(here / "native/GapFill.swift"),
+        "realWorkFillDriverSHA256": sha(here / "native/RealWorkFill.swift"),
         "gapFillShaderSHA256": sha(here / "native/GapFill.metal"),
         "gapFillMetallibSHA256": sha(resources / "gap-fill.metallib"),
         "gapFillOfflineShaderCommands": shader_commands,

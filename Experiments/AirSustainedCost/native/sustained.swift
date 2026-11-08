@@ -11,6 +11,7 @@ enum SustainedError: Error {
 }
 
 let originalModelSHA256 = "ef29a643a76a9202600458a23dddce16919337ef01743d0fbe817684ec990f74"
+let fillerModelSHA256 = "729ea555016da98e207bc4570e0be81dddbbd37302f7330c89696da798fba22d"
 let referenceWallP50Ms = 18.1323335
 let width = 1814, height = 1142
 let billion: UInt64 = 1_000_000_000
@@ -66,6 +67,9 @@ struct Options {
     let output: URL
     let cancelFile: String
     let gapFillEnabled: Bool
+    let realWorkFillEnabled: Bool
+    let fillerModel: URL?
+    let fillerExpectedSHA256: String?
 
     static let help = """
     Usage: air-sustained-cost --mode paced24|continuous --seconds 180|120
@@ -81,6 +85,10 @@ struct Options {
     ODF_AIR_SERVICE_TRACE=1 must be set before launch. No window or capture.
     ODF_AIR_GAP_FILL_DIAGNOSTIC=1 enables the isolated gap-fill contract only for
     paced24 seconds180 or seconds600; default is off. No automatic 600s follow-up.
+    ODF_AIR_REAL_WORK_FILL_DIAGNOSTIC=1 enables C4 redundant-work fill, paced24/180
+    only, and requires --filler-model-path ABS.rmw --filler-model-sha256 HEX64.
+    This flag is mutually exclusive with ALU gap fill. CPU identity-only uses the
+    same two filler arguments when this flag is1, before any Metal initialization.
     Exit: 0 complete; 3 baseline_not_ready; 4 cancelled; 5 calibration_failed;
       1 failed; 2 invalid CLI.
     --help exits before model, Metal, or output initialization.
@@ -89,8 +97,12 @@ struct Options {
     static func parse() throws -> Options? {
         let arguments = Array(CommandLine.arguments.dropFirst())
         if arguments == ["--help"] || arguments == ["-h"] { print(help); return nil }
-        let allowed: Set<String> = ["--mode", "--seconds", "--baseline-seconds", "--model-path",
+        let workValue = ProcessInfo.processInfo.environment["ODF_AIR_REAL_WORK_FILL_DIAGNOSTIC"] ?? "0"
+        guard workValue == "0" || workValue == "1" else { throw SustainedError.invalid("real-work flag must be0/1") }
+        let workEnabled = workValue == "1"
+        var allowed: Set<String> = ["--mode", "--seconds", "--baseline-seconds", "--model-path",
                                     "--model-sha256", "--output", "--cancel-file"]
+        if workEnabled { allowed.formUnion(["--filler-model-path", "--filler-model-sha256"]) }
         guard arguments.count == allowed.count * 2 else { throw SustainedError.invalid(help) }
         var values: [String: String] = [:]
         for index in stride(from: 0, to: arguments.count, by: 2) {
@@ -101,12 +113,19 @@ struct Options {
         let gapValue = ProcessInfo.processInfo.environment["ODF_AIR_GAP_FILL_DIAGNOSTIC"] ?? "0"
         guard gapValue == "0" || gapValue == "1" else { throw SustainedError.invalid("gap-fill flag must be0/1") }
         let gapEnabled = gapValue == "1"
+        guard !(gapEnabled && workEnabled) else { throw SustainedError.invalid("fill modes are mutually exclusive") }
         guard let mode = values["--mode"], let seconds = Int(values["--seconds"] ?? ""),
               let prefix = Int(values["--baseline-seconds"] ?? ""), prefix == 5,
-              (gapEnabled ? mode == "paced24" && (seconds == 180 || seconds == 600)
+              (workEnabled ? mode == "paced24" && seconds == 180 : gapEnabled ? mode == "paced24" && (seconds == 180 || seconds == 600)
                           : (mode == "paced24" && seconds == 180) || (mode == "continuous" && seconds == 120)),
               values["--model-sha256"] == originalModelSHA256 else {
             throw SustainedError.invalid("fixed original-model protocol: paced24/180 or continuous/120; prefix5; original SHA")
+        }
+        if workEnabled {
+            guard values["--filler-model-path"]?.hasPrefix("/") == true,
+                  values["--filler-model-sha256"] == fillerModelSHA256 else {
+                throw SustainedError.invalid("fixed C4 filler path/SHA required")
+            }
         }
         for key in ["--model-path", "--output", "--cancel-file"] {
             guard let value = values[key], value.hasPrefix("/"), !value.isEmpty else {
@@ -119,7 +138,9 @@ struct Options {
         }
         return Options(mode: mode, seconds: seconds, baselineSeconds: prefix,
                        model: URL(fileURLWithPath: values["--model-path"]!), expectedSHA256: values["--model-sha256"]!,
-                       output: destination, cancelFile: values["--cancel-file"]!, gapFillEnabled: gapEnabled)
+                       output: destination, cancelFile: values["--cancel-file"]!, gapFillEnabled: gapEnabled,
+                       realWorkFillEnabled: workEnabled, fillerModel: values["--filler-model-path"].map { URL(fileURLWithPath: $0) },
+                       fillerExpectedSHA256: values["--filler-model-sha256"])
     }
 }
 
@@ -135,6 +156,9 @@ struct Configuration: Encodable {
     let baselineSeconds: Int
     let targetHz: Int
     let gapFillEnabled: Bool
+    let realWorkFillEnabled: Bool
+    let fillerModelPath: String?
+    let expectedFillerSHA256: String?
     let width = 1814, height = 1142, warmup = 20
     let qualityTier = "fast", internalScale = 0.25, weightsDtype = "FP16"
     let maskUpdate = "accumulate", gpuIO = true, replaceMask = false
@@ -210,6 +234,22 @@ func validateOriginalModelIdentity(_ identity: [String: Any]) throws -> ModelIde
                  sha256: actualSHA, overrideApplied: overridden)
 }
 
+func validateFillerModelIdentity(_ identity: [String: Any]) throws -> ModelIdentity {
+    guard let actualSHA = identity["sha256"] as? String, actualSHA == fillerModelSHA256,
+          let stages = identity["stageCount"] as? Int, stages == 4,
+          let tensors = identity["tensorCount"] as? Int, tensors == 128,
+          let version = identity["containerVersion"] as? UInt32, version == 2,
+          identity["graphID"] as? String == "odf-ifnet425-fourstage-acc-v1",
+          identity["model"] as? String == "odf-ifnet425-fourstage-acc-v1",
+          let actualPath = identity["actualModelPath"] as? String,
+          let overridden = identity["overrideApplied"] as? Bool, !overridden else {
+        throw SustainedError.invalid("actual loaded fixed C4 filler identity mismatch")
+    }
+    return .init(stageCount: stages, graphID: identity["graphID"] as? String,
+                 tensorCount: tensors, containerVersion: Int(version), actualModelPath: actualPath,
+                 sha256: actualSHA, overrideApplied: overridden)
+}
+
 struct CPUIdentityReport: Encodable {
     let format = "odf-air-sustained-cpu-identity-v1"
     let origin = "CPU parsed model header, not GPU runtime identity"
@@ -221,14 +261,25 @@ struct CPUIdentityReport: Encodable {
     var status = "failed"
     var observedIdentity: ModelIdentitySnapshot?
     var validatedIdentity: ModelIdentity?
+    var fillerModelPath: String?
+    var expectedFillerSHA256: String?
+    var fillerObservedIdentity: ModelIdentitySnapshot?
+    var fillerValidatedIdentity: ModelIdentity?
     var firstFailure: String?
 }
 
 /// Dispatched before Options/Harness, RifeInterpolator, fixtures or any Metal context.
 func cpuIdentityCheck() throws -> Int32 {
     let arguments = Array(CommandLine.arguments.dropFirst()).filter { $0 != "--identity-check-only" }
-    let allowed: Set<String> = ["--model-path", "--model-sha256", "--output"]
-    guard arguments.count == 6,
+    let workValue = ProcessInfo.processInfo.environment["ODF_AIR_REAL_WORK_FILL_DIAGNOSTIC"] ?? "0"
+    guard workValue == "0" || workValue == "1",
+          !(workValue == "1" && ProcessInfo.processInfo.environment["ODF_AIR_GAP_FILL_DIAGNOSTIC"] == "1") else {
+        throw SustainedError.invalid("invalid/mutually exclusive CPU diagnostic flags")
+    }
+    let workEnabled = workValue == "1"
+    var allowed: Set<String> = ["--model-path", "--model-sha256", "--output"]
+    if workEnabled { allowed.formUnion(["--filler-model-path", "--filler-model-sha256"]) }
+    guard arguments.count == allowed.count * 2,
           CommandLine.arguments.filter({ $0 == "--identity-check-only" }).count == 1 else {
         throw SustainedError.invalid("CPU-only identity check requires model-path, model-sha256, output")
     }
@@ -249,6 +300,12 @@ func cpuIdentityCheck() throws -> Int32 {
         throw SustainedError.invalid("existing result retained")
     }
     var report = CPUIdentityReport(modelPath: model.path, expectedSHA256: values["--model-sha256"]!)
+    if workEnabled {
+        guard values["--filler-model-path"]?.hasPrefix("/") == true,
+              values["--filler-model-sha256"] == fillerModelSHA256 else { throw SustainedError.invalid("fixed CPU C4 path/SHA required") }
+        report.fillerModelPath = values["--filler-model-path"]
+        report.expectedFillerSHA256 = values["--filler-model-sha256"]
+    }
     do {
         // WeightStore's initializer is CPU-only. Do not call tensorData(on:),
         // RifeInterpolator, InferenceContext, or MTLCreateSystemDefaultDevice here.
@@ -265,6 +322,19 @@ func cpuIdentityCheck() throws -> Int32 {
         ]
         report.observedIdentity = ModelIdentitySnapshot(identity)
         report.validatedIdentity = try validateOriginalModelIdentity(identity)
+        if workEnabled {
+            let fillerURL = URL(fileURLWithPath: values["--filler-model-path"]!)
+            let filler = try WeightStore(url: fillerURL)
+            let fillerIdentity: [String: Any] = [
+                "stageCount": filler.header.scaleList.count,
+                "graphID": filler.header.graphID.map { $0 as Any } ?? NSNull(),
+                "model": filler.header.model, "tensorCount": filler.header.tensors.count,
+                "containerVersion": filler.containerVersion, "actualModelPath": fillerURL.path,
+                "sha256": filler.airDiagnosticSourceSHA256, "overrideApplied": false,
+            ]
+            report.fillerObservedIdentity = ModelIdentitySnapshot(fillerIdentity)
+            report.fillerValidatedIdentity = try validateFillerModelIdentity(fillerIdentity)
+        }
         report.status = "identity_check_passed"
     } catch { report.firstFailure = String(describing: error) }
     let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -274,6 +344,8 @@ func cpuIdentityCheck() throws -> Int32 {
 }
 
 struct Job: Encodable {
+    let role = "real"
+    let contextID: UInt64 = 1
     let jobID: UInt64
     let phase: String
     let stage: UInt32 = 3
@@ -292,11 +364,15 @@ struct Job: Encodable {
     let lastFillIDAtRealStart: UInt64
     let fillInFlightAtRealStart: Bool
     let fillStateObservationNs: UInt64
+    let lastExtraIDAtRealStart: UInt64
+    let extraInFlightAtRealStart: Bool
+    let extraStateObservationNs: UInt64
     let error: String?
 }
 
 struct Root: Encodable {
-    let contextID: UInt64 = 1
+    let contextID: UInt64
+    let role: String
     let observedAfterJobID: UInt64
     let observedPhase: String
     let observedSampleHostTicks: UInt64
@@ -318,7 +394,9 @@ struct Root: Encodable {
     let kernelStartSeconds: Double
     let kernelEndSeconds: Double
 
-    init(_ row: AirServiceTraceRecord, after: UInt64, phase: String, sequence: UInt64) {
+    init(_ row: AirServiceTraceRecord, after: UInt64, phase: String, sequence: UInt64,
+         contextID: UInt64 = 1, role: String = "real") {
+        self.contextID = contextID; self.role = role
         observedAfterJobID = after; observedPhase = phase
         observedSampleHostTicks = mach_absolute_time(); observationSequence = sequence
         jobID = row.jobID; stage = row.stage; rootIndex = row.rootIndex
@@ -375,11 +453,13 @@ struct Report: Encodable {
     var firstFailure: String?
     var functionalComplete = false
     var formalStarted = false
+    var setupSucceeded = false
     var configuration: Configuration
     let hostClock: HostClock
     var runStartNs: UInt64 = 0
     var runEndNs: UInt64 = 0
     var modelIdentity: ModelIdentity?
+    var interpolatorInstance: String?
     var device: String?
     var deviceRegistryID: UInt64?
     var lowPowerMode: Bool?
@@ -396,6 +476,7 @@ struct Report: Encodable {
     var traceOverflowTotal: UInt64 = 0
     var jobLimitReached = false
     var gapFill: GapFillReport?
+    var realWorkFill: RealWorkFillReport?
     let scope = "No window, SCK, presenter, source capture, FPS acceptance or quality acceptance. Thermal state is a coarse observation, not a temperature/frequency attribution."
     let prefixAndMeasurementAreSeparate = true
 }
@@ -409,6 +490,7 @@ final class Harness {
     var engine: RifeInterpolator?
     var output: CVPixelBuffer?
     var gapFill: GapFill?
+    var realWorkFill: RealWorkFill?
 
     init(_ options: Options) {
         self.options = options
@@ -417,6 +499,8 @@ final class Harness {
         report = Report(configuration: .init(mode: options.mode, seconds: options.seconds,
                         baselineSeconds: options.baselineSeconds, targetHz: options.mode == "paced24" ? 24 : 0,
                         gapFillEnabled: options.gapFillEnabled,
+                        realWorkFillEnabled: options.realWorkFillEnabled,
+                        fillerModelPath: options.fillerModel?.path, expectedFillerSHA256: options.fillerExpectedSHA256,
                         expectedModelSHA256: options.expectedSHA256, modelPath: options.model.path),
                         hostClock: .init(machTimebaseNumer: timebase.numer, machTimebaseDenom: timebase.denom))
         report.jobs.reserveCapacity(12_000)
@@ -453,6 +537,7 @@ final class Harness {
         pushSequence += 1
         engine.airServiceTraceBegin(jobID: id, stage: 3)
         let fillState = try gapFill?.atRealStart()
+        let extraState = try realWorkFill?.atRealStart()
         var generated = false
         var failure: Error?
         // Keep this scope identical to the original complete-push cost probe.
@@ -467,6 +552,9 @@ final class Harness {
                     lastFillIDAtRealStart: fillState?.lastFillID ?? 0,
                     fillInFlightAtRealStart: fillState?.inFlight ?? false,
                     fillStateObservationNs: fillState?.observedNs ?? 0,
+                    lastExtraIDAtRealStart: extraState?.lastID ?? 0,
+                    extraInFlightAtRealStart: extraState?.inFlight ?? false,
+                    extraStateObservationNs: extraState?.observedNs ?? 0,
                     error: failure.map { String(describing: $0) }))
         if let failure { throw failure }
         guard generated else { throw SustainedError.native("missing midpoint in \(phase)") }
@@ -541,6 +629,8 @@ final class Harness {
             state.jobCount += 1
             state.skippedSlotsBeforeJobs += missedBefore
             slot += 1
+            try realWorkFill?.offer(after: report.jobs.last!.jobID, phase: name, slot: slot-1,
+                                   nextTick: start + UInt64(slot)*billion/24, phaseEnd: nominalEnd)
             let stamp = nowNs()
             let elapsed = Int((stamp - start) / billion)
             if elapsed >= nextThermalIndex {
@@ -564,7 +654,7 @@ final class Harness {
         try checkCancel()
         guard try sha(options.model) == options.expectedSHA256 else { throw SustainedError.invalid("source model SHA mismatch") }
         let preferredDevice: MTLDevice?
-        if options.gapFillEnabled {
+        if options.gapFillEnabled || options.realWorkFillEnabled {
             guard let device = MTLCreateSystemDefaultDevice() else { throw SustainedError.native("gap-fill shared device unavailable") }
             preferredDevice = device
             report.deviceRegistryID = device.registryID
@@ -573,6 +663,7 @@ final class Harness {
                           preferredDevice: preferredDevice,
                           experimentOptions: .init(gpuIO: true, replaceMask: false)))
         self.engine = engine
+        report.interpolatorInstance = String(describing: ObjectIdentifier(engine))
         let identity = engine.airDiagnosticModelIdentity
         report.configuration.actualLoadedModelIdentity = ModelIdentitySnapshot(identity)
         report.modelIdentity = try validateOriginalModelIdentity(identity)
@@ -593,17 +684,25 @@ final class Harness {
         do { _ = try stream.push(first, timesteps: []) }
         catch { _ = readTrace(engine, after: 2, phase: "setup"); throw error }
         _ = readTrace(engine, after: 2, phase: "setup")
+        if options.realWorkFillEnabled, let device = preferredDevice {
+            let filler = RealWorkFill(device: device, model: options.fillerModel!, first: first, second: second,
+                                      cancelFile: options.cancelFile)
+            self.realWorkFill = filler
+            try filler.primeContext()
+        }
         for index in 0..<20 {
             try autoreleasepool {
                 try push(stream, engine: engine, first: first, second: second, output: output,
                          phase: "warmup", sequence: index)
             }
         }
-        if let device = preferredDevice {
+        if options.gapFillEnabled, let device = preferredDevice {
             let fill = try GapFill(device: device)
             self.gapFill = fill
             try fill.calibrate(checkCancel: checkCancel)
         }
+        try realWorkFill?.warmAndFreeze()
+        report.setupSucceeded = true
         try phase("baseline", seconds: options.baselineSeconds, stream: stream, engine: engine,
                   first: first, second: second, output: output)
         try checkCancel()
@@ -625,6 +724,14 @@ final class Harness {
 
     func finish() throws {
         report.runEndNs = nowNs()
+        if let work = realWorkFill {
+            let result = work.stopAndDrain()
+            report.realWorkFill = result
+            if report.status == "complete", let failure = result.firstFailure {
+                report.status = "failed"; report.functionalComplete = false
+                report.failureKind = "real_work_fill_error"; report.firstFailure = failure
+            }
+        }
         if let fill = gapFill {
             fill.finish()
             report.gapFill = fill.report
@@ -657,6 +764,9 @@ do {
         case SustainedError.calibration: harness.report.status = "calibration_failed"; harness.report.failureKind = "calibration_failed"
         case SustainedError.capacity: harness.report.failureKind = "capacity"
         default: harness.report.failureKind = "native_error"
+        }
+        if options.realWorkFillEnabled, !harness.report.setupSucceeded, harness.report.status != "cancelled" {
+            harness.report.status = "setup_failed"; harness.report.failureKind = "setup"
         }
     }
     try harness.finish()

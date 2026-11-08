@@ -65,8 +65,15 @@ def run(config_path):
         binary = Path(config["binary"]).expanduser().resolve(strict=True)
         model = Path(config["model_path"]).expanduser().resolve(strict=True)
         helper = Path(config["preflight_helper"]).expanduser().resolve(strict=True)
+        real_work = config.get("real_work_fill_enabled", False)
+        if not isinstance(real_work, bool):
+            raise RuntimeError("Real-work filler requires an explicit boolean")
+        filler = Path(config["filler_model_path"]).expanduser().resolve(strict=True) if real_work else None
         expected = {"binary": config["binary_sha256"], "model": config["model_sha256"]}
         actual = {"binary": sha(binary), "model": sha(model)}
+        if filler is not None:
+            expected["filler"] = config["filler_model_sha256"]
+            actual["filler"] = sha(filler)
         state["expected_sha256"] = expected
         state["actual_sha256"] = actual
         if actual != expected:
@@ -76,10 +83,13 @@ def run(config_path):
         gap_fill = config.get("gap_fill_enabled", False)
         if not isinstance(gap_fill, bool) or (gap_fill and config["mode"] != "paced24"):
             raise RuntimeError("Gap fill requires an explicit boolean and paced24 mode")
+        if real_work and (gap_fill or config["mode"] != "paced24"):
+            raise RuntimeError("Real-work filler requires paced24 and cannot use ALU gap fill")
         allowed_seconds = (180, 600) if gap_fill else ((180,) if config["mode"] == "paced24" else (120,))
         if config["seconds"] not in allowed_seconds:
             raise RuntimeError("Duration differs from the approved arm")
         state["gap_fill_enabled"] = gap_fill
+        state["real_work_fill_enabled"] = real_work
         lock_path = Path(config["gpu_lock"]).expanduser()
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         lock = lock_path.open("a")
@@ -95,9 +105,10 @@ def run(config_path):
         native_env.pop("RIFE_DUMP_DIR", None)
         native_env.update(ODF_AIR_SERVICE_TRACE="1", ODF_PERF_PROFILE="off",
                           ODF_K1_PROFILE="0", RIFE_VERBOSE="0",
-                          ODF_AIR_GAP_FILL_DIAGNOSTIC="1" if gap_fill else "0")
+                          ODF_AIR_GAP_FILL_DIAGNOSTIC="1" if gap_fill else "0",
+                          ODF_AIR_REAL_WORK_FILL_DIAGNOSTIC="1" if real_work else "0")
         state["native_environment_overrides"] = {
-            k: native_env[k] for k in ("ODF_AIR_SERVICE_TRACE", "ODF_PERF_PROFILE", "ODF_K1_PROFILE", "RIFE_VERBOSE", "ODF_AIR_GAP_FILL_DIAGNOSTIC")}
+            k: native_env[k] for k in ("ODF_AIR_SERVICE_TRACE", "ODF_PERF_PROFILE", "ODF_K1_PROFILE", "RIFE_VERBOSE", "ODF_AIR_GAP_FILL_DIAGNOSTIC", "ODF_AIR_REAL_WORK_FILL_DIAGNOSTIC")}
         state["App_model_override_unset"] = True
         state["RIFE_dump_directory_unset"] = True
         save()
@@ -157,6 +168,9 @@ def run(config_path):
                     "--seconds", str(config["seconds"]), "--baseline-seconds", "5",
                     "--model-path", str(model), "--model-sha256", config["model_sha256"],
                     "--cancel-file", str(cancel)]
+            if filler is not None:
+                args.extend(["--filler-model-path", str(filler),
+                             "--filler-model-sha256", config["filler_model_sha256"]])
             row = {"index": attempt_index, "started_utc": utc_now(), "args": args,
                    "preflight_before": state["last_preflight"], "process_cpu_before": process_snapshot(),
                    "result": str(result_path), "status": "native_running"}

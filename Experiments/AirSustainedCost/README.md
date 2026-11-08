@@ -135,6 +135,44 @@ Insufficient coverage is inconclusive and stops the diagnostic; it does not
 authorize retuning or the 600-second follow-up. Overall coverage cannot replace
 the required fraction of passing complete bins.
 
+The distinct RIFE-work fill diagnostic uses
+`ODF_AIR_REAL_WORK_FILL_DIAGNOSTIC=1` and explicit
+`--filler-model-path ABS.rmw --filler-model-sha256 HEX64` in both normal and
+`--identity-check-only` invocations. It is mutually exclusive with ALU fill and
+accepts only paced24/180. Real context1 remains original EF29 (5 stages/158 tensors);
+extra context2 is fixed untrained729e (RMW2/4 stages/128 tensors), direct model URL,
+override=false, on the same explicit device. The independent worker owns its
+interpolator, stream, Head/cache, output buffer (one-slot pool) and trace collector.
+Only immutable fixture buffers are shared. Extra output is discarded.
+
+Both streams are primed with A/Head only, then real warm20 precedes extra warm20.
+Every extra warm output must be generated,1814×1142,BGRA8,IOSurface,valid stride.
+The final warm output gets one full active-pixel hash and a fixed64×64 cell-center
+CPU luminance sample; population variance must be positive. BGRA8 delivery is
+naturally finite as a byte representation; internal FP16 tensors are not observed.
+There is no added dump, hidden full-pair prime, dropped cold sample or warm extension.
+All20 extra wall samples determine type7 p95 F=(19*x[18]+x[19])/20, rounded up to ns
+for admission and frozen within that process's prefix/formal phases. Each permitted
+new process rebuilds F by the identical procedure, without tuning or cross-run reuse.
+
+Each successful real tick makes at most one offer, including explicit busy/time/
+phase-edge refusal records. The adjacent next source tick is used; a tick already
+passed is not replaced by a farther future tick to fit extra work. Both the real
+offer and the worker's pre-start recheck require remaining>=ceil(F)+3ms; worker
+dispatch delay can reject the offer. There is no real-ticker worker join. Short
+state locks contain no GPU work, root copying, hashing or JSON. GPU contention may
+still increase real latency and is not hidden. Prefix5 starts with fill available;
+prefix-to-formal does not join pending work. Only final drain occurs after real
+phase clocks, with its bounds recorded.
+
+`jobs/roots` explicitly carry real/context1; `realWorkFill.extraJobs/extraRoots`
+carry extra/context2. The root key includes run,context,job,stage,rootIndex, so local
+job IDs cannot cross-contaminate. The real-start extra ID/state, admission offer,
+worker decision, actual extra wall bounds, complete roots, errors and limits are
+retained for overlap/union reconstruction. Filler ratios are descriptive, with no
+90% gate. Energy is unknown. Setup identity/output failures are `setup_failed`;
+no new shader or training is used for this mode.
+
 Portable packaging must retain the executable, all adjacent SwiftPM resource bundles,
 including the executable's separate `gap-fill.metallib` bundle,
 the explicitly hashed original model, licences and generated origin manifests.
