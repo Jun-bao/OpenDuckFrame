@@ -30,6 +30,7 @@
 #import <VideoToolbox/VideoToolbox.h>
 #import <QuartzCore/QuartzCore.h>
 #import <mach/mach_time.h>
+#import <sys/qos.h>
 
 #include <cstring>
 #include <cfloat>
@@ -687,6 +688,7 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
 
 // Own pixel buffers from admission until rejection or GPU completion. Pending
 // requests never reserve drawable/GPU tickets and remain strictly bounded.
+@class SPPreparedTextureLease, SPPreparedTextureMapper;
 @interface SPDisplayFrameRequest : NSObject
 @property(nonatomic, assign) CVPixelBufferRef enhanced;
 @property(nonatomic, assign) CVPixelBufferRef original;
@@ -706,12 +708,197 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
 @property(nonatomic) int64_t logicalTargetHost;
 @property(nonatomic) int64_t enqueueHost;
 @property(nonatomic, copy) NSDictionary *captureGeometry;
+@property(nonatomic, strong) SPPreparedTextureLease *preparedTextureLease;
+@property(nonatomic) int preparedTextureAdmissionReason;
 @end
+enum SPPreparedTextureReason { SPPreparedNone, SPPreparedCapacity, SPPreparedNotReady, SPPreparedMapFailed, SPPreparedMismatch, SPPreparedMissing, SPPreparedCancelled };
+static NSString *SPPreparedTextureReasonName(int reason) {
+    switch (reason) {
+        case SPPreparedNone: return @"none";
+        case SPPreparedCapacity: return @"capacity";
+        case SPPreparedNotReady: return @"not-ready";
+        case SPPreparedMapFailed: return @"map-failed";
+        case SPPreparedMismatch: return @"identity-or-context-mismatch";
+        case SPPreparedCancelled: return @"cancelled";
+        default: return @"missing";
+    }
+}
+enum SPPreparedTexturePhase { SPPreparedQueued, SPPreparedMapping, SPPreparedReady, SPPreparedInflight, SPPreparedRetired, SPPreparedFailed, SPPreparedAbandoned };
+
+@interface SPPreparedTextureLease : NSObject {
+@public
+    SPPreparedTextureMapper *_owner;
+    std::atomic<int> _phase;
+    std::atomic<int64_t> _mapStartedHostTicks, _mapEndedHostTicks;
+    CVPixelBufferRef _primary, _secondary;
+    CVPixelBufferRef _enhancedIdentity, _originalIdentity;
+    CVMetalTextureRef _primaryRef, _secondaryRef;
+    uint64_t _generation, _config, _epoch, _clockEpoch, _frameID;
+    SPLiveViewMode _mode;
+    BOOL _recycled; // mapper queue only
+}
+- (instancetype)initWithOwner:(SPPreparedTextureMapper *)owner frame:(SPDisplayFrameRequest *)frame;
+- (BOOL)claimForFrame:(SPDisplayFrameRequest *)frame reason:(int *)reason;
+- (void)cancel;
+- (void)complete;
+- (id<MTLTexture>)primaryTexture;
+- (id<MTLTexture>)secondaryTexture;
+@end
+
+// Diagnostic-only, fixed-capacity owner. Cache Create/Flush and every owned CF
+// release run on this queue; no view/frame is retained by the owner.
+@interface SPPreparedTextureMapper : NSObject {
+@public
+    dispatch_queue_t _queue;
+    id<MTLDevice> _device;
+    CVMetalTextureCacheRef _cache;
+    std::atomic<uint64_t> _outstanding, _peak, _admitted, _capacityRejected;
+    std::atomic<uint64_t> _maps, _mapFailures, _textureFailures, _cacheFailures, _mapFlushes, _recycleFlushes, _idleFlushes, _recycled, _cancelled;
+    std::atomic<uint64_t> _selected, _hits;
+    std::array<std::atomic<uint64_t>, 7> _fallbacks;
+}
+- (instancetype)initWithDevice:(id<MTLDevice>)device;
+- (SPPreparedTextureLease *)prepareFrame:(SPDisplayFrameRequest *)frame;
+- (SPPreparedTextureLease *)claimFrame:(SPDisplayFrameRequest *)frame recordSelection:(BOOL)record reason:(int *)reason;
+- (void)mapLease:(SPPreparedTextureLease *)lease;
+- (void)recycleLease:(SPPreparedTextureLease *)lease;
+- (NSDictionary *)snapshot;
+- (void)fenceForProbe;
+@end
+
 @implementation SPDisplayFrameRequest
 - (void)dealloc {
+    [_preparedTextureLease cancel];
     if (_enhanced) CVPixelBufferRelease(_enhanced);
     if (_original) CVPixelBufferRelease(_original);
 }
+@end
+
+@implementation SPPreparedTextureLease
+- (instancetype)initWithOwner:(SPPreparedTextureMapper *)owner frame:(SPDisplayFrameRequest *)frame {
+    if (!(self = [super init])) return nil;
+    _owner = owner; _phase.store(SPPreparedQueued); _mapStartedHostTicks.store(0); _mapEndedHostTicks.store(0);
+    _generation = frame.generation; _config = frame.config; _epoch = frame.epoch; _clockEpoch = frame.clockEpoch; _frameID = frame.frameID; _mode = frame.mode;
+    _enhancedIdentity = frame.enhanced; _originalIdentity = frame.original;
+    CVPixelBufferRef primary = frame.mode == SPLiveViewOriginal ? (frame.original ?: frame.enhanced) : frame.enhanced;
+    CVPixelBufferRef secondary = frame.original ?: frame.enhanced;
+    _primary = primary ? CVPixelBufferRetain(primary) : NULL;
+    _secondary = frame.mode == SPLiveViewCompare && secondary ? CVPixelBufferRetain(secondary) : NULL;
+    return self;
+}
+- (BOOL)claimForFrame:(SPDisplayFrameRequest *)frame reason:(int *)reason {
+    if (_generation != frame.generation || _config != frame.config || _epoch != frame.epoch || _clockEpoch != frame.clockEpoch ||
+        _frameID != frame.frameID || _mode != frame.mode || _enhancedIdentity != frame.enhanced || _originalIdentity != frame.original) {
+        *reason = SPPreparedMismatch; return NO;
+    }
+    int expected = SPPreparedReady;
+    if (_phase.compare_exchange_strong(expected, SPPreparedInflight, std::memory_order_acq_rel)) { *reason = SPPreparedNone; return YES; }
+    *reason = expected == SPPreparedFailed ? SPPreparedMapFailed :
+        (expected == SPPreparedAbandoned || expected == SPPreparedRetired ? SPPreparedCancelled : SPPreparedNotReady);
+    return NO;
+}
+- (void)cancel {
+    int phase = _phase.load();
+    while (phase == SPPreparedQueued || phase == SPPreparedMapping || phase == SPPreparedReady) {
+        if (_phase.compare_exchange_weak(phase, SPPreparedAbandoned)) {
+            _owner->_cancelled.fetch_add(1);
+            SPPreparedTextureMapper *owner = _owner;
+            dispatch_async(owner->_queue, ^{ [owner recycleLease:self]; });
+            return;
+        }
+    }
+}
+- (void)complete {
+    int expected = SPPreparedInflight;
+    if (!_phase.compare_exchange_strong(expected, SPPreparedRetired)) return;
+    SPPreparedTextureMapper *owner = _owner;
+    dispatch_async(owner->_queue, ^{ [owner recycleLease:self]; });
+}
+- (id<MTLTexture>)primaryTexture { return _primaryRef ? CVMetalTextureGetTexture(_primaryRef) : nil; }
+- (id<MTLTexture>)secondaryTexture { return _secondaryRef ? CVMetalTextureGetTexture(_secondaryRef) : nil; }
+@end
+
+@implementation SPPreparedTextureMapper
+- (instancetype)initWithDevice:(id<MTLDevice>)device {
+    if (!(self = [super init])) return nil;
+    _device = device;
+    _queue = dispatch_queue_create("app.openduckframe.air-prepared-texture-map", dispatch_queue_attr_make_with_autorelease_frequency(
+        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0), DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM));
+    _outstanding.store(0); _peak.store(0); _admitted.store(0); _capacityRejected.store(0);
+    _maps.store(0); _mapFailures.store(0); _textureFailures.store(0); _cacheFailures.store(0); _mapFlushes.store(0); _recycleFlushes.store(0);
+    _idleFlushes.store(0); _recycled.store(0); _cancelled.store(0); _selected.store(0); _hits.store(0);
+    for (auto &value : _fallbacks) value.store(0);
+    return self;
+}
+- (void)dealloc {
+    CVMetalTextureCacheRef cache = _cache;
+    if (cache) dispatch_async(_queue, ^{ CVMetalTextureCacheFlush(cache, 0); CFRelease(cache); });
+}
+- (SPPreparedTextureLease *)prepareFrame:(SPDisplayFrameRequest *)frame {
+    uint64_t count = _outstanding.load();
+    do { if (count >= 4) { _capacityRejected.fetch_add(1); frame.preparedTextureAdmissionReason = SPPreparedCapacity; return nil; } }
+    while (!_outstanding.compare_exchange_weak(count, count + 1));
+    uint64_t peak = _peak.load(); while (peak < count + 1 && !_peak.compare_exchange_weak(peak, count + 1)) {}
+    _admitted.fetch_add(1);
+    SPPreparedTextureLease *lease = [[SPPreparedTextureLease alloc] initWithOwner:self frame:frame];
+    frame.preparedTextureLease = lease;
+    dispatch_async(_queue, ^{ [self mapLease:lease]; });
+    return lease;
+}
+- (void)mapLease:(SPPreparedTextureLease *)lease {
+    int expected = SPPreparedQueued;
+    if (!lease->_phase.compare_exchange_strong(expected, SPPreparedMapping)) { [self recycleLease:lease]; return; }
+    _maps.fetch_add(1); lease->_mapStartedHostTicks.store(SPHostNow());
+    if (!_cache && CVMetalTextureCacheCreate(kCFAllocatorDefault, NULL, _device, NULL, &_cache) != kCVReturnSuccess) _cacheFailures.fetch_add(1);
+    BOOL valid = _cache && lease->_primary;
+    if (valid) {
+        CVReturn result = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, _cache, lease->_primary, NULL,
+            MTLPixelFormatBGRA8Unorm, CVPixelBufferGetWidth(lease->_primary), CVPixelBufferGetHeight(lease->_primary), 0, &lease->_primaryRef);
+        valid = result == kCVReturnSuccess && lease->_primaryRef && CVMetalTextureGetTexture(lease->_primaryRef);
+        if (!valid) _textureFailures.fetch_add(1);
+    }
+    if (valid && lease->_secondary) {
+        CVReturn result = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, _cache, lease->_secondary, NULL,
+            MTLPixelFormatBGRA8Unorm, CVPixelBufferGetWidth(lease->_secondary), CVPixelBufferGetHeight(lease->_secondary), 0, &lease->_secondaryRef);
+        valid = result == kCVReturnSuccess && lease->_secondaryRef && CVMetalTextureGetTexture(lease->_secondaryRef);
+        if (!valid) _textureFailures.fetch_add(1);
+    }
+    if (_cache) { CVMetalTextureCacheFlush(_cache, 0); _mapFlushes.fetch_add(1); }
+    lease->_mapEndedHostTicks.store(SPHostNow());
+    if (!valid) { _mapFailures.fetch_add(1); lease->_phase.store(SPPreparedFailed); [self recycleLease:lease]; return; }
+    expected = SPPreparedMapping;
+    if (!lease->_phase.compare_exchange_strong(expected, SPPreparedReady, std::memory_order_release)) [self recycleLease:lease];
+}
+- (void)recycleLease:(SPPreparedTextureLease *)lease {
+    if (lease->_recycled) return; lease->_recycled = YES;
+    if (lease->_primaryRef) { CFRelease(lease->_primaryRef); lease->_primaryRef = NULL; }
+    if (lease->_secondaryRef) { CFRelease(lease->_secondaryRef); lease->_secondaryRef = NULL; }
+    if (lease->_primary) { CVPixelBufferRelease(lease->_primary); lease->_primary = NULL; }
+    if (lease->_secondary) { CVPixelBufferRelease(lease->_secondary); lease->_secondary = NULL; }
+    if (_cache) { CVMetalTextureCacheFlush(_cache, 0); _recycleFlushes.fetch_add(1); }
+    _recycled.fetch_add(1);
+    if (_outstanding.fetch_sub(1) == 1 && _cache) _idleFlushes.fetch_add(1);
+}
+- (SPPreparedTextureLease *)claimFrame:(SPDisplayFrameRequest *)frame recordSelection:(BOOL)record reason:(int *)reason {
+    if (record) _selected.fetch_add(1);
+    SPPreparedTextureLease *lease = frame.preparedTextureLease;
+    int failure = lease ? SPPreparedNone : (frame.preparedTextureAdmissionReason ?: SPPreparedMissing);
+    if (lease && [lease claimForFrame:frame reason:&failure]) { if (record) _hits.fetch_add(1); *reason = SPPreparedNone; return lease; }
+    if (record) _fallbacks[(size_t)failure].fetch_add(1);
+    *reason = failure; [lease cancel]; return nil;
+}
+- (NSDictionary *)snapshot {
+    NSMutableDictionary *reasons = [NSMutableDictionary dictionary]; uint64_t fallback = 0;
+    for (int reason = 1; reason < 7; ++reason) { const uint64_t count = _fallbacks[(size_t)reason].load(); reasons[SPPreparedTextureReasonName(reason)] = @(count); fallback += count; }
+    return @{ @"enabled": @YES, @"capacity": @4, @"outstanding": @(_outstanding.load()), @"peakOutstanding": @(_peak.load()),
+        @"admitted": @(_admitted.load()), @"admissionCapacityRejected": @(_capacityRejected.load()), @"maps": @(_maps.load()),
+        @"selectedRenderRequests": @(_selected.load()), @"hits": @(_hits.load()), @"fallbacks": @(fallback), @"fallbackReasons": reasons,
+        @"mapFailures": @(_mapFailures.load()), @"textureFailures": @(_textureFailures.load()), @"cacheCreateFailures": @(_cacheFailures.load()),
+        @"mapFlushes": @(_mapFlushes.load()), @"recycleFlushes": @(_recycleFlushes.load()), @"lastIdleFlushes": @(_idleFlushes.load()),
+        @"recycled": @(_recycled.load()), @"cancelled": @(_cancelled.load()),
+        @"scope": @"Diagnostic independent serial cache; outstanding includes queued, ready, GPU-inflight and queued cleanup, bounded at four. Hit/fallback denominator is selected render requests only. Cache Create/Flush and lease CF release occur only on mapper queue; no drawable is acquired here." };
+}
+- (void)fenceForProbe { dispatch_sync(_queue, ^{}); }
 @end
 
 static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) {
@@ -724,6 +911,11 @@ static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) 
 @interface SPProspectiveDisplaySlot : NSObject {
 @public
     sp::DisplaySlotWindow timing;
+    int64_t selectionScanEndedHostTicks;
+    int64_t discardReportsStartedHostTicks, discardReportsEndedHostTicks;
+    uint64_t staleDiscardReportCount, supersededDiscardReportCount;
+    qos_class_t timerHandlerRequestedQoSClass;
+    bool timerHandlerQoSRecorded;
 }
 @property(nonatomic, strong) id<CAMetalDrawable> drawable;
 @property(nonatomic) double deadline;
@@ -769,6 +961,8 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
 - (void)reportPendingPresentation:(SPDisplayFrameRequest *)frame reason:(NSString *)reason;
 - (void)renderPendingPresentation:(SPDisplayFrameRequest *)frame slot:(SPProspectiveDisplaySlot *)slot selectionHost:(int64_t)selectionHost;
 - (void)observeSourceGeometry:(NSDictionary *)value generation:(uint64_t)generation;
+- (CVMetalTextureRef)createTexture:(CVPixelBufferRef)buffer apiStartedHostTicks:(int64_t *)started apiEndedHostTicks:(int64_t *)ended;
+- (NSDictionary *)runPreparedTextureLifetimeProbe;
 @end
 
 @implementation SPLivePreviewView {
@@ -808,6 +1002,7 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
     std::atomic<uint64_t> _surfaceToken;
     std::atomic<int> _inflightDraws;
     BOOL _airPresentationTimingDiagnostic;
+    SPPreparedTextureMapper *_preparedTextures;
     std::mutex _geometryMutex;
     sp::SharedGeometryAuthority _sharedGeometry;
     int64_t _geometryVerifiedHost;
@@ -850,6 +1045,10 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
     _haveSubmittedPresentationPTS = false;
     self.wantsLayer = YES;
     _device = MTLCreateSystemDefaultDevice();
+#if defined(ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC) && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC == 1
+    const char *preparedTextures = getenv("ODF_AIR_PREPARED_TEXTURE_DIAGNOSTIC");
+    if (preparedTextures && strcmp(preparedTextures, "1") == 0) _preparedTextures = [[SPPreparedTextureMapper alloc] initWithDevice:_device];
+#endif
     _metalLayer = [CAMetalLayer layer];
     _metalLayer.device = _device;
     _metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -1104,11 +1303,18 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
 }
 
 - (CVMetalTextureRef)createTexture:(CVPixelBufferRef)buffer {
+    return [self createTexture:buffer apiStartedHostTicks:nullptr apiEndedHostTicks:nullptr];
+}
+
+- (CVMetalTextureRef)createTexture:(CVPixelBufferRef)buffer apiStartedHostTicks:(int64_t *)started apiEndedHostTicks:(int64_t *)ended {
     if (!buffer || !_cache) return NULL;
     CVMetalTextureRef ref = NULL;
+    const size_t width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer);
+    if (started) *started = SPHostNow();
     CVReturn result = CVMetalTextureCacheCreateTextureFromImage(
         kCFAllocatorDefault, _cache, buffer, NULL, MTLPixelFormatBGRA8Unorm,
-        CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer), 0, &ref);
+        width, height, 0, &ref);
+    if (ended) *ended = SPHostNow();
     if (result != kCVReturnSuccess || !ref) return NULL;
     return ref;
 }
@@ -1157,7 +1363,94 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
     [enc endEncoding];
 }
 
++ (NSDictionary *)runPreparedTextureLifetimeProbe {
+    __block SPLivePreviewView *view = nil;
+    void (^makeView)(void) = ^{ view = [[SPLivePreviewView alloc] initWithFrame:NSMakeRect(0, 0, 64, 64)]; };
+    if (NSThread.isMainThread) makeView(); else dispatch_sync(dispatch_get_main_queue(), makeView);
+    return [view runPreparedTextureLifetimeProbe];
+}
+
+- (NSDictionary *)runPreparedTextureLifetimeProbe {
+    if (!_preparedTextures) return @{ @"ok": @NO, @"enabled": @NO, @"reason": @"requires diagnostic guard build and ODF_AIR_PREPARED_TEXTURE_DIAGNOSTIC=1" };
+    NSDictionary *attrs = @{ (id)kCVPixelBufferWidthKey:@64, (id)kCVPixelBufferHeightKey:@64,
+        (id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_32BGRA), (id)kCVPixelBufferIOSurfacePropertiesKey:@{}, (id)kCVPixelBufferMetalCompatibilityKey:@YES };
+    NSDictionary *limit = @{ (id)kCVPixelBufferPoolAllocationThresholdKey:@1 };
+    CVPixelBufferPoolRef pool = NULL; CVPixelBufferRef first = NULL, candidate = NULL;
+    CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, (__bridge CFDictionaryRef)attrs, &pool);
+    CVReturn created = pool ? CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault, pool, (__bridge CFDictionaryRef)limit, &first) : kCVReturnError;
+    if (created != kCVReturnSuccess || !first || !_pipeline) { if (first) CVPixelBufferRelease(first); if (pool) CFRelease(pool); return @{ @"ok":@NO, @"reason":@"prepared probe pixel pool/pipeline setup" }; }
+    CVPixelBufferLockBaseAddress(first, 0);
+    for (size_t y = 0; y < 64; ++y) {
+        uint8_t *row = (uint8_t *)CVPixelBufferGetBaseAddress(first) + y * CVPixelBufferGetBytesPerRow(first);
+        for (size_t x = 0; x < 64; ++x) { row[x*4] = 0; row[x*4+1] = 0; row[x*4+2] = 255; row[x*4+3] = 255; }
+    }
+    CVPixelBufferUnlockBaseAddress(first, 0);
+    NSMutableArray<SPDisplayFrameRequest *> *frames = [NSMutableArray array]; BOOL capacityBounded = YES;
+    for (uint64_t i = 0; i < 5; ++i) {
+        SPDisplayFrameRequest *frame = [SPDisplayFrameRequest new]; frame.enhanced = CVPixelBufferRetain(first);
+        frame.generation = 1; frame.config = 1; frame.epoch = 1; frame.clockEpoch = 1; frame.frameID = 9000 + i; frame.mode = SPLiveViewEnhanced;
+        SPPreparedTextureLease *lease = [_preparedTextures prepareFrame:frame];
+        if (i < 4) { capacityBounded = capacityBounded && lease != nil; [frames addObject:frame]; }
+        else capacityBounded = capacityBounded && lease == nil && frame.preparedTextureAdmissionReason == SPPreparedCapacity;
+    }
+    CVPixelBufferRelease(first); first = NULL;
+    [_preparedTextures fenceForProbe];
+    SPDisplayFrameRequest *frame = frames.firstObject;
+    int claimReason = SPPreparedNone;
+    SPPreparedTextureLease *lease = [_preparedTextures claimFrame:frame recordSelection:NO reason:&claimReason];
+    id<MTLTexture> mapped = [lease primaryTexture];
+    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
+    desc.usage = MTLTextureUsageRenderTarget; desc.storageMode = MTLStorageModeShared;
+    id<MTLTexture> output = [_device newTextureWithDescriptor:desc];
+    id<MTLSharedEvent> event = [_device newSharedEvent]; id<MTLCommandBuffer> command = [_commandQueue commandBuffer];
+    BOOL blocked = NO, reusable = NO, gpuCompleted = NO, sampledRed = NO;
+    const BOOL setup = lease && mapped && output && event && command;
+    if (setup) {
+        [command encodeWaitForEvent:event value:1];
+        SPProbeDrawable *surface = [SPProbeDrawable new]; surface.texture = output;
+        MTLRenderPassDescriptor *clear = [MTLRenderPassDescriptor renderPassDescriptor];
+        clear.colorAttachments[0].texture = output; clear.colorAttachments[0].loadAction = MTLLoadActionClear;
+        clear.colorAttachments[0].storeAction = MTLStoreActionStore; [[command renderCommandEncoderWithDescriptor:clear] endEncoding];
+        MTLViewport full = {0,0,64,64,0,1};
+        [self drawTexture:mapped frameWidth:64 frameHeight:64 viewport:full buffer:command drawable:(id<CAMetalDrawable>)surface fill:YES];
+        dispatch_semaphore_t done = dispatch_semaphore_create(0);
+        [command addCompletedHandler:^(id<MTLCommandBuffer> completed) { (void)completed; [lease complete]; dispatch_semaphore_signal(done); }];
+        [command commit];
+        // Drop every request and its original pixel-buffer retain. Only the
+        // inflight lease/texture ownership protects the source until completion.
+        frame = nil; [frames removeAllObjects]; [_preparedTextures fenceForProbe];
+        CVReturn busy = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault, pool, (__bridge CFDictionaryRef)limit, &candidate);
+        blocked = busy == kCVReturnWouldExceedAllocationThreshold && event.signaledValue == 0;
+        if (candidate) { CVPixelBufferRelease(candidate); candidate = NULL; }
+        event.signaledValue = 1;
+        const BOOL completedInTime = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) == 0;
+        gpuCompleted = completedInTime && command.status == MTLCommandBufferStatusCompleted;
+        if (gpuCompleted) {
+            uint8_t pixels[64*64*4] = {};
+            [output getBytes:pixels bytesPerRow:64*4 fromRegion:MTLRegionMake2D(0,0,64,64) mipmapLevel:0];
+            const size_t center = (32*64+32)*4; sampledRed = pixels[center+2] > 240 && pixels[center+1] < 10 && pixels[center] < 10;
+        }
+        mapped = nil; command = nil;
+        if (completedInTime) {
+            [_preparedTextures fenceForProbe];
+            CVReturn available = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault, pool, (__bridge CFDictionaryRef)limit, &candidate);
+            reusable = available == kCVReturnSuccess && candidate != NULL;
+            if (candidate) { CVPixelBufferRelease(candidate); candidate = NULL; }
+        }
+    } else { [lease complete]; frame = nil; [frames removeAllObjects]; [_preparedTextures fenceForProbe]; }
+    if (pool) CFRelease(pool);
+    NSDictionary *stats = [_preparedTextures snapshot];
+    const BOOL clean = [stats[@"outstanding"] unsignedLongLongValue] == 0 && [stats[@"peakOutstanding"] unsignedLongLongValue] == 4 &&
+        [stats[@"mapFailures"] unsignedLongLongValue] == 0 && [stats[@"textureFailures"] unsignedLongLongValue] == 0 && [stats[@"recycled"] unsignedLongLongValue] == 4;
+    return @{ @"ok": @(capacityBounded && setup && blocked && gpuCompleted && sampledRed && reusable && clean), @"enabled": @YES,
+        @"capacityBoundedAtFourAdmissions": @(capacityBounded), @"claimReason": SPPreparedTextureReasonName(claimReason),
+        @"poolBlockedBeforeGPUCompletion": @(blocked), @"gpuCompleted": @(gpuCompleted), @"mappedTextureReadbackRed": @(sampledRed),
+        @"poolReusableAfterGPUCompletionAndMapperFlush": @(reusable), @"preparedTexture": stats,
+        @"scope": @"Bounded independent-cache offscreen GPU read/draw probe with one-buffer pool threshold, four prepared leases and fifth admission rejection. Requests are released before GPU wait is signalled; release/Flush are fenced on mapper queue. No drawable, SCK, model or physical display." };
+}
+
 - (NSDictionary *)runOffscreenDrawAndLifetimeProbe {
+    if (_preparedTextures) return [self runPreparedTextureLifetimeProbe];
     MTLTextureDescriptor *outDesc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:32 mipmapped:NO];
     outDesc.usage=MTLTextureUsageRenderTarget; outDesc.storageMode=MTLStorageModeShared;
     id<MTLTexture> out=[_device newTextureWithDescriptor:outDesc];
@@ -1292,6 +1585,7 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
         return NO;
     }
     [_pendingPresentations insertObject:frame atIndex:sp::displayFrameInsertionIndex(timings, SPDisplayFrameTiming(frame))];
+    if (_preparedTextures) [_preparedTextures prepareFrame:frame];
     return YES; // admitted only; success is still counted exclusively by addPresentedHandler
 }
 
@@ -1317,6 +1611,7 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
 }
 
 - (void)reportPendingPresentation:(SPDisplayFrameRequest *)frame reason:(NSString *)reason details:(NSDictionary *)details {
+    [frame.preparedTextureLease cancel];
     if (!frame.counts || !self.presentationFailure) return;
     NSMutableDictionary *info = [@{
         @"reason": reason, @"generation": @(frame.generation), @"configVersion": @(frame.config),
@@ -1439,7 +1734,7 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
             @"frameID": trace.frameID ? @(trace.frameID) : (id)[NSNull null],
             @"outcome": SPDisplayTimerOutcomeName(trace.outcome), @"expiredOrigin": expiredOrigin ?: (id)[NSNull null] }];
     }
-    return @{ @"pendingSlots": @(pendingSlot), @"slotCapacity": @1,
+    NSDictionary *result = @{ @"pendingSlots": @(pendingSlot), @"slotCapacity": @1,
         @"pendingFrames": @(pendingFrames), @"frameCapacity": @(sp::displayQueueCapacity),
         @"expiredSlotsLifetime": @(_displaySlotExpired.load()),
         @"expiredInConsumeLifetime": @(_displaySlotExpiredInConsume.load()),
@@ -1449,6 +1744,12 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
         @"selectionGuardNs": @(sp::displaySelectionGuardNs), @"timerLeewayNs": @50000, @"timerStrict": @YES,
         @"timerTraceCapacity": @(history.size()), @"timerTraceTotal": @(total), @"timerTrace": events,
         @"timerTraceNote": @"bounded slot observations; handler entry includes OS wake and render-queue scheduling, lock acquisition separately includes mutex wait" };
+#if defined(ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC) && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC == 1
+    NSMutableDictionary *diagnostic = [result mutableCopy];
+    diagnostic[@"preparedTexture"] = _preparedTextures ? [_preparedTextures snapshot] : @{ @"enabled": @NO, @"capacity": @4 };
+    result = diagnostic;
+#endif
+    return result;
 }
 
 // All arm/park calls own presentationMutex. Publication and arming are one
@@ -1501,6 +1802,8 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
     @autoreleasepool {
         int64_t handlerEntryNs = (int64_t)(CACurrentMediaTime() * 1e9);
         int64_t selectionHost = SPHostNow();
+        const BOOL timingDiagnostic = _airPresentationTimingDiagnostic;
+        const qos_class_t handlerQoS = timingDiagnostic ? qos_class_self() : QOS_CLASS_UNSPECIFIED;
         const uint64_t token = armedSlot.token;
         SPProspectiveDisplaySlot *slot;
         SPDisplayFrameRequest *frame = nil;
@@ -1554,22 +1857,34 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
                 for (NSUInteger index = 0; index < selected; ++index) [superseded addObject:_pendingPresentations[index]];
                 [_pendingPresentations removeObjectsInRange:NSMakeRange(0, selected + 1)];
             }
+            if (timingDiagnostic) {
+                slot->selectionScanEndedHostTicks = SPHostNow();
+                slot->timerHandlerRequestedQoSClass = handlerQoS;
+                slot->timerHandlerQoSRecorded = true;
+            }
             trace.frameID = frame ? frame.frameID : 0;
             trace.outcome = frame ? SPDisplayTimerOutcome::selected : SPDisplayTimerOutcome::noFrame;
             [self recordDisplayTimerTraceLocked:trace];
         }
         int64_t callbackHost = slot.callbackHost;
+        if (timingDiagnostic) {
+            slot->staleDiscardReportCount = stale.count;
+            slot->supersededDiscardReportCount = superseded.count;
+            slot->discardReportsStartedHostTicks = SPHostNow();
+        }
         for (SPDisplayFrameRequest *discarded in stale) [self reportPendingPresentation:discarded reason:@"display-stale-pts"];
         for (SPDisplayFrameRequest *discarded in superseded) [self reportPendingPresentation:discarded reason:@"display-slot-superseded"
             details:@{ @"displayLinkCallbackHost": @(callbackHost), @"displayLinkTargetTimestamp": @(slot.deadline),
                 @"displayLinkTargetPresentationTimestamp": @(slot.displayTime),
                 @"scheduledMinusLogicalTargetNs": discarded.logicalTargetHost > 0 ? @((int64_t)(slot.displayTime * 1e9) - SPHostToNs(discarded.logicalTargetHost)) : (id)[NSNull null] }];
+        if (timingDiagnostic) slot->discardReportsEndedHostTicks = SPHostNow();
         if (frame) [self renderPendingPresentation:frame slot:slot selectionHost:selectionHost];
         else _displaySlotNoFrame.fetch_add(1);
     }
 }
 
 - (void)renderPendingPresentation:(SPDisplayFrameRequest *)frame slot:(SPProspectiveDisplaySlot *)slot selectionHost:(int64_t)selectionHost {
+    const int64_t renderEntryHostTicks = _airPresentationTimingDiagnostic ? SPHostNow() : 0;
     const double presentDeadline = slot.deadline, scheduledDisplayTime = slot.displayTime;
     const int64_t callbackHost = slot.callbackHost;
     const uint64_t slotToken = slot->timing.token;
@@ -1606,9 +1921,50 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
         std::atomic<long long> deadlineCheckHostTicks{0};
         std::atomic<double> deadlineCheckMediaTimeSeconds{0};
         std::atomic<double> deadlineSlackSeconds{0};
-        NSDictionary *timingMetadata(int64_t selectionHost, double deadline) const {
+        std::atomic<long long> selectionScanEndedHostTicks{0};
+        std::atomic<long long> discardReportsStartedHostTicks{0}, discardReportsEndedHostTicks{0};
+        std::atomic<uint64_t> staleDiscardReportCount{0}, supersededDiscardReportCount{0};
+        std::atomic<long long> renderEntryHostTicks{0};
+        std::atomic<long long> primaryCVTextureAPIStartedHostTicks{0}, primaryCVTextureAPIEndedHostTicks{0};
+        std::atomic<long long> secondaryCVTextureAPIStartedHostTicks{0}, secondaryCVTextureAPIEndedHostTicks{0};
+        std::atomic<unsigned int> timerHandlerRequestedQoSClass{0};
+        std::atomic<bool> timerHandlerQoSRecorded{false};
+        std::atomic<bool> preparedTextureEnabled{false}, preparedTextureHit{false};
+        std::atomic<int> preparedTextureFallbackReason{SPPreparedNone};
+        std::atomic<int64_t> preparedMapStartedHostTicks{0}, preparedMapEndedHostTicks{0};
+        std::atomic<uint64_t> preparedMapFrameID{0};
+        NSDictionary *timingMetadata(int64_t selectionHost, double deadline, uint64_t slotToken) const {
             const auto checkHost = deadlineCheckHostTicks.load();
-            return @{ @"selectionHostTicks": @(selectionHost),
+            const bool qosRecorded = timerHandlerQoSRecorded.load();
+            NSString *qosName = @"not-recorded";
+            if (qosRecorded) switch (timerHandlerRequestedQoSClass.load()) {
+                case QOS_CLASS_USER_INTERACTIVE: qosName = @"user-interactive"; break;
+                case QOS_CLASS_USER_INITIATED: qosName = @"user-initiated"; break;
+                case QOS_CLASS_DEFAULT: qosName = @"default"; break;
+                case QOS_CLASS_UTILITY: qosName = @"utility"; break;
+                case QOS_CLASS_BACKGROUND: qosName = @"background"; break;
+                case QOS_CLASS_UNSPECIFIED: qosName = @"unspecified"; break;
+                default: qosName = @"unknown"; break;
+            }
+            return @{ @"displaySlotToken": @(slotToken), @"selectionHostTicks": @(selectionHost),
+                @"selectionScanEndedHostTicks": @(selectionScanEndedHostTicks.load()),
+                @"discardReportsStartedHostTicks": @(discardReportsStartedHostTicks.load()),
+                @"discardReportsEndedHostTicks": @(discardReportsEndedHostTicks.load()),
+                @"staleDiscardReportCount": @(staleDiscardReportCount.load()),
+                @"supersededDiscardReportCount": @(supersededDiscardReportCount.load()),
+                @"discardReportCount": @(staleDiscardReportCount.load() + supersededDiscardReportCount.load()),
+                @"renderEntryHostTicks": @(renderEntryHostTicks.load()),
+                @"primaryCVTextureAPIStartedHostTicks": @(primaryCVTextureAPIStartedHostTicks.load()),
+                @"primaryCVTextureAPIEndedHostTicks": @(primaryCVTextureAPIEndedHostTicks.load()),
+                @"secondaryCVTextureAPIStartedHostTicks": @(secondaryCVTextureAPIStartedHostTicks.load()),
+                @"secondaryCVTextureAPIEndedHostTicks": @(secondaryCVTextureAPIEndedHostTicks.load()),
+                @"timerHandlerQoSRecorded": @(qosRecorded),
+                @"timerHandlerRequestedQoSClass": @(timerHandlerRequestedQoSClass.load()),
+                @"timerHandlerRequestedQoSName": qosName,
+                @"preparedTextureEnabled": @(preparedTextureEnabled.load()), @"preparedTextureHit": @(preparedTextureHit.load()),
+                @"preparedTextureFallbackReason": SPPreparedTextureReasonName(preparedTextureFallbackReason.load()),
+                @"preparedMapStartedHostTicks": @(preparedMapStartedHostTicks.load()), @"preparedMapEndedHostTicks": @(preparedMapEndedHostTicks.load()),
+                @"preparedMapFrameID": @(preparedMapFrameID.load()),
                 @"texturePreparationEndedHostTicks": @(texturePreparationEndedHostTicks.load()),
                 @"encodingEndedHostTicks": @(encodingEndedHostTicks.load()),
                 @"generationLockRequestedHostTicks": @(generationLockRequestedHostTicks.load()),
@@ -1619,11 +1975,31 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
                 @"deadlineCheckMediaTimeSeconds": checkHost ? @(deadlineCheckMediaTimeSeconds.load()) : (id)NSNull.null,
                 @"presentDeadlineMediaTimeSeconds": @(deadline),
                 @"deadlineSlackSeconds": checkHost ? @(deadlineSlackSeconds.load()) : (id)NSNull.null,
-                @"scope": @"Opt-in CPU stages only. HostTicks are mach_absolute_time; zero means stage not reached. Deadline CA media time is the actual comparison sample; its HostTicks were sampled immediately before it. Null means comparison not performed. No submission/presentation/GPU success is inferred." };
+                @"scope": @"Opt-in CPU stages only; HostTicks are mach_absolute_time. Zero means stage not reached, including secondary CV API outside Compare and deadline-path CV API on a preparedTextureHit; zero is not a measured CV duration. Prepared map timestamps belong to the independent mapper job for preparedMapFrameID. CV API stamps bracket only CVMetalTextureCacheCreateTextureFromImage after width/height lookup. Discard counts are calls to the existing reporting helper, whose forwarding guard is unchanged. QoS is qos_class_self's reported requested class, not priority overrides. Deadline CA media time is the actual comparison sample; its HostTicks were sampled immediately before it. Null means comparison not performed. No submission/presentation/GPU success is inferred." };
         }
     };
     auto note = std::make_shared<SPDrawNote>();
     const BOOL timingDiagnostic = _airPresentationTimingDiagnostic;
+    int preparedReason = SPPreparedNone;
+    SPPreparedTextureLease *preparedLease = _preparedTextures ? [_preparedTextures claimFrame:frame recordSelection:YES reason:&preparedReason] : nil;
+    if (timingDiagnostic) {
+        note->preparedTextureEnabled.store(_preparedTextures != nil); note->preparedTextureHit.store(preparedLease != nil);
+        note->preparedTextureFallbackReason.store(preparedReason);
+        if (preparedLease) {
+            note->preparedMapStartedHostTicks.store(preparedLease->_mapStartedHostTicks.load());
+            note->preparedMapEndedHostTicks.store(preparedLease->_mapEndedHostTicks.load()); note->preparedMapFrameID.store(preparedLease->_frameID);
+        }
+    }
+    if (timingDiagnostic) {
+        note->selectionScanEndedHostTicks.store(slot->selectionScanEndedHostTicks);
+        note->discardReportsStartedHostTicks.store(slot->discardReportsStartedHostTicks);
+        note->discardReportsEndedHostTicks.store(slot->discardReportsEndedHostTicks);
+        note->staleDiscardReportCount.store(slot->staleDiscardReportCount);
+        note->supersededDiscardReportCount.store(slot->supersededDiscardReportCount);
+        note->timerHandlerRequestedQoSClass.store((unsigned int)slot->timerHandlerRequestedQoSClass);
+        note->timerHandlerQoSRecorded.store(slot->timerHandlerQoSRecorded);
+        note->renderEntryHostTicks.store(renderEntryHostTicks);
+    }
     void (^reportFailure)(NSString *) = ^(NSString *why) {
         if (counts && self.presentationFailure) {
             NSDictionary *info = @{
@@ -1638,22 +2014,28 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
             @"presentRequestMethod": @"command-buffer-ordinary", @"presentRequestMediaTime": @(note->presentRequestMedia.load()) };
             if (timingDiagnostic) {
                 NSMutableDictionary *diagnosticInfo = [info mutableCopy];
-                diagnosticInfo[@"airPresentationTiming"] = note->timingMetadata(selectionHost, presentDeadline);
+                diagnosticInfo[@"airPresentationTiming"] = note->timingMetadata(selectionHost, presentDeadline, slotToken);
                 info = diagnosticInfo;
             }
             self.presentationFailure(info);
         }
     };
     void (^releaseTicket)(void) = ^{ self->_inflightDraws.fetch_sub(1); };
-    CVMetalTextureRef aRef = [self createTexture:primary];
-    CVMetalTextureRef bRef = mode == SPLiveViewCompare ? [self createTexture:secondary] : NULL;
-    id<MTLTexture> a = aRef ? CVMetalTextureGetTexture(aRef) : nil;
-    id<MTLTexture> b = bRef ? CVMetalTextureGetTexture(bRef) : nil;
+    int64_t primaryAPIStarted = 0, primaryAPIEnded = 0, secondaryAPIStarted = 0, secondaryAPIEnded = 0;
+    CVMetalTextureRef aRef = preparedLease ? NULL : (timingDiagnostic ? [self createTexture:primary apiStartedHostTicks:&primaryAPIStarted apiEndedHostTicks:&primaryAPIEnded] : [self createTexture:primary]);
+    CVMetalTextureRef bRef = !preparedLease && mode == SPLiveViewCompare ? (timingDiagnostic ? [self createTexture:secondary apiStartedHostTicks:&secondaryAPIStarted apiEndedHostTicks:&secondaryAPIEnded] : [self createTexture:secondary]) : NULL;
+    if (timingDiagnostic) {
+        note->primaryCVTextureAPIStartedHostTicks.store(primaryAPIStarted); note->primaryCVTextureAPIEndedHostTicks.store(primaryAPIEnded);
+        note->secondaryCVTextureAPIStartedHostTicks.store(secondaryAPIStarted); note->secondaryCVTextureAPIEndedHostTicks.store(secondaryAPIEnded);
+    }
+    id<MTLTexture> a = preparedLease ? [preparedLease primaryTexture] : (aRef ? CVMetalTextureGetTexture(aRef) : nil);
+    id<MTLTexture> b = preparedLease ? [preparedLease secondaryTexture] : (bRef ? CVMetalTextureGetTexture(bRef) : nil);
     if (timingDiagnostic) note->texturePreparationEndedHostTicks.store(SPHostNow());
     if (!drawable || !a || !self->_pipeline) {
         reportFailure(!drawable ? @"drawable" : (!a ? @"texture" : @"pipeline"));
         if (aRef) CFRelease(aRef);
         if (bRef) CFRelease(bRef);
+        [preparedLease complete];
         return;
     }
     id<MTLCommandBuffer> command = [self->_commandQueue commandBuffer];
@@ -1661,6 +2043,7 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
         reportFailure(@"command");
         if (aRef) CFRelease(aRef);
         if (bRef) CFRelease(bRef);
+        [preparedLease complete];
         return;
     }
     MTLRenderPassDescriptor *clear = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -1712,6 +2095,7 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
         note->gpuHost.store((long long)SPHostNow());
         if (aRef) CFRelease(aRef);
         if (bRef) CFRelease(bRef);
+        [preparedLease complete];
         uint64_t completedFrameID = frame.frameID; // retains the admitted buffers through GPU completion
         if (seenSurfaceToken && self.surfaceReady && seenClock == self->_presentationClockEpoch.load()) {
             self.surfaceReady(@{ @"generation": @(seen), @"configVersion": @(seenConfig), @"captureHost": @(captureHost),
@@ -1786,7 +2170,7 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
         };
         if (timingDiagnostic) {
             NSMutableDictionary *diagnosticInfo = [info mutableCopy];
-            diagnosticInfo[@"airPresentationTiming"] = note->timingMetadata(selectionHost, presentDeadline);
+            diagnosticInfo[@"airPresentationTiming"] = note->timingMetadata(selectionHost, presentDeadline, slotToken);
             info = diagnosticInfo;
         }
         self.presented(info);

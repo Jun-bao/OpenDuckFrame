@@ -112,7 +112,7 @@ The CLI accepts `--output /absolute/new.json --preflight-only`,
 `--output /absolute/new.json --inspect --dylib /absolute/bundled-library`, or
 `--output /absolute/new.json --dylib /absolute/bundled-library
 --source-width-points 1324 --source-height-points 834 --seconds 12
---minimum-idle-seconds 60`. Each of two phases lasts 5–30 seconds. The source
+--minimum-idle-seconds 60`. Each of two phases lasts 5–60 seconds. The source
 remains uncovered first, then the output covers it. A small display may only
 leave a strip of the first output exposed; the report records this geometry
 and does not call it a fully separated comparison.
@@ -150,3 +150,32 @@ it changes the selection guard to 2 ms while the normal build remains at
 counting rules. Processor status flags are retained as status history; as in
 the workbench, a budget warning alone does not stop the test. Plan rejection,
 stream/initialization errors and the existing timeouts still stop execution.
+
+With that diagnostic compile switch, the additional per-process
+`ODF_AIR_PREPARED_TEXTURE_DIAGNOSTIC=1` flag enables one independent serial
+texture-mapping cache. At most four leases cover queued mapping, ready work,
+GPU use and pending recycling. Selection never waits: absent, mismatched or
+unfinished mapping uses the original path. Each lease keeps its pixel buffers
+and CVMetalTextureRefs until discard or GPU completion; the mapper queue
+releases and flushes them. Normal builds and default runs leave this path off.
+`presentationSlots.output.preparedTexture` records hits, fallbacks, capacity,
+failures and recycling; the original renderer cache and flush remain intact.
+
+Before timing, `--prepared-lifetime-only --dylib /absolute/bundled-library`
+checks a real offscreen draw and red-pixel readback, four admission slots, a
+one-buffer pool blocked while the GPU waits, and reuse after GPU completion
+and mapper cleanup. It creates no window or capture stream. This checks the
+combined lease ownership, not each reference type independently; the fifth
+admission is attempted before the mapping fence. The GPU wait has a five-second
+timeout, while mapper fences require the runner's external process timeout
+for an overall bound. The command driver allows 30 seconds and the runner
+terminates that subprocess after 45 seconds.
+
+The frozen 2 ms candidate is first measured at X1, 2648×1668, for 60 seconds:
+all qualified windows must reach 29 counted source frames/s, submit-deadline
+failures must be at most 1%, selection-to-check p99 at most 1 ms, pre-mapping
+fallbacks at most 1%, with zero owned-pool drops/exhaustions or texture failures.
+Only a passing B proceeds to the large RIFE floor (at least 95% of qualified
+windows at 29/s). A failed candidate is retained for review; it does not change
+the original trial app, model or preferences, and does not establish Safari,
+physical-screen, visual-quality or 60 FPS acceptance.

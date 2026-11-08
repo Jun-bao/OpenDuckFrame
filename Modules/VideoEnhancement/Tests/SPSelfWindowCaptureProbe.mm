@@ -8,6 +8,8 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #import <dlfcn.h>
+#import <objc/message.h>
+#import <CoreFoundation/CoreFoundation.h>
 #import <mach/mach_time.h>
 #import <unistd.h>
 #include <atomic>
@@ -316,6 +318,9 @@ static void SPProbeText(NSString *text, double x, double baseline, double size, 
         @"gpuCompletionCounterScope": @"surfaceReady is warmup-token gated and this probe does not arm that token; gpuCompletedCallbacks is not total render throughput. Presented-event gpuHost is CPU completed-handler arrival, not a hardware GPU end timestamp.",
         @"sourcePattern": @"browser-samples/index.html mostly-static 1280x720 motion geometry, paced at 30 content slots/sec",
         @"mainBundle": NSBundle.mainBundle.bundlePath ?: @"", @"timeline": _timeline, @"phases": _phases } mutableCopy];
+    mach_timebase_info_data_t timebase = {}; mach_timebase_info(&timebase);
+    _report[@"machTimebase"] = @{ @"numer": @(timebase.numer), @"denom": @(timebase.denom),
+        @"scope": @"HostTicks multiplied by numer/denom are nanoseconds." };
     if ([_arm isEqual:@"bare"]) {
         _report[@"scope"] = @"Independent CAMetalDisplayLink drawable baseline, immediate bit-pattern encoding/presentDrawable/commit and static own occluder. No SCK, production library, processor, external windows, physical-display or human quality acceptance.";
         _report[@"captureAPI"] = @"none"; _report[@"sourcePattern"] = @"Static own-window occluder; independent output updates its binary counter on each 60Hz display-link callback.";
@@ -523,7 +528,7 @@ static void SPProbeText(NSString *text, double x, double baseline, double size, 
             if (![info[@"counts"] boolValue]) strong->_drawableUnscored++;
             else if ([info[@"synthetic"] boolValue]) strong->_drawableSynthetic++; else strong->_drawableSource++;
         }
-        // Bounded by 30s/phase and the display refresh; retain the exact callback
+        // Bounded by 60s/phase and the display refresh; retain the exact callback
         // fields for gap, wait and epoch interpretation rather than infer them.
         [strong->_drawableEvents addObject:info]; [strong->_drawableLock unlock];
     };
@@ -757,17 +762,18 @@ static void SPProbeText(NSString *text, double x, double baseline, double size, 
 @end
 
 static void SPProbeUsage(void) {
-    fprintf(stderr, "Usage: SelfProbe --output /absolute/new.json [--preflight-only | --inspect --dylib /absolute/Release.dylib | --arm bare|passthrough|rife (default rife) [--dylib /absolute/Release.dylib (required except bare)] [--control-only] [--source-width-points 1324 --source-height-points 834 --seconds 12 --minimum-idle-seconds 60]]\n");
+    fprintf(stderr, "Usage: SelfProbe --output /absolute/new.json [--preflight-only | --inspect --dylib /absolute/Release.dylib | --prepared-lifetime-only --dylib /absolute/Release.dylib | --arm bare|passthrough|rife (default rife) [--dylib /absolute/Release.dylib (required except bare)] [--control-only] [--source-width-points 1324 --source-height-points 834 --seconds 12 (5..60) --minimum-idle-seconds 60]]\n");
 }
 int main(int argc, const char **argv) {
     @autoreleasepool {
         NSMutableDictionary *options = [@{ @"arm": @"rife", @"control-only": @NO, @"source-width-points": @1324, @"source-height-points": @834, @"seconds": @12, @"minimum-idle-seconds": @60 } mutableCopy];
-        BOOL preflightOnly = NO, inspect = NO;
+        BOOL preflightOnly = NO, inspect = NO, preparedLifetimeOnly = NO;
         NSSet *numeric = [NSSet setWithArray:@[@"source-width-points", @"source-height-points", @"seconds", @"minimum-idle-seconds"]];
         for (int i = 1; i < argc; ++i) {
             NSString *arg = @(argv[i]);
             if ([arg isEqual:@"--preflight-only"]) { preflightOnly = YES; continue; }
             if ([arg isEqual:@"--inspect"]) { inspect = YES; continue; }
+            if ([arg isEqual:@"--prepared-lifetime-only"]) { preparedLifetimeOnly = YES; continue; }
             if ([arg isEqual:@"--control-only"]) { options[@"control-only"] = @YES; continue; }
             if (![arg hasPrefix:@"--"] || i + 1 >= argc) { SPProbeUsage(); return 2; }
             NSString *key = [arg substringFromIndex:2], *value = @(argv[++i]);
@@ -777,9 +783,38 @@ int main(int argc, const char **argv) {
         }
         NSString *output = options[@"output"], *dylib = options[@"dylib"];
         const BOOL validArm = [@[@"bare", @"passthrough", @"rife"] containsObject:options[@"arm"]];
-        const BOOL requiresDylib = !preflightOnly && (inspect || ![options[@"arm"] isEqual:@"bare"]);
-        if (!validArm || !output.isAbsolutePath || [NSFileManager.defaultManager fileExistsAtPath:output] || (requiresDylib && !dylib.isAbsolutePath) || (preflightOnly && inspect)) { SPProbeUsage(); return 2; }
-        if ([options[@"seconds"] doubleValue] < 5 || [options[@"seconds"] doubleValue] > 30 || [options[@"source-width-points"] doubleValue] < 320 || [options[@"source-width-points"] doubleValue] > 1700 || [options[@"source-height-points"] doubleValue] < 240 || [options[@"source-height-points"] doubleValue] > 1100 || [options[@"minimum-idle-seconds"] doubleValue] < 10 || [options[@"minimum-idle-seconds"] doubleValue] > 3600) { SPProbeUsage(); return 2; }
+        const BOOL requiresDylib = !preflightOnly && (inspect || preparedLifetimeOnly || ![options[@"arm"] isEqual:@"bare"]);
+        if (!validArm || !output.isAbsolutePath || [NSFileManager.defaultManager fileExistsAtPath:output] || (requiresDylib && !dylib.isAbsolutePath) || (preflightOnly && inspect) || (preparedLifetimeOnly && (preflightOnly || inspect))) { SPProbeUsage(); return 2; }
+        if ([options[@"seconds"] doubleValue] < 5 || [options[@"seconds"] doubleValue] > 60 || [options[@"source-width-points"] doubleValue] < 320 || [options[@"source-width-points"] doubleValue] > 1700 || [options[@"source-height-points"] doubleValue] < 240 || [options[@"source-height-points"] doubleValue] > 1100 || [options[@"minimum-idle-seconds"] doubleValue] < 10 || [options[@"minimum-idle-seconds"] doubleValue] > 3600) { SPProbeUsage(); return 2; }
+        if (preparedLifetimeOnly) {
+            [NSApplication sharedApplication]; [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+            NSMutableDictionary *result = [@{ @"mode": @"prepared-lifetime-only", @"windowsCreated": @NO,
+                @"captureStarted": @NO, @"modelPrepared": @NO,
+                @"scope": @"Bounded offscreen GPU texture use, completion and pixel-pool return; no display/FPS or human quality acceptance." } mutableCopy];
+            void *loaded = dlopen(dylib.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
+            Class view = NSClassFromString(@"SPLivePreviewView"); SEL selector = NSSelectorFromString(@"runPreparedTextureLifetimeProbe");
+            if (!loaded || !view || ![view respondsToSelector:selector]) {
+                const char *error = loaded ? nullptr : dlerror();
+                result[@"ok"] = @NO; result[@"firstFailure"] = error ? @(error) : @"prepared lifetime probe selector unavailable";
+            } else {
+                __block NSDictionary *probeResult = nil; dispatch_semaphore_t done = dispatch_semaphore_create(0);
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    probeResult = ((NSDictionary *(*)(id, SEL))objc_msgSend)(view, selector); dispatch_semaphore_signal(done);
+                });
+                const double started = SPProbeNow();
+                BOOL finished = NO;
+                while (SPProbeNow() - started < 30) {
+                    if (dispatch_semaphore_wait(done, DISPATCH_TIME_NOW) == 0) { finished = YES; break; }
+                    CFRunLoopRunInMode(kCFRunLoopDefaultMode, .02, false);
+                }
+                result[@"probe"] = finished ? (probeResult ?: @{}) : @{};
+                result[@"ok"] = @(finished && [probeResult[@"ok"] boolValue]);
+                if (!finished) result[@"firstFailure"] = @"prepared lifetime probe exceeded 30 seconds";
+            }
+            NSError *error = nil; NSData *json = [NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:&error];
+            if (!json || ![json writeToFile:output options:NSDataWritingWithoutOverwriting error:&error]) { fprintf(stderr, "result write failed: %s\n", error.localizedDescription.UTF8String); return 3; }
+            fprintf(stdout, "%s\n", output.UTF8String); return [result[@"ok"] boolValue] ? 0 : 1;
+        }
         if (preflightOnly || inspect) {
             NSMutableDictionary *result = [@{ @"mode": preflightOnly ? @"preflight-only" : @"inspect", @"arm": options[@"arm"], @"controlOnly": options[@"control-only"], @"preflight": SPProbePreflight([options[@"minimum-idle-seconds"] doubleValue]), @"windowsCreated": @NO, @"captureStarted": @NO, @"modelPrepared": @NO, @"mainBundle": NSBundle.mainBundle.bundlePath ?: @"" } mutableCopy];
             BOOL ok = YES;
