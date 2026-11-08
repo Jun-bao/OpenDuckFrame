@@ -171,11 +171,51 @@ timeout, while mapper fences require the runner's external process timeout
 for an overall bound. The command driver allows 30 seconds and the runner
 terminates that subprocess after 45 seconds.
 
-The frozen 2 ms candidate is first measured at X1, 2648×1668, for 60 seconds:
-all qualified windows must reach 29 counted source frames/s, submit-deadline
+The initial formal 2 ms candidate gate at X1, 2648×1668, for 60 seconds required
+all qualified windows to reach 29 counted source frames/s, submit-deadline
 failures must be at most 1%, selection-to-check p99 at most 1 ms, pre-mapping
 fallbacks at most 1%, with zero owned-pool drops/exhaustions or texture failures.
-Only a passing B proceeds to the large RIFE floor (at least 95% of qualified
-windows at 29/s). A failed candidate is retained for review; it does not change
+That result remains a strict failure: 52/53 qualified windows reached 29/s.
+The inspected low window had 29 callbacks in 1.000442 seconds; all 30 selected
+frames later had distinct positive presented times, including one callback in
+the next window. This closes that cohort's count difference without proving
+uniform cadence or real-screen quality. Other timing gaps and the unobserved
+export tail remain separate.
+
+For subsequent internal diagnosis, the advisor restored the original ratio
+criterion of at least 95% qualified windows at 29/s, with no attributable
+presentation loss, rather than silently reclassifying the old all-window
+gate. Only that reviewed progression criterion permits the large RIFE floor:
+at least 95% of qualified windows at 29/s, attributable presentation loss at
+most 1%, and selection-to-check p99 at most 1 ms. This loss criterion protects
+admitted original frames; synthetic losses are reported separately as
+interpolation delivery. Late originals and originals retired by a budget
+configuration change count as losses. Only a proven original-to-original
+collision in the same display slot is exempt. Unknown request types remain
+conservative failures until typed evidence is available. It includes the period before
+budget downgrade. The small 1814×1142, 60-second test follows only if the large
+gate passes; its target is at least 95% of windows at 58/s. These tests record
+downgrade and recovery behavior as well as model timing. A failed candidate
+is retained for review; it does not change
 the original trial app, model or preferences, and does not establish Safari,
 physical-screen, visual-quality or 60 FPS acceptance.
+
+For one 12-second attribution run, the same compile guard plus
+`ODF_AIR_CADENCE_CAUSAL_TRACE=1` adds preallocated POD rings for view admission,
+selection and typed retirement, raw callbacks, and each budget evaluation.
+Writes use the existing presentation mutex or processor serial queue. There
+is no pixel sampling, trace file IO, new queue or periodic array export.
+`presentationOrderDiagnostics.airCadenceCausalTrace` exports once after the
+controlled caller stops capture; it does not wait for or stop GPU work. Its
+cutoff, sequence ranges and overflow counters bound the evidence. Overflow,
+selection-to-check p99 above 1 ms or any submission deadline failure makes
+this attribution run unusable. Twelve seconds do not replace the 60-second
+gate, and newly typed requests do not fill old runs' unknown identities.
+
+Unassigned cleanup slot/replacement values remain null. Callback records can
+lack capture/admission/counts fields; associate them with their admission
+before building a per-config ledger. Absent callback `redraw` is exported as
+false and absent failure `clockEpoch` as zero, so these defaults are not proof
+of known values. Preserve unresolved GPU/callback tail as unknown. Budget
+caller gates are recorded directly; the policy's internal persistence or
+cooldown reason is not inferred from an unchanged decision.
