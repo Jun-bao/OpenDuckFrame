@@ -193,8 +193,10 @@ interpolation delivery. Late originals and originals retired by a budget
 configuration change count as losses. Only a proven original-to-original
 collision in the same display slot is exempt. Unknown request types remain
 conservative failures until typed evidence is available. It includes the period before
-budget downgrade. The small 1814×1142, 60-second test follows only if the large
-gate passes; its target is at least 95% of windows at 58/s. These tests record
+budget downgrade. A reviewed typed admission cohort with at most 1% original
+loss can authorize internal progression without reclassifying an older untyped
+large run as formally passed. The small 1814×1142, 60-second target is at least
+95% of windows at 58/s. These tests record
 downgrade and recovery behavior as well as model timing. A failed candidate
 is retained for review; it does not change
 the original trial app, model or preferences, and does not establish Safari,
@@ -219,3 +221,10 @@ false and absent failure `clockEpoch` as zero, so these defaults are not proof
 of known values. Preserve unresolved GPU/callback tail as unknown. Budget
 caller gates are recorded directly; the policy's internal persistence or
 cooldown reason is not inferred from an unchanged decision.
+
+The final small case uses the verified causal trace with zero overflow and
+the same timing-validity checks. A passing 58/s ratio requires one confirmation
+with the uninstrumented candidate before becoming a short self-scene 60 FPS
+candidate. A failed ratio ends that experiment stage. Further delay-alignment
+work first requires a separate read-only queue/cap check and an offline fixed
+22.3 ms target-shift prediction; it is not silently folded into the old result.
