@@ -5,6 +5,10 @@ import Foundation
 import RifeMetal
 import VideoToolbox
 import os
+#if ODF_AIR_SERVICE_TRACE
+import Darwin
+import RifeMetalCore
+#endif
 
 @objc(SPRifeBridge)
 final class SPRifeBridge: NSObject {
@@ -39,6 +43,75 @@ final class SPRifeBridge: NSObject {
     private var diagnosticCounts: [String: Int] = [:]
     private var convertSamplesMs: [Double] = [], pushSamplesMs: [Double] = []
     private var recentJobs: [[String: Any]] = []
+#if ODF_AIR_SERVICE_TRACE
+    // All storage is allocated once. Reads/writes use the existing state lock;
+    // runtime records are copied only after an existing synchronous push returns.
+    private let airServiceTrace: SPAirServiceTraceStore? =
+        ProcessInfo.processInfo.environment["ODF_AIR_SERVICE_TRACE"] == "1" ? SPAirServiceTraceStore() : nil
+#endif
+    @objc var serviceTraceEnabled: Bool {
+#if ODF_AIR_SERVICE_TRACE
+        return airServiceTrace != nil
+#else
+        return false
+#endif
+    }
+    @objc(setServiceTraceToken:configVersion:measurementEpoch:probe:probeIndex:probeRound:)
+    func setServiceTrace(token: UInt64, configVersion: UInt64, measurementEpoch: UInt64,
+                         probe: Bool, probeIndex: Int, probeRound: UInt64) {
+#if ODF_AIR_SERVICE_TRACE
+        guard let trace = airServiceTrace else { return }
+        state.lock()
+        trace.nextMetadata = SPAirServiceMetadata(token: token, configVersion: configVersion,
+            measurementEpoch: measurementEpoch, probe: probe, probeIndex: Int64(probeIndex), probeRound: probeRound)
+        state.unlock()
+#endif
+    }
+
+    @objc(serviceTraceSnapshotAtCutoffHostTicks:)
+    func serviceTraceSnapshot(cutoffHostTicks: UInt64) -> [String: Any] {
+#if ODF_AIR_SERVICE_TRACE
+        guard let trace = airServiceTrace else { return ["enabled": false] }
+        state.lock()
+        let copied = trace.copySnapshot()
+        let bridgeEpoch = epoch
+        state.unlock()
+        return copied.export(cutoffHostTicks: cutoffHostTicks, bridgeEpoch: bridgeEpoch)
+#else
+        return ["enabled": false, "compiled": false]
+#endif
+    }
+
+#if ODF_AIR_SERVICE_TRACE
+    private func airServiceEvent(_ kind: SPAirServiceEventKind, token: UInt64,
+                                 detail: UInt64 = 0, value: Double = 0, sourceFourCC: UInt32 = 0) {
+        guard let trace = airServiceTrace else { return }
+        let host = mach_absolute_time()
+        state.lock()
+        trace.appendEvent(kind: kind, token: token, host: host, detail: detail, value: value, sourceFourCC: sourceFourCC)
+        state.unlock()
+    }
+
+    private func admitAirServiceJob(token: UInt64, previousID: UInt64, currentID: UInt64,
+                                    previousPTS: CMTime, currentPTS: CMTime,
+                                    generation: UInt64, clockEpoch: UInt64, bridgeEpoch: UInt64) {
+        guard let trace = airServiceTrace else { return }
+        state.lock()
+        trace.admit(token: token, previousID: previousID, currentID: currentID,
+                    previousPTS: previousPTS, currentPTS: currentPTS, generation: generation,
+                    clockEpoch: clockEpoch, bridgeEpoch: bridgeEpoch)
+        state.unlock()
+    }
+
+    private func copyAirGPURecords(_ engine: RifeInterpolator) {
+        guard let trace = airServiceTrace else { return }
+        let count = engine.airServiceTraceCount
+        state.lock()
+        for index in 0..<count { trace.appendGPU(engine.airServiceTraceRecord(at: index)) }
+        trace.runtimeOverflow &+= engine.airServiceTraceOverflow
+        state.unlock()
+    }
+#endif
     private func count(_ name: String) {
         diagnosticLock.lock(); diagnosticCounts[name, default: 0] += 1; diagnosticLock.unlock()
     }
@@ -70,6 +143,9 @@ final class SPRifeBridge: NSObject {
         loadedModelID = modelID
         loadedQuality = tier.rawValue
         loadedExperiment = experiment?.diagnostics ?? [:]
+#if ODF_AIR_SERVICE_TRACE
+        airServiceTrace?.modelIdentity = engine.airDiagnosticModelIdentity
+#endif
         state.unlock()
     }
 
@@ -82,6 +158,10 @@ final class SPRifeBridge: NSObject {
         let seen = epoch
         state.unlock()
         guard let engine else { return false }
+#if ODF_AIR_SERVICE_TRACE
+        // This older API has no immutable source identities/PTS. Do not invent them.
+        airServiceEvent(.unsupportedStatelessSubmit, token: token)
+#endif
         exec.async {
             self.state.lock()
             let currentEpoch = self.epoch
@@ -133,8 +213,17 @@ final class SPRifeBridge: NSObject {
               previousID != currentID else { return false }
         state.lock(); let engine = interpolator; let seen = epoch; state.unlock()
         guard let engine else { return false }
+#if ODF_AIR_SERVICE_TRACE
+        admitAirServiceJob(token: token, previousID: previousID, currentID: currentID,
+            previousPTS: previousPTS, currentPTS: currentPTS, generation: generation,
+            clockEpoch: clockEpoch, bridgeEpoch: seen)
+        airServiceEvent(.enqueueCallBegin, token: token)
+#endif
         exec.async {
             autoreleasepool {
+#if ODF_AIR_SERVICE_TRACE
+                self.airServiceEvent(.execBegin, token: token)
+#endif
                 let started = ProcessInfo.processInfo.systemUptime
                 let trace = ProcessInfo.processInfo.environment["CHUANFLOW_THROUGHPUT_TRACE"] == "1"
                 let log = self.traceLog
@@ -142,27 +231,84 @@ final class SPRifeBridge: NSObject {
                 if trace { os_signpost(.begin, log: log, name: "RIFE stream", signpostID: signpost) }
                 defer { if trace { os_signpost(.end, log: log, name: "RIFE stream", signpostID: signpost) } }
                 self.state.lock(); let active = self.epoch == seen; self.state.unlock()
-                guard active else { completion(token, nil, 0, Self.error(1, "RIFE 结果属于旧会话")); return }
+                guard active else {
+#if ODF_AIR_SERVICE_TRACE
+                    self.airServiceEvent(.retiredBeforeExecution, token: token)
+#endif
+                    completion(token, nil, 0, Self.error(1, "RIFE 结果属于旧会话")); return
+                }
                 var convertNs: UInt64 = 0, pushNs: UInt64 = 0
                 var convertCalls = 0, pushCalls = 0
                 var cacheHit: Bool?
-                func measuredBGRA(_ bridge: SPRifeBridge, _ source: CVPixelBuffer) throws -> CVPixelBuffer {
+                func measuredBGRA(_ bridge: SPRifeBridge, _ source: CVPixelBuffer, role: UInt64) throws -> CVPixelBuffer {
+#if ODF_AIR_SERVICE_TRACE
+                    bridge.airServiceEvent(.ownedBGRABegin, token: token, detail: role)
+#endif
                     let began = DispatchTime.now().uptimeNanoseconds
-                    defer { convertNs += DispatchTime.now().uptimeNanoseconds - began; convertCalls += 1 }
-                    return try bridge.ownedBGRA(source)
+                    defer {
+                        convertNs += DispatchTime.now().uptimeNanoseconds - began; convertCalls += 1
+#if ODF_AIR_SERVICE_TRACE
+                        bridge.airServiceEvent(.ownedBGRAEnd, token: token, detail: role)
+#endif
+                    }
+                    return try bridge.ownedBGRA(source, diagnosticToken: token, diagnosticRole: role)
                 }
-                func measuredPush<T>(_ operation: () throws -> T) rethrows -> T {
+                func measuredPush<T>(_ bridge: SPRifeBridge, stage: UInt32, _ operation: () throws -> T) rethrows -> T {
+#if ODF_AIR_SERVICE_TRACE
+                    if bridge.airServiceTrace != nil {
+                        bridge.airServiceEvent(.pushBegin, token: token, detail: UInt64(stage))
+                        engine.airServiceTraceBegin(jobID: token, stage: stage)
+                    }
+#endif
                     let began = DispatchTime.now().uptimeNanoseconds
-                    defer { pushNs += DispatchTime.now().uptimeNanoseconds - began; pushCalls += 1 }
+                    defer {
+                        pushNs += DispatchTime.now().uptimeNanoseconds - began; pushCalls += 1
+#if ODF_AIR_SERVICE_TRACE
+                        bridge.airServiceEvent(.pushEnd, token: token, detail: UInt64(stage))
+                        bridge.copyAirGPURecords(engine)
+#endif
+                    }
                     return try operation()
                 }
                 func recordTiming(_ bridge: SPRifeBridge) -> Double {
+#if ODF_AIR_SERVICE_TRACE
+                    bridge.airServiceEvent(.latencyFinishBegin, token: token)
+#endif
                     let elapsed = SPPerformanceSimulation.current.finish(started: started)
+#if ODF_AIR_SERVICE_TRACE
+                    bridge.airServiceEvent(.latencyFinishEnd, token: token, value: elapsed)
+#endif
                     bridge.recordStreamTiming(totalMs: elapsed * 1000,
                                               convertMs: convertCalls > 0 ? Double(convertNs) / 1e6 : nil,
                                               pushMs: pushCalls > 0 ? Double(pushNs) / 1e6 : nil,
                                               hit: cacheHit)
                     return elapsed
+                }
+                func measuredFallback<T>(_ bridge: SPRifeBridge, _ operation: () throws -> T) rethrows -> T {
+#if ODF_AIR_SERVICE_TRACE
+                    if bridge.airServiceTrace != nil {
+                        bridge.airServiceEvent(.fallbackBegin, token: token)
+                        engine.airServiceTraceBegin(jobID: token, stage: 4)
+                    }
+                    defer {
+                        bridge.airServiceEvent(.fallbackEnd, token: token)
+                        bridge.copyAirGPURecords(engine)
+                    }
+#endif
+                    return try operation()
+                }
+                func measuredStreamCreation(_ bridge: SPRifeBridge, width: Int, height: Int) throws -> RifeStream {
+#if ODF_AIR_SERVICE_TRACE
+                    if bridge.airServiceTrace != nil {
+                        bridge.airServiceEvent(.streamCreateBegin, token: token)
+                        engine.airServiceTraceBegin(jobID: token, stage: 1)
+                    }
+                    defer {
+                        bridge.airServiceEvent(.streamCreateEnd, token: token)
+                        bridge.copyAirGPURecords(engine)
+                    }
+#endif
+                    return try engine.makeStream(width: width, height: height)
                 }
                 do {
                     let width = CVPixelBufferGetWidth(previous), height = CVPixelBufferGetHeight(previous)
@@ -170,7 +316,7 @@ final class SPRifeBridge: NSObject {
                         throw Self.error(2, "RIFE 输入尺寸不一致")
                     }
                     if self.stream == nil || self.streamEpoch != seen || self.stream?.width != width || self.stream?.height != height {
-                        self.stream = try engine.makeStream(width: width, height: height)
+                        self.stream = try measuredStreamCreation(self, width: width, height: height)
                         self.streamEpoch = seen; self.streamPrevious = nil; self.streamKey = nil; self.outputPool = nil
                     }
                     let stream = self.stream!
@@ -185,20 +331,42 @@ final class SPRifeBridge: NSObject {
                     let hit = previousFormat == currentFormat && self.streamPreviousFormat == previousFormat &&
                         self.streamPrevious === previous && self.streamKey?.matches(previousKey) == true
                     cacheHit = hit
+#if ODF_AIR_SERVICE_TRACE
+                    if self.airServiceTrace != nil {
+                        var keyMask: UInt64 = 0
+                        if previousFormat == currentFormat { keyMask |= 1 }
+                        if self.streamPreviousFormat == previousFormat { keyMask |= 2 }
+                        if self.streamPrevious === previous { keyMask |= 4 }
+                        if self.streamKey?.matches(previousKey) == true { keyMask |= 8 }
+                        self.airServiceEvent(.cacheDecision, token: token, detail: keyMask, value: hit ? 1 : 0)
+                    }
+#endif
                     if hit { self.count("hits") } else {
                         self.count("misses")
+#if ODF_AIR_SERVICE_TRACE
+                        self.airServiceEvent(.streamResetBegin, token: token, detail: 1)
+#endif
                         stream.reset(); self.streamPrevious = nil; self.streamKey = nil; self.count("resets")
-                        let left = try measuredBGRA(self, previous)
-                        guard try measuredPush({ try stream.push(left, timesteps: []) }).isEmpty else { throw Self.error(2, "RIFE 缓存初始化失败") }
+#if ODF_AIR_SERVICE_TRACE
+                        self.airServiceEvent(.streamResetEnd, token: token, detail: 1)
+#endif
+                        let left = try measuredBGRA(self, previous, role: 1)
+                        guard try measuredPush(self, stage: 2, { try stream.push(left, timesteps: []) }).isEmpty else { throw Self.error(2, "RIFE 缓存初始化失败") }
                     }
-                    let right = try measuredBGRA(self, current)
+                    let right = try measuredBGRA(self, current, role: 2)
                     let frames: [CVPixelBuffer]
                     if phases.count == 1 && phases[0] == 0.5 {
+#if ODF_AIR_SERVICE_TRACE
+                        self.airServiceEvent(.outputPoolBegin, token: token)
+#endif
                         let output = try self.pooledOutput(width: width, height: height)
-                        guard try measuredPush({ try stream.push(right, into: output) }) else { throw Self.error(2, "RIFE 中间帧缺失") }
+#if ODF_AIR_SERVICE_TRACE
+                        self.airServiceEvent(.outputPoolEnd, token: token)
+#endif
+                        guard try measuredPush(self, stage: 3, { try stream.push(right, into: output) }) else { throw Self.error(2, "RIFE 中间帧缺失") }
                         frames = [output]
                     } else {
-                        frames = try measuredPush { try stream.push(right, timesteps: phases) }
+                        frames = try measuredPush(self, stage: 3) { try stream.push(right, timesteps: phases) }
                     }
                     guard frames.count == phases.count, frames.allSatisfy({ CVPixelBufferGetWidth($0) == width && CVPixelBufferGetHeight($0) == height }) else {
                         throw Self.error(2, "RIFE 输出数量或尺寸不一致")
@@ -208,16 +376,41 @@ final class SPRifeBridge: NSObject {
                     self.streamKey = SPRifeContinuityKey(address: UInt(bitPattern: Unmanaged.passUnretained(current).toOpaque()),
                         identity: currentID, pts: currentPTS, generation: generation, clockEpoch: clockEpoch)
                     self.state.lock(); let stillActive = self.epoch == seen; self.state.unlock()
-                    guard stillActive else { stream.reset(); self.streamPrevious = nil; self.streamKey = nil; throw Self.error(1, "RIFE 结果属于旧会话") }
+                    guard stillActive else {
+#if ODF_AIR_SERVICE_TRACE
+                        self.airServiceEvent(.streamResetBegin, token: token, detail: 2)
+#endif
+                        stream.reset(); self.streamPrevious = nil; self.streamKey = nil
+#if ODF_AIR_SERVICE_TRACE
+                        self.airServiceEvent(.streamResetEnd, token: token, detail: 2)
+#endif
+                        throw Self.error(1, "RIFE 结果属于旧会话")
+                    }
+#if ODF_AIR_SERVICE_TRACE
+                    self.airServiceEvent(.wrapBegin, token: token)
+#endif
                     let owned = frames.map { buffer in
                         CVBufferPropagateAttachments(previous, buffer); Self.attach709IfMissing(buffer)
                         return SPOwnedPixelBuffer(retaining: buffer)
                     }
+#if ODF_AIR_SERVICE_TRACE
+                    self.airServiceEvent(.wrapEnd, token: token)
+                    self.airServiceEvent(.completionWillDeliver, token: token, detail: UInt64(owned.count))
+#endif
                     completion(token, owned, recordTiming(self), nil)
                 } catch {
+#if ODF_AIR_SERVICE_TRACE
+                    self.airServiceEvent(.streamResetBegin, token: token, detail: 3)
+#endif
                     self.stream?.reset(); self.streamPrevious = nil; self.streamKey = nil; self.count("resets")
+#if ODF_AIR_SERVICE_TRACE
+                    self.airServiceEvent(.streamResetEnd, token: token, detail: 3)
+#endif
                     let failure = Self.explain(error) as NSError
                     if failure.domain == "app.openduckframe.rife" && failure.code == 10 {
+#if ODF_AIR_SERVICE_TRACE
+                        self.airServiceEvent(.completionWillFail, token: token, detail: UInt64(bitPattern: Int64(failure.code)))
+#endif
                         completion(token, nil, recordTiming(self), failure)
                         return
                     }
@@ -226,22 +419,34 @@ final class SPRifeBridge: NSObject {
                     do {
                         self.state.lock(); let active = self.epoch == seen; self.state.unlock()
                         guard active else { throw Self.error(1, "RIFE 结果属于旧会话") }
-                        let left = try measuredBGRA(self, previous), right = try measuredBGRA(self, current)
-                        let frames = try engine.interpolate(previous: left, current: right, timesteps: phases)
+                        let left = try measuredBGRA(self, previous, role: 3), right = try measuredBGRA(self, current, role: 4)
+                        let frames = try measuredFallback(self) { try engine.interpolate(previous: left, current: right, timesteps: phases) }
                         guard frames.count == phases.count, frames.allSatisfy({
                             CVPixelBufferGetWidth($0) == CVPixelBufferGetWidth(previous) &&
                             CVPixelBufferGetHeight($0) == CVPixelBufferGetHeight(previous)
                         }) else { throw Self.error(2, "RIFE 回退输出数量或尺寸不一致") }
                         self.state.lock(); let stillActive = self.epoch == seen; self.state.unlock()
                         guard stillActive else { throw Self.error(1, "RIFE 结果属于旧会话") }
+#if ODF_AIR_SERVICE_TRACE
+                        self.airServiceEvent(.wrapBegin, token: token, detail: 1)
+#endif
                         let owned = frames.map { buffer in
                             CVBufferPropagateAttachments(left, buffer); Self.attach709IfMissing(buffer)
                             return SPOwnedPixelBuffer(retaining: buffer)
                         }
+#if ODF_AIR_SERVICE_TRACE
+                        self.airServiceEvent(.wrapEnd, token: token, detail: 1)
+#endif
                         self.count("fallbackSucceeded")
+#if ODF_AIR_SERVICE_TRACE
+                        self.airServiceEvent(.completionWillDeliver, token: token, detail: UInt64(owned.count))
+#endif
                         completion(token, owned, recordTiming(self), nil)
                     } catch {
                         self.count("fallbackFailed")
+#if ODF_AIR_SERVICE_TRACE
+                        self.airServiceEvent(.completionWillFail, token: token, detail: UInt64(bitPattern: Int64((error as NSError).code)))
+#endif
                         completion(token, nil, recordTiming(self), Self.explain(error))
                     }
                 }
@@ -277,10 +482,16 @@ final class SPRifeBridge: NSObject {
     @objc func resetLiveCacheForRateBudgetProbe() {
         // Enqueued before the first probe job on the same serial exec queue.
         exec.async {
+#if ODF_AIR_SERVICE_TRACE
+            self.airServiceEvent(.streamResetBegin, token: 0, detail: 4)
+#endif
             self.stream?.reset()
             self.streamPrevious = nil
             self.streamKey = nil
             self.streamPreviousFormat = 0
+#if ODF_AIR_SERVICE_TRACE
+            self.airServiceEvent(.streamResetEnd, token: 0, detail: 4)
+#endif
         }
     }
 
@@ -293,8 +504,14 @@ final class SPRifeBridge: NSObject {
         // while the stream is still using it on the GPU.
         exec.async {
             if self.streamPrevious != nil {
+#if ODF_AIR_SERVICE_TRACE
+                self.airServiceEvent(.streamResetBegin, token: 0, detail: 5)
+#endif
                 self.stream?.reset(); self.streamPrevious = nil; self.streamKey = nil
                 self.count("pressureResets")
+#if ODF_AIR_SERVICE_TRACE
+                self.airServiceEvent(.streamResetEnd, token: 0, detail: 5)
+#endif
             }
             self.state.lock(); self.pressureResetQueued = false; self.state.unlock()
         }
@@ -359,7 +576,13 @@ final class SPRifeBridge: NSObject {
         state.unlock()
         exec.async {
             if self.streamEpoch < invalidatedEpoch {
+#if ODF_AIR_SERVICE_TRACE
+                self.airServiceEvent(.streamResetBegin, token: 0, detail: 6)
+#endif
                 self.stream?.reset(); self.stream = nil; self.streamPrevious = nil; self.streamKey = nil; self.outputPool = nil
+#if ODF_AIR_SERVICE_TRACE
+                self.airServiceEvent(.streamResetEnd, token: 0, detail: 6)
+#endif
             }
             _ = engine
         }
@@ -545,7 +768,8 @@ final class SPRifeBridge: NSObject {
         return bundled
     }
 
-    private func ownedBGRA(_ source: CVPixelBuffer) throws -> CVPixelBuffer {
+    private func ownedBGRA(_ source: CVPixelBuffer, diagnosticToken: UInt64 = 0,
+                           diagnosticRole: UInt64 = 0) throws -> CVPixelBuffer {
         let format = CVPixelBufferGetPixelFormatType(source)
         if format == kCVPixelFormatType_32BGRA || format == kCVPixelFormatType_32RGBA {
             return source
@@ -562,6 +786,9 @@ final class SPRifeBridge: NSObject {
         let height = CVPixelBufferGetHeight(source)
         guard width >= 2, height >= 2 else { throw Self.error(6, "画面尺寸太小，不能交给 RIFE。") }
         let bgra = try Self.buffer(width: width, height: height, value: 0)
+#if ODF_AIR_SERVICE_TRACE
+        airServiceEvent(.vtTransferCall, token: diagnosticToken, detail: diagnosticRole, sourceFourCC: format)
+#endif
         let status = VTPixelTransferSessionTransferImage(transfer!, from: source, to: bgra)
         guard status == noErr else {
             throw Self.error(1, "当前画面是 \(Self.formatName(format))。RIFE 只接受 8 位 BGRA 或 RGBA，转换失败（\(status)）。HDR 不能用这套模型。")
@@ -727,3 +954,192 @@ final class SPRifeBridge: NSObject {
         NSError(domain: "app.openduckframe.rife", code: code, userInfo: [NSLocalizedDescriptionKey: text])
     }
 }
+
+#if ODF_AIR_SERVICE_TRACE
+private enum SPAirServiceEventKind: UInt32 {
+    case enqueueCallBegin = 1, execBegin, ownedBGRABegin, ownedBGRAEnd
+    case streamCreateBegin, streamCreateEnd, streamResetBegin, streamResetEnd, cacheDecision
+    case pushBegin, pushEnd, outputPoolBegin, outputPoolEnd, wrapBegin, wrapEnd
+    case fallbackBegin, fallbackEnd, latencyFinishBegin, latencyFinishEnd
+    case completionWillDeliver, completionWillFail, retiredBeforeExecution, unsupportedStatelessSubmit
+    case vtTransferCall
+    var label: String {
+        switch self {
+        case .enqueueCallBegin: return "enqueue-call-begin"
+        case .execBegin: return "exec-begin"
+        case .ownedBGRABegin: return "ownedBGRA-begin"
+        case .ownedBGRAEnd: return "ownedBGRA-end"
+        case .streamCreateBegin: return "stream-create-begin"
+        case .streamCreateEnd: return "stream-create-end"
+        case .streamResetBegin: return "stream-reset-begin"
+        case .streamResetEnd: return "stream-reset-end"
+        case .cacheDecision: return "cache-decision"
+        case .pushBegin: return "push-begin"
+        case .pushEnd: return "push-end"
+        case .outputPoolBegin: return "output-pool-begin"
+        case .outputPoolEnd: return "output-pool-end"
+        case .wrapBegin: return "wrap-begin"
+        case .wrapEnd: return "wrap-end"
+        case .fallbackBegin: return "fallback-begin"
+        case .fallbackEnd: return "fallback-end"
+        case .latencyFinishBegin: return "latency-finish-begin"
+        case .latencyFinishEnd: return "latency-finish-end"
+        case .completionWillDeliver: return "completion-will-deliver"
+        case .completionWillFail: return "completion-will-fail"
+        case .retiredBeforeExecution: return "retired-before-execution"
+        case .unsupportedStatelessSubmit: return "unsupported-stateless-submit"
+        case .vtTransferCall: return "vt-transfer-call"
+        }
+    }
+}
+
+private struct SPAirServiceMetadata {
+    var token: UInt64 = 0, configVersion: UInt64 = 0, measurementEpoch: UInt64 = 0
+    var probe = false
+    var probeIndex: Int64 = -1
+    var probeRound: UInt64 = 0
+}
+private struct SPAirServiceJob {
+    var sequence: UInt64 = 0, jobID: UInt64 = 0, admissionHostTicks: UInt64 = 0
+    var metadata = SPAirServiceMetadata(), metadataMatched = false
+    var previousID: UInt64 = 0, currentID: UInt64 = 0, generation: UInt64 = 0, clockEpoch: UInt64 = 0, bridgeEpoch: UInt64 = 0
+    var previousPTSValue: Int64 = 0, currentPTSValue: Int64 = 0
+    var previousPTSTimescale: Int32 = 0, currentPTSTimescale: Int32 = 0
+    var previousPTSEpoch: Int64 = 0, currentPTSEpoch: Int64 = 0
+}
+private struct SPAirServiceEvent {
+    var sequence: UInt64 = 0, jobID: UInt64 = 0, hostTicks: UInt64 = 0, detail: UInt64 = 0
+    var kind = SPAirServiceEventKind.enqueueCallBegin
+    var value: Double = 0
+    var sourceFourCC: UInt32 = 0
+}
+private struct SPAirServiceGPU {
+    var sequence: UInt64 = 0, sampleHostTicks: UInt64 = 0
+    var record = AirServiceTraceRecord()
+}
+
+// Storage only: caller holds the existing bridge state lock. All elements are
+// scalar structs; no dictionaries, growing arrays, callbacks or I/O on writers.
+private final class SPAirServiceRing<T> {
+    let capacity: Int
+    let storage: UnsafeMutablePointer<T>
+    private(set) var total: UInt64 = 0
+    init(capacity: Int, initial: T) {
+        self.capacity = capacity
+        storage = .allocate(capacity: capacity)
+        storage.initialize(repeating: initial, count: capacity)
+    }
+    deinit { storage.deinitialize(count: capacity); storage.deallocate() }
+    func append(_ value: T) {
+        storage[Int(total % UInt64(capacity))] = value
+        total &+= 1
+    }
+    func copy() -> [T] {
+        let count = Int(min(total, UInt64(capacity)))
+        var result: [T] = []; result.reserveCapacity(count)
+        let first = total - UInt64(count)
+        for index in 0..<count { result.append(storage[Int((first + UInt64(index)) % UInt64(capacity))]) }
+        return result
+    }
+}
+
+private final class SPAirServiceTraceStore {
+    let jobs = SPAirServiceRing(capacity: 4096, initial: SPAirServiceJob())
+    let events = SPAirServiceRing(capacity: 65536, initial: SPAirServiceEvent())
+    let gpu = SPAirServiceRing(capacity: 32768, initial: SPAirServiceGPU())
+    var nextMetadata = SPAirServiceMetadata()
+    var runtimeOverflow: UInt64 = 0, metadataMismatches: UInt64 = 0, exportCount: UInt64 = 0
+    var modelIdentity: [String: Any] = [:] // Prepared once, never built on a job path.
+    func admit(token: UInt64, previousID: UInt64, currentID: UInt64,
+               previousPTS: CMTime, currentPTS: CMTime, generation: UInt64, clockEpoch: UInt64, bridgeEpoch: UInt64) {
+        var job = SPAirServiceJob()
+        job.sequence = jobs.total + 1; job.jobID = token; job.admissionHostTicks = mach_absolute_time()
+        job.metadataMatched = nextMetadata.token == token
+        if job.metadataMatched { job.metadata = nextMetadata } else { metadataMismatches &+= 1 }
+        nextMetadata = SPAirServiceMetadata()
+        job.previousID = previousID; job.currentID = currentID; job.generation = generation
+        job.clockEpoch = clockEpoch; job.bridgeEpoch = bridgeEpoch
+        job.previousPTSValue = previousPTS.value; job.previousPTSTimescale = previousPTS.timescale; job.previousPTSEpoch = previousPTS.epoch
+        job.currentPTSValue = currentPTS.value; job.currentPTSTimescale = currentPTS.timescale; job.currentPTSEpoch = currentPTS.epoch
+        jobs.append(job)
+    }
+    func appendEvent(kind: SPAirServiceEventKind, token: UInt64, host: UInt64, detail: UInt64, value: Double, sourceFourCC: UInt32) {
+        events.append(SPAirServiceEvent(sequence: events.total + 1, jobID: token, hostTicks: host, detail: detail, kind: kind, value: value, sourceFourCC: sourceFourCC))
+    }
+    func appendGPU(_ record: AirServiceTraceRecord) {
+        gpu.append(SPAirServiceGPU(sequence: gpu.total + 1, sampleHostTicks: mach_absolute_time(), record: record))
+    }
+    func copySnapshot() -> SPAirServiceSnapshot {
+        exportCount &+= 1
+        return SPAirServiceSnapshot(sampleHostTicks: mach_absolute_time(), jobs: jobs.copy(), events: events.copy(), gpu: gpu.copy(),
+            jobTotal: jobs.total, eventTotal: events.total, gpuTotal: gpu.total, runtimeOverflow: runtimeOverflow,
+            metadataMismatches: metadataMismatches, exportOrdinal: exportCount, modelIdentity: modelIdentity)
+    }
+}
+
+private struct SPAirServiceSnapshot {
+    let sampleHostTicks: UInt64
+    let jobs: [SPAirServiceJob], events: [SPAirServiceEvent], gpu: [SPAirServiceGPU]
+    let jobTotal: UInt64, eventTotal: UInt64, gpuTotal: UInt64, runtimeOverflow: UInt64, metadataMismatches: UInt64, exportOrdinal: UInt64
+    let modelIdentity: [String: Any]
+    func export(cutoffHostTicks: UInt64, bridgeEpoch: UInt64) -> [String: Any] {
+        func ring(_ capacity: UInt64, _ total: UInt64, _ rows: [[String: Any]]) -> [String: Any] {
+            return ["capacity": capacity, "total": total, "dropped": total > capacity ? total - capacity : 0,
+                "firstseq": rows.first?["sequence"] ?? NSNull(), "lastseq": rows.last?["sequence"] ?? NSNull(),
+                "exportedCount": rows.count, "records": rows]
+        }
+        let jobRows: [[String: Any]] = jobs.filter { $0.admissionHostTicks <= cutoffHostTicks }.map { j in
+            ["sequence": j.sequence, "jobID": j.jobID, "admissionHostTicks": j.admissionHostTicks,
+             "metadataMatched": j.metadataMatched, "kind": j.metadataMatched ? (j.metadata.probe ? "probe" : "ordinary") : "unknown",
+             "configVersion": j.metadataMatched ? j.metadata.configVersion as Any : NSNull(),
+             "measurementEpoch": j.metadataMatched ? j.metadata.measurementEpoch as Any : NSNull(),
+             "probeIndex": j.metadataMatched && j.metadata.probe ? j.metadata.probeIndex as Any : NSNull(),
+             "probeRound": j.metadataMatched && j.metadata.probe ? j.metadata.probeRound as Any : NSNull(),
+             "previousID": j.previousID, "currentID": j.currentID, "generation": j.generation, "clockEpoch": j.clockEpoch, "bridgeEpoch": j.bridgeEpoch,
+             "previousPTS": ["value": j.previousPTSValue, "timescale": Int64(j.previousPTSTimescale), "epoch": j.previousPTSEpoch],
+             "currentPTS": ["value": j.currentPTSValue, "timescale": Int64(j.currentPTSTimescale), "epoch": j.currentPTSEpoch]]
+        }
+        let eventRows: [[String: Any]] = events.filter { $0.hostTicks <= cutoffHostTicks }.map { e in
+            ["sequence": e.sequence, "jobID": e.jobID == 0 ? NSNull() : e.jobID as Any,
+             "hostTicks": e.hostTicks, "kind": e.kind.label, "detail": e.detail,
+             "latencySeconds": e.kind == .latencyFinishEnd ? e.value as Any : NSNull(),
+             "cacheHit": e.kind == .cacheDecision ? (e.value == 1) as Any : NSNull(),
+             "role": e.kind == .vtTransferCall ? e.detail as Any : NSNull(),
+             "sourceFourCC": e.kind == .vtTransferCall ? e.sourceFourCC as Any : NSNull(),
+             "errorCode": e.kind == .completionWillFail ? Int64(bitPattern: e.detail) as Any : NSNull()]
+        }
+        let gpuRows: [[String: Any]] = gpu.filter { $0.sampleHostTicks <= cutoffHostTicks }.map { row in
+            let r = row.record
+            func ticks(_ value: UInt64, _ bit: UInt32) -> Any { (r.validityMask & bit) != 0 ? value as Any : NSNull() }
+            func seconds(_ value: Double, _ bit: UInt32) -> Any { (r.validityMask & bit) != 0 && value.isFinite && value > 0 ? value as Any : NSNull() }
+            return ["sequence": row.sequence, "sampleHostTicks": row.sampleHostTicks, "jobID": r.jobID, "stage": r.stage, "rootIndex": r.rootIndex,
+                "createHostTicks": ticks(r.createHostTicks, 1), "commitBeginHostTicks": ticks(r.commitBeginHostTicks, 2), "commitEndHostTicks": ticks(r.commitEndHostTicks, 2),
+                "waitBeginHostTicks": ticks(r.waitBeginHostTicks, 4), "waitEndHostTicks": ticks(r.waitEndHostTicks, 4),
+                "commitKind": r.commitKind, "status": (r.validityMask & 8) != 0 ? r.status as Any : NSNull(),
+                "validityMask": r.validityMask, "coverageFlags": r.coverageFlags,
+                "gpuStartSeconds": seconds(r.gpuStartSeconds, 16), "gpuEndSeconds": seconds(r.gpuEndSeconds, 16),
+                "kernelStartSeconds": seconds(r.kernelStartSeconds, 32), "kernelEndSeconds": seconds(r.kernelEndSeconds, 32)]
+        }
+        var timebase = mach_timebase_info_data_t(); mach_timebase_info(&timebase)
+        let overflow = (jobTotal > 4096 ? jobTotal - 4096 : 0) + (eventTotal > 65536 ? eventTotal - 65536 : 0) +
+            (gpuTotal > 32768 ? gpuTotal - 32768 : 0) + runtimeOverflow
+        let invalidGPU = gpuRows.filter { ($0["gpuStartSeconds"] is NSNull) || ($0["gpuEndSeconds"] is NSNull) }.count
+        let invalidKernel = gpuRows.filter { ($0["kernelStartSeconds"] is NSNull) || ($0["kernelEndSeconds"] is NSNull) }.count
+        let incompleteGPU = gpuRows.filter { (($0["coverageFlags"] as? UInt32 ?? 0) & 6) != 0 }.count
+        let stateless = eventRows.filter { ($0["kind"] as? String) == "unsupported-stateless-submit" }.count
+        return ["enabled": true, "compiled": true, "schema": "odf.air-service-trace.v1", "exportOrdinal": exportOrdinal,
+            "exportCutoffHostTicks": cutoffHostTicks, "sampleHostTicks": sampleHostTicks, "bridgeEpochAtSnapshot": bridgeEpoch,
+            "modelIdentity": modelIdentity, "overflowCount": overflow, "runtimeOverflowCount": runtimeOverflow,
+            "metadataMismatches": metadataMismatches, "invalidGPUTimingRows": invalidGPU, "invalidKernelTimingRows": invalidKernel, "incompleteGPUCoverageRows": incompleteGPU,
+            "unsupportedStatelessSubmits": stateless, "ringsComplete": overflow == 0,
+            "machTimebase": ["numer": timebase.numer, "denom": timebase.denom],
+            "jobs": ring(4096, jobTotal, jobRows), "events": ring(65536, eventTotal, eventRows), "gpu": ring(32768, gpuTotal, gpuRows),
+            "stageLabels": ["1": "stream-create", "2": "cache-prime", "3": "main-push", "4": "stateless-fallback"],
+            "ownedBGRARoles": ["1": "previous", "2": "current", "3": "fallback-previous", "4": "fallback-current"],
+            "resetReasons": ["1": "cache-miss", "2": "retired-after-push", "3": "stream-catch", "4": "rate-budget-probe", "5": "capture-pressure", "6": "invalidate"],
+            "cacheDecisionMask": ["1": "source-formats-equal", "2": "cached-format-equal", "4": "retained-previous-object-equal", "8": "continuity-key-equal"],
+            "sourceStoppedScope": "Controlled SelfProbe export after SCK stop and before processor.stop; copies existing-state-lock POD storage without exec.sync, GPU wait or flush. Only the current bridge instance is covered. In-flight jobs/root timing updates after cutoff remain unknown; counters are at sampleHostTicks, records are cutoff-filtered.",
+            "scope": "Trace-only; original jobID is the unconditional processor diagnosticID shared by ordinary and probe jobs. No ring reset on config/epoch. HostTicks are mach_absolute_time; GPU seconds are Metal documented host time in seconds. kernel seconds are raw Metal CFTimeInterval; their clock coordinate is not established by the local SDK, so no cross-domain subtraction is claimed. enqueue-call-begin brackets the dispatch submission request, not private queue admission. CPU event clocks are call-boundary wall times including normal waits; no claim of active CPU cycles. GPU command-buffer residency intervals are not active shader cycles. Implicit MPS commit brackets surround super.commitAndContinue, not its private exact commit instant; root create is first observation. Repeated (jobID,stage,rootIndex) rows are later observations of the same root, not extra GPU work. Invalid/unsupported timing is null. No completion callback was installed; GPU data is sampled after existing waits, never a CPU handler-arrival substitute. prepare/warmup before job admission is excluded; stateless submit is explicitly unsupported. No display/quality acceptance."]
+    }
+}
+#endif

@@ -37,6 +37,53 @@ static double SPProbeNow(void) { return (double)SPProbeNs(mach_absolute_time()) 
 static NSDictionary *SPProbeRect(NSRect r) {
     return @{ @"x": @(r.origin.x), @"y": @(r.origin.y), @"width": @(r.size.width), @"height": @(r.size.height) };
 }
+static NSString *SPProbeFourCC(OSType format) {
+    const uint8_t bytes[4] = { (uint8_t)(format >> 24), (uint8_t)(format >> 16), (uint8_t)(format >> 8), (uint8_t)format };
+    BOOL printable = YES;
+    for (NSUInteger i = 0; i < 4; ++i) printable = printable && bytes[i] >= 32 && bytes[i] <= 126;
+    return printable ? [[NSString alloc] initWithBytes:bytes length:4 encoding:NSASCIIStringEncoding]
+        : [NSString stringWithFormat:@"0x%08x", (unsigned)format];
+}
+// Copy only JSON scalar color metadata, never an attachment object description,
+// ICC payload, borrowed sample or SCK surface. Used once, on the capture queue.
+static id SPProbeColorAttachmentJSON(CVPixelBufferRef buffer, CFStringRef key) {
+    CFTypeRef value = CVBufferCopyAttachment(buffer, key, nullptr);
+    if (!value) return NSNull.null;
+    id result = NSNull.null;
+    const CFTypeID type = CFGetTypeID(value);
+    if (type == CFStringGetTypeID()) result = [(__bridge NSString *)value copy];
+    else if (type == CFBooleanGetTypeID()) result = @(CFBooleanGetValue((CFBooleanRef)value));
+    else if (type == CFNumberGetTypeID()) {
+        double number = 0;
+        if (CFNumberGetValue((CFNumberRef)value, kCFNumberDoubleType, &number) && std::isfinite(number)) result = @(number);
+    } else result = @{ @"unsupportedCFTypeID": @(type) };
+    CFRelease(value);
+    return result;
+}
+static NSDictionary *SPProbeFirstCaptureMetadata(CMSampleBufferRef sample, CVPixelBufferRef buffer, uint64_t host, uint64_t callback) {
+    const OSType format = CVPixelBufferGetPixelFormatType(buffer);
+    CMFormatDescriptionRef description = CMSampleBufferGetFormatDescription(sample);
+    CFTypeRef space = CVBufferCopyAttachment(buffer, kCVImageBufferCGColorSpaceKey, nullptr);
+    NSString *spaceName = nil;
+    const BOOL validSpace = space && CFGetTypeID(space) == CGColorSpaceGetTypeID();
+    if (validSpace) {
+        CFStringRef name = CGColorSpaceCopyName((CGColorSpaceRef)space);
+        if (name) { spaceName = [(__bridge NSString *)name copy]; CFRelease(name); }
+    }
+    NSDictionary *result = @{ @"callbackOrdinal": @(callback), @"hostTicks": @(host),
+        @"pixelBufferFourCC": SPProbeFourCC(format), @"pixelBufferFormatType": @(format),
+        @"sampleFormatSubtypeFourCC": description ? SPProbeFourCC(CMFormatDescriptionGetMediaSubType(description)) : (id)NSNull.null,
+        @"sampleFormatSubtype": description ? @(CMFormatDescriptionGetMediaSubType(description)) : (id)NSNull.null,
+        @"width": @(CVPixelBufferGetWidth(buffer)), @"height": @(CVPixelBufferGetHeight(buffer)),
+        @"colorPrimaries": SPProbeColorAttachmentJSON(buffer, kCVImageBufferColorPrimariesKey),
+        @"transferFunction": SPProbeColorAttachmentJSON(buffer, kCVImageBufferTransferFunctionKey),
+        @"yCbCrMatrix": SPProbeColorAttachmentJSON(buffer, kCVImageBufferYCbCrMatrixKey),
+        @"cgColorSpaceAttachmentPresent": @(space != nullptr), @"cgColorSpaceAttachmentTypeValid": @(validSpace),
+        @"cgColorSpaceName": spaceName ?: (id)NSNull.null,
+        @"scope": @"First valid/data-ready complete SCK image buffer, before content gating/copy. Scalar CVBuffer color attachments copied once; missing values stay null, no inferred color space or image content." };
+    if (space) CFRelease(space);
+    return result;
+}
 static NSDictionary *SPProbeScreenshot(CGImageRef image) {
     if (!image) return @{ @"imagePresent": @NO, @"nonblankSample": @NO };
     uint8_t pixels[32 * 32 * 4] = {};
@@ -294,6 +341,11 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
     uint64_t _drawableValid, _drawableSource, _drawableSynthetic, _drawableUnscored, _gpuCompletions;
     double _firstDrawableHost;
     uint64_t _callbacks, _complete, _idle, _invalid, _gateAdmitted, _gateDuplicates, _copied, _copyFailed;
+    std::atomic<uint64_t> _formatBuffers, _formatRequestedMatches, _formatUnexpected, _formatChanges;
+    std::atomic<uint32_t> _formatFirst, _formatLast;
+    NSDictionary *_firstCaptureMetadata;
+    NSString *_requestedCaptureFormat;
+    OSType _requestedCapturePixelFormat;
     int _bufferWidth, _bufferHeight;
     double _firstCallbackHost, _lastCallbackHost, _maxCallbackGap;
     NSMutableArray<NSNumber *> *_callbackGapsMs;
@@ -327,6 +379,7 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
 - (void)finish:(BOOL)complete;
 - (void)stopStreamAndFinalize:(BOOL)complete;
 - (void)recordSourceUpdateStarted:(uint64_t)started drawCallsBefore:(uint64_t)drawCalls initial:(BOOL)initial;
+- (NSDictionary *)captureFormatSnapshotOnCaptureQueue;
 @end
 
 @implementation SPSelfWindowCaptureProbe
@@ -336,6 +389,10 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
     _widthPoints = [options[@"source-width-points"] doubleValue]; _heightPoints = [options[@"source-height-points"] doubleValue];
     _seconds = [options[@"seconds"] doubleValue]; _minimumIdle = [options[@"minimum-idle-seconds"] doubleValue];
     _sourceFPS = [options[@"source-fps"] unsignedIntegerValue];
+    _requestedCaptureFormat = [options[@"capture-format"] copy];
+    _requestedCapturePixelFormat = [_requestedCaptureFormat isEqual:@"bgra"] ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    _formatBuffers.store(0); _formatRequestedMatches.store(0); _formatUnexpected.store(0); _formatChanges.store(0);
+    _formatFirst.store(0); _formatLast.store(0);
     _phase = -1; _stopping.store(false); _startHost = SPProbeNow();
     _captureQueue = dispatch_queue_create("app.openduckframe.self-window-probe.capture", DISPATCH_QUEUE_SERIAL);
     _drawableLock = [NSLock new]; _drawableEvents = [NSMutableArray array];
@@ -346,7 +403,8 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
         @"captureAPI": @"getCurrentProcessShareableContentWithCompletionHandler:", @"globalEnumeration": @NO,
         @"permissionRequests": @NO, @"focusActivation": @NO,
         @"gpuCompletionCounterScope": @"surfaceReady is warmup-token gated and this probe does not arm that token; gpuCompletedCallbacks is not total render throughput. Presented-event gpuHost is CPU completed-handler arrival, not a hardware GPU end timestamp.",
-        @"configuredSourceFPS": @(_sourceFPS), @"sourceUpdatesEnabled": @(![_arm isEqual:@"bare"]),
+        @"configuredSourceFPS": @(_sourceFPS), @"requestedCaptureFormat": _requestedCaptureFormat,
+        @"sourceUpdatesEnabled": @(![_arm isEqual:@"bare"]),
         @"sourcePattern": [NSString stringWithFormat:@"browser-samples/index.html mostly-static 1280x720 motion geometry, paced at %lu new content slots/sec", (unsigned long)_sourceFPS],
         @"mainBundle": NSBundle.mainBundle.bundlePath ?: @"", @"timeline": _timeline, @"phases": _phases } mutableCopy];
     mach_timebase_info_data_t timebase = {}; mach_timebase_info(&timebase);
@@ -410,6 +468,7 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
     dispatch_sync(_captureQueue, ^{
         capture = @{ @"callbacks": @(self->_callbacks), @"complete": @(self->_complete), @"idle": @(self->_idle),
             @"invalid": @(self->_invalid), @"statuses": [self->_captureStatuses copy],
+            @"formatObservation": [self captureFormatSnapshotOnCaptureQueue],
             @"gateAdmitted": @(self->_gateAdmitted), @"gateDuplicates": @(self->_gateDuplicates),
             @"copied": @(self->_copied), @"copyFailed": @(self->_copyFailed),
             @"bufferWidth": @(self->_bufferWidth), @"bufferHeight": @(self->_bufferHeight),
@@ -445,6 +504,21 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
     }
     _previousSnapshot = row; _lastSnapshotHost = now;
     return row;
+}
+- (NSDictionary *)captureFormatSnapshotOnCaptureQueue {
+    const uint64_t observed = _formatBuffers.load(std::memory_order_relaxed);
+    const OSType first = _formatFirst.load(std::memory_order_relaxed), last = _formatLast.load(std::memory_order_relaxed);
+    return @{ @"requestedCaptureFormat": _requestedCaptureFormat, @"requestedFourCC": SPProbeFourCC(_requestedCapturePixelFormat),
+        @"requestedPixelFormatType": @(_requestedCapturePixelFormat), @"observedImageBuffers": @(observed),
+        @"requestedFormatMatches": @(_formatRequestedMatches.load(std::memory_order_relaxed)),
+        @"unexpectedFormatBuffers": @(_formatUnexpected.load(std::memory_order_relaxed)),
+        @"actualFormatChanges": @(_formatChanges.load(std::memory_order_relaxed)),
+        @"firstActualFourCC": observed ? SPProbeFourCC(first) : (id)NSNull.null,
+        @"firstActualPixelFormatType": observed ? @(first) : (id)NSNull.null,
+        @"lastActualFourCC": observed ? SPProbeFourCC(last) : (id)NSNull.null,
+        @"lastActualPixelFormatType": observed ? @(last) : (id)NSNull.null,
+        @"firstFrame": _firstCaptureMetadata ?: (id)NSNull.null,
+        @"scope": @"Whole-run atomic scalar counts of valid/data-ready complete SCK image buffers before gate/copy, including warmup and all phases; idle/invalid/missing-buffer callbacks excluded. Changes compare consecutive observed formats. Capture-queue snapshot, no reset, no pixel sampling or content-ID/source one-to-one claim; color differences are observations, not acceptance gates." };
 }
 - (void)beginPhase:(NSInteger)phase {
     _phase = phase; _phaseStart = SPProbeNow();
@@ -652,10 +726,11 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
                 @"ownerMatchesProcess": @(owned.owningApplication.processID == getpid()), @"scWindowFrame": SPProbeRect(owned.frame),
                 @"filterContentRect": SPProbeRect(filter.contentRect), @"pointPixelScale": @(filter.pointPixelScale), @"configuredWidth": @(width), @"configuredHeight": @(height),
                 @"configurationGeometrySource": @"exact own NSView backing bounds; current-process SCK metadata is redacted", @"ownSourceBackingBounds": SPProbeRect(ownBacking),
-                @"pixelFormat": @"420v", @"colorSpace": @"ITU-R BT.709", @"queueDepth": @3, @"minimumFrameInterval": @0,
+                @"requestedCaptureFormat": strong->_requestedCaptureFormat, @"pixelFormat": SPProbeFourCC(strong->_requestedCapturePixelFormat),
+                @"pixelFormatType": @(strong->_requestedCapturePixelFormat), @"colorSpace": @"ITU-R BT.709", @"queueDepth": @3, @"minimumFrameInterval": @0,
                 @"queueDepthObservation": @"Configured only; internal SCK pool occupancy is not observable." };
             SCStreamConfiguration *config = [SCStreamConfiguration new]; config.width = width; config.height = height;
-            config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange; config.queueDepth = 3; config.minimumFrameInterval = kCMTimeZero;
+            config.pixelFormat = strong->_requestedCapturePixelFormat; config.queueDepth = 3; config.minimumFrameInterval = kCMTimeZero;
             config.showsCursor = NO; config.capturesAudio = NO; config.colorSpaceName = kCGColorSpaceITUR_709;
             const BOOL interpolate = [strong->_arm isEqual:@"rife"];
             SPLivePlanRequest *request = [requestType new]; request.requestID = 1; request.interpolationEnabled = interpolate;
@@ -713,6 +788,16 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
         _complete++; if (_complete == 1) [self recordProgress:@"first-complete-capture-frame"];
         if (!CMSampleBufferIsValid(sample) || !CMSampleBufferDataIsReady(sample)) { _invalid++; return; }
         CVPixelBufferRef buffer = CMSampleBufferGetImageBuffer(sample); if (!buffer) { _invalid++; return; }
+        const OSType actualFormat = CVPixelBufferGetPixelFormatType(buffer);
+        const uint64_t observed = _formatBuffers.fetch_add(1, std::memory_order_relaxed);
+        const OSType previousFormat = _formatLast.exchange(actualFormat, std::memory_order_relaxed);
+        if (actualFormat == _requestedCapturePixelFormat) _formatRequestedMatches.fetch_add(1, std::memory_order_relaxed);
+        else _formatUnexpected.fetch_add(1, std::memory_order_relaxed);
+        if (observed && previousFormat != actualFormat) _formatChanges.fetch_add(1, std::memory_order_relaxed);
+        if (!observed) {
+            _formatFirst.store(actualFormat, std::memory_order_relaxed);
+            _firstCaptureMetadata = SPProbeFirstCaptureMetadata(sample, buffer, host, _callbacks);
+        }
         _bufferWidth = (int)CVPixelBufferGetWidth(buffer); _bufferHeight = (int)CVPixelBufferGetHeight(buffer);
         if (![_bridge acceptsBuffer:buffer generation:1 hostNs:SPProbeNs(host)]) { _gateDuplicates++; return; } _gateAdmitted++;
         CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample);
@@ -728,6 +813,9 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error { [self fail:@"own-window SCK stopped" details:error.localizedDescription]; }
 - (void)finalize:(BOOL)complete {
     if (_didFinalize) return; _didFinalize = YES;
+    __block NSDictionary *captureFormat;
+    dispatch_sync(_captureQueue, ^{ captureFormat = [self captureFormatSnapshotOnCaptureQueue]; });
+    _report[@"captureFormatObservation"] = captureFormat;
     if (_bareView) {
         [_timeline addObject:[self snapshot]];
         NSDictionary *bare = [_bareView snapshotIncludingFrames:YES]; _report[@"bareMetal"] = bare;
@@ -828,11 +916,11 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
 @end
 
 static void SPProbeUsage(void) {
-    fprintf(stderr, "Usage: SelfProbe --output /absolute/new.json [--preflight-only | --inspect --dylib /absolute/Release.dylib | --prepared-lifetime-only --dylib /absolute/Release.dylib | --arm bare|passthrough|rife (default rife) [--dylib /absolute/Release.dylib (required except bare)] [--control-only] [--source-fps 24|30 (default 30) --source-width-points 1324 --source-height-points 834 --seconds 12 (5..60) --minimum-idle-seconds 60]]\n");
+    fprintf(stderr, "Usage: SelfProbe --output /absolute/new.json [--preflight-only | --inspect --dylib /absolute/Release.dylib | --prepared-lifetime-only --dylib /absolute/Release.dylib | --arm bare|passthrough|rife (default rife) [--dylib /absolute/Release.dylib (required except bare)] [--control-only] [--source-fps 24|30 (default 30) --capture-format nv12|bgra (default nv12) --source-width-points 1324 --source-height-points 834 --seconds 12 (5..60) --minimum-idle-seconds 60]]\n");
 }
 int main(int argc, const char **argv) {
     @autoreleasepool {
-        NSMutableDictionary *options = [@{ @"arm": @"rife", @"control-only": @NO, @"source-fps": @30, @"source-width-points": @1324, @"source-height-points": @834, @"seconds": @12, @"minimum-idle-seconds": @60 } mutableCopy];
+        NSMutableDictionary *options = [@{ @"arm": @"rife", @"control-only": @NO, @"source-fps": @30, @"capture-format": @"nv12", @"source-width-points": @1324, @"source-height-points": @834, @"seconds": @12, @"minimum-idle-seconds": @60 } mutableCopy];
         BOOL preflightOnly = NO, inspect = NO, preparedLifetimeOnly = NO;
         NSSet *numeric = [NSSet setWithArray:@[@"source-width-points", @"source-height-points", @"seconds", @"minimum-idle-seconds"]];
         for (int i = 1; i < argc; ++i) {
@@ -846,6 +934,9 @@ int main(int argc, const char **argv) {
             if ([key isEqual:@"source-fps"]) {
                 if (![value isEqual:@"24"] && ![value isEqual:@"30"]) { SPProbeUsage(); return 2; }
                 options[key] = @([value integerValue]);
+            } else if ([key isEqual:@"capture-format"]) {
+                if (![value isEqual:@"nv12"] && ![value isEqual:@"bgra"]) { SPProbeUsage(); return 2; }
+                options[key] = value;
             } else if ([numeric containsObject:key]) options[key] = @([value doubleValue]);
             else if ([key isEqual:@"dylib"] || [key isEqual:@"output"] || [key isEqual:@"arm"]) options[key] = value;
             else { SPProbeUsage(); return 2; }
@@ -857,7 +948,7 @@ int main(int argc, const char **argv) {
         if ([options[@"seconds"] doubleValue] < 5 || [options[@"seconds"] doubleValue] > 60 || [options[@"source-width-points"] doubleValue] < 320 || [options[@"source-width-points"] doubleValue] > 1700 || [options[@"source-height-points"] doubleValue] < 240 || [options[@"source-height-points"] doubleValue] > 1100 || [options[@"minimum-idle-seconds"] doubleValue] < 10 || [options[@"minimum-idle-seconds"] doubleValue] > 3600) { SPProbeUsage(); return 2; }
         if (preparedLifetimeOnly) {
             [NSApplication sharedApplication]; [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
-            NSMutableDictionary *result = [@{ @"mode": @"prepared-lifetime-only", @"windowsCreated": @NO,
+            NSMutableDictionary *result = [@{ @"mode": @"prepared-lifetime-only", @"requestedCaptureFormat": options[@"capture-format"], @"windowsCreated": @NO,
                 @"captureStarted": @NO, @"modelPrepared": @NO,
                 @"scope": @"Bounded offscreen GPU texture use, completion and pixel-pool return; no display/FPS or human quality acceptance." } mutableCopy];
             void *loaded = dlopen(dylib.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
@@ -885,7 +976,7 @@ int main(int argc, const char **argv) {
             fprintf(stdout, "%s\n", output.UTF8String); return [result[@"ok"] boolValue] ? 0 : 1;
         }
         if (preflightOnly || inspect) {
-            NSMutableDictionary *result = [@{ @"mode": preflightOnly ? @"preflight-only" : @"inspect", @"arm": options[@"arm"], @"controlOnly": options[@"control-only"], @"configuredSourceFPS": options[@"source-fps"], @"preflight": SPProbePreflight([options[@"minimum-idle-seconds"] doubleValue]), @"windowsCreated": @NO, @"captureStarted": @NO, @"modelPrepared": @NO, @"mainBundle": NSBundle.mainBundle.bundlePath ?: @"" } mutableCopy];
+            NSMutableDictionary *result = [@{ @"mode": preflightOnly ? @"preflight-only" : @"inspect", @"arm": options[@"arm"], @"controlOnly": options[@"control-only"], @"configuredSourceFPS": options[@"source-fps"], @"requestedCaptureFormat": options[@"capture-format"], @"preflight": SPProbePreflight([options[@"minimum-idle-seconds"] doubleValue]), @"windowsCreated": @NO, @"captureStarted": @NO, @"modelPrepared": @NO, @"mainBundle": NSBundle.mainBundle.bundlePath ?: @"" } mutableCopy];
             BOOL ok = YES;
             if (inspect) {
                 void *loaded = dlopen(dylib.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL); const char *loadError = loaded ? nullptr : dlerror();

@@ -13,6 +13,13 @@ static const NSInteger SPRifeBridgeErrorOutputPoolExhausted = 10;
 @interface SPRifeBridge : NSObject
 - (instancetype)initWithResourceBundle:(NSBundle *)bundle;
 @property (nonatomic) BOOL liveStreamEnabled;
+/// Trace-only process gate; false in normal builds. No trace arrays in streamDiagnostics.
+@property (nonatomic, readonly) BOOL serviceTraceEnabled;
+- (void)setServiceTraceToken:(uint64_t)token configVersion:(uint64_t)configVersion
+           measurementEpoch:(uint64_t)measurementEpoch probe:(BOOL)probe
+                 probeIndex:(NSInteger)probeIndex probeRound:(uint64_t)probeRound;
+/// Controlled post-capture export; copies bounded scalar records without waiting for exec/GPU.
+- (NSDictionary<NSString *, id> *)serviceTraceSnapshotAtCutoffHostTicks:(uint64_t)cutoffHostTicks;
 
 - (BOOL)prepareModelID:(NSString *)modelID
                quality:(NSString *)quality

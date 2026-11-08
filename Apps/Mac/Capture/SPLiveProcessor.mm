@@ -3335,6 +3335,10 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     ++_inflight;
     _rifeBusySinceHost = SPHostNow();
     SPLiveProcessor *selfRef = self;
+#if ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC
+    if (_rife.serviceTraceEnabled) [_rife setServiceTraceToken:job->diagnosticID configVersion:job->configVersion
+        measurementEpoch:job->measurementEpoch probe:YES probeIndex:job->probeIndex probeRound:job->probeRound];
+#endif
     BOOL submitted = [_rife submitLivePrevious:job->probeSourceA current:job->probeSourceB
         previousID:job->frameA currentID:job->frameB
         previousPTS:job->probePreviousPTS currentPTS:job->probeCurrentPTS
@@ -5308,6 +5312,14 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
                 @"scope": @"Trace-only diagnostic library. Preallocated POD rings never reset with configuration/measurement epochs. View writes use existing presentationMutex regions; processor writes use existing serial queue. No trace arrays are exported in periodic stats. Capacity overflow makes evidence incomplete. enqueueHostTicks is actual bounded-queue admission, requestStartHostTicks preserves the prior request timestamp. Unassigned cleanup slot/replacement are null. Callback metadata may lack original counts/capture/admission time; join to its admission using endpoint/generation/config/epoch/clock/frameID/requestStartHostTicks. endingInflight is unresolved at cutoff, not confirmed hardware work. Raw positive presented callbacks are recorded before score/context filtering; this is not physical/human acceptance. Budget caller gates are exact; fresh<8 is input evidence, internal persistence/cooldown reasons are not introspected." };
             result = extended;
         }
+#if ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC
+        if (self->_rife.serviceTraceEnabled) {
+            NSMutableDictionary *extended = [result mutableCopy];
+            const uint64_t serviceCutoff = causalCutoff > 0 ? (uint64_t)causalCutoff : (uint64_t)SPHostNow();
+            extended[@"airServiceTrace"] = [self->_rife serviceTraceSnapshotAtCutoffHostTicks:serviceCutoff];
+            result = extended;
+        }
+#endif
     };
     if (dispatch_get_specific(SPLiveQueueKey) == (__bridge void *)self) capture(); else dispatch_sync(_q, capture);
     return result;
@@ -6909,6 +6921,10 @@ presentationHost:(int64_t)presentationHost
         if (heldA != _held.end() && heldB != _held.end()) {
             const auto pa = heldA->second.pts, pb = heldB->second.pts;
             if (pa.den > 0 && pa.den <= INT32_MAX && pb.den > 0 && pb.den <= INT32_MAX) {
+#if ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC
+                if (_rife.serviceTraceEnabled) [_rife setServiceTraceToken:job->diagnosticID configVersion:job->configVersion
+                    measurementEpoch:job->measurementEpoch probe:NO probeIndex:-1 probeRound:0];
+#endif
                 submitted = [_rife submitLivePrevious:a current:b previousID:job->frameA currentID:job->frameB
                     previousPTS:CMTimeMake(pa.num, (int32_t)pa.den) currentPTS:CMTimeMake(pb.num, (int32_t)pb.den)
                     generation:generation clockEpoch:_clockEpoch timesteps:phases token:token completion:finish];
