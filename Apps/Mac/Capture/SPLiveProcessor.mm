@@ -807,6 +807,7 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
     std::atomic<bool> _warmSurfacePending;
     std::atomic<uint64_t> _surfaceToken;
     std::atomic<int> _inflightDraws;
+    BOOL _airPresentationTimingDiagnostic;
     std::mutex _geometryMutex;
     sp::SharedGeometryAuthority _sharedGeometry;
     int64_t _geometryVerifiedHost;
@@ -814,6 +815,8 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
 
 - (instancetype)initWithFrame:(NSRect)frame {
     if (!(self = [super initWithFrame:frame])) return nil;
+    const char *airTiming = getenv("ODF_AIR_PRESENTATION_TIMING_DIAGNOSTIC");
+    _airPresentationTimingDiagnostic = airTiming && strcmp(airTiming, "1") == 0;
     _generation.store(0);
     _highestGeneration = 0;
     _revealedGeneration = 0;
@@ -1594,10 +1597,36 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
         std::atomic<long long> scheduledHost{0};
         std::atomic<double> scheduledMedia{0};
         std::atomic<double> presentRequestMedia{0};
+        std::atomic<long long> texturePreparationEndedHostTicks{0};
+        std::atomic<long long> encodingEndedHostTicks{0};
+        std::atomic<long long> generationLockRequestedHostTicks{0};
+        std::atomic<long long> generationLockAcquiredHostTicks{0};
+        std::atomic<long long> presentationLockRequestedHostTicks{0};
+        std::atomic<long long> presentationLockAcquiredHostTicks{0};
+        std::atomic<long long> deadlineCheckHostTicks{0};
+        std::atomic<double> deadlineCheckMediaTimeSeconds{0};
+        std::atomic<double> deadlineSlackSeconds{0};
+        NSDictionary *timingMetadata(int64_t selectionHost, double deadline) const {
+            const auto checkHost = deadlineCheckHostTicks.load();
+            return @{ @"selectionHostTicks": @(selectionHost),
+                @"texturePreparationEndedHostTicks": @(texturePreparationEndedHostTicks.load()),
+                @"encodingEndedHostTicks": @(encodingEndedHostTicks.load()),
+                @"generationLockRequestedHostTicks": @(generationLockRequestedHostTicks.load()),
+                @"generationLockAcquiredHostTicks": @(generationLockAcquiredHostTicks.load()),
+                @"presentationLockRequestedHostTicks": @(presentationLockRequestedHostTicks.load()),
+                @"presentationLockAcquiredHostTicks": @(presentationLockAcquiredHostTicks.load()),
+                @"deadlineCheckHostTicks": @(checkHost),
+                @"deadlineCheckMediaTimeSeconds": checkHost ? @(deadlineCheckMediaTimeSeconds.load()) : (id)NSNull.null,
+                @"presentDeadlineMediaTimeSeconds": @(deadline),
+                @"deadlineSlackSeconds": checkHost ? @(deadlineSlackSeconds.load()) : (id)NSNull.null,
+                @"scope": @"Opt-in CPU stages only. HostTicks are mach_absolute_time; zero means stage not reached. Deadline CA media time is the actual comparison sample; its HostTicks were sampled immediately before it. Null means comparison not performed. No submission/presentation/GPU success is inferred." };
+        }
     };
     auto note = std::make_shared<SPDrawNote>();
+    const BOOL timingDiagnostic = _airPresentationTimingDiagnostic;
     void (^reportFailure)(NSString *) = ^(NSString *why) {
-        if (counts && self.presentationFailure) self.presentationFailure(@{
+        if (counts && self.presentationFailure) {
+            NSDictionary *info = @{
             @"reason": why, @"generation": @(seen), @"configVersion": @(seenConfig), @"measurementEpoch": @(seenEpoch),
             @"frameID": @(frameID), @"ptsNum": @(ptsNum), @"ptsDen": @(ptsDen), @"synthetic": @(synthetic), @"clockEpoch": @(seenClock),
             @"logicalTargetHost": @(presentationHost), @"presentationEnqueueHost": @(frame.enqueueHost),
@@ -1606,13 +1635,21 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
             @"displayLinkTargetTimestamp": @(presentDeadline), @"displayLinkTargetPresentationTimestamp": @(scheduledDisplayTime),
             @"metalCommitHost": @(note->commitHost.load()), @"metalScheduledHost": @(note->scheduledHost.load()),
             @"metalScheduledMediaTime": @(note->scheduledMedia.load()),
-            @"presentRequestMethod": @"command-buffer-ordinary", @"presentRequestMediaTime": @(note->presentRequestMedia.load()) });
+            @"presentRequestMethod": @"command-buffer-ordinary", @"presentRequestMediaTime": @(note->presentRequestMedia.load()) };
+            if (timingDiagnostic) {
+                NSMutableDictionary *diagnosticInfo = [info mutableCopy];
+                diagnosticInfo[@"airPresentationTiming"] = note->timingMetadata(selectionHost, presentDeadline);
+                info = diagnosticInfo;
+            }
+            self.presentationFailure(info);
+        }
     };
     void (^releaseTicket)(void) = ^{ self->_inflightDraws.fetch_sub(1); };
     CVMetalTextureRef aRef = [self createTexture:primary];
     CVMetalTextureRef bRef = mode == SPLiveViewCompare ? [self createTexture:secondary] : NULL;
     id<MTLTexture> a = aRef ? CVMetalTextureGetTexture(aRef) : nil;
     id<MTLTexture> b = bRef ? CVMetalTextureGetTexture(bRef) : nil;
+    if (timingDiagnostic) note->texturePreparationEndedHostTicks.store(SPHostNow());
     if (!drawable || !a || !self->_pipeline) {
         reportFailure(!drawable ? @"drawable" : (!a ? @"texture" : @"pipeline"));
         if (aRef) CFRelease(aRef);
@@ -1668,6 +1705,7 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
         [self drawTexture:a frameWidth:fw frameHeight:fh viewport:full buffer:command drawable:drawable fill:fillTarget
                   geometry:geometryCandidate.valid ? &geometryCandidate.render : nullptr];
     }
+    if (timingDiagnostic) note->encodingEndedHostTicks.store(SPHostNow());
     self->_inflightDraws.fetch_add(1);
     [command addCompletedHandler:^(id<MTLCommandBuffer> done) {
         if (done.status != MTLCommandBufferStatusCompleted) reportFailure(@"gpu");
@@ -1701,7 +1739,7 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
             [self revealSourceGeneration:seen];
         });
         if (!self.presented) return;
-        self.presented(@{
+        NSDictionary *info = @{
             @"captureHost": @(captureHost),
             @"presentedHost": @(SPHostNow()),
             @"presentedTime": @(presentedDrawable.presentedTime),
@@ -1745,18 +1783,38 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
             @"geometryVersion": geometryActivated ? @(geometryCandidate.version) : (id)[NSNull null],
             @"enhancedCenter": @(-1),
             @"originalCenter": @(-1),
-        });
+        };
+        if (timingDiagnostic) {
+            NSMutableDictionary *diagnosticInfo = [info mutableCopy];
+            diagnosticInfo[@"airPresentationTiming"] = note->timingMetadata(selectionHost, presentDeadline);
+            info = diagnosticInfo;
+        }
+        self.presented(info);
     }];
     // The update's present deadline differs from its future display target.
     // Ordinary command-buffer presentation waits for GPU scheduling before
     // invoking drawable.present(). Timed presents assert for these drawables.
     {
+        if (timingDiagnostic) note->generationLockRequestedHostTicks.store(SPHostNow());
         std::lock_guard<std::mutex> generationLock(_generationMutex);
+        if (timingDiagnostic) note->generationLockAcquiredHostTicks.store(SPHostNow());
+        if (timingDiagnostic) note->presentationLockRequestedHostTicks.store(SPHostNow());
         std::lock_guard<std::mutex> pendingLock(_presentationMutex);
+        if (timingDiagnostic) note->presentationLockAcquiredHostTicks.store(SPHostNow());
         NSString *invalid = seen != _generation.load() ? @"generation" :
             (seenConfig != _diagnosticConfig.load() ? @"configuration" : (seenEpoch != _diagnosticEpoch.load() ? @"epoch" :
                 (seenClock != _presentationClockEpoch.load() ? @"clock-retired" : nil)));
-        if (!invalid && CACurrentMediaTime() >= presentDeadline) invalid = @"display-submit-deadline";
+        if (!invalid) {
+            const int64_t checkHost = timingDiagnostic ? SPHostNow() : 0;
+            // This single existing CA clock sample remains the decision input.
+            const double checkMediaTime = CACurrentMediaTime();
+            if (timingDiagnostic) {
+                note->deadlineCheckHostTicks.store(checkHost);
+                note->deadlineCheckMediaTimeSeconds.store(checkMediaTime);
+                note->deadlineSlackSeconds.store(presentDeadline - checkMediaTime);
+            }
+            if (checkMediaTime >= presentDeadline) invalid = @"display-submit-deadline";
+        }
         if (invalid) { [command commit]; reportFailure(invalid); return; }
         [command addScheduledHandler:^(id<MTLCommandBuffer> scheduled) {
             (void)scheduled;

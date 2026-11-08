@@ -94,3 +94,52 @@ delayed or coalesced windows remain in the timeline but are excluded from the
 qualified one-second fractions. This is offscreen logical playout, with no
 ScreenCaptureKit, Safari, drawable or physical-display/quality acceptance.
 It does not change user preferences or require accessibility/screen recording.
+
+## Self-owned-window capture and presentation diagnostic
+
+`Modules/VideoEnhancement/Tests/SPSelfWindowCaptureProbe.mm` is a standalone
+accessory-app driver for a different layer: a generated 30 Hz source window,
+ScreenCaptureKit, the production content gate/owned copy/processor, and the
+production drawable presenter. It dynamically loads the optimized diagnostic
+library above. Package that library inside its own `Contents/Frameworks`, copy
+the ordinary app's Resources/Frameworks, and omit `ODFExperimentTrial` so the
+test uses the original model without changing trial preferences. Keep the
+runtime bundle outside protected Desktop/Documents/Downloads folders and use
+a private temporary directory for native results; no folder-access approval
+is needed for this test's own resources and results.
+
+The CLI accepts `--output /absolute/new.json --preflight-only`,
+`--output /absolute/new.json --inspect --dylib /absolute/bundled-library`, or
+`--output /absolute/new.json --dylib /absolute/bundled-library
+--source-width-points 1324 --source-height-points 834 --seconds 12
+--minimum-idle-seconds 60`. Each of two phases lasts 5–30 seconds. The source
+remains uncovered first, then the output covers it. A small display may only
+leave a strip of the first output exposed; the report records this geometry
+and does not call it a fully separated comparison.
+
+Only current-process content is queried, with an exact window ID and owner
+PID check. That API redacts window/filter geometry, so stream and plan sizes
+come from the exact own source view's backing bounds. An in-memory screenshot
+checks that filter before streaming; it saves no image. The test stops on new
+input, session/display changes or failures, closes its own windows, and never
+falls back to global enumeration or a permission request. Progress and the
+first failure remain in the result. `functionalComplete` is separate from
+29/58 counted-drawable observations; these callbacks are neither Safari
+acceptance nor physical-display or human quality proof. The token-gated
+`surfaceReady` counter is not total GPU throughput.
+
+For a presentation baseline, use `--arm bare|passthrough|rife` with
+`--control-only`, in that order. Bare uses its own immediate display-link
+renderer without loading the production library or creating a capture stream;
+its static own occluder preserves the control layout. Stop before the other
+arms if its measured valid-presented mean is below 58/s. Passthrough starts
+with interpolation disabled and multiplier 1; RIFE retains the original X2
+request. B/C acceptance still uses counted source plus synthetic frames,
+excluding redraws/holds, rather than every valid callback.
+
+The explicit per-process `ODF_AIR_PRESENTATION_TIMING_DIAGNOSTIC=1` flag adds
+texture/encoding, lock and actual deadline-check samples under
+`airPresentationTiming`. It preserves the existing cutoff and presentation
+logic, including failure paths. `HostTicks` require `mach_timebase_info`
+conversion; they are not nanoseconds. Existing `gpuHost` is CPU completion
+handler arrival, while the bare arm separately records GPUStartTime/GPUEndTime.

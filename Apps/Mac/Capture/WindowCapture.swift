@@ -45,6 +45,33 @@ enum R8FixtureDecoder {
     }
 }
 
+// Isolated self-window diagnostic only. The caller serializes these methods on
+// its capture queue, exactly as WindowCapture does for the same two helpers.
+@objc(SPSelfWindowCaptureBridge)
+final class SPSelfWindowCaptureBridge: NSObject {
+    private let gate = ContentFrameGate()
+    private let copier = OwnedFrameCopier()
+
+    @objc(acceptsBuffer:generation:hostNs:)
+    func acceptsBuffer(_ buffer: CVPixelBuffer, generation: UInt64, hostNs: Int64) -> Bool {
+        gate.evaluate(buffer: buffer, generation: generation, hostNs: hostNs) != .duplicate
+    }
+
+    @objc(copyBuffer:)
+    func copyBuffer(_ buffer: CVPixelBuffer) -> SPOwnedPixelBuffer? {
+        guard let copy = copier.copy(buffer) else { return nil }
+        return SPOwnedPixelBuffer(retaining: copy)
+    }
+
+    @objc var lastFailurePoolExhausted: Bool { copier.lastFailurePoolExhausted }
+
+    @objc(snapshotAtHostNs:generation:)
+    func snapshot(atHostNs hostNs: Int64, generation: UInt64) -> [String: Any] {
+        ["contentGate": gate.diagnostics(nowNs: hostNs, expectedGeneration: generation),
+         "ownedCopy": copier.snapshot()]
+    }
+}
+
 // Fixture-only orange motion evidence. The three rows are in full-buffer
 // coordinates; failure to see a coherent stripe is explicitly unknown.
 enum R8FixtureMotionProbe {
