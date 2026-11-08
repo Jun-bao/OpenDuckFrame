@@ -65,3 +65,32 @@ motion quality, perceptibility, application FPS, or deadline reliability.
 调整前四项后，增强会停止，回工作台点击“开始增强”应用。来源、尺寸、画质档位和
 目标帧率保持；新组合的效果由实际观看判断，不沿用其他组合的旧成绩。
 试用配置与正式版分开，不替换正式应用，也不发布或合并。
+
+## Headless Air cadence diagnostic
+
+`runFixedRateModelProbeWithBundle:` also accepts an explicit
+`ODF_AIR_CADENCE_DIAGNOSTIC=1` test mode. It runs only X2 with paced 30 Hz
+owned NV12 inputs through the production processor. The existing fixed-model
+probe is unchanged when this flag is absent.
+
+Set `ODF_AIR_CADENCE_WIDTH` and `ODF_AIR_CADENCE_HEIGHT` (even, 128–4096),
+`ODF_AIR_CADENCE_SECONDS` (5–60, default 24),
+`ODF_AIR_CADENCE_WARMUP_SECONDS` (1–5, default 3), and
+`ODF_AIR_CADENCE_DISPLAY_HZ` (30–240, default 60), then use the existing
+`Scripts/test_live_output_repair.sh fixed-model` driver. Its
+`ODF_TEST_RESOURCE_APP` must contain the original model without active trial
+preference overrides. For performance diagnosis, use a separately linked diagnostic dylib made from
+the actual optimized Release object files and point `ODF_TEST_DEBUG_DYLIB` to it.
+Xcode can suppress its automatic debug dylib for optimized builds even when
+`ENABLE_DEBUG_DYLIB=YES`; do not switch to Debug optimization to obtain one.
+The diagnostic loader and all resource/framework paths must be portable.
+Never replace the installed app to run this test.
+
+The timeline contains actual host intervals, logical source/synthetic/hold
+counts, production stats, and configuration/measurement epoch changes.
+`ok`/`executionOK` describe execution, not meeting the 29/58 observations.
+Report qualified `observedHostSeconds` alongside `nominalMeasurementSeconds`:
+delayed or coalesced windows remain in the timeline but are excluded from the
+qualified one-second fractions. This is offscreen logical playout, with no
+ScreenCaptureKit, Safari, drawable or physical-display/quality acceptance.
+It does not change user preferences or require accessibility/screen recording.

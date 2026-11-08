@@ -8331,6 +8331,133 @@ presentationHost:(int64_t)presentationHost
 }
 
 + (NSDictionary<NSString *, id> *)runFixedRateModelProbeWithBundle:(NSBundle *)bundle {
+    NSDictionary<NSString *, NSString *> *environment=NSProcessInfo.processInfo.environment;
+    if ([environment[@"ODF_AIR_CADENCE_DIAGNOSTIC"] isEqualToString:@"1"]) {
+        auto option=[&](NSString *key, int fallback, int minimum, int maximum) {
+            NSString *text=environment[key]; long long value=0;
+            NSScanner *scanner=text ? [NSScanner scannerWithString:text] : nil;
+            if (!scanner || ![scanner scanLongLong:&value] || !scanner.isAtEnd) return fallback;
+            return (int)MAX((long long)minimum,MIN((long long)maximum,value));
+        };
+        const int width=option(@"ODF_AIR_CADENCE_WIDTH",2648,128,4096)&~1;
+        const int height=option(@"ODF_AIR_CADENCE_HEIGHT",1668,128,4096)&~1;
+        const int seconds=option(@"ODF_AIR_CADENCE_SECONDS",24,5,60);
+        const int warmup=MIN(seconds-1,option(@"ODF_AIR_CADENCE_WARMUP_SECONDS",3,1,5));
+        const int refresh=option(@"ODF_AIR_CADENCE_DISPLAY_HZ",60,30,240);
+        const int inputRate=30,count=inputRate*seconds;
+        NSString *scope=@"logical offscreen playout; no SCK, drawable, physical display, or quality acceptance";
+        NSMutableArray<SPOwnedPixelBuffer *> *inputs=[NSMutableArray array];
+        const uint8_t levels[]={48,64,80,96,80,64};
+        for (int i=0;i<6;i++) {
+            CVPixelBufferRef frame=SPCreateBuffer(width,height,kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+            if (!frame) return @{ @"ok":@NO,@"executionOK":@NO,@"error":@"input allocation",@"scope":scope };
+            CVPixelBufferLockBaseAddress(frame,0);
+            for (size_t plane=0;plane<CVPixelBufferGetPlaneCount(frame);plane++)
+                memset(CVPixelBufferGetBaseAddressOfPlane(frame,plane),plane?128:levels[i],
+                    CVPixelBufferGetBytesPerRowOfPlane(frame,plane)*CVPixelBufferGetHeightOfPlane(frame,plane));
+            CVPixelBufferUnlockBaseAddress(frame,0);
+            [inputs addObject:[[SPOwnedPixelBuffer alloc] initWithBufferNoCopy:frame]];
+        }
+        SPRifeBridge *rife=[[SPRifeBridge alloc] initWithResourceBundle:bundle]; rife.liveStreamEnabled=YES;
+        NSError *error=nil;
+        if (![rife prepareModelID:@"rife-v4.25" quality:@"fast" width:width height:height error:&error])
+            return @{ @"ok":@NO,@"executionOK":@NO,@"error":error.localizedDescription?:@"RIFE setup",@"scope":scope };
+        NSDictionary *prepared=[rife streamDiagnostics];
+        NSString *experiment=prepared[@"experimentModel"];
+        if ((experiment && ![experiment isEqualToString:@"original"]) ||
+            [prepared[@"experimentIO"] boolValue] || [prepared[@"experimentReplaceMask"] boolValue]) {
+            [rife invalidate];
+            return @{ @"ok":@NO,@"executionOK":@NO,@"error":@"Use an original-model resource bundle without active experiment overrides; preferences were not changed.",
+                @"preparedStreamDiagnostics":prepared,@"scope":scope };
+        }
+        SPLiveProcessor *p=[[SPLiveProcessor alloc] init];
+        dispatch_sync(p->_q, ^{
+            p->_request.interpolationEnabled=YES; p->_request.engineID=@"rife.metal"; p->_request.modelID=@"rife-v4.25"; p->_request.qualityID=@"fast";
+            p->_request.quality=SPFRCQualityNormal; p->_request.scaleEnabled=NO;
+            p->_request.rifeStreamEnabled=YES; p->_request.rateKind=SPLiveRateMultiplier;
+            p->_request.multiplier=2; p->_request.captureCapFPS=0; p->_request.displayRefreshHz=refresh;
+            p->_width=width; p->_height=height; p->_resolved.outputWidth=width; p->_resolved.outputHeight=height;
+            p->_resolved.committed=YES; p->_resolved.interpolationActive=YES; p->_sessionReady=YES; p->_rife=rife; p->_testCapturePlayout=YES;
+            [p resetSchedulerOnQueue]; [p refreshResolvedOnQueue];
+        });
+        const int64_t start=SPHostNow(); int64_t first=0,last=0;
+        NSMutableArray<NSDictionary *> *timeline=[NSMutableArray array];
+        __block int64_t previousHost=start;
+        __block uint64_t previousSource=0,previousSynthetic=0,previousHolds=0,previousEpoch=0,previousConfig=0;
+        __block BOOL haveSnapshot=NO;
+        // These test vectors are lifetime logical counts, independent of the
+        // production measurement epochs. Production stats remain raw snapshots.
+        void (^sample)(NSString *)=^(NSString *kind) {
+            const int64_t host=SPHostNow();
+            uint64_t source=0,synthetic=0,holds=p->_testHoldPlayout.size();
+            for (const auto &entry:p->_testPlayout) { if (entry.second) synthetic++; else source++; }
+            const double elapsed=(double)SPHostToNs(host-start)/1e9;
+            const double previousElapsed=(double)SPHostToNs(previousHost-start)/1e9;
+            const double interval=(double)SPHostToNs(host-previousHost)/1e9;
+            const BOOL reset=source<previousSource || synthetic<previousSynthetic || holds<previousHolds || holds>source;
+            const BOOL valid=haveSnapshot && !reset && interval>0;
+            const uint64_t sourceDelta=reset?0:source-previousSource,syntheticDelta=reset?0:synthetic-previousSynthetic,holdDelta=reset?0:holds-previousHolds;
+            const BOOL validUnique=valid && sourceDelta>=holdDelta;
+            const BOOL completeSecond=[kind isEqualToString:@"second"] && interval>=0.9 && interval<=1.1;
+            NSDictionary *stats=[p currentStats];
+            [timeline addObject:@{ @"kind":kind,@"host":@(host),@"hostElapsedSeconds":@(elapsed),@"intervalStartSeconds":@(previousElapsed),@"intervalSeconds":@(interval),
+                @"completeHostSecond":@(completeSecond),@"measurementWindow":@(completeSecond && previousElapsed>=warmup && elapsed<=seconds),
+                @"logicalSourceSlotsTotal":@(source),@"logicalSyntheticTotal":@(synthetic),@"logicalHoldTotal":@(holds),@"logicalSlotTotal":@(source+synthetic),
+                @"logicalCounterReset":@(reset),@"sourceSlotDelta":valid?@(sourceDelta):(id)NSNull.null,
+                @"syntheticDelta":valid?@(syntheticDelta):(id)NSNull.null,@"holdDelta":valid?@(holdDelta):(id)NSNull.null,
+                @"logicalUniqueFPS":validUnique?@((sourceDelta-holdDelta+syntheticDelta)/interval):(id)NSNull.null,
+                @"logicalSlotFPS":valid?@((sourceDelta+syntheticDelta)/interval):(id)NSNull.null,
+                @"configVersion":@(p->_configVersion),@"measurementEpoch":@(p->_measurementEpoch),
+                @"epochChanged":@(haveSnapshot && previousEpoch!=p->_measurementEpoch),@"configChanged":@(haveSnapshot && previousConfig!=p->_configVersion),
+                @"stats":stats }];
+            previousHost=host; previousSource=source; previousSynthetic=synthetic; previousHolds=holds;
+            previousEpoch=p->_measurementEpoch; previousConfig=p->_configVersion; haveSnapshot=YES;
+        };
+        dispatch_sync(p->_q, ^{ sample(@"initial"); });
+        dispatch_source_t sampler=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,p->_q);
+        dispatch_source_set_timer(sampler,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC),NSEC_PER_SEC,NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(sampler, ^{ sample(@"second"); });
+        dispatch_resume(sampler);
+        for (int i=0;i<count;i++) {
+            const int64_t ptsNs=(int64_t)i*1000000000/inputRate+(i?llround(1800000*sin(i*1.731)):0);
+            SPProbeSpinUntilHost(start+SPRationalToHost(sp::spMake(ptsNs,1000000000)));
+            const int64_t host=SPHostNow(); if (!i) first=host; last=host;
+            [p pushPixelBuffer:inputs[i%6].buffer ptsNum:ptsNs ptsDen:1000000000 host:host generation:1];
+        }
+        SPProbeSpinUntilHost(start+SPRationalToHost(sp::spMake(seconds,1)));
+        dispatch_sync(p->_q, ^{ dispatch_source_cancel(sampler); sample(@"input-end"); });
+        __block BOOL drained=NO;
+        const int64_t drainDeadline=SPHostNow()+SPRationalToHost(sp::spMake(2,1));
+        do {
+            dispatch_sync(p->_q, ^{ drained=p->_inflight==0 && p->_rateBudgetProbeInFlightToken==0 && [p inboundCount]==0; });
+            if (!drained) usleep(10000);
+        } while (!drained && SPHostNow()<drainDeadline);
+        __block NSDictionary *result=nil;
+        dispatch_sync(p->_q, ^{
+            sample(@"final");
+            BOOL ordered=YES;
+            for (size_t i=1;i<p->_testPlayout.size();i++)
+                if (sp::spCmp(p->_testPlayout[i-1].first,p->_testPlayout[i].first)>=0) ordered=NO;
+            double inputFPS=(count-1)*1e9/(double)SPHostToNs(last-first);
+            BOOL executed=drained && ordered && inputFPS>inputRate-1 && inputFPS<inputRate+1 && p->_syntheticFail==0 && p->_testPlayout.size()>p->_testHoldPlayout.size();
+            NSUInteger observed=0,atLeast29=0,atLeast58=0; double measuredSeconds=0;
+            for (NSDictionary *row in timeline) if ([row[@"measurementWindow"] boolValue] && [row[@"logicalUniqueFPS"] isKindOfClass:NSNumber.class]) {
+                observed++; measuredSeconds+=[row[@"intervalSeconds"] doubleValue];
+                if ([row[@"logicalUniqueFPS"] doubleValue]>=29) atLeast29++;
+                if ([row[@"logicalUniqueFPS"] doubleValue]>=58) atLeast58++;
+            }
+            result=@{ @"ok":@(executed),@"executionOK":@(executed),@"scope":scope,
+                @"configuration":@{ @"inputSize":@[@(width),@(height)],@"inputRate":@(inputRate),@"displayRefreshHz":@(refresh),@"durationSeconds":@(seconds),@"warmupSeconds":@(warmup),@"requestedMultiplier":@2,
+                    @"model":@"rife-v4.25",@"quality":@"fast",@"inputFormat":@"NV12 video-range",@"inputContent":@"six immutable uniform luma levels with neutral chroma",@"timestampJitterMs":@1.8 },
+                @"inputFPS":@(inputFPS),@"inputFramesSubmitted":@(count),@"monotonicPTS":@(ordered),@"drained":@(drained),@"drainLimitSeconds":@2,
+                @"preparedStreamDiagnostics":prepared,@"timeline":[timeline copy],@"finalStats":[p currentStats],
+                @"logicalGoalObservations":@{ @"hostSecondWindows":@(observed),@"observedHostSeconds":@(measuredSeconds),@"nominalMeasurementSeconds":@(seconds-warmup),@"windowsAtLeast29":@(atLeast29),@"windowsAtLeast58":@(atLeast58),
+                    @"fractionAtLeast29":observed?@((double)atLeast29/observed):(id)NSNull.null,@"fractionAtLeast58":observed?@((double)atLeast58/observed):(id)NSNull.null },
+                @"resultNote":@"ok/executionOK describe execution only; logical goal observations exclude warmup and incomplete host windows and do not certify display FPS or user-visible quality. Raw production stats may reset at the recorded epoch/config changes; no deltas are inferred from those stats." };
+        });
+        [p stop];
+        return result;
+    }
     const int requestedInput=[NSProcessInfo.processInfo.environment[@"ODF_FIXED_RATE_PROBE_INPUT_FPS"] intValue];
     const int inputRate=requestedInput==28?28:30;
     const int width=2560,height=1410,count=inputRate*5;
