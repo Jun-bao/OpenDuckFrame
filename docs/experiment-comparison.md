@@ -228,3 +228,26 @@ with the uninstrumented candidate before becoming a short self-scene 60 FPS
 candidate. A failed ratio ends that experiment stage. Further delay-alignment
 work first requires a separate read-only queue/cap check and an offline fixed
 22.3 ms target-shift prediction; it is not silently folded into the old result.
+
+The alignment candidate additionally requires
+`ODF_AIR_DELAY_ALIGNMENT_DIAGNOSTIC=1` in the diagnostic guard build. Only
+RIFE multiplier mode with both requested and effective multiplier 2 replaces
+the 16 ms render margin with the same timed view's published preparation lead
+plus 3 ms. Passthrough, the existing cap, byte limit, rounding, shrink smoothing
+and budget policy remain unchanged. The normal build does not enable it.
+
+Its trace also exports separate callback and consume/disposition slot rings.
+Callbacks write only on the existing main run loop; unsupported threads are
+counted. The main-only ring is read only when the originating main caller is
+synchronously exporting on its processor queue, which prevents another main
+callback. Consumer and proactive-retirement writes use the existing mutex.
+Unsupported export, unsupported writer or overflow invalidates coverage.
+
+`airCadenceCausalTrace.delayAlignment.recomputes` records each recompute's
+interval, model/process cost, published lead, margin, wanted delay, cap,
+queue limit, rounded delay and final delay. Source-only early returns mark
+uncomputed inputs null and retain their zero result. The 90 ms invariant is
+the **logical timeline delay** for each X2 recompute. Capture-to-positive-
+presented latency is a separate distribution, split by frame type and X2/X1;
+it has no newly invented threshold in this diagnostic. Publishing a changed
+typical latency remains a product decision.

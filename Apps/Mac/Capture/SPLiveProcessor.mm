@@ -66,8 +66,9 @@ static bool SPAirCadenceCausalTraceRequested() {
 #endif
 }
 
-// Preallocated POD only. The caller owns the existing presentation mutex or
-// processor serial queue; this container adds no synchronization or hot-path IO.
+// Preallocated POD only. Writers use existing mutex/serial-queue ownership, or
+// the explicitly checked main-run-loop-only callback contract below. This
+// container adds no synchronization or hot-path IO.
 template<class T, size_t Capacity> struct SPAirCausalRing {
     std::array<T, Capacity> records{};
     uint64_t total = 0;
@@ -102,6 +103,34 @@ struct SPAirBudgetEvent {
 static_assert(std::is_pod<SPAirFrameEvent>::value && std::is_pod<SPAirBudgetEvent>::value, "causal trace records must remain POD");
 using SPAirFrameRing = SPAirCausalRing<SPAirFrameEvent, 16384>;
 using SPAirBudgetRing = SPAirCausalRing<SPAirBudgetEvent, 8192>;
+
+enum class SPAirSlotCallbackOutcome : uint8_t { createdToken, busy, entryRejected };
+enum class SPAirSlotEntryReject : uint8_t { none, wrongLink, invisible, noGeneration, invalidDeadline, invalidDisplayTime, displayNotAfterDeadline, deadlineReached };
+enum class SPAirSlotOrigin : uint8_t { timerAttempt, callbackReplaced, callbackContextRetired, visibilityRetired, contextCleanupRetired };
+struct SPAirSlotCallbackEvent {
+    uint64_t sequence, generation, config, epoch, clock, createdToken, observedToken;
+    int64_t entryHostTicks, outcomeHostTicks, entryMediaNs;
+    double targetTimestampMediaSeconds, targetPresentationTimestampMediaSeconds;
+    SPAirSlotCallbackOutcome outcome;
+    SPAirSlotEntryReject reject;
+    bool contextUnderPresentationMutex;
+};
+struct SPAirSlotConsumeEvent {
+    uint64_t sequence, token, observedToken, frameID, generation, config, epoch, clock;
+    uint64_t currentGeneration, currentConfig, currentEpoch, currentClock;
+    int64_t entryHostTicks, recordHostTicks, handlerEntryMediaNs, lockAcquiredMediaNs, plannedSelectionMediaNs, deadlineMediaNs, displayTimeMediaNs;
+    uint8_t outcome;
+    SPAirSlotOrigin origin;
+    bool terminal;
+};
+struct SPAirSlotSnapshot {
+    int64_t sampleHostTicks, deadlineMediaNs, displayTimeMediaNs;
+    uint64_t token, generation, config, epoch, clock;
+    bool hasPending;
+};
+static_assert(std::is_pod<SPAirSlotCallbackEvent>::value && std::is_pod<SPAirSlotConsumeEvent>::value, "slot trace records must remain POD");
+using SPAirSlotCallbackRing = SPAirCausalRing<SPAirSlotCallbackEvent, 16384>;
+using SPAirSlotConsumeRing = SPAirCausalRing<SPAirSlotConsumeEvent, 16384>;
 
 static SPAirFrameReason SPAirReason(NSString *value) {
     if ([value isEqualToString:@"display-slot-superseded"]) return SPAirFrameReason::superseded;
@@ -1114,6 +1143,7 @@ struct SPDisplayTimerTrace {
     uint64_t observedToken = 0, frameID = 0;
     int64_t handlerEntryNs = 0, lockAcquiredNs = 0;
     SPDisplayTimerOutcome outcome = SPDisplayTimerOutcome::noCurrentSlot;
+    int64_t handlerEntryHostTicks = 0; // opt-in metadata; existing mach entry sample
 };
 static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
     switch (outcome) {
@@ -1129,6 +1159,46 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
     }
 }
 
+static NSDictionary *SPAirSlotCallbackExport(const std::vector<SPAirSlotCallbackEvent> &values, uint64_t total, int64_t cutoff) {
+    NSMutableArray *events = [NSMutableArray arrayWithCapacity:values.size()];
+    NSArray *reasons = @[@"none", @"wrong-link", @"drawable-invisible", @"zero-generation", @"nonfinite-target-timestamp", @"nonfinite-target-presentation-timestamp", @"display-not-after-deadline", @"deadline-already-reached"];
+    for (const auto &e : values) {
+        if (e.outcomeHostTicks > cutoff) continue;
+        [events addObject:@{ @"sequence": @(e.sequence), @"entryHostTicks": @(e.entryHostTicks), @"outcomeHostTicks": @(e.outcomeHostTicks), @"entryMediaNs": @(e.entryMediaNs),
+            @"targetTimestampMediaSeconds": std::isfinite(e.targetTimestampMediaSeconds) ? @(e.targetTimestampMediaSeconds) : (id)NSNull.null,
+            @"targetPresentationTimestampMediaSeconds": std::isfinite(e.targetPresentationTimestampMediaSeconds) ? @(e.targetPresentationTimestampMediaSeconds) : (id)NSNull.null,
+            @"outcome": e.outcome == SPAirSlotCallbackOutcome::createdToken ? @"created-token" : (e.outcome == SPAirSlotCallbackOutcome::busy ? @"busy" : @"entry-rejected"),
+            @"entryRejectReason": reasons[(NSUInteger)e.reject], @"createdToken": e.createdToken ? @(e.createdToken) : (id)NSNull.null,
+            @"observedToken": e.contextUnderPresentationMutex ? @(e.observedToken) : (id)NSNull.null,
+            @"generation": @(e.generation), @"configVersion": @(e.config), @"measurementEpoch": @(e.epoch), @"clockEpoch": @(e.clock),
+            @"contextUnderPresentationMutex": @(e.contextUnderPresentationMutex) }];
+    }
+    return SPAirRingMetadata(total, 16384, events);
+}
+static NSDictionary *SPAirSlotConsumeExport(const std::vector<SPAirSlotConsumeEvent> &values, uint64_t total, int64_t cutoff) {
+    NSMutableArray *events = [NSMutableArray arrayWithCapacity:values.size()];
+    for (const auto &e : values) {
+        if (e.recordHostTicks > cutoff) continue;
+        NSArray *origins = @[@"timer-attempt", @"callback-replaced-expired-slot", @"callback-retired-context", @"visibility-retired-slot", @"context-cleanup-retired-slot"];
+        [events addObject:@{ @"sequence": @(e.sequence), @"token": @(e.token), @"observedToken": @(e.observedToken), @"frameID": e.frameID ? @(e.frameID) : (id)NSNull.null,
+            @"origin": origins[(NSUInteger)e.origin], @"terminalDisposition": @(e.terminal),
+            @"entryHostTicks": e.entryHostTicks ? @(e.entryHostTicks) : (id)NSNull.null, @"recordHostTicks": @(e.recordHostTicks),
+            @"handlerEntryMediaNs": e.origin == SPAirSlotOrigin::timerAttempt ? @(e.handlerEntryMediaNs) : (id)NSNull.null,
+            @"lockAcquiredMediaNs": e.origin == SPAirSlotOrigin::timerAttempt ? @(e.lockAcquiredMediaNs) : (id)NSNull.null,
+            @"plannedSelectionMediaNs": @(e.plannedSelectionMediaNs), @"deadlineMediaNs": @(e.deadlineMediaNs), @"displayTimeMediaNs": @(e.displayTimeMediaNs),
+            @"outcome": SPDisplayTimerOutcomeName((SPDisplayTimerOutcome)e.outcome), @"generation": @(e.generation), @"configVersion": @(e.config), @"measurementEpoch": @(e.epoch), @"clockEpoch": @(e.clock),
+            @"currentGeneration": @(e.currentGeneration), @"currentConfigVersion": @(e.currentConfig), @"currentMeasurementEpoch": @(e.currentEpoch), @"currentClockEpoch": @(e.currentClock) }];
+    }
+    return SPAirRingMetadata(total, 16384, events);
+}
+static NSDictionary *SPAirSlotSnapshotExport(SPAirSlotSnapshot snapshot) {
+    return @{ @"sampleHostTicks": snapshot.sampleHostTicks ? @(snapshot.sampleHostTicks) : (id)NSNull.null,
+        @"pendingToken": snapshot.hasPending ? @(snapshot.token) : (id)NSNull.null,
+        @"generation": snapshot.hasPending ? @(snapshot.generation) : (id)NSNull.null, @"configVersion": snapshot.hasPending ? @(snapshot.config) : (id)NSNull.null,
+        @"measurementEpoch": snapshot.hasPending ? @(snapshot.epoch) : (id)NSNull.null, @"clockEpoch": snapshot.hasPending ? @(snapshot.clock) : (id)NSNull.null,
+        @"deadlineMediaNs": snapshot.hasPending ? @(snapshot.deadlineMediaNs) : (id)NSNull.null, @"displayTimeMediaNs": snapshot.hasPending ? @(snapshot.displayTimeMediaNs) : (id)NSNull.null };
+}
+
 @interface SPLivePreviewView () <CAMetalDisplayLinkDelegate>
 - (void)updateDisplayLinkConfiguration;
 - (void)setPresentationClockEpoch:(uint64_t)clockEpoch;
@@ -1137,6 +1207,7 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
 - (void)armDisplaySlotLocked:(uint64_t)token;
 - (void)parkDisplaySlotTimerLocked;
 - (void)recordDisplayTimerTraceLocked:(SPDisplayTimerTrace)trace;
+- (void)recordAirSlotTraceLocked:(SPDisplayTimerTrace)trace origin:(SPAirSlotOrigin)origin;
 - (void)consumeDisplaySlot:(sp::DisplaySlotWindow)armedSlot;
 - (int64_t)presentationPreparationLeadNs;
 - (NSDictionary *)displaySlotDiagnostics;
@@ -1147,6 +1218,10 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
 - (CVMetalTextureRef)createTexture:(CVPixelBufferRef)buffer apiStartedHostTicks:(int64_t *)started apiEndedHostTicks:(int64_t *)ended;
 - (NSDictionary *)runPreparedTextureLifetimeProbe;
 - (void)copyAirCadenceEvents:(std::vector<SPAirFrameEvent> *)events total:(uint64_t *)total;
+- (void)copyAirCadenceEvents:(std::vector<SPAirFrameEvent> *)events total:(uint64_t *)total
+    consumes:(std::vector<SPAirSlotConsumeEvent> *)consumes consumeTotal:(uint64_t *)consumeTotal snapshot:(SPAirSlotSnapshot *)snapshot;
+- (BOOL)copyAirSlotCallbacks:(std::vector<SPAirSlotCallbackEvent> *)events total:(uint64_t *)total
+    mainCallerSynchronouslyOnProcessorQueue:(BOOL)safe unsupported:(uint64_t *)unsupported;
 @end
 
 @implementation SPLivePreviewView {
@@ -1188,6 +1263,9 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
     BOOL _airPresentationTimingDiagnostic;
     SPPreparedTextureMapper *_preparedTextures;
     std::unique_ptr<SPAirFrameRing> _airCadenceFrames;
+    std::unique_ptr<SPAirSlotCallbackRing> _airSlotCallbacks; // main-thread writer only
+    std::unique_ptr<SPAirSlotConsumeRing> _airSlotConsumes; // existing presentationMutex only
+    std::atomic<uint64_t> _airSlotCallbackUnsupported;
     std::mutex _geometryMutex;
     sp::SharedGeometryAuthority _sharedGeometry;
     int64_t _geometryVerifiedHost;
@@ -1197,7 +1275,11 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
     if (!(self = [super initWithFrame:frame])) return nil;
     const char *airTiming = getenv("ODF_AIR_PRESENTATION_TIMING_DIAGNOSTIC");
     _airPresentationTimingDiagnostic = airTiming && strcmp(airTiming, "1") == 0;
-    if (SPAirCadenceCausalTraceRequested()) _airCadenceFrames = std::make_unique<SPAirFrameRing>();
+    if (SPAirCadenceCausalTraceRequested()) {
+        _airCadenceFrames = std::make_unique<SPAirFrameRing>();
+        _airSlotCallbacks = std::make_unique<SPAirSlotCallbackRing>(); _airSlotConsumes = std::make_unique<SPAirSlotConsumeRing>();
+    }
+    _airSlotCallbackUnsupported.store(0);
     _generation.store(0);
     _highestGeneration = 0;
     _revealedGeneration = 0;
@@ -1802,7 +1884,10 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
           if (_airCadenceFrames) for (SPDisplayFrameRequest *frame in _pendingPresentations)
               _airCadenceFrames->append(SPAirFrameRecord(frame, SPAirFrameKind::discarded, SPAirFrameReason::invisible, SPAirFrameStage::visibilityCleanup));
           discarded = [_pendingPresentations copy]; [_pendingPresentations removeAllObjects];
-          if (_prospectiveSlot) { _displaySlotRetired.fetch_add(1); _prospectiveSlot = nil; }
+          if (_prospectiveSlot) {
+              if (_airSlotConsumes) [self recordAirSlotTraceLocked:{_prospectiveSlot->timing, _prospectiveSlot->timing.token, 0, 0, 0, SPDisplayTimerOutcome::retired} origin:SPAirSlotOrigin::visibilityRetired];
+              _displaySlotRetired.fetch_add(1); _prospectiveSlot = nil;
+          }
           [self parkDisplaySlotTimerLocked]; }
         for (SPDisplayFrameRequest *frame in discarded) [self reportPendingPresentation:frame reason:@"display-invisible"];
     }
@@ -1829,6 +1914,7 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
     {
         std::lock_guard<std::mutex> lock(_presentationMutex);
         if (_prospectiveSlot && !sp::sameDisplaySlotContext(_prospectiveSlot->timing.context, [self displaySlotContext])) {
+            if (_airSlotConsumes) [self recordAirSlotTraceLocked:{_prospectiveSlot->timing, _prospectiveSlot->timing.token, 0, 0, 0, SPDisplayTimerOutcome::retired} origin:SPAirSlotOrigin::contextCleanupRetired];
             _displaySlotRetired.fetch_add(1); _prospectiveSlot = nil;
             [self parkDisplaySlotTimerLocked];
         }
@@ -1910,10 +1996,35 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
 }
 
 - (void)copyAirCadenceEvents:(std::vector<SPAirFrameEvent> *)events total:(uint64_t *)total {
+    [self copyAirCadenceEvents:events total:total consumes:nullptr consumeTotal:nullptr snapshot:nullptr];
+}
+
+- (void)copyAirCadenceEvents:(std::vector<SPAirFrameEvent> *)events total:(uint64_t *)total
+    consumes:(std::vector<SPAirSlotConsumeEvent> *)consumes consumeTotal:(uint64_t *)consumeTotal snapshot:(SPAirSlotSnapshot *)snapshot {
     if (!_airCadenceFrames) { *total = 0; return; }
     events->reserve(16384); // controlled export only; allocation precedes existing mutex
+    if (consumes) consumes->reserve(16384);
     std::lock_guard<std::mutex> lock(_presentationMutex);
+    if (snapshot) {
+        snapshot->sampleHostTicks = SPHostNow(); snapshot->hasPending = _prospectiveSlot != nil;
+        if (_prospectiveSlot) {
+            const auto pending = _prospectiveSlot->timing; snapshot->token = pending.token; snapshot->generation = pending.context.generation; snapshot->config = pending.context.config;
+            snapshot->epoch = pending.context.measurementEpoch; snapshot->clock = pending.context.clockEpoch; snapshot->deadlineMediaNs = pending.deadlineNs; snapshot->displayTimeMediaNs = pending.displayNs;
+        }
+    }
     _airCadenceFrames->copy(*events); *total = _airCadenceFrames->total;
+    if (consumes && consumeTotal) { _airSlotConsumes->copy(*consumes); *consumeTotal = _airSlotConsumes->total; }
+}
+
+- (BOOL)copyAirSlotCallbacks:(std::vector<SPAirSlotCallbackEvent> *)events total:(uint64_t *)total
+    mainCallerSynchronouslyOnProcessorQueue:(BOOL)safe unsupported:(uint64_t *)unsupported {
+    *unsupported = _airSlotCallbackUnsupported.load();
+    *total = 0;
+    // The controlled main caller is synchronously inside/blocked by its _q
+    // export, so no main-run-loop delegate can write while this copy executes.
+    if (!safe || !dispatch_get_specific(SPLiveQueueKey) || !_airSlotCallbacks) return NO;
+    events->reserve(16384); _airSlotCallbacks->copy(*events); *total = _airSlotCallbacks->total;
+    return YES;
 }
 
 - (int64_t)presentationPreparationLeadNs { return _displayPreparationLeadNs.load(); }
@@ -1921,6 +2032,23 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
 - (void)recordDisplayTimerTraceLocked:(SPDisplayTimerTrace)trace {
     _displayTimerTrace[_displayTimerTraceCount % _displayTimerTrace.size()] = trace;
     ++_displayTimerTraceCount;
+    if (_airSlotConsumes && (trace.handlerEntryHostTicks || trace.outcome == SPDisplayTimerOutcome::expiredReplaced))
+        [self recordAirSlotTraceLocked:trace origin:trace.handlerEntryHostTicks ? SPAirSlotOrigin::timerAttempt : SPAirSlotOrigin::callbackReplaced];
+}
+
+- (void)recordAirSlotTraceLocked:(SPDisplayTimerTrace)trace origin:(SPAirSlotOrigin)origin {
+    if (_airSlotConsumes) {
+        SPAirSlotConsumeEvent event{}; event.token = trace.armed.token; event.observedToken = trace.observedToken; event.frameID = trace.frameID;
+        event.generation = trace.armed.context.generation; event.config = trace.armed.context.config; event.epoch = trace.armed.context.measurementEpoch; event.clock = trace.armed.context.clockEpoch;
+        const auto current = [self displaySlotContext]; event.currentGeneration = current.generation; event.currentConfig = current.config; event.currentEpoch = current.measurementEpoch; event.currentClock = current.clockEpoch;
+        event.entryHostTicks = trace.handlerEntryHostTicks; event.recordHostTicks = SPHostNow(); event.handlerEntryMediaNs = trace.handlerEntryNs; event.lockAcquiredMediaNs = trace.lockAcquiredNs;
+        event.plannedSelectionMediaNs = trace.armed.deadlineNs - sp::displaySelectionGuardNs; event.deadlineMediaNs = trace.armed.deadlineNs; event.displayTimeMediaNs = trace.armed.displayNs;
+        event.outcome = (uint8_t)trace.outcome; event.origin = origin;
+        event.terminal = trace.outcome == SPDisplayTimerOutcome::selected || trace.outcome == SPDisplayTimerOutcome::noFrame ||
+            trace.outcome == SPDisplayTimerOutcome::expiredConsume || trace.outcome == SPDisplayTimerOutcome::expiredReplaced ||
+            trace.outcome == SPDisplayTimerOutcome::retired || trace.outcome == SPDisplayTimerOutcome::gpuBusy;
+        _airSlotConsumes->append(event);
+    }
 }
 
 - (NSDictionary *)displaySlotDiagnostics {
@@ -1986,28 +2114,51 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
         int64_t callbackHost = SPHostNow();
         double deadline = update.targetTimestamp, displayTime = update.targetPresentationTimestamp;
         int64_t nowNs = (int64_t)(CACurrentMediaTime() * 1e9);
-        if (link != _displayLink || !_drawableVisible.load() || !_generation.load() ||
-            !std::isfinite(deadline) || !std::isfinite(displayTime) || displayTime <= deadline ||
-            deadline * 1e9 <= nowNs) return;
+        const BOOL slotTrace = _airSlotCallbacks && NSThread.isMainThread;
+        if (_airSlotCallbacks && !slotTrace) _airSlotCallbackUnsupported.fetch_add(1, std::memory_order_relaxed);
+        SPAirSlotCallbackEvent slotEvent{};
+        if (slotTrace) {
+            slotEvent.entryHostTicks = callbackHost; slotEvent.entryMediaNs = nowNs;
+            slotEvent.targetTimestampMediaSeconds = deadline; slotEvent.targetPresentationTimestampMediaSeconds = displayTime;
+            const auto context = [self displaySlotContext]; slotEvent.generation = context.generation; slotEvent.config = context.config; slotEvent.epoch = context.measurementEpoch; slotEvent.clock = context.clockEpoch;
+        }
+        auto rejected = [&](bool value, SPAirSlotEntryReject reason) { if (value && slotTrace) slotEvent.reject = reason; return value; };
+        auto recordCallback = [&](SPAirSlotCallbackOutcome outcome) {
+            if (slotTrace) { slotEvent.outcome = outcome; slotEvent.outcomeHostTicks = SPHostNow(); _airSlotCallbacks->append(slotEvent); }
+        };
+        // Same short-circuit predicates, evaluation order and return as before;
+        // record only the predicate which actually rejects this callback.
+        if (rejected(link != _displayLink, SPAirSlotEntryReject::wrongLink) || rejected(!_drawableVisible.load(), SPAirSlotEntryReject::invisible) || rejected(!_generation.load(), SPAirSlotEntryReject::noGeneration) ||
+            rejected(!std::isfinite(deadline), SPAirSlotEntryReject::invalidDeadline) || rejected(!std::isfinite(displayTime), SPAirSlotEntryReject::invalidDisplayTime) || rejected(displayTime <= deadline, SPAirSlotEntryReject::displayNotAfterDeadline) ||
+            rejected(deadline * 1e9 <= nowNs, SPAirSlotEntryReject::deadlineReached)) { recordCallback(SPAirSlotCallbackOutcome::entryRejected); return; }
         SPProspectiveDisplaySlot *slot = [SPProspectiveDisplaySlot new];
         slot.drawable = update.drawable; slot.deadline = deadline; slot.displayTime = displayTime; slot.callbackHost = callbackHost;
         {
             std::lock_guard<std::mutex> lock(_presentationMutex);
             auto context = [self displaySlotContext];
+            if (slotTrace) {
+                slotEvent.generation = context.generation; slotEvent.config = context.config; slotEvent.epoch = context.measurementEpoch; slotEvent.clock = context.clockEpoch;
+                slotEvent.contextUnderPresentationMutex = true; slotEvent.observedToken = _prospectiveSlot ? _prospectiveSlot->timing.token : 0;
+            }
             if (_prospectiveSlot && !sp::canReplaceDisplaySlot(_prospectiveSlot->timing, context, nowNs)) {
-                _displaySlotBusy.fetch_add(1); return; // preserve an older slot that is still usable
+                _displaySlotBusy.fetch_add(1); recordCallback(SPAirSlotCallbackOutcome::busy); return; // preserve an older slot that is still usable
             }
             if (_prospectiveSlot) {
                 if (sp::sameDisplaySlotContext(_prospectiveSlot->timing.context, context)) {
                     _displaySlotExpired.fetch_add(1); _displaySlotExpiredByCallback.fetch_add(1);
                     [self recordDisplayTimerTraceLocked:{_prospectiveSlot->timing, _prospectiveSlot->timing.token, 0, 0,
                         (int64_t)(CACurrentMediaTime() * 1e9), SPDisplayTimerOutcome::expiredReplaced}];
-                } else _displaySlotRetired.fetch_add(1);
+                } else {
+                    if (_airSlotConsumes) [self recordAirSlotTraceLocked:{_prospectiveSlot->timing, _prospectiveSlot->timing.token, 0, 0, 0, SPDisplayTimerOutcome::retired} origin:SPAirSlotOrigin::callbackContextRetired];
+                    _displaySlotRetired.fetch_add(1);
+                }
             }
             slot->timing = {++_nextDisplaySlotToken, context, (int64_t)(deadline * 1e9), (int64_t)(displayTime * 1e9)};
             _prospectiveSlot = slot;
             _displayPreparationLeadNs.store(sp::displayPreparationLeadNs(slot->timing));
             [self armDisplaySlotLocked:slot->timing.token];
+            if (slotTrace) slotEvent.createdToken = slot->timing.token;
+            recordCallback(SPAirSlotCallbackOutcome::createdToken);
         }
     }
 }
@@ -2028,6 +2179,7 @@ static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
             int64_t lockAcquiredNs = (int64_t)(CACurrentMediaTime() * 1e9);
             slot = _prospectiveSlot;
             SPDisplayTimerTrace trace{armedSlot, slot ? slot->timing.token : 0, 0, handlerEntryNs, lockAcquiredNs, SPDisplayTimerOutcome::noCurrentSlot};
+            if (_airSlotConsumes) trace.handlerEntryHostTicks = selectionHost;
             if (!slot) { [self recordDisplayTimerTraceLocked:trace]; return; }
             auto decision = sp::displaySlotDecision(slot->timing, token, [self displaySlotContext], lockAcquiredNs);
             if (decision == sp::DisplaySlotDecision::staleToken) {
@@ -2614,10 +2766,42 @@ static NSArray *SPRifeJobPairClockValues(const SPLiveJob *job) {
     deadline:(int64_t)deadline retryHost:(int64_t)retryHost frozenPairClock:(const sp::RifePairClockTarget *)frozenPairClock;
 @end
 
+struct SPAirDelayAlignmentEvent {
+    uint64_t sequence, generation, config, epochBefore, epochAfter;
+    int64_t hostTicks, intervalNs, modelNs, processNs, presentationLeadNs, renderMarginNs;
+    int64_t wantedNs, capNs, queueLimitNs, roundedNs, finalNs;
+    int requestedMultiplier, effectiveMultiplier;
+    bool calculated, activeX2, sourceOnly, timeClamped, byteClamped;
+};
+using SPAirDelayAlignmentRing = SPAirCausalRing<SPAirDelayAlignmentEvent, 16384>;
+static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlignmentEvent> &values, uint64_t total, int64_t cutoff) {
+    NSMutableArray *events = [NSMutableArray arrayWithCapacity:values.size()];
+    for (const auto &e : values) {
+        if (e.hostTicks > cutoff) continue;
+        [events addObject:@{ @"sequence": @(e.sequence), @"hostTicks": @(e.hostTicks), @"generation": @(e.generation),
+            @"configVersion": @(e.config), @"epochBefore": @(e.epochBefore), @"epochAfter": @(e.epochAfter),
+            @"calculated": @(e.calculated), @"activeX2": @(e.activeX2), @"sourceOnly": @(e.sourceOnly),
+            @"requestedMultiplier": @(e.requestedMultiplier), @"effectiveMultiplier": @(e.effectiveMultiplier),
+            @"intervalNs": e.calculated ? @(e.intervalNs) : (id)NSNull.null,
+            @"modelNs": e.calculated ? @(e.modelNs) : (id)NSNull.null,
+            @"processNs": e.calculated ? @(e.processNs) : (id)NSNull.null,
+            @"presentationLeadNs": e.activeX2 ? @(e.presentationLeadNs) : (id)NSNull.null,
+            @"renderMarginNs": e.calculated ? @(e.renderMarginNs) : (id)NSNull.null,
+            @"wantedNs": e.calculated ? @(e.wantedNs) : (id)NSNull.null,
+            @"capNs": @(e.capNs), @"queueLimitNs": e.calculated ? @(e.queueLimitNs) : (id)NSNull.null,
+            @"roundedNs": e.calculated ? @(e.roundedNs) : (id)NSNull.null,
+            @"finalNs": @(e.finalNs), @"timeClamped": @(e.timeClamped), @"byteClamped": @(e.byteClamped) }];
+    }
+    return SPAirRingMetadata(total, 16384, events);
+}
+
 @implementation SPLiveProcessor {
     dispatch_queue_t _q;
     std::unique_ptr<SPAirFrameRing> _airCadenceCallbacks;
     std::unique_ptr<SPAirBudgetRing> _airCadenceBudget;
+    BOOL _airDelayAlignmentRequested, _airDelayAlignmentActiveX2;
+    int64_t _airDelayAlignmentLeadNs, _airDelayAlignmentMarginNs;
+    std::unique_ptr<SPAirDelayAlignmentRing> _airDelayAlignmentEvents;
     SPLivePlanRequest *_request;
     SPLiveResolvedPlan *_resolved;
     SPFRCEngine *_engine;
@@ -2872,6 +3056,11 @@ static NSArray *SPRifeJobPairClockValues(const SPLiveJob *job) {
 - (instancetype)init {
     if (!(self = [super init])) return nil;
     if (SPAirCadenceCausalTraceRequested()) { _airCadenceCallbacks = std::make_unique<SPAirFrameRing>(); _airCadenceBudget = std::make_unique<SPAirBudgetRing>(); }
+#if defined(ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC) && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC == 1
+    const char *alignDelay = getenv("ODF_AIR_DELAY_ALIGNMENT_DIAGNOSTIC");
+    _airDelayAlignmentRequested = alignDelay && strcmp(alignDelay, "1") == 0;
+#endif
+    if (_airDelayAlignmentRequested && _airCadenceCallbacks) _airDelayAlignmentEvents = std::make_unique<SPAirDelayAlignmentRing>();
     _capturePressureQueued = false;
     _capturePressureGeneration = 0;
     _q = dispatch_queue_create("app.openduckframe.live",
@@ -3545,6 +3734,10 @@ static NSArray *SPRifeJobPairClockValues(const SPLiveJob *job) {
         @"queued": @([self inboundCount]),
         @"p95ms": @(p95),
         @"delayMs": @((double)SPHostToNs(_delayHost) / 1e6),
+        @"delayAlignmentRequested": @(_airDelayAlignmentRequested),
+        @"delayAlignmentActiveX2": @(_airDelayAlignmentActiveX2),
+        @"delayAlignmentPresentationLeadNs": @(_airDelayAlignmentLeadNs),
+        @"delayAlignmentRenderMarginNs": @(_airDelayAlignmentMarginNs),
         @"delayClamped": @(_delayClamped),
         @"delayTimeClamped": @(_delayTimeClamped), @"delayByteClamped": @(_delayByteClamped),
         @"interactiveCapMs": @(_request.quality == SPFRCQualityHigh ? SPQualityCapSec * 1000.0 : SPInteractiveCapSec * 1000.0),
@@ -5047,6 +5240,8 @@ static NSArray *SPRifeJobPairClockValues(const SPLiveJob *job) {
 }
 
 - (NSDictionary *)presentationOrderDiagnostics {
+    const BOOL callerWasMain = NSThread.isMainThread;
+    const BOOL callerWasProcessorQueue = dispatch_get_specific(SPLiveQueueKey) == (__bridge void *)self;
     __block NSDictionary *result;
     void (^capture)(void) = ^{
         const int64_t causalCutoff = self->_airCadenceCallbacks ? SPHostNow() : 0;
@@ -5059,20 +5254,56 @@ static NSArray *SPRifeJobPairClockValues(const SPLiveJob *job) {
                     @"configVersion": @(self->_configVersion), @"measurementEpoch": @(self->_measurementEpoch), @"eventsInCallbackOrder": events };
         if (self->_airCadenceCallbacks) {
             std::vector<SPAirFrameEvent> preview, output, callbacks; std::vector<SPAirBudgetEvent> budgets;
+            std::vector<SPAirSlotCallbackEvent> previewSlotCallbacks, outputSlotCallbacks;
+            std::vector<SPAirSlotConsumeEvent> previewSlotConsumes, outputSlotConsumes;
+            SPAirSlotSnapshot previewSlotSnapshot{}, outputSlotSnapshot{};
             uint64_t previewTotal = 0, outputTotal = 0;
-            [self.preview copyAirCadenceEvents:&preview total:&previewTotal]; [self.outputPreview copyAirCadenceEvents:&output total:&outputTotal];
+            uint64_t previewCallbackTotal = 0, outputCallbackTotal = 0, previewConsumeTotal = 0, outputConsumeTotal = 0, previewUnsupported = 0, outputUnsupported = 0;
+            [self.preview copyAirCadenceEvents:&preview total:&previewTotal consumes:&previewSlotConsumes consumeTotal:&previewConsumeTotal snapshot:&previewSlotSnapshot];
+            [self.outputPreview copyAirCadenceEvents:&output total:&outputTotal consumes:&outputSlotConsumes consumeTotal:&outputConsumeTotal snapshot:&outputSlotSnapshot];
+            const BOOL captureWasProcessorQueue = dispatch_get_specific(SPLiveQueueKey) == (__bridge void *)self;
+            const BOOL mainCallerSyncExport = callerWasMain && !callerWasProcessorQueue && captureWasProcessorQueue;
+            const BOOL previewCallbackSafe = [self.preview copyAirSlotCallbacks:&previewSlotCallbacks total:&previewCallbackTotal mainCallerSynchronouslyOnProcessorQueue:mainCallerSyncExport unsupported:&previewUnsupported];
+            const BOOL outputCallbackSafe = [self.outputPreview copyAirSlotCallbacks:&outputSlotCallbacks total:&outputCallbackTotal mainCallerSynchronouslyOnProcessorQueue:mainCallerSyncExport unsupported:&outputUnsupported];
+            const BOOL callbackExportSafe = mainCallerSyncExport && previewCallbackSafe && outputCallbackSafe;
             callbacks.reserve(16384); self->_airCadenceCallbacks->copy(callbacks);
             budgets.reserve(8192); self->_airCadenceBudget->copy(budgets);
             NSDictionary *previewExport = SPAirFrameExport(preview, previewTotal, @"preview", causalCutoff);
             NSDictionary *outputExport = SPAirFrameExport(output, outputTotal, @"output", causalCutoff);
             NSDictionary *callbackExport = SPAirFrameExport(callbacks, self->_airCadenceCallbacks->total, nil, causalCutoff);
             NSDictionary *budgetExport = SPAirBudgetExport(budgets, self->_airCadenceBudget->total, causalCutoff);
+            NSDictionary *unavailableCallbacks = @{ @"capacity": @16384, @"total": NSNull.null, @"dropped": NSNull.null,
+                @"firstseq": NSNull.null, @"lastseq": NSNull.null, @"exportedCount": @0, @"events": @[], @"unsupported": @YES };
+            NSDictionary *previewCallbackExport = previewCallbackSafe ? SPAirSlotCallbackExport(previewSlotCallbacks, previewCallbackTotal, causalCutoff) : unavailableCallbacks;
+            NSDictionary *outputCallbackExport = outputCallbackSafe ? SPAirSlotCallbackExport(outputSlotCallbacks, outputCallbackTotal, causalCutoff) : unavailableCallbacks;
+            NSDictionary *previewConsumeExport = SPAirSlotConsumeExport(previewSlotConsumes, previewConsumeTotal, causalCutoff);
+            NSDictionary *outputConsumeExport = SPAirSlotConsumeExport(outputSlotConsumes, outputConsumeTotal, causalCutoff);
+            NSDictionary *delayExport = nil;
+            uint64_t delayOverflow = 0;
+            if (self->_airDelayAlignmentEvents) {
+                std::vector<SPAirDelayAlignmentEvent> delayEvents; delayEvents.reserve(16384);
+                self->_airDelayAlignmentEvents->copy(delayEvents);
+                delayExport = SPAirDelayAlignmentExport(delayEvents, self->_airDelayAlignmentEvents->total, causalCutoff);
+                delayOverflow = [delayExport[@"dropped"] unsignedLongLongValue];
+            }
+            const uint64_t slotOverflow = [previewConsumeExport[@"dropped"] unsignedLongLongValue] + [outputConsumeExport[@"dropped"] unsignedLongLongValue] +
+                (previewCallbackSafe ? [previewCallbackExport[@"dropped"] unsignedLongLongValue] : 0) + (outputCallbackSafe ? [outputCallbackExport[@"dropped"] unsignedLongLongValue] : 0);
             const uint64_t overflow = [previewExport[@"dropped"] unsignedLongLongValue] + [outputExport[@"dropped"] unsignedLongLongValue] +
-                [callbackExport[@"dropped"] unsignedLongLongValue] + [budgetExport[@"dropped"] unsignedLongLongValue];
+                [callbackExport[@"dropped"] unsignedLongLongValue] + [budgetExport[@"dropped"] unsignedLongLongValue] + slotOverflow + delayOverflow;
             NSMutableDictionary *extended = [result mutableCopy];
             extended[@"airCadenceCausalTrace"] = @{ @"enabled": @YES, @"exportCutoffHostTicks": @(causalCutoff),
-                @"overflowCount": @(overflow), @"ringsComplete": @(overflow == 0), @"preview": previewExport, @"output": outputExport,
+                @"overflowCount": @(overflow), @"overflowCountKnown": @(callbackExportSafe), @"ringsComplete": @(overflow == 0 && callbackExportSafe && previewUnsupported == 0 && outputUnsupported == 0), @"preview": previewExport, @"output": outputExport,
                 @"callbacks": callbackExport, @"rateBudget": budgetExport,
+                @"delayAlignment": @{ @"enabled": @(self->_airDelayAlignmentEvents != nullptr),
+                    @"recomputes": delayExport ?: @{},
+                    @"scope": @"POD per-recompute inputs and result; nanoseconds except HostTicks. Source-only early return has calculated=false and uncomputed fields null. Logical finalNs is capped at 90ms in the normal test tier; capture-to-positive-presented latency is measured separately, not bounded by this field." },
+                @"slots": @{ @"callbackExportSafe": @(callbackExportSafe), @"valid": @(callbackExportSafe && previewUnsupported == 0 && outputUnsupported == 0 && slotOverflow == 0),
+                    @"overflowCount": @(slotOverflow), @"overflowCountKnown": @(callbackExportSafe),
+                    @"callerWasMain": @(callerWasMain), @"callerWasProcessorQueue": @(callerWasProcessorQueue), @"captureWasProcessorQueue": @(captureWasProcessorQueue),
+                    @"unsupported": @(previewUnsupported + outputUnsupported),
+                    @"preview": @{ @"callbackExportSafe": @(previewCallbackSafe), @"unsupported": @(previewUnsupported), @"callbacks": previewCallbackExport, @"consumes": previewConsumeExport, @"pendingSlotSnapshot": SPAirSlotSnapshotExport(previewSlotSnapshot) },
+                    @"output": @{ @"callbackExportSafe": @(outputCallbackSafe), @"unsupported": @(outputUnsupported), @"callbacks": outputCallbackExport, @"consumes": outputConsumeExport, @"pendingSlotSnapshot": SPAirSlotSnapshotExport(outputSlotSnapshot) },
+                    @"scope": @"Separate preallocated rings: display-link callback is main-thread-only; unexpected off-main callbacks increment only an atomic unsupported counter and invalidate coverage. Callback copy requires an originating main caller synchronously exporting on its processor queue, so the main run loop cannot deliver another callback (including inline dispatch_sync execution). Otherwise its ring is not read and total/dropped remain unknown. Consume attempts and proactive token dispositions write/copy only under existing presentationMutex; consume, frame and pending-slot snapshot copies share one lock region. origin distinguishes timer attempts, callback replacement and visibility/context cleanup. terminalDisposition is true only when the old state clears/replaces that token; stale/no-current/waiting attempts are nonterminal. pendingSlotSnapshot has its own sampleHostTicks after global cutoff, not an atomic state at exportCutoffHostTicks; filtered post-cutoff dispositions leave an unknown tail for offline accounting. Early-reject context is an entry atomic snapshot, while created/busy context is read under presentationMutex. Guard reasons are the first true original short-circuit predicate. HostTicks and CA MediaNs/MediaSeconds are separate clocks. Overflow invalidates completeness." },
                 @"sourceStoppedScope": @"Controlled caller contract: SelfProbe exports after SCK stop completion and before processor.stop. This method does not verify capture state, wait for GPU, flush, or stop any queue. Records are filtered by record host <= exportCutoffHostTicks; GPU/callback tail remains unknown.",
                 @"scope": @"Trace-only diagnostic library. Preallocated POD rings never reset with configuration/measurement epochs. View writes use existing presentationMutex regions; processor writes use existing serial queue. No trace arrays are exported in periodic stats. Capacity overflow makes evidence incomplete. enqueueHostTicks is actual bounded-queue admission, requestStartHostTicks preserves the prior request timestamp. Unassigned cleanup slot/replacement are null. Callback metadata may lack original counts/capture/admission time; join to its admission using endpoint/generation/config/epoch/clock/frameID/requestStartHostTicks. endingInflight is unresolved at cutoff, not confirmed hardware work. Raw positive presented callbacks are recorded before score/context filtering; this is not physical/human acceptance. Budget caller gates are exact; fresh<8 is input evidence, internal persistence/cooldown reasons are not introspected." };
             result = extended;
@@ -5556,6 +5787,16 @@ static NSArray *SPRifeJobPairClockValues(const SPLiveJob *job) {
 }
 
 - (void)recomputeInteractiveDelay {
+    SPAirDelayAlignmentEvent alignmentEvent{};
+    if (_airDelayAlignmentEvents) {
+        alignmentEvent.hostTicks = SPHostNow(); alignmentEvent.generation = _sourceGeneration;
+        alignmentEvent.config = _configVersion; alignmentEvent.epochBefore = _measurementEpoch;
+        alignmentEvent.requestedMultiplier = (int)_request.multiplier; alignmentEvent.effectiveMultiplier = _effectiveMultiplier;
+        alignmentEvent.capNs = (int64_t)llround((_request.quality == SPFRCQualityHigh ? SPQualityCapSec : SPInteractiveCapSec) * 1e9);
+    }
+    _airDelayAlignmentActiveX2 = NO;
+    _airDelayAlignmentLeadNs = 0;
+    _airDelayAlignmentMarginNs = 0;
     // There is no future temporal phase to wait for in source-only output.
     // Scaling finishes before enqueue; its actual cost is not an extra queue
     // delay. In-flight work remains owned by its original epoch.
@@ -5567,6 +5808,10 @@ static NSArray *SPRifeJobPairClockValues(const SPLiveJob *job) {
         _delayTimeClamped = NO;
         _delayByteClamped = NO;
         _delayClampNoted = NO;
+        if (_airDelayAlignmentEvents) {
+            alignmentEvent.sourceOnly = true; alignmentEvent.epochAfter = _measurementEpoch;
+            alignmentEvent.finalNs = SPHostToNs(_delayHost); _airDelayAlignmentEvents->append(alignmentEvent);
+        }
         return;
     }
     double interval = 1.0 / 30.0;
@@ -5597,7 +5842,16 @@ static NSArray *SPRifeJobPairClockValues(const SPLiveJob *job) {
     }
     if (process < 0.008) process = 0.008;
     double cap = _request.quality == SPFRCQualityHigh ? SPQualityCapSec : SPInteractiveCapSec;
-    double wanted = lead + process + 0.016;
+    double renderMargin = 0.016;
+    if (_airDelayAlignmentRequested && _request.rateKind == SPLiveRateMultiplier && _request.multiplier == 2 &&
+        _effectiveMultiplier == 2 && [_request.engineID isEqualToString:@"rife.metal"]) {
+        SPLivePreviewView *timedView = self.outputPreview.windowVisibleSnapshot ? self.outputPreview : self.preview;
+        _airDelayAlignmentLeadNs = MAX((int64_t)16000000, [timedView presentationPreparationLeadNs]);
+        _airDelayAlignmentMarginNs = _airDelayAlignmentLeadNs + 3000000;
+        _airDelayAlignmentActiveX2 = YES;
+        renderMargin = (double)_airDelayAlignmentMarginNs / 1e9;
+    }
+    double wanted = lead + process + renderMargin;
     if (_lowLatency && [self requestUsesLowPrescale:_request width:_width height:_height] && _captureToOutputReadyNs.size() >= 8) {
         // Include actual capture-to-ready time, which also covers pre-scaling,
         // conversion, asynchronous delivery and comparison baseline work.
@@ -5625,6 +5879,7 @@ static NSArray *SPRifeJobPairClockValues(const SPLiveJob *job) {
         clamped = YES;
     }
     int64_t next = SPRationalToHost(sp::spMake((int64_t)llround(delay * 1000.0), 1000));
+    const int64_t roundedDelayHost = next;
     if (_delayHost > next) {
         double current = (double)SPHostToNs(_delayHost) / 1e9;
         if (current > cap + 0.001) {
@@ -5661,6 +5916,16 @@ static NSArray *SPRifeJobPairClockValues(const SPLiveJob *job) {
     _delayTimeClamped = timeClamped;
     _delayByteClamped = byteClamped;
     _delayHost = next;
+    if (_airDelayAlignmentEvents) {
+        alignmentEvent.calculated = true; alignmentEvent.activeX2 = _airDelayAlignmentActiveX2;
+        alignmentEvent.epochAfter = _measurementEpoch;
+        alignmentEvent.intervalNs = (int64_t)llround(interval * 1e9); alignmentEvent.modelNs = (int64_t)llround(frc * 1e9);
+        alignmentEvent.processNs = (int64_t)llround(process * 1e9); alignmentEvent.presentationLeadNs = _airDelayAlignmentLeadNs;
+        alignmentEvent.renderMarginNs = (int64_t)llround(renderMargin * 1e9); alignmentEvent.wantedNs = (int64_t)llround(wanted * 1e9);
+        alignmentEvent.queueLimitNs = (int64_t)llround(queueLimit * 1e9); alignmentEvent.roundedNs = SPHostToNs(roundedDelayHost);
+        alignmentEvent.finalNs = SPHostToNs(_delayHost); alignmentEvent.timeClamped = timeClamped; alignmentEvent.byteClamped = byteClamped;
+        _airDelayAlignmentEvents->append(alignmentEvent);
+    }
 }
 
 - (int64_t)targetHostForPTS:(sp::SPRational)pts {
