@@ -15,6 +15,8 @@
 #include <atomic>
 #include <cmath>
 #include <memory>
+#include <array>
+#include <type_traits>
 #import "SPLiveProcessor.h"
 #import "SPFRCEngine.h"
 
@@ -226,27 +228,40 @@ static void SPProbeText(NSString *text, double x, double baseline, double size, 
 
 // Deliberately mostly static, matching browser-samples/index.html. Flashing the
 // background each tick would bypass the production sparse-fingerprint gate.
-@interface SPProbePatternView : NSView
+@interface SPProbePatternView : NSView {
+    NSString *_sourceHeading, *_sourceFooter;
+}
+@property(nonatomic) NSUInteger contentFPS;
 @property uint64_t frameNumber;
 @property uint64_t timerTicks;
 @property uint64_t contentUpdates;
 @property uint64_t drawCalls;
 @property uint64_t skippedSlots;
+@property(nonatomic) uint64_t lastDrawContentID;
+@property(nonatomic) uint64_t lastDrawStartedHostTicks;
+@property(nonatomic) uint64_t lastDrawCompletedHostTicks;
+- (void)configureSourceFPS:(NSUInteger)fps staticPattern:(BOOL)staticPattern;
 @end
 @implementation SPProbePatternView
+- (void)configureSourceFPS:(NSUInteger)fps staticPattern:(BOOL)staticPattern {
+    self.contentFPS = fps;
+    _sourceHeading = staticPattern ? @"静态遮挡窗口" : [NSString stringWithFormat:@"%lu FPS 内容样本", (unsigned long)fps];
+    _sourceFooter = staticPattern ? @"静态图案 / 自有窗口诊断" : [NSString stringWithFormat:@"固定 %lu FPS / 自有窗口诊断", (unsigned long)fps];
+}
 - (BOOL)isFlipped { return YES; }
 - (BOOL)isOpaque { return YES; }
 - (void)drawRect:(NSRect)dirtyRect {
     self.drawCalls++;
+    self.lastDrawContentID = self.frameNumber; self.lastDrawStartedHostTicks = mach_absolute_time();
     SPProbeFill(0x101820, self.bounds);
     [NSGraphicsContext saveGraphicsState];
     const double scale = MIN(self.bounds.size.width / 1280.0, self.bounds.size.height / 720.0);
     NSAffineTransform *transform = [NSAffineTransform transform];
     [transform translateXBy:(self.bounds.size.width - 1280 * scale) / 2 yBy:(self.bounds.size.height - 720 * scale) / 2];
     [transform scaleBy:scale]; [transform concat];
-    SPProbeText(@"30 FPS 内容样本", 48, 54, 23, NO, 0xdce9f2);
+    SPProbeText(_sourceHeading, 48, 54, 23, NO, 0xdce9f2);
     SPProbeText(@"小川帧流 / 固定内容帧率", 48, 86, 18, NO, 0xa1b5c2);
-    const double t = self.frameNumber / 30.0;
+    const double t = self.frameNumber / (double)self.contentFPS;
     const double x = 72 + fmod(t * 192, 1008);
     SPProbeFill(0x263b49, NSMakeRect(48, 328, 1184, 2));
     SPProbeFill(0xffb35c, NSMakeRect(x, 194, 128, 128));
@@ -256,10 +271,20 @@ static void SPProbeText(NSString *text, double x, double baseline, double size, 
     SPProbeFill(0x263b49, NSMakeRect(48, 512, 1184, 2));
     SPProbeText([NSString stringWithFormat:@"FRAME %07llu", (unsigned long long)self.frameNumber], 48, 588, 38, YES, 0xf4f8fa);
     for (int i = 0; i < 16; ++i) SPProbeFill((self.frameNumber >> i) & 1 ? 0xe1edf4 : 0x344957, NSMakeRect(650 + i * 32, 554, 24, 36));
-    SPProbeText(@"固定 30 FPS / 自有窗口诊断", 48, 658, 17, NO, 0xa1b5c2);
+    SPProbeText(_sourceFooter, 48, 658, 17, NO, 0xa1b5c2);
     [NSGraphicsContext restoreGraphicsState];
+    self.lastDrawCompletedHostTicks = mach_absolute_time();
 }
 @end
+
+// Main-thread writer, exported only after its timer is stopped. No per-update
+// objects, IO or locks; the existing display call remains synchronous.
+struct SPProbeSourceUpdate {
+    uint64_t sequence, contentID, timerTicks, contentUpdates, updateStartedHostTicks, displayReturnedHostTicks;
+    uint64_t drawCallsBefore, drawCallsAfter, lastDrawContentID, lastDrawStartedHostTicks, lastDrawCompletedHostTicks;
+    bool initialContent;
+};
+static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records must remain POD");
 
 @interface SPSelfWindowCaptureProbe : NSObject <SCStreamOutput, SCStreamDelegate> {
     dispatch_queue_t _captureQueue;
@@ -287,6 +312,9 @@ static void SPProbeText(NSString *text, double x, double baseline, double size, 
     NSDictionary *_previousSnapshot;
     NSString *_outputPath, *_dylibPath, *_controlLayout, *_arm;
     double _widthPoints, _heightPoints, _seconds, _minimumIdle;
+    NSUInteger _sourceFPS;
+    uint64_t _sourceStartHostTicks, _sourceUpdateTotal;
+    std::array<SPProbeSourceUpdate, 8192> _sourceUpdates;
     double _startHost, _sourceStart, _phaseStart, _lastSnapshotHost, _lastIdle;
     NSInteger _phase;
     BOOL _streamStarted, _streamStartPending, _planCommitted, _didFinalize, _controlOnly;
@@ -298,6 +326,7 @@ static void SPProbeText(NSString *text, double x, double baseline, double size, 
 - (void)start;
 - (void)finish:(BOOL)complete;
 - (void)stopStreamAndFinalize:(BOOL)complete;
+- (void)recordSourceUpdateStarted:(uint64_t)started drawCallsBefore:(uint64_t)drawCalls initial:(BOOL)initial;
 @end
 
 @implementation SPSelfWindowCaptureProbe
@@ -306,6 +335,7 @@ static void SPProbeText(NSString *text, double x, double baseline, double size, 
     _outputPath = options[@"output"]; _dylibPath = options[@"dylib"]; _arm = options[@"arm"]; _controlOnly = [options[@"control-only"] boolValue];
     _widthPoints = [options[@"source-width-points"] doubleValue]; _heightPoints = [options[@"source-height-points"] doubleValue];
     _seconds = [options[@"seconds"] doubleValue]; _minimumIdle = [options[@"minimum-idle-seconds"] doubleValue];
+    _sourceFPS = [options[@"source-fps"] unsignedIntegerValue];
     _phase = -1; _stopping.store(false); _startHost = SPProbeNow();
     _captureQueue = dispatch_queue_create("app.openduckframe.self-window-probe.capture", DISPATCH_QUEUE_SERIAL);
     _drawableLock = [NSLock new]; _drawableEvents = [NSMutableArray array];
@@ -316,7 +346,8 @@ static void SPProbeText(NSString *text, double x, double baseline, double size, 
         @"captureAPI": @"getCurrentProcessShareableContentWithCompletionHandler:", @"globalEnumeration": @NO,
         @"permissionRequests": @NO, @"focusActivation": @NO,
         @"gpuCompletionCounterScope": @"surfaceReady is warmup-token gated and this probe does not arm that token; gpuCompletedCallbacks is not total render throughput. Presented-event gpuHost is CPU completed-handler arrival, not a hardware GPU end timestamp.",
-        @"sourcePattern": @"browser-samples/index.html mostly-static 1280x720 motion geometry, paced at 30 content slots/sec",
+        @"configuredSourceFPS": @(_sourceFPS), @"sourceUpdatesEnabled": @(![_arm isEqual:@"bare"]),
+        @"sourcePattern": [NSString stringWithFormat:@"browser-samples/index.html mostly-static 1280x720 motion geometry, paced at %lu new content slots/sec", (unsigned long)_sourceFPS],
         @"mainBundle": NSBundle.mainBundle.bundlePath ?: @"", @"timeline": _timeline, @"phases": _phases } mutableCopy];
     mach_timebase_info_data_t timebase = {}; mach_timebase_info(&timebase);
     _report[@"machTimebase"] = @{ @"numer": @(timebase.numer), @"denom": @(timebase.denom),
@@ -329,6 +360,14 @@ static void SPProbeText(NSString *text, double x, double baseline, double size, 
         _report[@"runtimeLimitSeconds"] = @30;
     } else _report[@"plan"] = @{ @"state": @"not-requested", @"interpolationRequested": @([_arm isEqual:@"rife"]), @"rifePreparationRequested": @([_arm isEqual:@"rife"]) };
     return self;
+}
+- (void)recordSourceUpdateStarted:(uint64_t)started drawCallsBefore:(uint64_t)drawCalls initial:(BOOL)initial {
+    SPProbeSourceUpdate event{}; event.sequence = ++_sourceUpdateTotal;
+    event.contentID = _pattern.frameNumber; event.timerTicks = _pattern.timerTicks; event.contentUpdates = _pattern.contentUpdates;
+    event.updateStartedHostTicks = started; event.displayReturnedHostTicks = mach_absolute_time();
+    event.drawCallsBefore = drawCalls; event.drawCallsAfter = _pattern.drawCalls; event.lastDrawContentID = _pattern.lastDrawContentID;
+    event.lastDrawStartedHostTicks = _pattern.lastDrawStartedHostTicks; event.lastDrawCompletedHostTicks = _pattern.lastDrawCompletedHostTicks;
+    event.initialContent = initial; _sourceUpdates[(event.sequence - 1) % _sourceUpdates.size()] = event;
 }
 - (void)recordProgress:(NSString *)stage {
     if (![NSThread isMainThread]) { dispatch_async(dispatch_get_main_queue(), ^{ [self recordProgress:stage]; }); return; }
@@ -391,7 +430,7 @@ static void SPProbeText(NSString *text, double x, double baseline, double size, 
     NSMutableDictionary *row = [@{ @"hostElapsedSeconds": @(now - _startHost), @"phase": @(_phase),
         @"phaseElapsedSeconds": @(_phase >= 0 ? now - _phaseStart : 0),
         @"intervalSeconds": @(_lastSnapshotHost > 0 ? now - _lastSnapshotHost : 0),
-        @"source": @{ @"timerTicks": @(_pattern.timerTicks), @"contentUpdates": @(_pattern.contentUpdates),
+        @"source": @{ @"configuredContentFPS": @(_sourceFPS), @"updatesEnabled": @(_bareView == nil), @"timerTicks": @(_pattern.timerTicks), @"contentUpdates": @(_pattern.contentUpdates),
             @"drawCalls": @(_pattern.drawCalls), @"skippedContentSlots": @(_pattern.skippedSlots), @"frameNumber": @(_pattern.frameNumber) },
         @"capture": capture, @"drawable": drawable, @"processor": stats, @"windows": [self windowSnapshot] } mutableCopy];
     if (_previousSnapshot) {
@@ -504,9 +543,10 @@ static void SPProbeText(NSString *text, double x, double baseline, double size, 
     _sourceWindow = [[SPProbeWindow alloc] initWithContentRect:sourceFrame styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
     _outputWindow = [[SPProbeWindow alloc] initWithContentRect:outputFrame styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
     for (NSWindow *window in @[_sourceWindow, _outputWindow]) { window.releasedWhenClosed = NO; window.ignoresMouseEvents = YES; window.animationBehavior = NSWindowAnimationBehaviorNone; window.level = NSNormalWindowLevel; }
-    _sourceWindow.title = bare ? @"ODF static own occluder" : @"ODF self-owned 30 FPS source";
+    _sourceWindow.title = bare ? @"ODF static own occluder" : [NSString stringWithFormat:@"ODF self-owned %lu FPS source", (unsigned long)_sourceFPS];
     _outputWindow.title = bare ? @"ODF independent bare Metal output" : @"ODF self-owned production output";
-    _pattern = [[SPProbePatternView alloc] initWithFrame:NSMakeRect(0, 0, _widthPoints, _heightPoints)]; _sourceWindow.contentView = _pattern;
+    _pattern = [[SPProbePatternView alloc] initWithFrame:NSMakeRect(0, 0, _widthPoints, _heightPoints)];
+    [_pattern configureSourceFPS:_sourceFPS staticPattern:bare]; _sourceWindow.contentView = _pattern;
     __weak SPSelfWindowCaptureProbe *weakSelf = self;
     if (bare) {
         _bareView = [[SPProbeBareMetalView alloc] initWithFrame:NSMakeRect(0, 0, _widthPoints, _heightPoints)];
@@ -562,14 +602,18 @@ static void SPProbeText(NSString *text, double x, double baseline, double size, 
     }
     [_outputWindow orderFront:nil]; [_sourceWindow orderFront:nil];
     [_outputView refreshVisibilitySnapshot];
-    _sourceStart = SPProbeNow(); [_pattern display];
+    _sourceStartHostTicks = mach_absolute_time(); _sourceStart = (double)SPProbeNs(_sourceStartHostTicks) / 1e9;
+    const uint64_t initialDrawCalls = _pattern.drawCalls; [_pattern display];
+    if (!bare) [self recordSourceUpdateStarted:_sourceStartHostTicks drawCallsBefore:initialDrawCalls initial:YES];
     if (!bare) {
-    _tickTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / 30 repeats:YES block:^(NSTimer *timer) {
+    _tickTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / _sourceFPS repeats:YES block:^(NSTimer *timer) {
         SPSelfWindowCaptureProbe *strong = weakSelf; if (!strong || strong->_stopping.load()) return;
         SPProbePatternView *pattern = strong->_pattern; pattern.timerTicks++;
-        const uint64_t slot = (uint64_t)floor((SPProbeNow() - strong->_sourceStart) * 30);
+        const uint64_t slot = (uint64_t)floor((SPProbeNow() - strong->_sourceStart) * strong->_sourceFPS);
         if (slot != pattern.frameNumber) { if (slot > pattern.frameNumber + 1) pattern.skippedSlots += slot - pattern.frameNumber - 1;
-            pattern.frameNumber = slot; pattern.contentUpdates++; [pattern setNeedsDisplay:YES]; [pattern display]; }
+            const uint64_t started = mach_absolute_time(), drawsBefore = pattern.drawCalls;
+            pattern.frameNumber = slot; pattern.contentUpdates++; [pattern setNeedsDisplay:YES]; [pattern display];
+            [strong recordSourceUpdateStarted:started drawCallsBefore:drawsBefore initial:NO]; }
     }];
     }
     _monitorTimer = [NSTimer scheduledTimerWithTimeInterval:.2 repeats:YES block:^(NSTimer *timer) { [weakSelf monitor]; }];
@@ -700,6 +744,28 @@ static void SPProbeText(NSString *text, double x, double baseline, double size, 
         _hiddenPreview.presented = nil; _hiddenPreview.presentationFailure = nil;
     }
     [_sourceWindow close]; [_outputWindow close];
+    const uint64_t sourceRetained = MIN(_sourceUpdateTotal, (uint64_t)_sourceUpdates.size());
+    NSMutableArray *sourceEvents = [NSMutableArray arrayWithCapacity:(NSUInteger)sourceRetained];
+    for (uint64_t index = _sourceUpdateTotal - sourceRetained; index < _sourceUpdateTotal; ++index) {
+        const auto &event = _sourceUpdates[index % _sourceUpdates.size()];
+        const BOOL directDrawObserved = event.drawCallsAfter > event.drawCallsBefore && event.lastDrawContentID == event.contentID &&
+            event.lastDrawStartedHostTicks >= event.updateStartedHostTicks && event.lastDrawCompletedHostTicks >= event.lastDrawStartedHostTicks &&
+            event.lastDrawCompletedHostTicks <= event.displayReturnedHostTicks;
+        [sourceEvents addObject:@{ @"sequence": @(event.sequence), @"contentID": @(event.contentID), @"initialContent": @(event.initialContent),
+            @"timerTicks": @(event.timerTicks), @"contentUpdates": @(event.contentUpdates),
+            @"updateStartedHostTicks": @(event.updateStartedHostTicks), @"displayReturnedHostTicks": @(event.displayReturnedHostTicks),
+            @"drawCallsBefore": @(event.drawCallsBefore), @"drawCallsAfter": @(event.drawCallsAfter),
+            @"lastDrawContentID": event.lastDrawStartedHostTicks ? @(event.lastDrawContentID) : (id)NSNull.null,
+            @"lastDrawStartedHostTicks": event.lastDrawStartedHostTicks ? @(event.lastDrawStartedHostTicks) : (id)NSNull.null,
+            @"lastDrawCompletedHostTicks": event.lastDrawCompletedHostTicks ? @(event.lastDrawCompletedHostTicks) : (id)NSNull.null,
+            @"directDrawObservedForContent": @(directDrawObserved) }];
+    }
+    _report[@"sourceUpdateTrace"] = @{ @"enabled": @(![_arm isEqual:@"bare"]), @"configuredContentFPS": @(_sourceFPS),
+        @"sourceStartHostTicks": _sourceStartHostTicks ? @(_sourceStartHostTicks) : (id)NSNull.null,
+        @"capacity": @(_sourceUpdates.size()), @"total": @(_sourceUpdateTotal), @"dropped": @(_sourceUpdateTotal - sourceRetained),
+        @"firstseq": sourceRetained ? @(_sourceUpdateTotal - sourceRetained + 1) : (id)NSNull.null,
+        @"lastseq": sourceRetained ? @(_sourceUpdateTotal) : (id)NSNull.null, @"events": sourceEvents,
+        @"scope": @"Main-thread POD records for initial content 0 and each actual content-ID advance, exported after timer stop. HostTicks use machTimebase. Timer/content slots use configured FPS; the counter, binary bars and motion advance only on new slots. Late timer slots are skipped, not filled with repeated frames. Direct draw proves drawRect ran for that content during display(), not WindowServer presentation or a decoded SCK content ID; timestamp association alone does not prove capture/source one-to-one identity." };
     _report[@"functionalComplete"] = @(complete && !_report[@"firstFailure"]);
     _report[@"elapsedSeconds"] = @(SPProbeNow() - _startHost);
     NSMutableArray *goals = [NSMutableArray array];
@@ -762,11 +828,11 @@ static void SPProbeText(NSString *text, double x, double baseline, double size, 
 @end
 
 static void SPProbeUsage(void) {
-    fprintf(stderr, "Usage: SelfProbe --output /absolute/new.json [--preflight-only | --inspect --dylib /absolute/Release.dylib | --prepared-lifetime-only --dylib /absolute/Release.dylib | --arm bare|passthrough|rife (default rife) [--dylib /absolute/Release.dylib (required except bare)] [--control-only] [--source-width-points 1324 --source-height-points 834 --seconds 12 (5..60) --minimum-idle-seconds 60]]\n");
+    fprintf(stderr, "Usage: SelfProbe --output /absolute/new.json [--preflight-only | --inspect --dylib /absolute/Release.dylib | --prepared-lifetime-only --dylib /absolute/Release.dylib | --arm bare|passthrough|rife (default rife) [--dylib /absolute/Release.dylib (required except bare)] [--control-only] [--source-fps 24|30 (default 30) --source-width-points 1324 --source-height-points 834 --seconds 12 (5..60) --minimum-idle-seconds 60]]\n");
 }
 int main(int argc, const char **argv) {
     @autoreleasepool {
-        NSMutableDictionary *options = [@{ @"arm": @"rife", @"control-only": @NO, @"source-width-points": @1324, @"source-height-points": @834, @"seconds": @12, @"minimum-idle-seconds": @60 } mutableCopy];
+        NSMutableDictionary *options = [@{ @"arm": @"rife", @"control-only": @NO, @"source-fps": @30, @"source-width-points": @1324, @"source-height-points": @834, @"seconds": @12, @"minimum-idle-seconds": @60 } mutableCopy];
         BOOL preflightOnly = NO, inspect = NO, preparedLifetimeOnly = NO;
         NSSet *numeric = [NSSet setWithArray:@[@"source-width-points", @"source-height-points", @"seconds", @"minimum-idle-seconds"]];
         for (int i = 1; i < argc; ++i) {
@@ -777,7 +843,10 @@ int main(int argc, const char **argv) {
             if ([arg isEqual:@"--control-only"]) { options[@"control-only"] = @YES; continue; }
             if (![arg hasPrefix:@"--"] || i + 1 >= argc) { SPProbeUsage(); return 2; }
             NSString *key = [arg substringFromIndex:2], *value = @(argv[++i]);
-            if ([numeric containsObject:key]) options[key] = @([value doubleValue]);
+            if ([key isEqual:@"source-fps"]) {
+                if (![value isEqual:@"24"] && ![value isEqual:@"30"]) { SPProbeUsage(); return 2; }
+                options[key] = @([value integerValue]);
+            } else if ([numeric containsObject:key]) options[key] = @([value doubleValue]);
             else if ([key isEqual:@"dylib"] || [key isEqual:@"output"] || [key isEqual:@"arm"]) options[key] = value;
             else { SPProbeUsage(); return 2; }
         }
@@ -816,7 +885,7 @@ int main(int argc, const char **argv) {
             fprintf(stdout, "%s\n", output.UTF8String); return [result[@"ok"] boolValue] ? 0 : 1;
         }
         if (preflightOnly || inspect) {
-            NSMutableDictionary *result = [@{ @"mode": preflightOnly ? @"preflight-only" : @"inspect", @"arm": options[@"arm"], @"controlOnly": options[@"control-only"], @"preflight": SPProbePreflight([options[@"minimum-idle-seconds"] doubleValue]), @"windowsCreated": @NO, @"captureStarted": @NO, @"modelPrepared": @NO, @"mainBundle": NSBundle.mainBundle.bundlePath ?: @"" } mutableCopy];
+            NSMutableDictionary *result = [@{ @"mode": preflightOnly ? @"preflight-only" : @"inspect", @"arm": options[@"arm"], @"controlOnly": options[@"control-only"], @"configuredSourceFPS": options[@"source-fps"], @"preflight": SPProbePreflight([options[@"minimum-idle-seconds"] doubleValue]), @"windowsCreated": @NO, @"captureStarted": @NO, @"modelPrepared": @NO, @"mainBundle": NSBundle.mainBundle.bundlePath ?: @"" } mutableCopy];
             BOOL ok = YES;
             if (inspect) {
                 void *loaded = dlopen(dylib.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL); const char *loadError = loaded ? nullptr : dlerror();

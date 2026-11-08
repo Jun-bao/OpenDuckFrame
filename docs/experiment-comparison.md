@@ -98,7 +98,7 @@ It does not change user preferences or require accessibility/screen recording.
 ## Self-owned-window capture and presentation diagnostic
 
 `Modules/VideoEnhancement/Tests/SPSelfWindowCaptureProbe.mm` is a standalone
-accessory-app driver for a different layer: a generated 30 Hz source window,
+accessory-app driver for a different layer: a generated 24 or 30 Hz source window,
 ScreenCaptureKit, the production content gate/owned copy/processor, and the
 production drawable presenter. It dynamically loads the optimized diagnostic
 library above. Package that library inside its own `Contents/Frameworks`, copy
@@ -111,11 +111,20 @@ is needed for this test's own resources and results.
 The CLI accepts `--output /absolute/new.json --preflight-only`,
 `--output /absolute/new.json --inspect --dylib /absolute/bundled-library`, or
 `--output /absolute/new.json --dylib /absolute/bundled-library
---source-width-points 1324 --source-height-points 834 --seconds 12
+--source-fps 24 --source-width-points 1324 --source-height-points 834 --seconds 12
 --minimum-idle-seconds 60`. Each of two phases lasts 5–60 seconds. The source
 remains uncovered first, then the output covers it. A small display may only
 leave a strip of the first output exposed; the report records this geometry
 and does not call it a fully separated comparison.
+
+`--source-fps` accepts exactly `24` or `30` and defaults to `30`. It changes
+the source content clock and motion, not the capture sampling cap. Preflight
+and inspect report the configured rate. `sourceUpdateTrace` exports bounded
+main-thread content IDs and update/draw timestamps after the timer stops;
+overflow makes this source evidence incomplete. These records establish the
+test source's updates, not pixel-level identity between each source update
+and a captured frame. The single 24 Hz characterization retains the product
+candidate, including its existing delay interval clamp, and is not acceptance.
 
 Only current-process content is queried, with an exact window ID and owner
 PID check. That API redacts window/filter geometry, so stream and plan sizes
