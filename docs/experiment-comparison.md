@@ -143,3 +143,10 @@ texture/encoding, lock and actual deadline-check samples under
 logic, including failure paths. `HostTicks` require `mach_timebase_info`
 conversion; they are not nanoseconds. Existing `gpuHost` is CPU completion
 handler arrival, while the bare arm separately records GPUStartTime/GPUEndTime.
+
+`ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC=1` is a compile-time experiment only:
+it changes the selection guard to 2 ms while the normal build remains at
+1 ms. It does not change the drawable's actual submission deadline or the
+counting rules. Processor status flags are retained as status history; as in
+the workbench, a budget warning alone does not stop the test. Plan rejection,
+stream/initialization errors and the existing timeouts still stop execution.

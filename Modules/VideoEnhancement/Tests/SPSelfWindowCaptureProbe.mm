@@ -537,7 +537,21 @@ static void SPProbeText(NSString *text, double x, double baseline, double size, 
             else if (state == 0) [strong fail:@"requested production plan did not commit" details:reason ?: @""];
         });
     };
-    _processor.statusHandler = ^(NSString *status, BOOL failed, uint64_t requestID) { if (failed) [weakSelf fail:@"production processor failure" details:status]; };
+    // Production uses this flag to color its status, including recoverable
+    // budget warnings. Plan rejection and the existing stream/startup checks
+    // decide whether this diagnostic can execute the requested configuration.
+    _processor.statusHandler = ^(NSString *status, BOOL failed, uint64_t requestID) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            SPSelfWindowCaptureProbe *strong = weakSelf; if (!strong || strong->_didFinalize) return;
+            NSMutableArray *events = strong->_report[@"processorStatusEvents"];
+            if (!events) { events = [NSMutableArray array]; strong->_report[@"processorStatusEvents"] = events; }
+            NSDictionary *event = @{ @"status": status ?: @"", @"failedFlag": @(failed), @"requestID": @(requestID),
+                @"hostElapsedSeconds": @(SPProbeNow() - strong->_startHost),
+                @"scope": @"Production UI status flag, not an execution stop; plan/stream errors and timeouts remain authoritative." };
+            [events addObject:event];
+            if (failed && !strong->_report[@"firstFailedStatus"]) strong->_report[@"firstFailedStatus"] = event;
+        });
+    };
     [_processor adoptSourceGeneration:1];
     [_processor setRawCadenceRefreshHz:60 captureLimit:0 displayID:CGMainDisplayID()];
     }

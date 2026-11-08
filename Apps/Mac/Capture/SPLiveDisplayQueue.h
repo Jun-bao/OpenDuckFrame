@@ -32,7 +32,13 @@ struct DisplaySlotWindow {
     int64_t deadlineNs = 0, displayNs = 0;
 };
 
+// Isolated diagnostic build: measured preparation plus timer overhead needs
+// about 1.75 ms in the tested scene. Keep the normal policy until validation.
+#if defined(ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC) && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC == 1
+constexpr int64_t displaySelectionGuardNs = 2000000;
+#else
 constexpr int64_t displaySelectionGuardNs = 1000000;
+#endif
 enum class DisplaySlotDecision { staleToken, retired, waiting, ready, expired };
 
 inline bool canArmDisplaySlot(DisplaySlotWindow slot, uint64_t token, DisplaySlotContext current) {
