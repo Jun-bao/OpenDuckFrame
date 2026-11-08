@@ -7,7 +7,7 @@ import RifeMetal
 import RifeMetalCore
 
 enum SustainedError: Error {
-    case invalid(String), cancelled, native(String), trace(String), capacity
+    case invalid(String), cancelled, native(String), trace(String), calibration(String), capacity
 }
 
 let originalModelSHA256 = "ef29a643a76a9202600458a23dddce16919337ef01743d0fbe817684ec990f74"
@@ -65,6 +65,7 @@ struct Options {
     let expectedSHA256: String
     let output: URL
     let cancelFile: String
+    let gapFillEnabled: Bool
 
     static let help = """
     Usage: air-sustained-cost --mode paced24|continuous --seconds 180|120
@@ -78,7 +79,10 @@ struct Options {
     only if prefix push-wall p50 is strictly below 36.264667ms. No automatic retry.
     paced24 skips missed slots without catch-up; continuous has no pacing sleep.
     ODF_AIR_SERVICE_TRACE=1 must be set before launch. No window or capture.
-    Exit: 0 complete; 3 baseline_not_ready; 4 cancelled; 1 failed; 2 invalid CLI.
+    ODF_AIR_GAP_FILL_DIAGNOSTIC=1 enables the isolated gap-fill contract only for
+    paced24 seconds180 or seconds600; default is off. No automatic 600s follow-up.
+    Exit: 0 complete; 3 baseline_not_ready; 4 cancelled; 5 calibration_failed;
+      1 failed; 2 invalid CLI.
     --help exits before model, Metal, or output initialization.
     """
 
@@ -94,9 +98,13 @@ struct Options {
             guard allowed.contains(key), values[key] == nil else { throw SustainedError.invalid("unknown/duplicate option: \(key)") }
             values[key] = arguments[index + 1]
         }
+        let gapValue = ProcessInfo.processInfo.environment["ODF_AIR_GAP_FILL_DIAGNOSTIC"] ?? "0"
+        guard gapValue == "0" || gapValue == "1" else { throw SustainedError.invalid("gap-fill flag must be0/1") }
+        let gapEnabled = gapValue == "1"
         guard let mode = values["--mode"], let seconds = Int(values["--seconds"] ?? ""),
               let prefix = Int(values["--baseline-seconds"] ?? ""), prefix == 5,
-              (mode == "paced24" && seconds == 180) || (mode == "continuous" && seconds == 120),
+              (gapEnabled ? mode == "paced24" && (seconds == 180 || seconds == 600)
+                          : (mode == "paced24" && seconds == 180) || (mode == "continuous" && seconds == 120)),
               values["--model-sha256"] == originalModelSHA256 else {
             throw SustainedError.invalid("fixed original-model protocol: paced24/180 or continuous/120; prefix5; original SHA")
         }
@@ -111,7 +119,7 @@ struct Options {
         }
         return Options(mode: mode, seconds: seconds, baselineSeconds: prefix,
                        model: URL(fileURLWithPath: values["--model-path"]!), expectedSHA256: values["--model-sha256"]!,
-                       output: destination, cancelFile: values["--cancel-file"]!)
+                       output: destination, cancelFile: values["--cancel-file"]!, gapFillEnabled: gapEnabled)
     }
 }
 
@@ -126,6 +134,7 @@ struct Configuration: Encodable {
     let seconds: Int
     let baselineSeconds: Int
     let targetHz: Int
+    let gapFillEnabled: Bool
     let width = 1814, height = 1142, warmup = 20
     let qualityTier = "fast", internalScale = 0.25, weightsDtype = "FP16"
     let maskUpdate = "accumulate", gpuIO = true, replaceMask = false
@@ -280,6 +289,9 @@ struct Job: Encodable {
     let missedSlotsBefore: Int
     let traceRecordCount: Int
     let traceOverflow: UInt64
+    let lastFillIDAtRealStart: UInt64
+    let fillInFlightAtRealStart: Bool
+    let fillStateObservationNs: UInt64
     let error: String?
 }
 
@@ -369,6 +381,7 @@ struct Report: Encodable {
     var runEndNs: UInt64 = 0
     var modelIdentity: ModelIdentity?
     var device: String?
+    var deviceRegistryID: UInt64?
     var lowPowerMode: Bool?
     var firstInputSHA256: String?
     var secondInputSHA256: String?
@@ -382,6 +395,7 @@ struct Report: Encodable {
     var rootObservationsDropped = 0
     var traceOverflowTotal: UInt64 = 0
     var jobLimitReached = false
+    var gapFill: GapFillReport?
     let scope = "No window, SCK, presenter, source capture, FPS acceptance or quality acceptance. Thermal state is a coarse observation, not a temperature/frequency attribution."
     let prefixAndMeasurementAreSeparate = true
 }
@@ -394,6 +408,7 @@ final class Harness {
     var observationSequence: UInt64 = 0
     var engine: RifeInterpolator?
     var output: CVPixelBuffer?
+    var gapFill: GapFill?
 
     init(_ options: Options) {
         self.options = options
@@ -401,6 +416,7 @@ final class Harness {
         mach_timebase_info(&timebase)
         report = Report(configuration: .init(mode: options.mode, seconds: options.seconds,
                         baselineSeconds: options.baselineSeconds, targetHz: options.mode == "paced24" ? 24 : 0,
+                        gapFillEnabled: options.gapFillEnabled,
                         expectedModelSHA256: options.expectedSHA256, modelPath: options.model.path),
                         hostClock: .init(machTimebaseNumer: timebase.numer, machTimebaseDenom: timebase.denom))
         report.jobs.reserveCapacity(12_000)
@@ -436,6 +452,7 @@ final class Harness {
         let inputShift = pushSequence.isMultiple(of: 2) ? 7 : 0
         pushSequence += 1
         engine.airServiceTraceBegin(jobID: id, stage: 3)
+        let fillState = try gapFill?.atRealStart()
         var generated = false
         var failure: Error?
         // Keep this scope identical to the original complete-push cost probe.
@@ -447,6 +464,9 @@ final class Harness {
                     wallStartNs: start, wallEndNs: end, wallNs: end - start, generated: generated,
                     scheduledSlot: slot, targetNs: targetNs, launchLagNs: targetNs.map { start >= $0 ? start - $0 : 0 },
                     missedSlotsBefore: missed, traceRecordCount: count, traceOverflow: overflow,
+                    lastFillIDAtRealStart: fillState?.lastFillID ?? 0,
+                    fillInFlightAtRealStart: fillState?.inFlight ?? false,
+                    fillStateObservationNs: fillState?.observedNs ?? 0,
                     error: failure.map { String(describing: $0) }))
         if let failure { throw failure }
         guard generated else { throw SustainedError.native("missing midpoint in \(phase)") }
@@ -495,7 +515,11 @@ final class Harness {
                 var tick = start + UInt64(slot) * billion / 24
                 while true {
                     let stamp = nowNs()
-                    if stamp < tick { Thread.sleep(forTimeInterval: Double(tick - stamp) / 1e9) }
+                    if stamp < tick {
+                        try gapFill?.fillUntil(nextTick: tick, phase: name, checkCancel: checkCancel)
+                        let afterFill = nowNs()
+                        if afterFill < tick { Thread.sleep(forTimeInterval: Double(tick - afterFill) / 1e9) }
+                    }
                     try checkCancel()
                     let awake = nowNs()
                     if awake >= nominalEnd { break }
@@ -539,13 +563,20 @@ final class Harness {
         }
         try checkCancel()
         guard try sha(options.model) == options.expectedSHA256 else { throw SustainedError.invalid("source model SHA mismatch") }
+        let preferredDevice: MTLDevice?
+        if options.gapFillEnabled {
+            guard let device = MTLCreateSystemDefaultDevice() else { throw SustainedError.native("gap-fill shared device unavailable") }
+            preferredDevice = device
+            report.deviceRegistryID = device.registryID
+        } else { preferredDevice = nil }
         let engine = try RifeInterpolator(configuration: .init(modelURL: options.model, qualityTier: .fast,
+                          preferredDevice: preferredDevice,
                           experimentOptions: .init(gpuIO: true, replaceMask: false)))
         self.engine = engine
         let identity = engine.airDiagnosticModelIdentity
         report.configuration.actualLoadedModelIdentity = ModelIdentitySnapshot(identity)
         report.modelIdentity = try validateOriginalModelIdentity(identity)
-        report.device = MTLCreateSystemDefaultDevice()?.name
+        report.device = preferredDevice?.name ?? MTLCreateSystemDefaultDevice()?.name
         report.lowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
         let first = try image(width, height, 0), second = try image(width, height, 7)
         let output = try PixelBufferConvert.makeOutputPixelBuffer(width: width, height: height)
@@ -568,6 +599,11 @@ final class Harness {
                          phase: "warmup", sequence: index)
             }
         }
+        if let device = preferredDevice {
+            let fill = try GapFill(device: device)
+            self.gapFill = fill
+            try fill.calibrate(checkCancel: checkCancel)
+        }
         try phase("baseline", seconds: options.baselineSeconds, stream: stream, engine: engine,
                   first: first, second: second, output: output)
         try checkCancel()
@@ -589,6 +625,14 @@ final class Harness {
 
     func finish() throws {
         report.runEndNs = nowNs()
+        if let fill = gapFill {
+            fill.finish()
+            report.gapFill = fill.report
+            if report.status == "complete", let failure = fill.report.completionFailure {
+                report.status = "failed"; report.functionalComplete = false
+                report.failureKind = "gap_fill_error"; report.firstFailure = failure
+            }
+        }
         if let output, report.jobs.contains(where: { $0.generated }) { report.lastOutputSHA256 = pixelHash(output) }
         let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         // Exceptional unsupported numeric values stay explicit; they are never zeros.
@@ -610,6 +654,7 @@ do {
         switch error {
         case SustainedError.cancelled: harness.report.status = "cancelled"; harness.report.failureKind = "cancelled"
         case SustainedError.trace: harness.report.failureKind = "trace"
+        case SustainedError.calibration: harness.report.status = "calibration_failed"; harness.report.failureKind = "calibration_failed"
         case SustainedError.capacity: harness.report.failureKind = "capacity"
         default: harness.report.failureKind = "native_error"
         }
@@ -620,6 +665,7 @@ do {
     case "complete": exit(0)
     case "baseline_not_ready": exit(3)
     case "cancelled": exit(4)
+    case "calibration_failed": exit(5)
     default: exit(1)
     }
 } catch {

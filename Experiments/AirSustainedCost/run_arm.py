@@ -44,7 +44,7 @@ def run(config_path):
         raise SystemExit("Existing coordinator retained; this arm cannot be repeated")
     state = {"schema": "odf.sustained-arm-coordinator.v1", "started_utc": utc_now(),
              "status": "starting", "arm": config["arm"], "attempts": [],
-             "formal_measurements_started": 0, "system_settings_changed": False}
+             "formal_measurements_started": 0, "prefix_attempts_used": 0, "system_settings_changed": False}
     runtime = Path(tempfile.mkdtemp(prefix="odf-sustained-arm-"))
     prefs = [Path(p).expanduser() for p in config.get("preference_paths", [])]
     def prefhash():
@@ -73,9 +73,13 @@ def run(config_path):
             raise RuntimeError("Frozen binary/model hash mismatch; no native run")
         if config["mode"] not in ("paced24", "continuous"):
             raise RuntimeError("Unknown frozen mode")
-        expected_seconds = 180 if config["mode"] == "paced24" else 120
-        if config["seconds"] != expected_seconds:
+        gap_fill = config.get("gap_fill_enabled", False)
+        if not isinstance(gap_fill, bool) or (gap_fill and config["mode"] != "paced24"):
+            raise RuntimeError("Gap fill requires an explicit boolean and paced24 mode")
+        allowed_seconds = (180, 600) if gap_fill else ((180,) if config["mode"] == "paced24" else (120,))
+        if config["seconds"] not in allowed_seconds:
             raise RuntimeError("Duration differs from the approved arm")
+        state["gap_fill_enabled"] = gap_fill
         lock_path = Path(config["gpu_lock"]).expanduser()
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         lock = lock_path.open("a")
@@ -90,9 +94,10 @@ def run(config_path):
         native_env.pop("ODF_AIR_FOURSTAGE_MODEL_PATH", None)
         native_env.pop("RIFE_DUMP_DIR", None)
         native_env.update(ODF_AIR_SERVICE_TRACE="1", ODF_PERF_PROFILE="off",
-                          ODF_K1_PROFILE="0", RIFE_VERBOSE="0")
+                          ODF_K1_PROFILE="0", RIFE_VERBOSE="0",
+                          ODF_AIR_GAP_FILL_DIAGNOSTIC="1" if gap_fill else "0")
         state["native_environment_overrides"] = {
-            k: native_env[k] for k in ("ODF_AIR_SERVICE_TRACE", "ODF_PERF_PROFILE", "ODF_K1_PROFILE", "RIFE_VERBOSE")}
+            k: native_env[k] for k in ("ODF_AIR_SERVICE_TRACE", "ODF_PERF_PROFILE", "ODF_K1_PROFILE", "RIFE_VERBOSE", "ODF_AIR_GAP_FILL_DIAGNOSTIC")}
         state["App_model_override_unset"] = True
         state["RIFE_dump_directory_unset"] = True
         save()
@@ -224,6 +229,14 @@ def run(config_path):
                 raise RuntimeError("Native result missing; retain first failure, no retry")
             native = json.loads(result_path.read_text())
             row["native_status"] = native.get("status")
+            row["native_failureKind"] = native.get("failureKind")
+            if isinstance(native.get("formalStarted"), bool):
+                state["formal_measurements_started"] = int(native["formalStarted"])
+            if native.get("status") in ("complete", "baseline_not_ready") or native.get("baselineGate", {}).get("sampleCount", 0) > 0:
+                state["prefix_attempts_used"] += 1
+            if native.get("status") == "calibration_failed":
+                state["failureKind"] = "calibration_failed"
+                row["failureKind"] = "calibration_failed"
             row["native_sha256"] = sha(result_path)
             row["status"] = "finished"
             if native.get("status") == "complete" and process.returncode == 0 and not cancel_reason:

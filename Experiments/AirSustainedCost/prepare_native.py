@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Add a sustained-cost executable to a fresh copy of the frozen trace runtime.
 
-This prepares source only. It never builds, runs Metal, replaces a model, or
-modifies the input runtime. Build with SwiftPM --jobs 4 after preparation.
+This compiles only the independent diagnostic shader with the offline Metal
+compiler, then prepares Swift source. It never executes GPU work, replaces a
+model, or modifies the input runtime. Build Swift with --jobs 4 afterwards.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import subprocess
 
 
 def sha(path: Path) -> str:
@@ -59,11 +61,28 @@ def prepare(source: Path, output: Path) -> dict[str, object]:
                 '        .library(name: "RifeMetal", targets: ["RifeMetal", "RifeMetalCore"]),\n'
                 '        .executable(name: "air-sustained-cost", targets: ["air-sustained-cost"]),')
     text = once(text, '    targets: [\n', '    targets: [\n'
-                '        .executableTarget(name: "air-sustained-cost", dependencies: ["RifeMetal", "RifeMetalCore"]),\n')
+                '        .executableTarget(name: "air-sustained-cost", dependencies: ["RifeMetal", "RifeMetalCore"], resources: [.copy("Resources/gap-fill.metallib")]),\n')
     package.write_text(text)
     target = output / "Sources/air-sustained-cost"
     target.mkdir()
     shutil.copyfile(here / "native/sustained.swift", target / "main.swift")
+    shutil.copyfile(here / "native/GapFill.swift", target / "GapFill.swift")
+    resources = target / "Resources"
+    resources.mkdir()
+    shader_build = output / "GapFillShaderBuild"
+    shader_build.mkdir()
+    shutil.copyfile(here / "native/GapFill.metal", shader_build / "GapFill.metal")
+    shader_commands = [
+        ["xcrun", "--sdk", "macosx", "metal", "-c", str(shader_build / "GapFill.metal"),
+         "-o", str(shader_build / "GapFill.air")],
+        ["xcrun", "--sdk", "macosx", "metallib", str(shader_build / "GapFill.air"),
+         "-o", str(resources / "gap-fill.metallib")],
+    ]
+    with (output / "gap-fill-shader-build.log").open("w") as log:
+        for command in shader_commands:
+            completed = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
+            if completed.returncode:
+                raise RuntimeError(f"offline diagnostic shader compilation failed: {command[3]}")
     for relative, expected in original.items():
         if sha(source / relative) != expected:
             raise ValueError(f"input changed during preparation: {relative}")
@@ -75,6 +94,11 @@ def prepare(source: Path, output: Path) -> dict[str, object]:
         "sourceSHA256": original,
         "preparerSHA256": sha(Path(__file__)),
         "driverSHA256": sha(here / "native/sustained.swift"),
+        "gapFillDriverSHA256": sha(here / "native/GapFill.swift"),
+        "gapFillShaderSHA256": sha(here / "native/GapFill.metal"),
+        "gapFillMetallibSHA256": sha(resources / "gap-fill.metallib"),
+        "gapFillOfflineShaderCommands": shader_commands,
+        "gapFillRuntimeShaderCompilation": False,
         "packageSHA256": sha(package),
         "runtimeSourcesByteIdentical": True,
         "modelResourcesUnchanged": True,
@@ -84,7 +108,8 @@ def prepare(source: Path, output: Path) -> dict[str, object]:
     }
     (output / "air-sustained-native-origin.json").write_text(json.dumps(result, indent=2) + "\n")
     return {"output": str(output), "runtimeFilesVerified": len(original),
-            "driverSHA256": result["driverSHA256"], "sourceOnly": True}
+            "driverSHA256": result["driverSHA256"], "swiftBuilt": False,
+            "diagnosticShaderCompiledOffline": True, "gpuExecuted": False}
 
 
 def main() -> None:
