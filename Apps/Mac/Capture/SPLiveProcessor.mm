@@ -5320,6 +5320,20 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
             result = extended;
         }
 #if ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC
+        if (self->_airDelayAlignmentRequested && [self->_request.engineID isEqualToString:@"apple.frc"]) {
+            NSMutableDictionary *extended = [result mutableCopy];
+            extended[@"appleFRCIdentity"] = @{ @"requestedEngineID": self->_request.engineID ?: @"",
+                @"resolvedEngineID": self->_resolved.engineID ?: @"", @"resolvedModelID": self->_resolved.modelID ?: @"",
+                @"qualityID": self->_request.qualityID ?: @"", @"quality": @(self->_request.quality),
+                @"OSVersion": NSProcessInfo.processInfo.operatingSystemVersionString,
+                @"isSupportedIfResolved": @([SPFRCEngine availabilityIfResolved]),
+                @"engineInstanceCreated": @(self->_engine != nil), @"actualEngineClass": self->_engine ? NSStringFromClass(self->_engine.class) : (id)NSNull.null,
+                @"sessionsActual": @(self->_engine ? self->_engine.sessionCount : 0), @"width": @(self->_width), @"height": @(self->_height),
+                @"sourcePixelFormat": @(self->_sourcePixelFormat), @"rifeStreamEnabled": @(self->_request.rifeStreamEnabled),
+                @"captureToOutputReadyOrigin": @"B source captureHost; includes B-side capture/copy/queue, input/VT/output conversions and delivery; excludes the A-to-B source interval. No extra I subtraction.",
+                @"scope": @"Guard-build explicit delay-alignment diagnostic snapshot of the actual configured processor instance; capability alone is not session or performance acceptance." };
+            result = extended;
+        }
         if (self->_rife.serviceTraceEnabled) {
             NSMutableDictionary *extended = [result mutableCopy];
             const uint64_t serviceCutoff = causalCutoff > 0 ? (uint64_t)causalCutoff : (uint64_t)SPHostNow();
@@ -5870,7 +5884,11 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     if (process < 0.008) process = 0.008;
     double renderMargin = 0.016;
     if (_airDelayAlignmentRequested && _request.rateKind == SPLiveRateMultiplier && _request.multiplier == 2 &&
-        _effectiveMultiplier == 2 && [_request.engineID isEqualToString:@"rife.metal"]) {
+        _effectiveMultiplier == 2 && ([_request.engineID isEqualToString:@"rife.metal"]
+#if defined(ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC) && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC == 1
+        || [_request.engineID isEqualToString:@"apple.frc"]
+#endif
+        )) {
         SPLivePreviewView *timedView = self.outputPreview.windowVisibleSnapshot ? self.outputPreview : self.preview;
         _airDelayAlignmentLeadNs = MAX((int64_t)16000000, [timedView presentationPreparationLeadNs]);
         _airDelayAlignmentMarginNs = _airDelayAlignmentLeadNs + 3000000;

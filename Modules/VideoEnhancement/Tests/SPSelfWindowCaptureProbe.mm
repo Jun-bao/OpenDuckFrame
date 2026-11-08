@@ -1,5 +1,5 @@
 // Standalone accessory-app diagnostic: bare Metal, captured passthrough, or
-// captured RIFE. Capture uses only the exact own window; never requests TCC/AX.
+// captured RIFE or Apple FRC. Capture uses only the exact own window; never requests TCC/AX.
 #import <AppKit/AppKit.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -16,6 +16,8 @@
 #include <cmath>
 #include <memory>
 #include <array>
+#include <algorithm>
+#include <vector>
 #include <type_traits>
 #import "SPLiveProcessor.h"
 #import "SPFRCEngine.h"
@@ -34,6 +36,18 @@ static int64_t SPProbeNs(uint64_t host) {
     return (int64_t)(((__uint128_t)host * timebase.numer) / timebase.denom);
 }
 static double SPProbeNow(void) { return (double)SPProbeNs(mach_absolute_time()) / 1e9; }
+static BOOL SPProbeInterpolates(NSString *arm) { return [arm isEqual:@"rife"] || [arm isEqual:@"apple"]; }
+static NSDictionary *SPProbeAppleFRCIdentity(void) {
+    Class frc = NSClassFromString(@"SPFRCEngine");
+    const BOOL supported = frc && ((BOOL (*)(id, SEL))objc_msgSend)((id)frc, @selector(isAvailable));
+    NSOperatingSystemVersion os = NSProcessInfo.processInfo.operatingSystemVersion;
+    return @{ @"engineID": @"apple.frc", @"api": @"VideoToolbox frame-rate conversion via SPFRCEngine",
+        @"OSVersion": NSProcessInfo.processInfo.operatingSystemVersionString,
+        @"OSVersionComponents": @[@(os.majorVersion), @(os.minorVersion), @(os.patchVersion)],
+        @"engineClassAvailable": @(frc != Nil), @"isSupportedViaEngine": @(supported),
+        @"supportScope": @"SPFRCEngine.isAvailable resolves OS/API capability; it does not prove a configured session or successful frame processing.",
+        @"rifeModelResourceRequired": @NO };
+}
 static NSDictionary *SPProbeRect(NSRect r) {
     return @{ @"x": @(r.origin.x), @"y": @(r.origin.y), @"width": @(r.size.width), @"height": @(r.size.height) };
 }
@@ -333,6 +347,189 @@ struct SPProbeSourceUpdate {
 };
 static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records must remain POD");
 
+// Finalization only. Keep physical Media bins separate from callback-host bins;
+// neither path assumes that mach and Media absolute origins are equal.
+static NSNumber *SPProbeNumber(id value) { return [value isKindOfClass:NSNumber.class] ? value : nil; }
+static NSArray *SPProbePresentedIdentity(NSDictionary *info) {
+    NSMutableArray *key = [NSMutableArray arrayWithObject:@"output"];
+    for (NSString *name in @[@"generation", @"configVersion", @"measurementEpoch", @"clockEpoch", @"frameID"]) {
+        NSNumber *number = SPProbeNumber(info[name]); if (!number) return nil; [key addObject:number];
+    }
+    return [key copy];
+}
+static double SPProbeTimestampArithmeticErrorNs(double seconds) {
+    const double ns = seconds * 1e9;
+    return 1 + std::abs(std::nextafter(seconds, INFINITY) - seconds) * 1e9 + std::abs(std::nextafter(ns, INFINITY) - ns);
+}
+static NSDictionary *SPProbeExactSecondObservations(NSArray *timeline, NSDictionary *phase, NSDictionary *presentationOrder) {
+    const uint64_t startTicks = [phase[@"measurementStartHostTicks"] unsignedLongLongValue];
+    const uint64_t endTicks = [phase[@"measurementEndHostTicks"] unsignedLongLongValue];
+    if (!startTicks || endTicks <= startTicks) return @{ @"phase": phase[@"index"] ?: @-1,
+        @"status": @"unknown", @"reason": @"missing complete phase host boundaries; no nominal duration substituted" };
+    const int64_t startNs = SPProbeNs(startTicks), endNs = SPProbeNs(endTicks), secondNs = 1000000000;
+    NSMutableDictionary<NSArray *, NSDictionary *> *admissions = [NSMutableDictionary dictionary];
+    NSArray *admissionEvents = presentationOrder[@"airCadenceCausalTrace"][@"output"][@"events"];
+    for (NSDictionary *event in admissionEvents) if ([event[@"kind"] isEqual:@"admitted"]) {
+        NSArray *identity = SPProbePresentedIdentity(event); if (identity) admissions[identity] = event;
+    }
+    NSMutableDictionary<NSArray *, NSDictionary *> *firstPositive = [NSMutableDictionary dictionary];
+    NSMutableSet *conflictingIdentities = [NSMutableSet set];
+    NSUInteger invalidIdentity = 0, duplicatePositive = 0, unjoinedPositive = 0, unscoredPositive = 0;
+    for (NSDictionary *row in timeline) for (NSDictionary *info in row[@"drawable"][@"presentedEventsSinceSnapshot"]) {
+        const double media = [SPProbeNumber(info[@"presentedTime"]) doubleValue];
+        if (!std::isfinite(media) || media <= 0) continue;
+        if (![info[@"counts"] boolValue] || [info[@"redraw"] boolValue]) { unscoredPositive++; continue; }
+        NSArray *identity = SPProbePresentedIdentity(info);
+        const uint64_t callbackTicks = [SPProbeNumber(info[@"presentedHost"]) unsignedLongLongValue];
+        if (!identity || !callbackTicks || !SPProbeNumber(info[@"synthetic"])) { invalidIdentity++; continue; }
+        NSDictionary *admitted = admissions[identity];
+        if (admissionEvents && !admitted) { unjoinedPositive++; continue; }
+        if (admitted && (![admitted[@"counts"] boolValue] || [admitted[@"redraw"] boolValue])) { unscoredPositive++; continue; }
+        const BOOL synthetic = [info[@"synthetic"] boolValue];
+        if (admitted && ![admitted[@"type"] isEqual:(synthetic ? @"synthetic" : @"original")]) {
+            [conflictingIdentities addObject:identity]; continue;
+        }
+        const int64_t mediaNs = (int64_t)llround(media * 1e9);
+        NSDictionary *old = firstPositive[identity];
+        if (old) {
+            duplicatePositive++;
+            if ([old[@"synthetic"] boolValue] != synthetic) [conflictingIdentities addObject:identity];
+            if ([old[@"mediaNs"] longLongValue] <= mediaNs) continue;
+        }
+        firstPositive[identity] = @{ @"mediaNs": @(mediaNs), @"callbackTicks": @(callbackTicks), @"synthetic": @(synthetic),
+            @"arithmeticErrorNs": @(SPProbeTimestampArithmeticErrorNs(media)) };
+    }
+    for (NSArray *identity in conflictingIdentities) [firstPositive removeObjectForKey:identity];
+    NSArray *frames = [firstPositive.allValues sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [a[@"mediaNs"] compare:b[@"mediaNs"]];
+    }];
+    int64_t first = INT64_MAX, last = 0;
+    double anchorError = 0;
+    NSUInteger cohortFrames = 0;
+    for (NSDictionary *frame in frames) {
+        const uint64_t callback = [frame[@"callbackTicks"] unsignedLongLongValue];
+        if (callback < startTicks || callback >= endTicks) continue;
+        const int64_t media = [frame[@"mediaNs"] longLongValue];
+        if (media < first) { first = media; anchorError = [frame[@"arithmeticErrorNs"] doubleValue]; }
+        last = std::max(last, media); cohortFrames++;
+    }
+    struct CountBin { uint64_t source = 0, synthetic = 0, count = 0, unknownType = 0, lower = 0, upper = 0; };
+    const size_t hostCount = (size_t)((endNs - startNs) / secondNs);
+    const size_t mediaCount = cohortFrames >= 2 && last >= first ? (size_t)((last - first) / secondNs) : 0;
+    std::vector<CountBin> hostBins(hostCount), mediaBins(mediaCount);
+    NSUInteger hostTailFrames = 0, mediaTailFrames = 0, lateCallbacksInMediaSpan = 0, priorCallbacksInMediaSpan = 0, coincidentTimes = 0;
+    std::vector<int64_t> actualTimes;
+    std::vector<double> actualErrors;
+    std::vector<int> actualTypes; // 1=source, 2=synthetic, 0=conflicting identities at this actual time.
+    for (NSDictionary *frame in frames) {
+        const uint64_t callback = [frame[@"callbackTicks"] unsignedLongLongValue];
+        const BOOL synthetic = [frame[@"synthetic"] boolValue];
+        if (callback >= startTicks && callback < endTicks) {
+            const size_t index = (size_t)((SPProbeNs(callback) - startNs) / secondNs);
+            if (index < hostCount) { if (synthetic) hostBins[index].synthetic++; else hostBins[index].source++; }
+            else hostTailFrames++;
+        }
+        const int64_t media = [frame[@"mediaNs"] longLongValue];
+        if (cohortFrames < 2 || media < first || media > last) continue;
+        if (callback >= endTicks) lateCallbacksInMediaSpan++;
+        if (callback < startTicks) priorCallbacksInMediaSpan++;
+        if (!actualTimes.empty() && actualTimes.back() == media) {
+            coincidentTimes++; actualErrors.back() = std::max(actualErrors.back(), [frame[@"arithmeticErrorNs"] doubleValue]);
+            actualTypes.back() = 0;
+        }
+        else { actualTimes.push_back(media); actualErrors.push_back([frame[@"arithmeticErrorNs"] doubleValue]); actualTypes.push_back(synthetic ? 2 : 1); }
+    }
+    NSUInteger ambiguousMediaTimes = 0;
+    for (size_t position = 0; position < actualTimes.size(); ++position) {
+        const int64_t media = actualTimes[position];
+        const int type = actualTypes[position]; ambiguousMediaTimes += type == 0;
+        const int64_t relative = media - first, central = relative / secondNs;
+        const double error = media == first ? 0 : actualErrors[position] + anchorError;
+        const int64_t lower = (int64_t)std::floor(((double)relative - error) / secondNs);
+        const int64_t upper = (int64_t)std::floor(((double)relative + error) / secondNs);
+        if (central >= 0 && (size_t)central < mediaCount) {
+            auto &bin = mediaBins[(size_t)central]; bin.count++;
+            if (type == 2) bin.synthetic++; else if (type == 1) bin.source++; else bin.unknownType++;
+        } else mediaTailFrames++;
+        for (int64_t index = lower; index <= upper; ++index) if (index >= 0 && (size_t)index < mediaCount) {
+            mediaBins[(size_t)index].upper++;
+            if (lower == upper && type != 0) mediaBins[(size_t)index].lower++;
+        }
+    }
+    NSMutableArray *hostRows = [NSMutableArray array], *mediaRows = [NSMutableArray array];
+    NSUInteger host47 = 0, media47 = 0, mediaPass = 0, mediaUnknown = 0;
+    for (size_t index = 0; index < hostCount; ++index) {
+        const auto &bin = hostBins[index]; const uint64_t count = bin.source + bin.synthetic; host47 += count >= 47;
+        [hostRows addObject:@{ @"index": @(index), @"startHostNs": @(startNs + (int64_t)index * secondNs),
+            @"endHostNs": @(startNs + (int64_t)(index + 1) * secondNs), @"source": @(bin.source), @"synthetic": @(bin.synthetic),
+            @"newFrames": @(count), @"atLeast47": @(count >= 47) }];
+    }
+    for (size_t index = 0; index < mediaCount; ++index) {
+        const auto &bin = mediaBins[index]; const uint64_t count = bin.count;
+        NSString *status = bin.lower >= 47 ? @"pass" : (bin.upper < 47 ? @"fail" : @"unknown");
+        media47 += count >= 47; mediaPass += bin.lower >= 47; mediaUnknown += [status isEqual:@"unknown"];
+        [mediaRows addObject:@{ @"index": @(index), @"startPresentedTimeMediaNs": @(first + (int64_t)index * secondNs),
+            @"endPresentedTimeMediaNs": @(first + (int64_t)(index + 1) * secondNs), @"source": @(bin.source), @"synthetic": @(bin.synthetic),
+            @"newFrames": @(count), @"unknownTypeTimes": @(bin.unknownType), @"lowerCount": @(bin.lower), @"upperCount": @(bin.upper), @"atLeast47": @(count >= 47), @"statusGe47": status }];
+    }
+    std::vector<double> periods;
+    double periodError = 0;
+    NSMutableDictionary *tokens = [NSMutableDictionary dictionary];
+    for (NSDictionary *event in presentationOrder[@"airCadenceCausalTrace"][@"slots"][@"output"][@"callbacks"][@"events"])
+        if ([event[@"outcome"] isEqual:@"created-token"] && SPProbeNumber(event[@"createdToken"])) tokens[event[@"createdToken"]] = event;
+    for (NSNumber *token in tokens) {
+        NSDictionary *a = tokens[token], *b = tokens[@(token.unsignedLongLongValue + 1)]; if (!b) continue;
+        BOOL sameContext = YES;
+        for (NSString *key in @[@"generation", @"configVersion", @"measurementEpoch", @"clockEpoch"])
+            sameContext = sameContext && [a[key] isEqual:b[key]];
+        NSNumber *ta = SPProbeNumber(a[@"targetPresentationTimestampMediaSeconds"]), *tb = SPProbeNumber(b[@"targetPresentationTimestampMediaSeconds"]);
+        if (!sameContext || !ta || !tb) continue;
+        const double delta = (tb.doubleValue - ta.doubleValue) * 1e9;
+        if (std::isfinite(delta) && delta > 0) {
+            periods.push_back(delta);
+            periodError = std::max(periodError, SPProbeTimestampArithmeticErrorNs(ta.doubleValue) + SPProbeTimestampArithmeticErrorNs(tb.doubleValue));
+        }
+    }
+    NSMutableDictionary *holes = [@{ @"status": @"unknown", @"adjacentIntervals": @(actualTimes.empty() ? 0 : actualTimes.size() - 1),
+        @"scope": @"Distinct actual positive Media times; same-time identities disclosed. No phase-edge gap inferred. Vsync spacing comes only from consecutive actual created display tokens in the same context; scheduled targets are never gap endpoints." } mutableCopy];
+    if (!periods.empty() && actualTimes.size() >= 2) {
+        std::sort(periods.begin(), periods.end()); const size_t n = periods.size();
+        const double period = (periods[(n - 1) / 2] + periods[n / 2]) / 2;
+        NSUInteger central = 0, definite = 0, unknown = 0;
+        for (size_t index = 1; index < actualTimes.size(); ++index) {
+            const double gap = (double)(actualTimes[index] - actualTimes[index - 1]), error = actualErrors[index] + actualErrors[index - 1];
+            central += gap >= 3 * period;
+            if (gap - error >= 3 * (period + periodError)) definite++;
+            else if (!(gap + error < 3 * (period - periodError))) unknown++;
+        }
+        const double denominator = (double)(actualTimes.size() - 1);
+        [holes addEntriesFromDictionary:@{ @"status": @"observed", @"observedVsyncNs": @(period), @"observedVsyncArithmeticErrorNs": @(periodError),
+            @"observedVsyncSamples": @(periods.size()), @"gapsAtLeast3Vsync": @(central), @"centralFraction": @(central / denominator),
+            @"definiteHoleCount": @(definite), @"numericBoundaryUnknownCount": @(unknown),
+            @"fractionLower": @(definite / denominator), @"fractionUpper": @((definite + unknown) / denominator),
+            @"numericScope": @"Outward binary64/integer-ns arithmetic bounds; no physical-refresh jitter calibration." }];
+    }
+    return @{ @"phase": phase[@"index"] ?: @-1, @"phaseComplete": phase[@"complete"] ?: @NO,
+        @"measurementStartHostTicks": @(startTicks), @"measurementEndHostTicks": @(endTicks),
+        @"admissionJoinAvailable": @(admissionEvents != nil), @"unjoinedPositiveRecords": @(unjoinedPositive), @"invalidIdentityRecords": @(invalidIdentity),
+        @"conflictingFrameIdentities": @(conflictingIdentities.count), @"duplicatePositiveRecords": @(duplicatePositive), @"unscoredPositiveRecords": @(unscoredPositive),
+        @"callbackObservationScope": @"Raw callbacks are copied under the existing lock after each snapshotHostTicks sample. Capture is stopped before the final copy, but GPU is not drained; any later callback tail remains unknown. Processor trace has its own cutoff, not an atomic shared snapshot.",
+        @"mediaPresented": @{ @"role": @"primary", @"status": mediaCount ? @"first_actual_positive_anchored" : @"unknown",
+            @"anchorPresentedTimeMediaNs": cohortFrames ? @(first) : (id)NSNull.null, @"lastPresentedTimeMediaNs": cohortFrames ? @(last) : (id)NSNull.null,
+            @"cohortUniquePositiveFrames": @(cohortFrames), @"completeOneSecondBins": @(mediaCount), @"retainedFullSeconds": @(mediaCount),
+            @"tailDurationNs": cohortFrames ? @(last - first - (int64_t)mediaCount * secondNs) : (id)NSNull.null, @"tailFrames": @(mediaTailFrames),
+            @"binsAtLeast47": @(media47), @"fractionAtLeast47": mediaCount ? @(double(media47) / mediaCount) : (id)NSNull.null,
+            @"fractionAtLeast47Lower": mediaCount ? @(double(mediaPass) / mediaCount) : (id)NSNull.null,
+            @"fractionAtLeast47Upper": mediaCount ? @(double(mediaPass + mediaUnknown) / mediaCount) : (id)NSNull.null,
+            @"lateCallbackFramesInsideMediaSpan": @(lateCallbacksInMediaSpan), @"priorCallbackFramesInsideMediaSpan": @(priorCallbacksInMediaSpan),
+            @"coincidentPositiveTimeIdentities": @(coincidentTimes), @"ambiguousPositiveTimes": @(ambiguousMediaTimes), @"bins": mediaRows, @"holes": holes,
+            @"scope": @"First actual positive Media time from the phase callback cohort anchors complete half-open 1s bins. All observed first positive identities physically inside its first/last Media span are included, with cohort-external callbacks disclosed. Main counts are unique actual Media times, not identity multiplicity. Multiple identities at one time contribute at most one upper count, have unknown source/synthetic attribution and cannot support a definite lower count. Media seconds rounded to ns; count intervals preserve arithmetic and identity uncertainty. No mach/Media origin equality or physical/human acceptance asserted." },
+        @"callbackHost": @{ @"role": @"auxiliary_positive_presented_callback_rate", @"completeOneSecondBins": @(hostCount),
+            @"tailDurationNs": @(endNs - startNs - (int64_t)hostCount * secondNs), @"tailFrames": @(hostTailFrames),
+            @"binsAtLeast47": @(host47), @"fractionAtLeast47": hostCount ? @(double(host47) / hostCount) : (id)NSNull.null, @"bins": hostRows },
+        @"gateScope": @"Exact-second >=47 observations only. Coverage/ontime/source-loss/deadline/CPU/resource gates require their distinct denominators and existing full trace; functionalComplete is not App24->48 acceptance." };
+}
+
 @interface SPSelfWindowCaptureProbe : NSObject <SCStreamOutput, SCStreamDelegate> {
     dispatch_queue_t _captureQueue;
     std::atomic_bool _stopping;
@@ -416,7 +613,8 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
         _report[@"gpuCompletionCounterScope"] = @"Bare command-buffer completion callback count. gpuCompletedHost is CPU callback arrival; gpuStartTime/gpuEndTime are the command buffer GPU timestamps, not callback host.";
         _report[@"plan"] = @{ @"state": @"not-applicable", @"processorCreated": @NO, @"rifePreparationRequested": @NO };
         _report[@"runtimeLimitSeconds"] = @30;
-    } else _report[@"plan"] = @{ @"state": @"not-requested", @"interpolationRequested": @([_arm isEqual:@"rife"]), @"rifePreparationRequested": @([_arm isEqual:@"rife"]) };
+    } else _report[@"plan"] = @{ @"state": @"not-requested", @"interpolationRequested": @(SPProbeInterpolates(_arm)),
+        @"rifePreparationRequested": @([_arm isEqual:@"rife"]), @"applePreparationRequested": @([_arm isEqual:@"apple"]) };
     return self;
 }
 - (void)recordSourceUpdateStarted:(uint64_t)started drawCallsBefore:(uint64_t)drawCalls initial:(BOOL)initial {
@@ -463,7 +661,8 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
         @"sourceKey": @(_sourceWindow.isKeyWindow), @"outputKey": @(_outputWindow.isKeyWindow) };
 }
 - (NSDictionary *)snapshot {
-    const double now = SPProbeNow();
+    const uint64_t snapshotHostTicks = mach_absolute_time();
+    const double now = (double)SPProbeNs(snapshotHostTicks) / 1e9;
     __block NSDictionary *capture;
     dispatch_sync(_captureQueue, ^{
         capture = @{ @"callbacks": @(self->_callbacks), @"complete": @(self->_complete), @"idle": @(self->_idle),
@@ -486,7 +685,7 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
     [_drawableEvents removeAllObjects]; [_drawableLock unlock];
     if (_bareView) drawable = [_bareView snapshotIncludingFrames:NO];
     NSDictionary *stats = _processor.stats ?: @{};
-    NSMutableDictionary *row = [@{ @"hostElapsedSeconds": @(now - _startHost), @"phase": @(_phase),
+    NSMutableDictionary *row = [@{ @"hostElapsedSeconds": @(now - _startHost), @"snapshotHostTicks": @(snapshotHostTicks), @"phase": @(_phase),
         @"phaseElapsedSeconds": @(_phase >= 0 ? now - _phaseStart : 0),
         @"intervalSeconds": @(_lastSnapshotHost > 0 ? now - _lastSnapshotHost : 0),
         @"source": @{ @"configuredContentFPS": @(_sourceFPS), @"updatesEnabled": @(_bareView == nil), @"timerTicks": @(_pattern.timerTicks), @"contentUpdates": @(_pattern.contentUpdates),
@@ -536,6 +735,7 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
     NSDictionary *boundary = [self snapshot]; [_timeline addObject:boundary];
     NSMutableDictionary *record = _phases.lastObject;
     record[@"measurementStartHostElapsedSeconds"] = boundary[@"hostElapsedSeconds"];
+    record[@"measurementStartHostTicks"] = boundary[@"snapshotHostTicks"];
     record[@"startValidPresentedCallbacks"] = boundary[@"drawable"][@"validPresentedCallbacks"];
 }
 - (void)monitor {
@@ -561,7 +761,7 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
         if (((_streamStarted && _planCommitted) || _bareView) && hasDrawable && sourceVisible && outputVisible) {
             _report[@"startup"] = @{ @"seconds": @(SPProbeNow() - _startHost), @"planCommittedHostElapsedSeconds": _bareView ? (id)NSNull.null : @(_planCommitHost - _startHost), @"firstDrawableIsPresentedHandler": @YES };
             [self beginPhase:0];
-        } else if (SPProbeNow() - _startHost > 45) [self fail:@"startup timeout: capture, committed RIFE plan or drawable not ready" details:_processor.stats ?: @{}];
+        } else if (SPProbeNow() - _startHost > 45) [self fail:@"startup timeout: capture, requested committed plan or drawable not ready" details:_processor.stats ?: @{}];
         return;
     }
     const double now = SPProbeNow();
@@ -574,6 +774,7 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
         const uint64_t valid = [end[@"drawable"][@"validPresentedCallbacks"] unsignedLongLongValue];
         const uint64_t delta = valid - [phase[@"startValidPresentedCallbacks"] unsignedLongLongValue];
         phase[@"measurementEndHostElapsedSeconds"] = end[@"hostElapsedSeconds"]; phase[@"endValidPresentedCallbacks"] = @(valid);
+        phase[@"measurementEndHostTicks"] = end[@"snapshotHostTicks"];
         phase[@"validPresentedCallbackDelta"] = @(delta); phase[@"measuredDurationSeconds"] = @(dt);
         phase[@"meanValidPresentedCallbackFPS"] = @(dt > 0 ? delta / dt : 0);
         if (_phase == 0 && !_controlOnly) [self beginPhase:1]; else [self finish:YES];
@@ -603,6 +804,10 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
     [self recordProgress:@"production-library-loaded"];
     processorType = NSClassFromString(@"SPLiveProcessor"); viewType = NSClassFromString(@"SPLivePreviewView"); bridgeType = NSClassFromString(@"SPSelfWindowCaptureBridge"); requestType = NSClassFromString(@"SPLivePlanRequest");
     if (!processorType || !viewType || !bridgeType || !requestType) { [self fail:@"diagnostic classes missing" details:nil]; return; }
+    if ([_arm isEqual:@"apple"]) {
+        NSDictionary *identity = SPProbeAppleFRCIdentity(); _report[@"appleFRCIdentity"] = identity;
+        if (![identity[@"isSupportedViaEngine"] boolValue]) { [self fail:@"Apple FRC capability unavailable" details:identity]; return; }
+    }
     [self recordProgress:@"production-classes-resolved"];
     }
     NSScreen *screen = NSScreen.mainScreen;
@@ -651,8 +856,14 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
     _processor.planHandler = ^(NSInteger state, NSString *engine, NSString *model, NSString *reason, uint64_t requestID) {
         dispatch_async(dispatch_get_main_queue(), ^{ SPSelfWindowCaptureProbe *strong = weakSelf; if (!strong || strong->_stopping.load()) return;
             strong->_report[@"plan"] = @{ @"state": @(state), @"engine": engine ?: @"", @"model": model ?: @"", @"reason": reason ?: @"",
-                @"requestID": @(requestID), @"interpolationRequested": @([strong->_arm isEqual:@"rife"]), @"rifePreparationRequested": @([strong->_arm isEqual:@"rife"]) };
-            if (state == 2) { strong->_planCommitted = YES; strong->_planCommitHost = SPProbeNow(); }
+                @"requestID": @(requestID), @"interpolationRequested": @(SPProbeInterpolates(strong->_arm)),
+                @"rifePreparationRequested": @([strong->_arm isEqual:@"rife"]), @"applePreparationRequested": @([strong->_arm isEqual:@"apple"]) };
+            if (state == 2) {
+                if ([strong->_arm isEqual:@"apple"] && (![engine isEqual:@"apple.frc"] || ![model isEqual:@"vt.frc.normal"])) {
+                    [strong fail:@"committed Apple FRC identity mismatch" details:strong->_report[@"plan"]]; return;
+                }
+                strong->_planCommitted = YES; strong->_planCommitHost = SPProbeNow();
+            }
             else if (state == 0) [strong fail:@"requested production plan did not commit" details:reason ?: @""];
         });
     };
@@ -732,12 +943,19 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
             SCStreamConfiguration *config = [SCStreamConfiguration new]; config.width = width; config.height = height;
             config.pixelFormat = strong->_requestedCapturePixelFormat; config.queueDepth = 3; config.minimumFrameInterval = kCMTimeZero;
             config.showsCursor = NO; config.capturesAudio = NO; config.colorSpaceName = kCGColorSpaceITUR_709;
-            const BOOL interpolate = [strong->_arm isEqual:@"rife"];
+            const BOOL apple = [strong->_arm isEqual:@"apple"], interpolate = SPProbeInterpolates(strong->_arm);
             SPLivePlanRequest *request = [requestType new]; request.requestID = 1; request.interpolationEnabled = interpolate;
-            request.engineID = @"rife.metal"; request.modelID = @"rife-v4.25"; request.qualityID = @"fast"; request.quality = 1; request.rifeStreamEnabled = interpolate;
+            request.engineID = apple ? @"apple.frc" : @"rife.metal"; request.modelID = apple ? @"vt.frc.normal" : @"rife-v4.25";
+            request.qualityID = apple ? @"normal" : @"fast"; request.quality = SPFRCQualityNormal; request.rifeStreamEnabled = !apple && interpolate;
             request.rateKind = SPLiveRateMultiplier; request.multiplier = interpolate ? 2 : 1; request.captureCapFPS = 0;
             request.scaleEnabled = NO; request.outputWidth = width; request.outputHeight = height; request.viewMode = SPLiveViewEnhanced; request.displayRefreshHz = 60;
             strong->_report[@"planRequestedDimensionsPixels"] = @{ @"width": @(width), @"height": @(height) };
+            if (apple) strong->_report[@"appleRequestedConfiguration"] = @{ @"engineID": request.engineID, @"modelID": request.modelID,
+                @"qualityID": request.qualityID, @"quality": @(request.quality), @"multiplier": @(request.multiplier),
+                @"rateKind": @(request.rateKind), @"rifeStreamEnabled": @(request.rifeStreamEnabled),
+                @"scaleEnabled": @(request.scaleEnabled), @"sourceFPS": @(strong->_sourceFPS),
+                @"captureWidth": @(width), @"captureHeight": @(height), @"requestedCaptureFormat": strong->_requestedCaptureFormat,
+                @"continuousEnvironment": NSProcessInfo.processInfo.environment[@"CHUANFLOW_FRC_CONTINUOUS"] ?: (id)NSNull.null };
             [strong->_processor updateRequest:request];
             [strong recordProgress:@"checking-exact-own-window-screenshot"];
             SCStreamConfiguration *shot = [SCStreamConfiguration new]; shot.width = width; shot.height = height;
@@ -826,6 +1044,14 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
         if (_sourceWindow && _outputWindow) [_timeline addObject:[self snapshot]];
         _report[@"finalProcessorStats"] = _processor.stats ?: @{};
         _report[@"presentationOrder"] = [_processor presentationOrderDiagnostics] ?: @{};
+        if ([_arm isEqual:@"apple"]) {
+            NSDictionary *stats = _report[@"finalProcessorStats"];
+            _report[@"appleActualPlanIdentity"] = @{ @"committed": @(_planCommitted), @"plan": _report[@"plan"] ?: @{},
+                @"processorEngineID": stats[@"engineID"] ?: (id)NSNull.null, @"processorModelID": stats[@"modelID"] ?: (id)NSNull.null,
+                @"processorQualityID": stats[@"qualityID"] ?: (id)NSNull.null, @"sessionsActual": stats[@"r8SessionsActual"] ?: (id)NSNull.null,
+                @"sourceWidth": stats[@"sourceWidth"] ?: (id)NSNull.null, @"sourceHeight": stats[@"sourceHeight"] ?: (id)NSNull.null,
+                @"sourcePixelFormat": stats[@"sourcePixelFormat"] ?: (id)NSNull.null };
+        }
         [_processor stop];
         _processor.preview = nil; _processor.outputPreview = nil;
         _outputView.presented = nil; _outputView.surfaceReady = nil; _outputView.presentationFailure = nil;
@@ -868,6 +1094,12 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
             @"scope": @"Short actual presented-handler observations in this self scene, not stable physical FPS or human quality acceptance; incomplete windows remain in timeline." }];
     }
     _report[@"goalObservations"] = goals;
+    if (!_bareView) {
+        NSMutableArray *exactSeconds = [NSMutableArray array];
+        for (NSDictionary *phase in _phases)
+            [exactSeconds addObject:SPProbeExactSecondObservations(_timeline, phase, _report[@"presentationOrder"] ?: @{})];
+        _report[@"exactSecondObservations"] = exactSeconds;
+    }
     NSError *jsonError = nil; NSData *json = [NSJSONSerialization dataWithJSONObject:_report options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:&jsonError];
     NSError *writeError = nil; const BOOL written = json && [json writeToFile:_outputPath options:NSDataWritingWithoutOverwriting error:&writeError];
     _exitCode = !written ? 3 : ([_report[@"functionalComplete"] boolValue] ? 0 : 1);
@@ -916,7 +1148,7 @@ static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records mu
 @end
 
 static void SPProbeUsage(void) {
-    fprintf(stderr, "Usage: SelfProbe --output /absolute/new.json [--preflight-only | --inspect --dylib /absolute/Release.dylib | --prepared-lifetime-only --dylib /absolute/Release.dylib | --arm bare|passthrough|rife (default rife) [--dylib /absolute/Release.dylib (required except bare)] [--control-only] [--source-fps 24|30 (default 30) --capture-format nv12|bgra (default nv12) --source-width-points 1324 --source-height-points 834 --seconds 12 (5..60) --minimum-idle-seconds 60]]\n");
+    fprintf(stderr, "Usage: SelfProbe --output /absolute/new.json [--preflight-only | --inspect --dylib /absolute/Release.dylib | --prepared-lifetime-only --dylib /absolute/Release.dylib | --arm bare|passthrough|rife|apple (default rife) [--dylib /absolute/Release.dylib (required except bare)] [--control-only] [--source-fps 24|30 (default 30) --capture-format nv12|bgra (default nv12) --source-width-points 1324 --source-height-points 834 --seconds 12 (5..60) --minimum-idle-seconds 60]]\n");
 }
 int main(int argc, const char **argv) {
     @autoreleasepool {
@@ -942,7 +1174,7 @@ int main(int argc, const char **argv) {
             else { SPProbeUsage(); return 2; }
         }
         NSString *output = options[@"output"], *dylib = options[@"dylib"];
-        const BOOL validArm = [@[@"bare", @"passthrough", @"rife"] containsObject:options[@"arm"]];
+        const BOOL validArm = [@[@"bare", @"passthrough", @"rife", @"apple"] containsObject:options[@"arm"]];
         const BOOL requiresDylib = !preflightOnly && (inspect || preparedLifetimeOnly || ![options[@"arm"] isEqual:@"bare"]);
         if (!validArm || !output.isAbsolutePath || [NSFileManager.defaultManager fileExistsAtPath:output] || (requiresDylib && !dylib.isAbsolutePath) || (preflightOnly && inspect) || (preparedLifetimeOnly && (preflightOnly || inspect))) { SPProbeUsage(); return 2; }
         if ([options[@"seconds"] doubleValue] < 5 || [options[@"seconds"] doubleValue] > 60 || [options[@"source-width-points"] doubleValue] < 320 || [options[@"source-width-points"] doubleValue] > 1700 || [options[@"source-height-points"] doubleValue] < 240 || [options[@"source-height-points"] doubleValue] > 1100 || [options[@"minimum-idle-seconds"] doubleValue] < 10 || [options[@"minimum-idle-seconds"] doubleValue] > 3600) { SPProbeUsage(); return 2; }
@@ -984,12 +1216,18 @@ int main(int argc, const char **argv) {
                 for (NSString *name in @[@"SPLiveProcessor", @"SPLivePlanRequest", @"SPLivePreviewView", @"SPSelfWindowCaptureBridge"]) { classes[name] = @(NSClassFromString(name) != Nil); ok = ok && [classes[name] boolValue]; }
                 result[@"classes"] = classes; result[@"dylibLoaded"] = @(loaded != nullptr);
                 if (loadError) result[@"firstFailure"] = @(loadError);
-                NSBundle *modelBundle = [NSBundle bundleWithURL:[NSBundle.mainBundle URLForResource:@"RifeMetal_RifeMetal" withExtension:@"bundle"]];
-                NSURL *model = [modelBundle URLForResource:@"rife-v4.25" withExtension:@"rmw"];
-                result[@"originalModelResource"] = model.path ?: (id)NSNull.null;
-                result[@"originalModelResourceExists"] = @(model && [NSFileManager.defaultManager fileExistsAtPath:model.path]);
+                if ([options[@"arm"] isEqual:@"apple"]) {
+                    NSDictionary *identity = SPProbeAppleFRCIdentity(); result[@"appleFRCIdentity"] = identity;
+                    result[@"originalModelResourceRequired"] = @NO;
+                    ok = ok && loaded && [identity[@"engineClassAvailable"] boolValue] && [identity[@"isSupportedViaEngine"] boolValue];
+                } else {
+                    NSBundle *modelBundle = [NSBundle bundleWithURL:[NSBundle.mainBundle URLForResource:@"RifeMetal_RifeMetal" withExtension:@"bundle"]];
+                    NSURL *model = [modelBundle URLForResource:@"rife-v4.25" withExtension:@"rmw"];
+                    result[@"originalModelResource"] = model.path ?: (id)NSNull.null;
+                    result[@"originalModelResourceExists"] = @(model && [NSFileManager.defaultManager fileExistsAtPath:model.path]);
+                    ok = ok && loaded && [result[@"originalModelResourceExists"] boolValue];
+                }
                 result[@"experimentTrialBundleFlag"] = @([[NSBundle.mainBundle objectForInfoDictionaryKey:@"ODFExperimentTrial"] boolValue]);
-                ok = ok && loaded && [result[@"originalModelResourceExists"] boolValue];
             } else ok = [result[@"preflight"][@"allowed"] boolValue];
             result[@"ok"] = @(ok); NSError *error = nil; NSData *json = [NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:&error];
             if (!json || ![json writeToFile:output options:NSDataWritingWithoutOverwriting error:&error]) { fprintf(stderr, "result write failed: %s\n", error.localizedDescription.UTF8String); return 3; }
