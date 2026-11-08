@@ -28,6 +28,12 @@ profile、deferred commit、fused stage、trim 等实验保持原状态关闭。
 
 本生成器只提供原模型的只读身份。可选的四阶段模型组合由 [Air24Training 的独立 preparer](../Air24Training/prepare_app_runtime.py) 在另一个新副本中完成。区分 package 生成身份、实际加载的模型身份和运行环境，不能仅凭文件名认定模型。
 
+## 独立的尺寸／延迟取舍诊断
+
+App 的 guard 诊断构建还支持两个显式开关：`ODF_AIR_TRUE_SOURCE_INTERVAL_DIAGNOSTIC=1` 仅移除 delay 公式的 1/30 上限；`ODF_AIR_INTERACTIVE_CAP_125MS_DIAGNOSTIC=1` 仅将交互档逻辑 cap 改为 125ms。正常构建、开关未启用时的 90ms 默认值及 quality cap 均不变；P、预算和呈现契约不因这两个开关改变。
+
+实际启用请求记录在 `airCadenceCausalTrace.delayAlignment` 的 `trueSourceIntervalRequested`／`interactiveCap125msRequested`，每次重算保留真实 `intervalNs`／`capNs`。启动尚无有效源估计时仍可使用原 1/30 fallback。它们属于另行说明的探索诊断，不是 service trace 本身的行为，也不能用较小源窗口或 125ms 结果宣称原尺寸／90ms 目标通过。
+
 ## 记录与导出
 
 [SPRifeBridge](../../Apps/Mac/Capture/SPRifeEngine.swift) 在原有 `exec` 路径记录，使用原有 `state` 锁保护自己的预分配标量环；native collector 由原有同步推理路径串行访问。没有新增锁对象、队列、GPU 等待、GPU completion handler 或热路径文件/日志输出。

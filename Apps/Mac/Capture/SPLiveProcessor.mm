@@ -2800,6 +2800,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     std::unique_ptr<SPAirFrameRing> _airCadenceCallbacks;
     std::unique_ptr<SPAirBudgetRing> _airCadenceBudget;
     BOOL _airDelayAlignmentRequested, _airDelayAlignmentActiveX2;
+    BOOL _airTrueSourceIntervalRequested, _airInteractiveCap125msRequested;
     int64_t _airDelayAlignmentLeadNs, _airDelayAlignmentMarginNs;
     std::unique_ptr<SPAirDelayAlignmentRing> _airDelayAlignmentEvents;
     SPLivePlanRequest *_request;
@@ -3059,6 +3060,10 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 #if defined(ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC) && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC == 1
     const char *alignDelay = getenv("ODF_AIR_DELAY_ALIGNMENT_DIAGNOSTIC");
     _airDelayAlignmentRequested = alignDelay && strcmp(alignDelay, "1") == 0;
+    const char *trueInterval = getenv("ODF_AIR_TRUE_SOURCE_INTERVAL_DIAGNOSTIC");
+    _airTrueSourceIntervalRequested = trueInterval && strcmp(trueInterval, "1") == 0;
+    const char *cap125ms = getenv("ODF_AIR_INTERACTIVE_CAP_125MS_DIAGNOSTIC");
+    _airInteractiveCap125msRequested = cap125ms && strcmp(cap125ms, "1") == 0;
 #endif
     if (_airDelayAlignmentRequested && _airCadenceCallbacks) _airDelayAlignmentEvents = std::make_unique<SPAirDelayAlignmentRing>();
     _capturePressureQueued = false;
@@ -5299,8 +5304,10 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
                 @"overflowCount": @(overflow), @"overflowCountKnown": @(callbackExportSafe), @"ringsComplete": @(overflow == 0 && callbackExportSafe && previewUnsupported == 0 && outputUnsupported == 0), @"preview": previewExport, @"output": outputExport,
                 @"callbacks": callbackExport, @"rateBudget": budgetExport,
                 @"delayAlignment": @{ @"enabled": @(self->_airDelayAlignmentEvents != nullptr),
+                    @"trueSourceIntervalRequested": @(self->_airTrueSourceIntervalRequested),
+                    @"interactiveCap125msRequested": @(self->_airInteractiveCap125msRequested),
                     @"recomputes": delayExport ?: @{},
-                    @"scope": @"POD per-recompute inputs and result; nanoseconds except HostTicks. Source-only early return has calculated=false and uncomputed fields null. Logical finalNs is capped at 90ms in the normal test tier; capture-to-positive-presented latency is measured separately, not bounded by this field." },
+                    @"scope": @"POD per-recompute inputs and result; nanoseconds except HostTicks. Source-only early return has calculated=false and uncomputed fields null. capNs is the actual logical cap: normal interactive 90ms, explicit guard-build diagnostic 125ms; quality cap is unchanged. True-source-interval diagnostic only removes the 1/30 upper clamp; initial fallback and source-estimate validity rule are unchanged. Capture-to-positive-presented latency is measured separately, not bounded by finalNs." },
                 @"slots": @{ @"callbackExportSafe": @(callbackExportSafe), @"valid": @(callbackExportSafe && previewUnsupported == 0 && outputUnsupported == 0 && slotOverflow == 0),
                     @"overflowCount": @(slotOverflow), @"overflowCountKnown": @(callbackExportSafe),
                     @"callerWasMain": @(callerWasMain), @"callerWasProcessorQueue": @(callerWasProcessorQueue), @"captureWasProcessorQueue": @(captureWasProcessorQueue),
@@ -5799,12 +5806,16 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 }
 
 - (void)recomputeInteractiveDelay {
+    double cap = _request.quality == SPFRCQualityHigh ? SPQualityCapSec : SPInteractiveCapSec;
+#if defined(ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC) && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC == 1
+    if (_airInteractiveCap125msRequested && _request.quality != SPFRCQualityHigh) cap = 0.125;
+#endif
     SPAirDelayAlignmentEvent alignmentEvent{};
     if (_airDelayAlignmentEvents) {
         alignmentEvent.hostTicks = SPHostNow(); alignmentEvent.generation = _sourceGeneration;
         alignmentEvent.config = _configVersion; alignmentEvent.epochBefore = _measurementEpoch;
         alignmentEvent.requestedMultiplier = (int)_request.multiplier; alignmentEvent.effectiveMultiplier = _effectiveMultiplier;
-        alignmentEvent.capNs = (int64_t)llround((_request.quality == SPFRCQualityHigh ? SPQualityCapSec : SPInteractiveCapSec) * 1e9);
+        alignmentEvent.capNs = (int64_t)llround(cap * 1e9);
     }
     _airDelayAlignmentActiveX2 = NO;
     _airDelayAlignmentLeadNs = 0;
@@ -5831,7 +5842,11 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         double seconds = (double)SPHostToNs(_intervalHost) / 1e9;
         if (seconds > 0.001) interval = seconds;
     }
+#if defined(ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC) && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC == 1
+    if (!_airTrueSourceIntervalRequested && interval > 1.0 / 30.0) interval = 1.0 / 30.0;
+#else
     if (interval > 1.0 / 30.0) interval = 1.0 / 30.0;
+#endif
     double lead = [self informationLeadSeconds:interval];
     double frc = _frcEwmaSec;
     if (_frcNs.size() >= 8) {
@@ -5853,7 +5868,6 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         process = MAX(process, (double)recent[(recent.size() - 1) * 80 / 100] / 1e9);
     }
     if (process < 0.008) process = 0.008;
-    double cap = _request.quality == SPFRCQualityHigh ? SPQualityCapSec : SPInteractiveCapSec;
     double renderMargin = 0.016;
     if (_airDelayAlignmentRequested && _request.rateKind == SPLiveRateMultiplier && _request.multiplier == 2 &&
         _effectiveMultiplier == 2 && [_request.engineID isEqualToString:@"rife.metal"]) {
