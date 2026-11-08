@@ -28,7 +28,8 @@
 
 int main(int argc, const char **argv) {
     @autoreleasepool {
-        if ((argc != 3 && argc != 4) || !dlopen(argv[1], RTLD_NOW | RTLD_LOCAL)) { fprintf(stderr,"dlopen: %s\n",dlerror()); return 2; }
+        const BOOL sourceClockFlags=argc>4 && strcmp(argv[3],"source-clock")==0;
+        if ((argc != 3 && argc != 4 && !sourceClockFlags) || !dlopen(argv[1], RTLD_NOW | RTLD_LOCAL)) { fprintf(stderr,"dlopen: %s\n",dlerror()); return 2; }
         id activity = [[NSProcessInfo processInfo] beginActivityWithOptions:(NSActivityLatencyCritical | NSActivityUserInitiated)
                                                                       reason:@"Bounded headless cadence contract"];
         Class type = NSClassFromString(@"SPLiveProcessor");
@@ -80,7 +81,7 @@ int main(int argc, const char **argv) {
         BOOL low=argc==4 && strcmp(argv[3],"low120")==0, low2k=argc==4 && strcmp(argv[3],"low2k")==0, switching=argc==4 && strcmp(argv[3],"switch")==0, quality=argc==4 && strcmp(argv[3],"quality")==0, staticHold=argc==4 && strcmp(argv[3],"static")==0;
         BOOL nativeBridge=argc==4 && strcmp(argv[3],"native-bridge")==0;
         BOOL sourceLifecycle=argc==4 && strcmp(argv[3],"source-lifecycle")==0;
-        BOOL sourceClock=argc==4 && strcmp(argv[3],"source-clock")==0;
+        BOOL sourceClock=argc>=4 && strcmp(argv[3],"source-clock")==0;
         BOOL pendingReplacement=argc==4 && strcmp(argv[3],"pending-replacement")==0;
         BOOL rejectedPTS=argc==4 && strcmp(argv[3],"rejected-pts")==0;
         BOOL budget=argc==4 && strcmp(argv[3],"budget")==0;

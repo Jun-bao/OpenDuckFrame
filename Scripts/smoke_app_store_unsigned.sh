@@ -121,6 +121,7 @@ echo "==> Building pinned FFmpeg and dav1d dependencies"
 echo "==> Building pinned subtitle dependencies"
 "$ROOT/Scripts/build_subtitle_libs.sh"
 echo "==> Generating Apps/Mac/OpenDuckFrame.xcodeproj"
+"$ROOT/Scripts/prepare_rife_runtime.sh"
 ODF_ENABLE_SPARKLE=false \
 ODF_SPARKLE_FEED_URL= \
 ODF_SPARKLE_PUBLIC_ED_KEY= \
