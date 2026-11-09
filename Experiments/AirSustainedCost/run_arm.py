@@ -61,6 +61,7 @@ def run(config_path):
     save()
     preflight_log = (root / "preflight-records.jsonl").open("x")
     lock = None
+    observer = None
     try:
         binary = Path(config["binary"]).expanduser().resolve(strict=True)
         model = Path(config["model_path"]).expanduser().resolve(strict=True)
@@ -85,6 +86,11 @@ def run(config_path):
             raise RuntimeError("Gap fill requires an explicit boolean and paced24 mode")
         if real_work and (gap_fill or config["mode"] != "paced24"):
             raise RuntimeError("Real-work filler requires paced24 and cannot use ALU gap fill")
+        observer_config = config.get("metrics_observer")
+        if observer_config is not None and not isinstance(observer_config, dict):
+            raise RuntimeError("Metrics observer requires an explicit configuration object")
+        if observer_config is not None and (real_work or gap_fill):
+            raise RuntimeError("Observed A/B keeps both filler modes disabled")
         allowed_seconds = (180, 600) if gap_fill else ((180,) if config["mode"] == "paced24" else (120,))
         if config["seconds"] not in allowed_seconds:
             raise RuntimeError("Duration differs from the approved arm")
@@ -176,17 +182,50 @@ def run(config_path):
                    "result": str(result_path), "status": "native_running"}
             state["attempts"].append(row)
             state["formal_measurements_started"] = None
-            progress("native_running", active_attempt=attempt_index)
+            if observer_config is not None:
+                from observe_metrics import MetricsObserver
+                observer = MetricsObserver(observer_config, attempt_dir)
+                observer.start()
+                lead_deadline = time.monotonic() + 45
+                progress("observer_preroll", active_attempt=attempt_index)
+                while not observer.ready_for_native(minimum_lead_seconds=10):
+                    observer.poll()
+                    observer.clock_if_due()
+                    row["metrics_observer"] = observer.snapshot()
+                    if row["metrics_observer"].get("first_error"):
+                        raise RuntimeError("Metrics observer failed before native launch")
+                    ready, _ = preflight("observer-preroll")
+                    if not ready:
+                        raise RuntimeError("Session/display/input changed before native launch")
+                    if time.monotonic() >= lead_deadline:
+                        raise RuntimeError("Metrics observer did not become ready within 45 seconds")
+                    save()
+                    time.sleep(1)
+                row["metrics_observer"] = observer.snapshot()
+                if prefhash() != state["preferences_before"]:
+                    raise RuntimeError("Trial preferences changed during observer preroll")
+            progress("native_preparing", active_attempt=attempt_index)
             cancel_reason = None
             cancel_started = None
             with (attempt_dir / "stdout.jsonl").open("x") as stdout, (attempt_dir / "stderr.log").open("x") as stderr:
                 process = subprocess.Popen(args, env=native_env, stdout=stdout, stderr=stderr)
                 row["pid"] = process.pid
-                save()
                 start = time.monotonic()
                 next_update = start
                 try:
+                    if observer is not None:
+                        try:
+                            observer.mark_native_started(pid=process.pid)
+                        except Exception as error:
+                            row.setdefault("metrics_observer_start_mark_error", str(error))
+                    save()
                     while process.poll() is None:
+                        if observer is not None:
+                            try:
+                                observer.poll()
+                                observer.clock_if_due()
+                            except Exception as error:
+                                row.setdefault("metrics_observer_poll_error", str(error))
                         if cancel_reason is None:
                             try:
                                 ready, _ = preflight("native-watch")
@@ -229,6 +268,13 @@ def run(config_path):
                                 process.kill()
                                 row["only_own_native_killed"] = process.pid
                                 process.wait(timeout=10)
+                    if observer is not None:
+                        try:
+                            observer.mark_native_finished(returncode=process.returncode)
+                            observer.stop_after_native(post_seconds=10)
+                        except Exception as error:
+                            row.setdefault("metrics_observer_stop_error", str(error))
+                        row["metrics_observer"] = observer.snapshot()
             row["exit_code"] = process.returncode
             row["completed_utc"] = utc_now()
             row["process_cpu_after"] = process_snapshot()
@@ -253,14 +299,26 @@ def run(config_path):
                 row["failureKind"] = "calibration_failed"
             row["native_sha256"] = sha(result_path)
             row["status"] = "finished"
+            observer_failed = observer is not None and bool(
+                row.get("metrics_observer", {}).get("first_error")
+                or row.get("metrics_observer_start_mark_error")
+                or row.get("metrics_observer_poll_error")
+                or row.get("metrics_observer_stop_error"))
+            row["metrics_observer_failed"] = observer_failed
             if native.get("status") == "complete" and process.returncode == 0 and not cancel_reason:
                 state["formal_measurements_started"] = 1
+                if observer_failed:
+                    progress("observation_incomplete", reason="Native retained; observer failed; no further run")
+                    return 0
                 progress("complete")
                 return 0
             if native.get("status") == "baseline_not_ready" and process.returncode == 3 and not cancel_reason:
                 state["formal_measurements_started"] = 0
                 if "first_baseline_failure" not in state:
                     state["first_baseline_failure"] = dict(row)
+                if observer_failed:
+                    progress("observation_incomplete", reason="Prefix retained; observer failed; no retry")
+                    return 0
                 progress("baseline_not_ready", active_attempt=attempt_index)
                 if time.monotonic() >= wait_deadline:
                     break
@@ -273,6 +331,16 @@ def run(config_path):
         progress("incomplete")
         return 1
     finally:
+        if observer is not None:
+            try:
+                observer.close()
+                state["last_metrics_observer"] = observer.snapshot()
+                if state["last_metrics_observer"].get("first_error") and state["status"] == "complete":
+                    state["status"] = "observation_incomplete"
+            except Exception as error:
+                state.setdefault("metrics_observer_cleanup_error", str(error))
+                if state["status"] == "complete":
+                    state["status"] = "observation_incomplete"
         state["completed_utc"] = utc_now()
         state["preferences_after"] = prefhash()
         state["preferences_unchanged"] = state["preferences_after"] == state["preferences_before"]
