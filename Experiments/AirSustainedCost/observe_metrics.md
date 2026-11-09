@@ -107,3 +107,18 @@ Its errors, timestamps and actual CB durations remain in `residentKeepAlive`;
 The1814×1142 geometry is a mechanism diagnostic. Application acceptance must
 separately record actual capture, model processing and presentation geometry;
 it cannot infer the user's original-window performance from this native run.
+
+Analyze a settled keepalive run with a manifest frozen before the data is read:
+
+```sh
+python3 -B Experiments/AirSustainedCost/analyze_keepalive.py \
+  --input /ABS/attempt-01/native.json \
+  --manifest /ABS/analysis-manifest.json \
+  --output /ABS/NEW-keepalive-review.json
+```
+
+The manifest pins the new executable, original model, observer helper,
+configuration and source/resource evidence. This analysis uses its own native
+identity check rather than treating the new executable as the old A/B binary.
+Optional `--reference-facts` adds descriptive power comparisons with frozen old
+facts. It does not start another measurement or alter the acceptance gates.
