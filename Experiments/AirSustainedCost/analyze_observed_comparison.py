@@ -12,7 +12,7 @@ import json
 import re
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from decimal import Decimal as D
+from decimal import Decimal as D, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 
 import analyze as native_analysis
@@ -84,6 +84,10 @@ def clock_segments(raw):
                          "absoluteOffsetChangeLowerNs": delta_lo, "absoluteOffsetChangeUpperNs": delta_hi,
                          "hostSpanLo": a["hostLo"], "hostSpanHi": b["hostHi"]})
     return segments, {"anchorCount": len(anchors), "rejectedAnchorIndices": rejected,
+                      "anchors": [{"rawIndex": a["rawIndex"], "utcNs": a["utc"],
+                                   "machLowerNs": a["hostLo"], "machUpperNs": a["hostHi"],
+                                   "parentMonotonicBeforeNs": a["monoLo"], "parentMonotonicAfterNs": a["monoHi"]}
+                                  for a in anchors],
                       "segments": [{"fromAnchor": s["a"]["rawIndex"], "toAnchor": s["b"]["rawIndex"],
                                     "valid": s["valid"], "reason": s["reason"],
                                     "utcStartNs": s["a"]["utc"], "utcEndNs": s["b"]["utc"],
@@ -224,29 +228,35 @@ def align_bins(native, mapped, segments):
 def summarize_window(arm, begin, end, minimum_bins):
     bins = [b for b in arm["bins"] if begin <= b["index"] < end]
     known = [b for b in bins if b["observationStatus"] == "known"]
+    comparable = [b for b in known if b["nativeGpuBinStatus"] == "valid"]
     missing = len(bins)-len(known)
-    metric_keys = sorted({k for b in known for k in b["metricsMedian"]})
-    metrics = {k: native_analysis.distribution(b["metricsMedian"][k] for b in known if b["metricsMedian"].get(k) is not None)
+    metric_keys = sorted({k for b in comparable for k in b["metricsMedian"]})
+    metrics = {k: native_analysis.distribution(b["metricsMedian"][k] for b in comparable if b["metricsMedian"].get(k) is not None)
                for k in metric_keys}
-    gpu = native_analysis.distribution(b["nativeGpuUnionMedianMs"] for b in bins if b["nativeGpuUnionMedianMs"] is not None)
-    wall = native_analysis.distribution(b["nativeWallMedianMs"] for b in bins if b["nativeWallMedianMs"] is not None)
+    gpu = native_analysis.distribution(b["nativeGpuUnionMedianMs"] for b in comparable if b["nativeGpuUnionMedianMs"] is not None)
+    wall = native_analysis.distribution(b["nativeWallMedianMs"] for b in comparable if b["nativeWallMedianMs"] is not None)
     native_start = arm["native"]["measurement"]["bounds"]["startNs"]
     pooled = [j for j in arm["native"]["job_series"] if j["phase"] == "measurement"
               and j["wallStartNs"] is not None and begin*NS <= j["wallStartNs"]-native_start < end*NS]
     insufficient = len(bins) < minimum_bins
     fraction = D(missing)/len(bins) if bins else None
-    native_invalid = [b["index"] for b in bins if b["nativeGpuBinStatus"] != "valid"]
+    native_low = [b["index"] for b in bins if b["nativeGpuBinStatus"] in ("lowcount", "empty")]
+    native_invalid = [b["index"] for b in bins if b["nativeGpuBinStatus"] == "invalid"]
+    observer_complete = not insufficient and fraction is not None and fraction <= D('.1')
     return {"startCpuSecond": begin, "endCpuSecondExclusive": end, "completeBins": len(bins),
             "minimumCompleteBins": minimum_bins, "insufficientWindow": insufficient,
             "knownObservationBins": len(known), "missingObservationBins": missing,
             "missingFraction": fraction, "missingAbove10Percent": fraction is None or fraction > D('.1'),
             "unknownBinIndices": [b["index"] for b in bins if b["observationStatus"] != "known"],
-            "nativeInvalidOrLowSampleBins": native_invalid,
-            "validForFrequencyComparison": not insufficient and fraction is not None and fraction <= D('.1') and not native_invalid,
+            "nativeInvalidOrLowSampleBins": sorted(native_low+native_invalid),
+            "excludedNativeLowSampleBins": native_low, "excludedNativeInvalidBins": native_invalid,
+            "observationWindowComplete": observer_complete,
+            "comparisonEligibleBins": len(comparable), "comparisonEligibleBinIndices": [b["index"] for b in comparable],
+            "validForFrequencyComparison": observer_complete and not native_invalid,
             "metricsOverBinMedians": metrics, "gpuUnionOverBinMediansMs": gpu,
             "wallOverBinMediansMs": wall, "pooledNativeJobsDescriptiveOnly": native_analysis.job_profile(pooled),
             "GPUUnionOnObserverKnownBinsDescriptiveOnly": native_analysis.distribution(b["nativeGpuUnionMedianMs"] for b in known if b["nativeGpuUnionMedianMs"] is not None),
-            "weighting": "Median inside each complete native CPU second, then median of per-second medians; equal time weight. Pooled jobs are descriptive only."}
+            "weighting": "Median inside each complete native CPU second, then equal-time median over the common observer-known and native-eligible bins for frequency and cost. Native lowcount bins are excluded from both medians, not counted as observer missing and not a whole-window veto. Pooled jobs are descriptive only."}
 
 
 def frequency_classification(arms):
@@ -381,6 +391,61 @@ def json_default(value):
     raise TypeError(type(value).__name__)
 
 
+def native_mark_mach_bounds(arm, name):
+    """Bound one event using chronological order inside its own observer only.
+
+    A preceding anchor's last mach read is before the event. A following
+    anchor's first mach read is after it. No equal rates, shared parent epoch,
+    UTC offset, interpolation or reception-delay assumption is needed here.
+    """
+    mark = arm["observerMetadata"].get(name) or {}
+    stamp = native_analysis.integer(mark.get("monotonic_ns"))
+    anchors = arm["clockMapping"].get("anchors", [])
+    if stamp is None:
+        return {"status": "unknown", "reason": "native_mark_missing", "mark": name}
+    before = [a for a in anchors if a["parentMonotonicAfterNs"] < stamp]
+    after = [a for a in anchors if a["parentMonotonicBeforeNs"] > stamp]
+    if not before or not after:
+        return {"status": "unknown", "reason": "native_mark_not_bracketed_within_own_process", "mark": name}
+    lower = max(before, key=lambda a: a["machUpperNs"])
+    upper = min(after, key=lambda a: a["machLowerNs"])
+    lo = lower["machUpperNs"].to_integral_value(rounding=ROUND_FLOOR)
+    hi = upper["machLowerNs"].to_integral_value(rounding=ROUND_CEILING)
+    if lo > hi:
+        return {"status": "unknown", "reason": "inconsistent_mach_order", "mark": name}
+    return {"status": "bounded", "mark": name, "localParentMonotonicNs": stamp,
+            "markUtcNsDescriptiveOnly": mark.get("utc_epoch_ns"),
+            "machLowerNs": lo, "machUpperNs": hi, "boundWidthNs": hi-lo,
+            "rounding": "Outward to integer nanoseconds: lower floor, upper ceil",
+            "precedingAnchorRawIndex": lower["rawIndex"], "followingAnchorRawIndex": upper["rawIndex"],
+            "scope": "Local parent monotonic is used only for before/after ordering within this observer process; endpoint bounds themselves are recorded mach reads."}
+
+
+def common_mach_cooldown(arms):
+    a, b = arms["A"], arms["B"]
+    a_info = a["observerMetadata"].get("clock_info") or {}
+    b_info = b["observerMetadata"].get("clock_info") or {}
+    timebases = [[info.get("timebase_numer"), info.get("timebase_denom")] for info in (a_info, b_info)]
+    common = (all("mach_absolute_time" in str(info.get("mach_api", "")) for info in (a_info, b_info))
+              and timebases[0] == timebases[1] and all(native_analysis.integer(v) is not None and v > 0 for v in timebases[0]))
+    end = native_mark_mach_bounds(a, "native_end")
+    start = native_mark_mach_bounds(b, "native_start")
+    result = {"method": "native event bounds from each process's UTC/mach anchor chronology; subtract only common mach endpoints",
+              "commonClockBasis": {"sameAirScope": "Same Air host and uninterrupted mach clock are the run contract's scope; matching API/timebase records support the conversion, not a shared parent-monotonic origin.",
+                                   "A_machAPI": a_info.get("mach_api"), "B_machAPI": b_info.get("mach_api"),
+                                   "timebases": timebases, "recordedAPIAndTimebaseMatch": common,
+                                   "crossProcessParentMonotonicSubtractionUsed": False},
+              "A_nativeEnd": end, "B_nativeStart": start,
+              "secondsLowerBound": None, "secondsUpperBound": None,
+              "boundWidthSeconds": None, "cooldownAtLeast300s": None}
+    if common and end["status"] == "bounded" and start["status"] == "bounded":
+        lo = (start["machLowerNs"]-end["machUpperNs"])/NS
+        hi = (start["machUpperNs"]-end["machLowerNs"])/NS
+        result.update(secondsLowerBound=lo, secondsUpperBound=hi, boundWidthSeconds=hi-lo,
+                      cooldownAtLeast300s=True if lo >= 300 else False if hi < 300 else None)
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for label in ("a", "b"):
@@ -397,13 +462,19 @@ def main():
         env = getattr(args, "environment_" + lower) or raw.parent.parent / "coordinator-state.json"
         arms[label] = load_arm(label, raw, obs, env)
     result = frequency_classification(arms)
-    a_end = native_analysis.integer((arms["A"]["observerMetadata"].get("native_end") or {}).get("monotonic_ns"))
-    b_start = native_analysis.integer((arms["B"]["observerMetadata"].get("native_start") or {}).get("monotonic_ns"))
-    cooldown = D(b_start-a_end)/NS if a_end is not None and b_start is not None else None
-    timing_protocol = {"cooldownSecondsBetweenNativeMarks": cooldown,
-                       "cooldownAtLeast300s": cooldown >= 300 if cooldown is not None else None,
+    descriptive_windows = {}
+    primary = arms["A"]["native"]["primary_spike"]
+    if primary["classification"] == "spike_observed":
+        descriptive_windows["A_before"] = summarize_window(arms["A"], 0, primary["first_definite_onset_measurement_s"], 5)
+        descriptive_windows["A_after"] = summarize_window(arms["A"], primary["first_confirmation_measurement_s"]+5, len(arms["A"]["bins"]), 30)
+    if arms["B"]["native"]["measurement"]["bounds"]:
+        descriptive_windows["B_available_measurement"] = summarize_window(arms["B"], 0, len(arms["B"]["bins"]), 60)
+    cooldown = common_mach_cooldown(arms)
+    timing_protocol = {"cooldownCommonMachBounds": cooldown,
+                       "cooldownAtLeast300s": cooldown["cooldownAtLeast300s"],
+                       "parentMonotonicScope": "Lead/tail differences are within each process only; cross-process cooldown uses mach bounds.",
                        "paddingByArm": {k: v["padding"] for k,v in arms.items()}}
-    if (cooldown is None or cooldown < 300 or any(a["padding"]["leadAtLeast10s"] is not True
+    if (cooldown["cooldownAtLeast300s"] is not True or any(a["padding"]["leadAtLeast10s"] is not True
             or a["padding"]["tailAtLeast10s"] is not True for a in arms.values())):
         result = {"classification": "observation_incomplete", "reason": "required_cooldown_or_observer_padding_not_verified",
                   "frequencyConclusion": None, "descriptivePatternBeforeProtocolCheck": result}
@@ -411,6 +482,8 @@ def main():
         arm["native"].pop("job_series", None)  # Pooled window statistics already retained; immutable raw remains authoritative.
     report = {"format": "odf-air-rootless-observed-comparison-v1", "classification": result,
               "arms": arms, "timingProtocol": timing_protocol,
+              "availableWindowsDescriptiveOnly": descriptive_windows,
+              "incompleteNativeDataIsNotPromotedByDescriptiveWindows": True,
               "analyzerSHA256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               "nativeAnalyzerSHA256": hashlib.sha256(Path(native_analysis.__file__).read_bytes()).hexdigest(),
               "contract": {"primaryTimestamp": "macmon source UTC mapped through UTC/mach brackets; no UTC/mach zero offset",
@@ -419,7 +492,7 @@ def main():
                            "clockJumpUnknownThresholdMs": 50, "sourceGapThresholdSeconds": D('1.5'),
                            "missingFractionMaximumInclusive": D('.1'), "firstSampleDiscardedButRawRetained": True,
                            "A_before": "formal[0,onset), >=5 complete CPU bins", "A_after": "formal[confirmation+5,end of complete bins), >=30 bins",
-                           "B": "all formal complete CPU bins, >=60", "aggregation": "within-bin median, then equal-time median over bins; pooled jobs separate",
+                           "B": "all formal complete CPU bins, >=60", "aggregation": "within-bin median, then equal-time median over common observer-known/native-eligible bins; observation completeness keeps its original full-bin denominator; pooled jobs separate",
                            "frequencyAfterMaximumRatio": D('.6'), "B_frequencyMinimumRatio": D('.9'),
                            "inverseFrequencyRelativeTolerance": D('.25'), "noClockExplanationGpuMinimumRatio": 2,
                            "noClockExplanationFrequencyMinimumRatio": D('.9')},
