@@ -68,6 +68,7 @@ struct Options {
     let cancelFile: String
     let gapFillEnabled: Bool
     let realWorkFillEnabled: Bool
+    let residentKeepAliveEnabled: Bool
     let fillerModel: URL?
     let fillerExpectedSHA256: String?
 
@@ -89,6 +90,8 @@ struct Options {
     only, and requires --filler-model-path ABS.rmw --filler-model-sha256 HEX64.
     This flag is mutually exclusive with ALU gap fill. CPU identity-only uses the
     same two filler arguments when this flag is1, before any Metal initialization.
+    ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC=1 enables independent single-SIMD-group
+    keepalive only for paced24/180, mutually exclusive with both fill modes.
     Exit: 0 complete; 3 baseline_not_ready; 4 cancelled; 5 calibration_failed;
       1 failed; 2 invalid CLI.
     --help exits before model, Metal, or output initialization.
@@ -113,10 +116,15 @@ struct Options {
         let gapValue = ProcessInfo.processInfo.environment["ODF_AIR_GAP_FILL_DIAGNOSTIC"] ?? "0"
         guard gapValue == "0" || gapValue == "1" else { throw SustainedError.invalid("gap-fill flag must be0/1") }
         let gapEnabled = gapValue == "1"
-        guard !(gapEnabled && workEnabled) else { throw SustainedError.invalid("fill modes are mutually exclusive") }
+        let residentValue = ProcessInfo.processInfo.environment["ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC"] ?? "0"
+        guard residentValue == "0" || residentValue == "1" else { throw SustainedError.invalid("resident keepalive flag must be0/1") }
+        let residentEnabled = residentValue == "1"
+        guard [gapEnabled, workEnabled, residentEnabled].filter({ $0 }).count <= 1 else {
+            throw SustainedError.invalid("fill and keepalive modes are mutually exclusive")
+        }
         guard let mode = values["--mode"], let seconds = Int(values["--seconds"] ?? ""),
               let prefix = Int(values["--baseline-seconds"] ?? ""), prefix == 5,
-              (workEnabled ? mode == "paced24" && seconds == 180 : gapEnabled ? mode == "paced24" && (seconds == 180 || seconds == 600)
+              ((workEnabled || residentEnabled) ? mode == "paced24" && seconds == 180 : gapEnabled ? mode == "paced24" && (seconds == 180 || seconds == 600)
                           : (mode == "paced24" && seconds == 180) || (mode == "continuous" && seconds == 120)),
               values["--model-sha256"] == originalModelSHA256 else {
             throw SustainedError.invalid("fixed original-model protocol: paced24/180 or continuous/120; prefix5; original SHA")
@@ -139,7 +147,8 @@ struct Options {
         return Options(mode: mode, seconds: seconds, baselineSeconds: prefix,
                        model: URL(fileURLWithPath: values["--model-path"]!), expectedSHA256: values["--model-sha256"]!,
                        output: destination, cancelFile: values["--cancel-file"]!, gapFillEnabled: gapEnabled,
-                       realWorkFillEnabled: workEnabled, fillerModel: values["--filler-model-path"].map { URL(fileURLWithPath: $0) },
+                       realWorkFillEnabled: workEnabled, residentKeepAliveEnabled: residentEnabled,
+                       fillerModel: values["--filler-model-path"].map { URL(fileURLWithPath: $0) },
                        fillerExpectedSHA256: values["--filler-model-sha256"])
     }
 }
@@ -157,6 +166,7 @@ struct Configuration: Encodable {
     let targetHz: Int
     let gapFillEnabled: Bool
     let realWorkFillEnabled: Bool
+    let residentKeepAliveEnabled: Bool
     let fillerModelPath: String?
     let expectedFillerSHA256: String?
     let width = 1814, height = 1142, warmup = 20
@@ -272,8 +282,10 @@ struct CPUIdentityReport: Encodable {
 func cpuIdentityCheck() throws -> Int32 {
     let arguments = Array(CommandLine.arguments.dropFirst()).filter { $0 != "--identity-check-only" }
     let workValue = ProcessInfo.processInfo.environment["ODF_AIR_REAL_WORK_FILL_DIAGNOSTIC"] ?? "0"
-    guard workValue == "0" || workValue == "1",
-          !(workValue == "1" && ProcessInfo.processInfo.environment["ODF_AIR_GAP_FILL_DIAGNOSTIC"] == "1") else {
+    let gapValue = ProcessInfo.processInfo.environment["ODF_AIR_GAP_FILL_DIAGNOSTIC"] ?? "0"
+    let residentValue = ProcessInfo.processInfo.environment["ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC"] ?? "0"
+    guard [workValue, gapValue, residentValue].allSatisfy({ $0 == "0" || $0 == "1" }),
+          [workValue, gapValue, residentValue].filter({ $0 == "1" }).count <= 1 else {
         throw SustainedError.invalid("invalid/mutually exclusive CPU diagnostic flags")
     }
     let workEnabled = workValue == "1"
@@ -454,6 +466,7 @@ struct Report: Encodable {
     var functionalComplete = false
     var formalStarted = false
     var setupSucceeded = false
+    var diagnosticInvalid = false
     var configuration: Configuration
     let hostClock: HostClock
     var runStartNs: UInt64 = 0
@@ -477,6 +490,7 @@ struct Report: Encodable {
     var jobLimitReached = false
     var gapFill: GapFillReport?
     var realWorkFill: RealWorkFillReport?
+    var residentKeepAlive: ResidentKeepAliveReport?
     let scope = "No window, SCK, presenter, source capture, FPS acceptance or quality acceptance. Thermal state is a coarse observation, not a temperature/frequency attribution."
     let prefixAndMeasurementAreSeparate = true
 }
@@ -491,6 +505,7 @@ final class Harness {
     var output: CVPixelBuffer?
     var gapFill: GapFill?
     var realWorkFill: RealWorkFill?
+    var residentKeepAlive: ResidentKeepAlive?
 
     init(_ options: Options) {
         self.options = options
@@ -500,6 +515,7 @@ final class Harness {
                         baselineSeconds: options.baselineSeconds, targetHz: options.mode == "paced24" ? 24 : 0,
                         gapFillEnabled: options.gapFillEnabled,
                         realWorkFillEnabled: options.realWorkFillEnabled,
+                        residentKeepAliveEnabled: options.residentKeepAliveEnabled,
                         fillerModelPath: options.fillerModel?.path, expectedFillerSHA256: options.fillerExpectedSHA256,
                         expectedModelSHA256: options.expectedSHA256, modelPath: options.model.path),
                         hostClock: .init(machTimebaseNumer: timebase.numer, machTimebaseDenom: timebase.denom))
@@ -571,6 +587,7 @@ final class Harness {
 
     func phase(_ name: String, seconds: Int, stream: RifeStream, engine: RifeInterpolator,
                first: CVPixelBuffer, second: CVPixelBuffer, output: CVPixelBuffer) throws {
+        residentKeepAlive?.markPhase(name)
         let start = nowNs(), nominalEnd = start + UInt64(seconds) * billion
         var state = Phase(startNs: start, requestedEndNs: nominalEnd, endNs: start, requestedSeconds: seconds)
         var slot = 0, skipped = 0, nextThermalIndex = 1
@@ -654,7 +671,7 @@ final class Harness {
         try checkCancel()
         guard try sha(options.model) == options.expectedSHA256 else { throw SustainedError.invalid("source model SHA mismatch") }
         let preferredDevice: MTLDevice?
-        if options.gapFillEnabled || options.realWorkFillEnabled {
+        if options.gapFillEnabled || options.realWorkFillEnabled || options.residentKeepAliveEnabled {
             guard let device = MTLCreateSystemDefaultDevice() else { throw SustainedError.native("gap-fill shared device unavailable") }
             preferredDevice = device
             report.deviceRegistryID = device.registryID
@@ -702,6 +719,13 @@ final class Harness {
             try fill.calibrate(checkCancel: checkCancel)
         }
         try realWorkFill?.warmAndFreeze()
+        if options.residentKeepAliveEnabled, let device = preferredDevice {
+            let keeper = try ResidentKeepAlive(device: device)
+            residentKeepAlive = keeper
+            try keeper.calibrate(checkCancel: checkCancel)
+            try checkCancel()
+            try keeper.start()
+        }
         report.setupSucceeded = true
         try phase("baseline", seconds: options.baselineSeconds, stream: stream, engine: engine,
                   first: first, second: second, output: output)
@@ -724,6 +748,12 @@ final class Harness {
 
     func finish() throws {
         report.runEndNs = nowNs()
+        if let keeper = residentKeepAlive {
+            let result = keeper.stopAndDrain(reason: report.status)
+            report.residentKeepAlive = result
+            report.diagnosticInvalid = result.firstFailure != nil || result.overflow || result.recordsDropped > 0
+                || result.lifecycle.pendingAtEnd != 0
+        }
         if let work = realWorkFill {
             let result = work.stopAndDrain()
             report.realWorkFill = result

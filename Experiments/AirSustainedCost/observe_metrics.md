@@ -3,8 +3,8 @@
 The coordinator optionally adds the `observe_metrics.py` sidecar and a separate
 CPU analysis step. Existing native/model sources, filler code, frozen binaries
 and old evidence remain untouched. The coordinator owns all native parameters,
-HID/cooldown/session checks and single-run limits. An observed arm uses the
-original native binary and model with both filler modes disabled.
+HID/cooldown/session checks and single-run limits. Original A/B observation uses
+the original native binary and model with both filler modes disabled.
 
 Set `metrics_observer` in the arm configuration to the object passed below.
 Without it, the existing native-only path remains available. A sampler failure
@@ -86,3 +86,24 @@ Explicit `--observer-a/b` and `--environment-a/b` paths are also supported.
 Frequency comparisons use equal-time CPU bins, require the frozen minimum
 windows and at most10% missing observations, and report descriptive consistency
 only. Native throughput remains separate from application playback FPS.
+
+## Resident keepalive diagnostic
+
+`resident_keepalive_enabled: true` selects the separately compiled native
+keepalive diagnostic. It requires `metrics_observer`, paced24/180 and both older
+filler modes disabled. The original model and Core metallib remain unchanged;
+the new executable includes `native/ResidentKeepAlive.swift`. Its environment
+flag is `ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC=1`, defaulting to0.
+
+The independent queue dispatches one threadgroup with
+`pipeline.threadExecutionWidth` threads per command buffer. At most2 CBs share
+one tracked private scratch buffer. After model warmup, five pilot CBs, one
+iteration conversion and five validation CBs freeze a roughly1ms workload.
+The worker covers the separate prefix and formal phases without adding any
+admission check or wait to real pushes; cleanup drains it after phase timing.
+Its errors, timestamps and actual CB durations remain in `residentKeepAlive`;
+`diagnosticInvalid` prevents treating an asynchronous failure as a valid result.
+
+The1814×1142 geometry is a mechanism diagnostic. Application acceptance must
+separately record actual capture, model processing and presentation geometry;
+it cannot infer the user's original-window performance from this native run.

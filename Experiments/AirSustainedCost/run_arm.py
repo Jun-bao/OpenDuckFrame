@@ -86,16 +86,24 @@ def run(config_path):
             raise RuntimeError("Gap fill requires an explicit boolean and paced24 mode")
         if real_work and (gap_fill or config["mode"] != "paced24"):
             raise RuntimeError("Real-work filler requires paced24 and cannot use ALU gap fill")
+        resident_keepalive = config.get("resident_keepalive_enabled", False)
+        if not isinstance(resident_keepalive, bool):
+            raise RuntimeError("Resident keepalive requires an explicit boolean")
+        if resident_keepalive and (real_work or gap_fill or config["mode"] != "paced24" or config["seconds"] != 180):
+            raise RuntimeError("Resident keepalive requires paced24/180 with both filler modes disabled")
         observer_config = config.get("metrics_observer")
         if observer_config is not None and not isinstance(observer_config, dict):
             raise RuntimeError("Metrics observer requires an explicit configuration object")
         if observer_config is not None and (real_work or gap_fill):
             raise RuntimeError("Observed A/B keeps both filler modes disabled")
+        if resident_keepalive and observer_config is None:
+            raise RuntimeError("Resident keepalive requires the frozen hardware observer")
         allowed_seconds = (180, 600) if gap_fill else ((180,) if config["mode"] == "paced24" else (120,))
         if config["seconds"] not in allowed_seconds:
             raise RuntimeError("Duration differs from the approved arm")
         state["gap_fill_enabled"] = gap_fill
         state["real_work_fill_enabled"] = real_work
+        state["resident_keepalive_enabled"] = resident_keepalive
         lock_path = Path(config["gpu_lock"]).expanduser()
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         lock = lock_path.open("a")
@@ -112,9 +120,10 @@ def run(config_path):
         native_env.update(ODF_AIR_SERVICE_TRACE="1", ODF_PERF_PROFILE="off",
                           ODF_K1_PROFILE="0", RIFE_VERBOSE="0",
                           ODF_AIR_GAP_FILL_DIAGNOSTIC="1" if gap_fill else "0",
-                          ODF_AIR_REAL_WORK_FILL_DIAGNOSTIC="1" if real_work else "0")
+                          ODF_AIR_REAL_WORK_FILL_DIAGNOSTIC="1" if real_work else "0",
+                          ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC="1" if resident_keepalive else "0")
         state["native_environment_overrides"] = {
-            k: native_env[k] for k in ("ODF_AIR_SERVICE_TRACE", "ODF_PERF_PROFILE", "ODF_K1_PROFILE", "RIFE_VERBOSE", "ODF_AIR_GAP_FILL_DIAGNOSTIC", "ODF_AIR_REAL_WORK_FILL_DIAGNOSTIC")}
+            k: native_env[k] for k in ("ODF_AIR_SERVICE_TRACE", "ODF_PERF_PROFILE", "ODF_K1_PROFILE", "RIFE_VERBOSE", "ODF_AIR_GAP_FILL_DIAGNOSTIC", "ODF_AIR_REAL_WORK_FILL_DIAGNOSTIC", "ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC")}
         state["App_model_override_unset"] = True
         state["RIFE_dump_directory_unset"] = True
         save()
