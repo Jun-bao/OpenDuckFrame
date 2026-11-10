@@ -1636,8 +1636,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let aspect = preview.widthAnchor.constraint(equalTo: preview.heightAnchor, multiplier: 16.0 / 9.0)
         let fillWidth = preview.widthAnchor.constraint(equalTo: well.widthAnchor)
         let fillHeight = preview.heightAnchor.constraint(equalTo: well.heightAnchor)
-        fillWidth.priority = .defaultHigh
-        fillHeight.priority = .defaultHigh
+        fillWidth.priority = .defaultLow
+        fillHeight.priority = .defaultLow
         previewAspect = aspect
         viewMode.translatesAutoresizingMaskIntoConstraints = false
         viewMode.segmentDistribution = .fillEqually
@@ -1934,7 +1934,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         content.translatesAutoresizingMaskIntoConstraints = false
         host.addSubview(content)
         let fill = content.widthAnchor.constraint(equalTo: host.widthAnchor, constant: -32)
-        fill.priority = .defaultHigh
+        // Preferred fill must yield to window resizing, whose priority is 500.
+        fill.priority = .defaultLow
         NSLayoutConstraint.activate([
             fill,
             content.widthAnchor.constraint(lessThanOrEqualToConstant: maxWidth),
