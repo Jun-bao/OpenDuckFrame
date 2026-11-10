@@ -120,7 +120,19 @@ static NSDictionary *SPAirMeasurementRow(const spAirMeasurement::Event &event) {
             } else {
                 row[@"candidateCount"] = @(event.values[0]); row[@"displayTimeMediaNs"] = @(event.values[1]);
                 row[@"deadlineMediaNs"] = @(event.values[2]);
-                if (event.kind == K::choiceEnd) row[@"selectedIndex"] = event.frameID ? @(event.values[3]) : (id)NSNull.null;
+                if (event.kind == K::choiceEnd) {
+                    row[@"selectedIndex"] = event.frameID ? @(event.values[3]) : (id)NSNull.null;
+                    if (event.flags & 512u) {
+                        const auto branch = (spAirDisplayPolicyB::Branch)(event.flags >> 16);
+                        row[@"ruleBEnabled"] = @((event.flags & 1024u) != 0);
+                        row[@"ruleBApplied"] = @(branch == spAirDisplayPolicyB::Branch::boundedLag || branch == spAirDisplayPolicyB::Branch::allStaleLatest);
+                        row[@"ruleBBranch"] = @((int)branch);
+                        row[@"ruleBRefreshPeriodNs"] = event.clockLifeID ? @(event.clockLifeID) : (id)NSNull.null;
+                        row[@"ruleBHistoryCount"] = @(event.armID);
+                        row[@"ruleBSelectedLagNs"] = event.frameID && event.targetHostTicks > 0 ?
+                            @((int64_t)event.values[1] - SPHostToNs(event.targetHostTicks)) : (id)NSNull.null;
+                    }
+                }
             }
             break;
         case K::leaseRequest:

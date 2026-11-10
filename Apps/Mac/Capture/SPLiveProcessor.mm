@@ -13,6 +13,7 @@
 #include "SPAirWindowOptimization.hpp"
 #include "SPAirMeasurementTrace.hpp"
 #include "SPAirSourceConversion.hpp"
+#include "SPAirDisplayPolicyB.hpp"
 #import "SPRateSchedule.hpp"
 #import "SPLiveDisplayQueue.h"
 #import "SPRifePairAffineClock.hpp"
@@ -1225,6 +1226,8 @@ static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) 
 @interface SPProspectiveDisplaySlot : NSObject {
 @public
     sp::DisplaySlotWindow timing;
+    spAirDisplayPolicyB::RefreshHistory ruleBHistory;
+    bool ruleBEnabled;
     int64_t selectionScanEndedHostTicks;
     int64_t discardReportsStartedHostTicks, discardReportsEndedHostTicks;
     uint64_t staleDiscardReportCount, supersededDiscardReportCount;
@@ -1483,6 +1486,7 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
 - (sp::DisplaySlotContext)displaySlotContext;
 - (void)armDisplaySlotLocked:(uint64_t)token;
 - (void)parkDisplaySlotTimerLocked;
+- (void)resetAirDisplayPolicyLocked;
 - (void)recordDisplayTimerTraceLocked:(SPDisplayTimerTrace)trace;
 - (void)recordAirSlotTraceLocked:(SPDisplayTimerTrace)trace origin:(SPAirSlotOrigin)origin;
 - (void)consumeDisplaySlot:(sp::DisplaySlotWindow)armedSlot;
@@ -1516,6 +1520,10 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
     SPProspectiveDisplaySlot *_prospectiveSlot;
     uint64_t _nextDisplaySlotToken;
     std::atomic<int64_t> _displayPreparationLeadNs;
+    spAirDisplayPolicyB::RefreshHistory _airDisplayRefreshHistory;
+    spAirDisplayPolicyB::Decision _airRuleBLastDecision;
+    uint64_t _airRuleBDecisionCount;
+    std::size_t _airRuleBLastHistoryCount;
     std::atomic<uint64_t> _displaySlotExpired, _displaySlotRetired, _displaySlotBusy, _displaySlotNoFrame;
     std::mutex _presentationMutex;
     NSMutableArray<SPDisplayFrameRequest *> *_pendingPresentations;
@@ -1705,7 +1713,11 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
     if (enabled && !_preparedTextures) _preparedTextures = [[SPPreparedTextureMapper alloc] initWithDevice:_device];
     [self setAirBetaCaptureWidth:width height:height];
     _selectionGuardNs.store(enabled ? 2000000 : _diagnosticSelectionGuardNs);
-    _airPerformanceEnabled.store(enabled, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(_presentationMutex);
+        if (_airPerformanceEnabled.exchange(enabled, std::memory_order_acq_rel) != enabled)
+            [self resetAirDisplayPolicyLocked];
+    }
     return YES;
 #else
     _airPerformanceEnabled.store(false);
@@ -1824,7 +1836,7 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
         if (generation > _highestGeneration) _highestGeneration = generation;
         std::lock_guard<std::mutex> pendingLock(_presentationMutex);
         old = _generation.exchange(generation);
-        if (generation != old) _haveSubmittedPresentationPTS = false;
+        if (generation != old) { _haveSubmittedPresentationPTS = false; [self resetAirDisplayPolicyLocked]; }
     }
     if (generation != old) {
         { std::lock_guard<std::mutex> lock(_geometryMutex); _sharedGeometry.invalidate(); }
@@ -1867,7 +1879,7 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
             event.generation = _generation.load(); event.config = config; event.epoch = epoch; event.clock = _presentationClockEpoch.load();
             event.previousConfig = oldConfig; event.previousEpoch = oldEpoch; _airCadenceFrames->append(event);
         }
-        if (oldConfig != config || oldEpoch != epoch) _haveSubmittedPresentationPTS = false;
+        if (oldConfig != config || oldEpoch != epoch) { _haveSubmittedPresentationPTS = false; [self resetAirDisplayPolicyLocked]; }
     }
     if (oldConfig != config || oldEpoch != epoch) {
         { std::lock_guard<std::mutex> lock(_geometryMutex); _sharedGeometry.invalidate(); }
@@ -1881,7 +1893,7 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
         std::lock_guard<std::mutex> generationLock(_generationMutex);
         std::lock_guard<std::mutex> pendingLock(_presentationMutex);
         changed = _presentationClockEpoch.exchange(clockEpoch) != clockEpoch;
-        if (changed) _haveSubmittedPresentationPTS = false;
+        if (changed) { _haveSubmittedPresentationPTS = false; [self resetAirDisplayPolicyLocked]; }
     }
     if (changed) { [self invalidateSharedGeometry]; [self discardOutdatedPresentations]; }
 }
@@ -2433,6 +2445,13 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
     return {_generation.load(), _diagnosticConfig.load(), _diagnosticEpoch.load(), _presentationClockEpoch.load()};
 }
 
+- (void)resetAirDisplayPolicyLocked {
+    _airDisplayRefreshHistory.reset();
+    _airRuleBLastDecision = {};
+    _airRuleBDecisionCount = 0; _airRuleBLastHistoryCount = 0;
+    if (_prospectiveSlot) _prospectiveSlot->ruleBEnabled = false;
+}
+
 - (void)copyAirCadenceEvents:(std::vector<SPAirFrameEvent> *)events total:(uint64_t *)total {
     [self copyAirCadenceEvents:events total:total consumes:nullptr consumeTotal:nullptr snapshot:nullptr];
 }
@@ -2496,10 +2515,15 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
 - (NSDictionary *)displaySlotDiagnostics {
     std::array<SPDisplayTimerTrace, 64> history;
     uint64_t total; NSUInteger pendingFrames; bool pendingSlot;
+    bool ruleBEnabled;
+    spAirDisplayPolicyB::Decision ruleBDecision;
+    uint64_t ruleBDecisionCount; std::size_t ruleBHistoryCount;
     {
         std::lock_guard<std::mutex> lock(_presentationMutex);
         history = _displayTimerTrace; total = _displayTimerTraceCount;
         pendingFrames = _pendingPresentations.count; pendingSlot = _prospectiveSlot != nil;
+        ruleBEnabled = _airPerformanceEnabled.load(); ruleBDecision = _airRuleBLastDecision;
+        ruleBDecisionCount = _airRuleBDecisionCount; ruleBHistoryCount = _airRuleBLastHistoryCount;
     }
     // Build diagnostic objects outside the deadline-sensitive publication lock.
     NSUInteger count = (NSUInteger)MIN(total, (uint64_t)history.size());
@@ -2526,6 +2550,10 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
         @"retiredSlotsLifetime": @(_displaySlotRetired.load()), @"busySlotsLifetime": @(_displaySlotBusy.load()),
         @"noFrameSlotsLifetime": @(_displaySlotNoFrame.load()), @"preparationLeadNs": @(_displayPreparationLeadNs.load()),
         @"selectionGuardNs": @([self selectionGuardNs]), @"timerLeewayNs": @50000, @"timerStrict": @YES,
+        @"ruleB": @{ @"enabled": @(ruleBEnabled), @"historyCapacity": @8, @"decisionCountInContext": @(ruleBDecisionCount),
+            @"lastDecisionBranch": ruleBDecisionCount ? @((int)ruleBDecision.branch) : (id)NSNull.null,
+            @"lastDecisionRefreshPeriodNs": ruleBDecision.refreshPeriodNs > 0 ? @(ruleBDecision.refreshPeriodNs) : (id)NSNull.null,
+            @"lastDecisionHistoryCount": @(ruleBHistoryCount) },
         @"timerTraceCapacity": @(history.size()), @"timerTraceTotal": @(total), @"timerTrace": events,
         @"timerTraceNote": @"bounded slot observations; handler entry includes OS wake and render-queue scheduling, lock acquisition separately includes mutex wait" };
 #if defined(ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC) && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC == 1
@@ -2596,6 +2624,11 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
                 }
             }
             slot->timing = {++_nextDisplaySlotToken, context, (int64_t)(deadline * 1e9), (int64_t)(displayTime * 1e9), [self selectionGuardNs]};
+            slot->ruleBEnabled = [self airPerformanceEnabled];
+            if (slot->ruleBEnabled) {
+                _airDisplayRefreshHistory.observe(slot->timing.displayNs);
+                slot->ruleBHistory = _airDisplayRefreshHistory;
+            }
             _prospectiveSlot = slot;
             _displayPreparationLeadNs.store(sp::displayPreparationLeadNs(slot->timing));
             [self armDisplaySlotLocked:slot->timing.token];
@@ -2667,7 +2700,14 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
             std::vector<sp::DisplayQueueFrame> timings;
             for (SPDisplayFrameRequest *pending in _pendingPresentations) timings.push_back(SPDisplayFrameTiming(pending));
             const uint64_t measurementChoiceBegin = _measurementTrace ? SPHostNow() : 0;
-            auto selected = sp::chooseDisplayFrame(timings, (int64_t)(slot.displayTime * 1e9));
+            const bool ruleBEnabled = slot->ruleBEnabled && [self airPerformanceEnabled];
+            const auto ruleB = spAirDisplayPolicyB::decide(timings, slot->timing.displayNs,
+                slot->ruleBHistory.intervals, slot->ruleBHistory.count, ruleBEnabled);
+            const auto selected = ruleB.selected;
+            if (ruleBEnabled) {
+                _airRuleBLastDecision = ruleB; _airRuleBLastHistoryCount = slot->ruleBHistory.count;
+                ++_airRuleBDecisionCount;
+            }
             if (_measurementTrace) {
                 const uint64_t ended = SPHostNow(), group = _measurementTrace->identity();
                 spAirMeasurement::Event event; event.kind = spAirMeasurement::Kind::choiceBegin;
@@ -2687,6 +2727,12 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
                 }
                 event.kind = spAirMeasurement::Kind::choiceEnd; event.values[3] = selected;
                 event.frameID = selected < timings.size() ? timings[selected].frameID : 0;
+                event.flags = 512u | (ruleBEnabled ? 1024u : 0u) | ((uint32_t)ruleB.branch << 16);
+                event.clockLifeID = ruleB.refreshPeriodNs; event.armID = slot->ruleBHistory.count;
+                if (selected < timings.size()) {
+                    event.ptsNum = timings[selected].pts.num; event.ptsDen = timings[selected].pts.den;
+                    event.targetHostTicks = _pendingPresentations[selected].logicalTargetHost;
+                }
                 _measurementTrace->append(event);
             }
             if (selected < timings.size()) {
