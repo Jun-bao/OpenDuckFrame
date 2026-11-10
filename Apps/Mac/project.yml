@@ -31,7 +31,7 @@ settings:
     MACOSX_DEPLOYMENT_TARGET: "14.0"
     ARCHS: arm64
     MARKETING_VERSION: "0.3.2"
-    CURRENT_PROJECT_VERSION: "26"
+    CURRENT_PROJECT_VERSION: "27"
     ODF_BUNDLE_ID: app.openduckframe.OpenDuckFrame
     ODF_DISPLAY_NAME: OpenDuckFrame
     ODF_CANDIDATE_LABEL: "r6"

@@ -13,11 +13,14 @@ extension Notification.Name {
 /// One place for the workbench type scale, spacing and surfaces.
 private enum WorkbenchStyle {
     static let edge: CGFloat = 16
+    static let gap: CGFloat = 12
+    static let inspectorWidth: CGFloat = 300
     static let panelRadius: CGFloat = 12
     static let groupRadius: CGFloat = 10
     static var titleFont: NSFont { .systemFont(ofSize: 20, weight: .semibold) }
-    static var brandFont: NSFont { .systemFont(ofSize: 15, weight: .semibold) }
+    static var brandFont: NSFont { .systemFont(ofSize: 13, weight: .semibold) }
     static var captionFont: NSFont { .systemFont(ofSize: 11) }
+    @MainActor static var labelWidth: CGFloat { EnhancementText.chinese ? 84 : 104 }
 }
 
 @MainActor enum EnhancementText {
@@ -1034,7 +1037,13 @@ enum WorkbenchTitle {
     }
 }
 
-final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate, NSTextFieldDelegate {
+private final class CollapsingLabel: NSTextField {
+    override var stringValue: String {
+        didSet { isHidden = stringValue.isEmpty }
+    }
+}
+
+final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate, NSTextFieldDelegate, NSToolbarDelegate {
     /// Capture callbacks call only the processor's queueing entry points.
     private final class CaptureProcessorSink: @unchecked Sendable {
         let processor: SPLiveProcessor
@@ -1059,6 +1068,15 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private final class WorkbenchWindow: NSWindow {
         var beforeMouseDown: ((NSEvent) -> Void)?
+        var openSettings: (() -> Void)?
+        override func performKeyEquivalent(with event: NSEvent) -> Bool {
+            if event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+               event.charactersIgnoringModifiers == "," {
+                openSettings?()
+                return true
+            }
+            return super.performKeyEquivalent(with: event)
+        }
         override func sendEvent(_ event: NSEvent) {
             if event.type == .leftMouseDown { beforeMouseDown?(event) }
             super.sendEvent(event)
@@ -1107,8 +1125,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private let statusLabel = NSTextField(labelWithString: "")
     private var lastWindowOptimizationStatus = ""
-    private let statsLabel = NSTextField(labelWithString: "")
-    private let budgetLabel = NSTextField(labelWithString: "")
+    private let statsLabel = CollapsingLabel(labelWithString: "")
+    private let budgetLabel = CollapsingLabel(labelWithString: "")
     private let planLabel = NSTextField(wrappingLabelWithString: "")
     private let sizeChainLabel = NSTextField(wrappingLabelWithString: "")
     private let airBetaStatusLabel = NSTextField(wrappingLabelWithString: "")
@@ -1187,7 +1205,14 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let enhancementDelayStepper = NSStepper()
     private let enhancementDelayCustomRow = NSStackView()
     private var enhancementDelayCustomSelected = false
-    private let configRows = NSStackView()
+    private let pageControl = NSSegmentedControl()
+    private let configPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let configActions = NSPopUpButton(frame: .zero, pullsDown: true)
+    private var scaleBody: NSView?
+    private var framesBody: NSView?
+    private var previewAspect: NSLayoutConstraint?
+    private var formLabels: [(NSTextField, NSView, NSLayoutConstraint)] = []
+    private var hasPendingFormChanges = false
     private let captureCapPopup = NSPopUpButton()
     private let recentStack = NSStackView()
     private var liveLogTimer: Timer?
@@ -1234,7 +1259,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let phaseLabel = NSTextField(wrappingLabelWithString: "")
     private let compatibilityButton = NSButton(title: "改用 RIFE 4.25", target: nil, action: nil)
     private let emptyOverlay = NSView()
-    private var navButtons: [NSButton] = []
     private var page = 0
     private var pendingApply: EnhancementProfile?
     private var liveApply = LiveApplyTracker()
@@ -1255,8 +1279,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private var generation: UInt64 = 1
     private var renameEditor: ConfigRenameField?
     private var renameID: String?
-    private weak var renameRow: NSButton?
-    private var renameOriginalTitle = ""
     private var countdown = EnhancementCountdown()
     private var countdownTimer: Timer?
     private var countdownSourceGeneration: UInt64?
@@ -1271,12 +1293,11 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private struct SCDisplayBox { var title: String; var display: Any }
 
     private init() {
-        let window = WorkbenchWindow(contentRect: NSRect(x: 0, y: 0, width: 1180, height: 760),
+        let window = WorkbenchWindow(contentRect: NSRect(x: 0, y: 0, width: 1180, height: 700),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable],
                               backing: .buffered, defer: false)
-        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
-        window.title = WorkbenchTitle.text(EnhancementText.t("Quality Workbench", "画质工作台"), version: version)
-        window.minSize = NSSize(width: 1100, height: 760)
+        window.title = "OpenDuckFrame"
+        window.minSize = NSSize(width: 840, height: 620)
         super.init(window: window)
 #if ODF_AIR_BETA_DIAGNOSTIC
         Self.betaInstance = self
@@ -1286,6 +1307,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         applyAirBetaPreset(&profile)
         window.delegate = self
         window.contentView = build()
+        installToolbar(on: window)
+        window.openSettings = { [weak self] in self?.showSettings() }
+        if !window.setFrameUsingName("OpenDuckFrame.Workbench") { window.center() }
+        window.setFrameAutosaveName("OpenDuckFrame.Workbench")
         window.initialFirstResponder = sourceKindControl
         window.beforeMouseDown = { [weak self] event in self?.endDimensionEditingBeforeClick(event) }
         installCountdownLabels()
@@ -1454,7 +1479,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     func showWorkbench() {
         applyAppearance()
         showWindow(nil)
-        window?.center()
+        installWorkbenchMenuEntries()
         NSApp.activate(ignoringOtherApps: true)
         startLiveLogIfNeeded()
         if SPRifeExperiments.available, !SPRifeExperiments.airBeta, !experimentPanelAutoOpened,
@@ -1550,267 +1575,71 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private func build() -> NSView {
         let root = NSView()
         root.wantsLayer = true
-        let sidebar = glass()
         let inspector = glass()
-        let bottom = glass()
-        let strip = glass()
-        sidebar.translatesAutoresizingMaskIntoConstraints = false
-        inspector.translatesAutoresizingMaskIntoConstraints = false
-        bottom.translatesAutoresizingMaskIntoConstraints = false
-        strip.translatesAutoresizingMaskIntoConstraints = false
-        stageHost.translatesAutoresizingMaskIntoConstraints = false
-        sourceHost.translatesAutoresizingMaskIntoConstraints = false
-        libraryHost.translatesAutoresizingMaskIntoConstraints = false
-        preview.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(sidebar)
-        root.addSubview(stageHost)
-        root.addSubview(sourceHost)
-        root.addSubview(libraryHost)
-
-        let brand = NSTextField(labelWithString: EnhancementText.t("OpenDuckFrame", "OpenDuckFrame"))
-        brand.font = WorkbenchStyle.brandFont
-        brand.textColor = .labelColor
-        let brandIcon = NSImageView(image: NSApp.applicationIconImage)
-        brandIcon.imageScaling = .scaleProportionallyUpOrDown
-        brandIcon.translatesAutoresizingMaskIntoConstraints = false
-        brandIcon.widthAnchor.constraint(equalToConstant: 28).isActive = true
-        brandIcon.heightAnchor.constraint(equalToConstant: 28).isActive = true
-        let brandRow = NSStackView(views: [brandIcon, brand])
-        brandRow.orientation = .horizontal
-        brandRow.alignment = .centerY
-        brandRow.spacing = 8
-        navButtons = [
-            navButton(EnhancementText.t("Workbench", "工作台"), "rectangle.inset.filled", #selector(showStage)),
-            navButton(EnhancementText.t("Input", "输入源"), "macwindow", #selector(showSourcePage)),
-            navButton(EnhancementText.t("Technology Library", "技术库"), "books.vertical", #selector(showLibrary)),
-        ]
+        let well = NSView()
+        for view in [inspector, well, stageHost, sourceHost, libraryHost, preview] as [NSView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+        }
+        for view in [stageHost, sourceHost, libraryHost] { root.addSubview(view) }
         appearanceControl.target = self
         appearanceControl.action = #selector(appearanceChanged)
         languageControl.target = self
         languageControl.action = #selector(languageChanged)
-        let sideStack = NSStackView()
-        sideStack.orientation = .vertical
-        sideStack.alignment = .leading
-        sideStack.spacing = 2
-        sideStack.addArrangedSubview(brandRow)
-        sideStack.setCustomSpacing(18, after: brandRow)
-        sideStack.addArrangedSubview(navButtons[0])
-        sideStack.addArrangedSubview(navButtons[1])
-        if !SPRifeExperiments.airBeta { sideStack.addArrangedSubview(navButtons[2]) }
-        sideStack.setCustomSpacing(20, after: SPRifeExperiments.airBeta ? navButtons[1] : navButtons[2])
-        if p0ControlsEnabled {
-            let opaque = NSButton(title: "", target: self, action: #selector(toggleP0OpaqueFromMain))
-            let focus = NSButton(title: "", target: self, action: #selector(toggleP0ActivationFromMain))
-            let cap = NSButton(title: "", target: self, action: #selector(toggleP0CaptureCapFromMain))
-            opaque.identifier = NSUserInterfaceItemIdentifier("p0.main.opaque")
-            focus.identifier = NSUserInterfaceItemIdentifier("p0.main.focus")
-            cap.identifier = NSUserInterfaceItemIdentifier("p0.main.capture")
-            for item in [opaque, focus, cap] { item.bezelStyle = .rounded; sideStack.addArrangedSubview(item) }
-            p0MainOpaqueButton = opaque; p0MainActivateButton = focus; p0MainCaptureButton = cap
-            refreshP0ControlTitles()
-        }
-        sideStack.addArrangedSubview(heading(SPRifeExperiments.airBeta
-            ? EnhancementText.t("Test mode", "测试模式") : EnhancementText.t("Configs", "配置")))
-        configRows.orientation = .vertical
-        configRows.alignment = .leading
-        configRows.spacing = 4
-        configRows.widthAnchor.constraint(equalToConstant: 168).isActive = true
-        sideStack.addArrangedSubview(configRows)
-        let upper = scrolled(sideStack, inset: 0)
-        let footer = NSStackView()
-        footer.orientation = .vertical
-        footer.alignment = .leading
-        footer.spacing = 6
-        footer.translatesAutoresizingMaskIntoConstraints = false
-        let settingsButton = NSButton(title: EnhancementText.t("Settings", "设置"), target: self, action: #selector(showSettings))
-        settingsButton.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
-        settingsButton.imagePosition = .imageLeading
-        settingsButton.alignment = .left
-        settingsButton.bezelStyle = .rounded
-        settingsButton.widthAnchor.constraint(equalToConstant: 168).isActive = true
-        let projectLinks = NSStackView()
-        projectLinks.orientation = .horizontal
-        projectLinks.distribution = .fillEqually
-        projectLinks.spacing = 4
-        for (title, key) in [(EnhancementText.t("Website", "官网"), "ODFWebsiteURL"),
-                             ("GitHub", "ODFRepositoryURL"),
-                             (EnhancementText.t("Feedback", "反馈"), "ODFFeedbackURL")] {
-            let link = NSButton(title: title, target: self, action: #selector(openProjectLink(_:)))
-            link.identifier = NSUserInterfaceItemIdentifier(key)
-            link.bezelStyle = .inline
-            link.isBordered = false
-            link.font = WorkbenchStyle.captionFont
-            link.contentTintColor = .secondaryLabelColor
-            projectLinks.addArrangedSubview(link)
-        }
-        projectLinks.widthAnchor.constraint(equalToConstant: 168).isActive = true
-        footer.addArrangedSubview(projectLinks)
-        footer.setCustomSpacing(10, after: projectLinks)
-        if SPRifeExperiments.available && !SPRifeExperiments.airBeta {
-            let comparison = NSButton(title: EnhancementText.t("Compare Options", "方案对比"), target: self, action: #selector(showExperimentComparison))
-            comparison.identifier = NSUserInterfaceItemIdentifier("experiments.comparison.open")
-            comparison.image = NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: nil)
-            comparison.imagePosition = .imageLeading
-            comparison.alignment = .left
-            comparison.bezelStyle = .rounded
-            comparison.widthAnchor.constraint(equalToConstant: 168).isActive = true
-            footer.addArrangedSubview(comparison)
-        }
-        footer.addArrangedSubview(settingsButton)
         languageControl.selectedSegment = EnhancementText.chinese ? 0 : 1
-        sidebar.content.addSubview(upper)
-        sidebar.content.addSubview(footer)
-        NSLayoutConstraint.activate([
-            upper.leadingAnchor.constraint(equalTo: sidebar.content.leadingAnchor, constant: 12),
-            upper.trailingAnchor.constraint(equalTo: sidebar.content.trailingAnchor, constant: -12),
-            upper.topAnchor.constraint(equalTo: sidebar.content.topAnchor, constant: 12),
-            upper.bottomAnchor.constraint(equalTo: footer.topAnchor, constant: -12),
-            footer.leadingAnchor.constraint(equalTo: sidebar.content.leadingAnchor, constant: 12),
-            footer.trailingAnchor.constraint(lessThanOrEqualTo: sidebar.content.trailingAnchor, constant: -12),
-            footer.bottomAnchor.constraint(equalTo: sidebar.content.bottomAnchor, constant: -12),
-        ])
 
-        let title = NSTextField(labelWithString: EnhancementText.t("Quality Workbench", "画质工作台"))
-        title.font = WorkbenchStyle.titleFont
-        title.textColor = .labelColor
-        sourceKindControl.target = self
-        sourceKindControl.action = #selector(sourceKindChanged)
-        sourceKindControl.setLabel(EnhancementText.t("Window", "窗口"), forSegment: 0)
-        sourceKindControl.setLabel(EnhancementText.t("Display", "显示器"), forSegment: 1)
-        sourceKindControl.setLabel(EnhancementText.t("Video File", "视频文件"), forSegment: 2)
-        sourceKindControl.isHidden = SPRifeExperiments.airBeta
-        sourceKindControl.segmentDistribution = .fillEqually
-        sourceKindControl.translatesAutoresizingMaskIntoConstraints = false
-        sourceKindControl.widthAnchor.constraint(greaterThanOrEqualToConstant: 360).isActive = true
-        sourceStripLabel.font = .systemFont(ofSize: 15, weight: .semibold)
-        sourceStripLabel.textColor = .labelColor
-        sourceStripLabel.lineBreakMode = .byTruncatingTail
-        sourceStripLabel.stringValue = EnhancementText.t("None selected", "未选择")
-        sourceMetaLabel.font = .systemFont(ofSize: 12)
-        sourceMetaLabel.textColor = .secondaryLabelColor
-        sourceMetaLabel.stringValue = ""
-        let sourceText = NSStackView()
-        sourceText.orientation = .vertical
-        sourceText.alignment = .leading
-        sourceText.spacing = 1
-        sourceText.addArrangedSubview(sourceStripLabel)
-        sourceText.addArrangedSubview(sourceMetaLabel)
-        let stripColumn = NSStackView()
-        stripColumn.orientation = .vertical
-        stripColumn.alignment = .leading
-        stripColumn.spacing = 8
-        stripColumn.addArrangedSubview(sourceKindControl)
-        let stripRow = NSStackView()
-        stripRow.orientation = .horizontal
-        stripRow.alignment = .centerY
-        stripRow.spacing = 8
-        sourceText.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        stripRow.addArrangedSubview(sourceText)
-        let stripSpacer = NSView()
-        stripSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        stripRow.addArrangedSubview(stripSpacer)
-        stripColumn.addArrangedSubview(stripRow)
-        sourceKindControl.widthAnchor.constraint(equalTo: stripColumn.widthAnchor).isActive = true
-        stripRow.widthAnchor.constraint(equalTo: stripColumn.widthAnchor).isActive = true
-        fill(strip.content, with: stripColumn)
-
-        let well = NSView()
         well.wantsLayer = true
         well.layer?.backgroundColor = NSColor.black.cgColor
         well.layer?.cornerRadius = WorkbenchStyle.panelRadius
-        well.translatesAutoresizingMaskIntoConstraints = false
+        well.layer?.masksToBounds = true
         well.addSubview(preview)
         emptyOverlay.translatesAutoresizingMaskIntoConstraints = false
         emptyOverlay.wantsLayer = true
+        emptyOverlay.layer?.backgroundColor = NSColor.black.cgColor
         let emptyTitle = NSTextField(labelWithString: EnhancementText.t("Choose a source to preview", "选择来源后在这里预览"))
         emptyTitle.font = .systemFont(ofSize: 18, weight: .semibold)
         emptyTitle.textColor = .white
+        emptyTitle.alignment = .center
         let emptyButton = button(EnhancementText.t("Choose Window", "选择窗口"), #selector(chooseCurrentKind), primary: true)
         emptySourceButton = emptyButton
-        let emptyStack = NSStackView()
+        let emptyStack = NSStackView(views: [emptyTitle, emptyButton])
         emptyStack.orientation = .vertical
         emptyStack.alignment = .centerX
         emptyStack.spacing = 12
-        emptyStack.addArrangedSubview(emptyTitle)
-        emptyStack.addArrangedSubview(emptyButton)
-        emptyOverlay.addSubview(emptyStack)
         emptyStack.translatesAutoresizingMaskIntoConstraints = false
+        emptyOverlay.addSubview(emptyStack)
         well.addSubview(emptyOverlay)
-        NSLayoutConstraint.activate([
-            preview.leadingAnchor.constraint(equalTo: well.leadingAnchor),
-            preview.trailingAnchor.constraint(equalTo: well.trailingAnchor),
-            preview.topAnchor.constraint(equalTo: well.topAnchor),
-            preview.bottomAnchor.constraint(equalTo: well.bottomAnchor),
-            emptyStack.centerXAnchor.constraint(equalTo: emptyOverlay.centerXAnchor),
-            emptyStack.centerYAnchor.constraint(equalTo: emptyOverlay.centerYAnchor),
-            emptyOverlay.leadingAnchor.constraint(equalTo: well.leadingAnchor),
-            emptyOverlay.trailingAnchor.constraint(equalTo: well.trailingAnchor),
-            emptyOverlay.topAnchor.constraint(equalTo: well.topAnchor),
-            emptyOverlay.bottomAnchor.constraint(equalTo: well.bottomAnchor),
-        ])
-
-        let inspectorScroll = scrolled(inspectorColumn())
-        inspector.content.addSubview(inspectorScroll)
-        NSLayoutConstraint.activate([
-            inspectorScroll.leadingAnchor.constraint(equalTo: inspector.content.leadingAnchor),
-            inspectorScroll.trailingAnchor.constraint(equalTo: inspector.content.trailingAnchor),
-            inspectorScroll.topAnchor.constraint(equalTo: inspector.content.topAnchor),
-            inspectorScroll.bottomAnchor.constraint(equalTo: inspector.content.bottomAnchor),
-        ])
-        let outputCard = glass()
-        outputCard.translatesAutoresizingMaskIntoConstraints = false
-        let outputRow = NSStackView()
-        outputRow.orientation = .horizontal
-        outputRow.alignment = .centerY
-        outputRow.spacing = 8
-        outputRow.addArrangedSubview(heading(EnhancementText.t("Output", "输出")))
-        if !SPRifeExperiments.airBeta {
-            outputRow.addArrangedSubview(displayPopup)
-            outputRow.addArrangedSubview(fullscreenCheck)
-        }
-        let fpsRow = NSStackView()
-        fpsRow.orientation = .horizontal
-        fpsRow.alignment = .centerY
-        fpsRow.spacing = 4
-        fpsRow.addArrangedSubview(NSTextField(labelWithString: EnhancementText.t("Show FPS", "显示帧率")))
-        fpsRow.addArrangedSubview(fpsSwitch)
-        fpsSwitch.state = FPSPreference.enabled(in: .standard) ? .on : .off
-        fpsSwitch.target = self
-        fpsSwitch.action = #selector(fpsVisibilityChanged)
-        outputRow.addArrangedSubview(fpsRow)
-        fill(outputCard.content, with: outputRow)
+        let aspect = preview.widthAnchor.constraint(equalTo: preview.heightAnchor, multiplier: 16.0 / 9.0)
+        let fillWidth = preview.widthAnchor.constraint(equalTo: well.widthAnchor)
+        let fillHeight = preview.heightAnchor.constraint(equalTo: well.heightAnchor)
+        fillWidth.priority = .defaultHigh
+        fillHeight.priority = .defaultHigh
+        previewAspect = aspect
         viewMode.translatesAutoresizingMaskIntoConstraints = false
         viewMode.segmentDistribution = .fillEqually
         viewMode.appearance = NSAppearance(named: .darkAqua)
-        viewMode.isHidden = SPRifeExperiments.airBeta
         viewMode.isEnabled = !SPRifeExperiments.airBeta
         well.addSubview(viewMode)
-        NSLayoutConstraint.activate([
-            viewMode.widthAnchor.constraint(equalToConstant: 240),
-            viewMode.centerXAnchor.constraint(equalTo: well.centerXAnchor),
-            viewMode.bottomAnchor.constraint(equalTo: well.bottomAnchor, constant: -12),
-        ])
-        fill(bottom.content, with: bottomBar())
-        stageHost.addSubview(title)
-        stageHost.addSubview(outputCard)
-        stageHost.addSubview(strip)
+
+        let source = sourceBlock()
+        let sourceDivider = divider()
+        let inspectorScroll = scrolled(inspectorColumn(), inset: 16)
+        let runDivider = divider()
+        let run = runPanel()
+        let content = inspector.content
+        for view in [source, sourceDivider, inspectorScroll, runDivider, run] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(view)
+        }
         stageHost.addSubview(well)
         stageHost.addSubview(inspector)
-        stageHost.addSubview(bottom)
-        title.translatesAutoresizingMaskIntoConstraints = false
-
-        let sourceScroll = scrolled(sourceColumn())
+        let sourceScroll = scrolled(readableColumn(sourceColumn(), maxWidth: 900))
+        let libraryScroll = scrolled(readableColumn(libraryColumn(), maxWidth: 760))
         sourceHost.addSubview(sourceScroll)
-        let libraryScroll = scrolled(libraryColumn())
         libraryHost.addSubview(libraryScroll)
         NSLayoutConstraint.activate([
-            sidebar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: WorkbenchStyle.edge),
-            sidebar.topAnchor.constraint(equalTo: root.topAnchor, constant: WorkbenchStyle.edge),
-            sidebar.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -WorkbenchStyle.edge),
-            sidebar.widthAnchor.constraint(equalToConstant: 200),
-            stageHost.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: 12),
+            stageHost.topAnchor.constraint(equalTo: root.safeAreaLayoutGuide.topAnchor, constant: 10),
+            stageHost.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: WorkbenchStyle.edge),
             stageHost.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -WorkbenchStyle.edge),
-            stageHost.topAnchor.constraint(equalTo: root.topAnchor, constant: WorkbenchStyle.edge),
             stageHost.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -WorkbenchStyle.edge),
             sourceHost.leadingAnchor.constraint(equalTo: stageHost.leadingAnchor),
             sourceHost.trailingAnchor.constraint(equalTo: stageHost.trailingAnchor),
@@ -1828,33 +1657,267 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             libraryScroll.trailingAnchor.constraint(equalTo: libraryHost.trailingAnchor),
             libraryScroll.topAnchor.constraint(equalTo: libraryHost.topAnchor),
             libraryScroll.bottomAnchor.constraint(equalTo: libraryHost.bottomAnchor),
-            title.leadingAnchor.constraint(equalTo: stageHost.leadingAnchor),
-            title.topAnchor.constraint(equalTo: stageHost.topAnchor),
-            strip.leadingAnchor.constraint(equalTo: stageHost.leadingAnchor),
-            strip.trailingAnchor.constraint(equalTo: inspector.leadingAnchor, constant: -12),
-            strip.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 12),
-            strip.heightAnchor.constraint(equalToConstant: 92),
+            inspector.topAnchor.constraint(equalTo: stageHost.topAnchor),
+            inspector.bottomAnchor.constraint(equalTo: stageHost.bottomAnchor),
             inspector.trailingAnchor.constraint(equalTo: stageHost.trailingAnchor),
-            inspector.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 12),
-            inspector.bottomAnchor.constraint(equalTo: bottom.topAnchor, constant: -12),
-            inspector.widthAnchor.constraint(equalToConstant: 320),
+            inspector.widthAnchor.constraint(equalToConstant: WorkbenchStyle.inspectorWidth),
+            well.topAnchor.constraint(equalTo: stageHost.topAnchor),
+            well.bottomAnchor.constraint(equalTo: stageHost.bottomAnchor),
             well.leadingAnchor.constraint(equalTo: stageHost.leadingAnchor),
-            well.trailingAnchor.constraint(equalTo: inspector.leadingAnchor, constant: -12),
-            well.topAnchor.constraint(equalTo: strip.bottomAnchor, constant: 12),
-            well.heightAnchor.constraint(equalTo: well.widthAnchor, multiplier: 9.0 / 16.0),
-            outputCard.leadingAnchor.constraint(equalTo: well.leadingAnchor),
-            outputCard.trailingAnchor.constraint(equalTo: well.trailingAnchor),
-            outputCard.topAnchor.constraint(equalTo: well.bottomAnchor, constant: 8),
-            outputCard.heightAnchor.constraint(equalToConstant: 64),
-            outputCard.bottomAnchor.constraint(lessThanOrEqualTo: bottom.topAnchor, constant: -8),
-            bottom.leadingAnchor.constraint(equalTo: stageHost.leadingAnchor),
-            bottom.trailingAnchor.constraint(equalTo: stageHost.trailingAnchor),
-            bottom.bottomAnchor.constraint(equalTo: stageHost.bottomAnchor),
-            bottom.heightAnchor.constraint(equalToConstant: 72),
+            well.trailingAnchor.constraint(equalTo: inspector.leadingAnchor, constant: -WorkbenchStyle.gap),
+            preview.centerXAnchor.constraint(equalTo: well.centerXAnchor),
+            preview.centerYAnchor.constraint(equalTo: well.centerYAnchor),
+            preview.widthAnchor.constraint(lessThanOrEqualTo: well.widthAnchor),
+            preview.heightAnchor.constraint(lessThanOrEqualTo: well.heightAnchor),
+            aspect, fillWidth, fillHeight,
+            emptyStack.centerXAnchor.constraint(equalTo: emptyOverlay.centerXAnchor),
+            emptyStack.centerYAnchor.constraint(equalTo: emptyOverlay.centerYAnchor),
+            emptyStack.widthAnchor.constraint(lessThanOrEqualTo: emptyOverlay.widthAnchor, constant: -32),
+            emptyOverlay.leadingAnchor.constraint(equalTo: well.leadingAnchor),
+            emptyOverlay.trailingAnchor.constraint(equalTo: well.trailingAnchor),
+            emptyOverlay.topAnchor.constraint(equalTo: well.topAnchor),
+            emptyOverlay.bottomAnchor.constraint(equalTo: well.bottomAnchor),
+            viewMode.widthAnchor.constraint(equalToConstant: 240),
+            viewMode.centerXAnchor.constraint(equalTo: well.centerXAnchor),
+            viewMode.bottomAnchor.constraint(equalTo: well.bottomAnchor, constant: -12),
+            source.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
+            source.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            source.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            sourceDivider.topAnchor.constraint(equalTo: source.bottomAnchor, constant: 12),
+            sourceDivider.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            sourceDivider.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            inspectorScroll.topAnchor.constraint(equalTo: sourceDivider.bottomAnchor),
+            inspectorScroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            inspectorScroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            inspectorScroll.bottomAnchor.constraint(equalTo: runDivider.topAnchor),
+            runDivider.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            runDivider.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            run.topAnchor.constraint(equalTo: runDivider.bottomAnchor, constant: 12),
+            run.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            run.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            run.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
         ])
         showPage(0)
         rebuildConfigRows()
         return root
+    }
+
+    private var hasSelectedSource: Bool {
+        if profile.sourceKind == "file" { return selectedFilePlayer() != nil }
+        return capture.running && activeSourceKind == profile.sourceKind
+    }
+
+    private func updateSourceChrome(hasSource: Bool) {
+        emptyOverlay.isHidden = hasSource
+        sourceActionButton?.isHidden = !hasSource
+        sourceMetaLabel.isHidden = !hasSource || sourceMetaLabel.stringValue.isEmpty
+        viewMode.isHidden = !hasSource || SPRifeExperiments.airBeta
+        refreshActions()
+    }
+
+    private func setPreviewAspect(_ size: CGSize) {
+        guard size.width > 0, size.height > 0 else { return }
+        let ratio = size.width / size.height
+        guard previewAspect?.multiplier != ratio else { return }
+        previewAspect?.isActive = false
+        let next = preview.widthAnchor.constraint(equalTo: preview.heightAnchor, multiplier: ratio)
+        next.isActive = true
+        previewAspect = next
+    }
+
+    private func refreshFormLabels() {
+        for (label, view, width) in formLabels {
+            width.constant = WorkbenchStyle.labelWidth
+            let control = (view as? NSControl) ?? view.subviews.compactMap { $0 as? NSControl }.first
+            label.textColor = control?.isEnabled == false ? .tertiaryLabelColor : .labelColor
+        }
+    }
+
+    private enum ToolbarID {
+        static let brand = NSToolbarItem.Identifier("odf.brand")
+        static let pages = NSToolbarItem.Identifier("odf.pages")
+        static let compare = NSToolbarItem.Identifier("odf.compare")
+        static let settings = NSToolbarItem.Identifier("odf.settings")
+    }
+
+    private func installToolbar(on window: NSWindow) {
+        let toolbar = NSToolbar(identifier: "odf.main")
+        toolbar.delegate = self
+        toolbar.displayMode = .iconOnly
+        toolbar.allowsUserCustomization = false
+        toolbar.centeredItemIdentifiers = [ToolbarID.pages]
+        window.toolbar = toolbar
+        window.toolbarStyle = .unified
+        window.titleVisibility = .hidden
+        window.title = "OpenDuckFrame"
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        let compare: [NSToolbarItem.Identifier] = SPRifeExperiments.available && !SPRifeExperiments.airBeta ? [ToolbarID.compare] : []
+        return [ToolbarID.brand, .flexibleSpace, ToolbarID.pages, .flexibleSpace] + compare + [ToolbarID.settings]
+    }
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        toolbarDefaultItemIdentifiers(toolbar)
+    }
+
+    func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier identifier: NSToolbarItem.Identifier,
+                 willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        let item = NSToolbarItem(itemIdentifier: identifier)
+        switch identifier {
+        case ToolbarID.brand:
+            let icon = NSImageView(image: NSApp.applicationIconImage)
+            icon.imageScaling = .scaleProportionallyUpOrDown
+            icon.widthAnchor.constraint(equalToConstant: 22).isActive = true
+            icon.heightAnchor.constraint(equalToConstant: 22).isActive = true
+            let name = NSTextField(labelWithString: "OpenDuckFrame")
+            name.font = WorkbenchStyle.brandFont
+            let shortVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+            let version = NSTextField(labelWithString: "v" + shortVersion)
+            version.font = WorkbenchStyle.captionFont
+            version.textColor = .secondaryLabelColor
+            let brand = NSStackView(views: [icon, name, version])
+            brand.alignment = .centerY
+            brand.spacing = 6
+            item.view = brand
+            item.label = "OpenDuckFrame"
+            item.visibilityPriority = .high
+        case ToolbarID.pages:
+            var titles = [EnhancementText.t("Workbench", "工作台"), EnhancementText.t("Input", "输入源")]
+            if !SPRifeExperiments.airBeta { titles.append(EnhancementText.t("Library", "技术库")) }
+            pageControl.segmentCount = titles.count
+            for (index, title) in titles.enumerated() { pageControl.setLabel(title, forSegment: index) }
+            pageControl.selectedSegment = page
+            pageControl.trackingMode = .selectOne
+            pageControl.segmentDistribution = .fillEqually
+            pageControl.target = self
+            pageControl.action = #selector(pageControlChanged(_:))
+            item.view = pageControl
+            item.label = EnhancementText.t("Page", "页面")
+            item.visibilityPriority = .high
+        case ToolbarID.compare:
+            let compare = NSButton(image: NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: nil) ?? NSImage(), target: self, action: #selector(showExperimentComparison))
+            compare.identifier = NSUserInterfaceItemIdentifier("experiments.comparison.open")
+            compare.bezelStyle = .texturedRounded
+            item.view = compare
+            item.label = EnhancementText.t("Compare Options", "方案对比")
+            item.toolTip = item.label
+            compare.setAccessibilityLabel(item.label)
+            item.visibilityPriority = .low
+        case ToolbarID.settings:
+            item.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
+            item.label = EnhancementText.t("Settings", "设置")
+            item.toolTip = item.label
+            item.isBordered = true
+            item.target = self
+            item.action = #selector(showSettings)
+            item.visibilityPriority = .high
+        default:
+            return nil
+        }
+        return item
+    }
+
+    @objc private func pageControlChanged(_ sender: NSSegmentedControl) {
+        switch sender.selectedSegment {
+        case 1: showSourcePage()
+        case 2: showLibrary()
+        default: showStage()
+        }
+    }
+
+    private func installWorkbenchMenuEntries() {
+        guard let help = NSApp.mainMenu?.items.compactMap(\.submenu).first(where: {
+            $0.identifier?.rawValue == "sp.helpMenu"
+        }) else { return }
+        for (title, key) in [(EnhancementText.t("Website", "官网"), "ODFWebsiteURL"),
+                             ("GitHub", "ODFRepositoryURL"),
+                             (EnhancementText.t("Feedback", "反馈"), "ODFFeedbackURL")] {
+            guard let value = Bundle.main.object(forInfoDictionaryKey: key) as? String, !value.isEmpty else { continue }
+            let item = help.items.first { $0.identifier?.rawValue == key || ($0.representedObject as? String) == value }
+                ?? NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            if item.menu == nil { help.addItem(item) }
+            item.title = title
+            item.identifier = NSUserInterfaceItemIdentifier(key)
+            item.target = self
+            item.action = #selector(openProjectLink(_:))
+        }
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        installWorkbenchMenuEntries()
+    }
+
+    private func sourceBlock() -> NSView {
+        sourceKindControl.target = self
+        sourceKindControl.action = #selector(sourceKindChanged)
+        sourceKindControl.setLabel(EnhancementText.t("Window", "窗口"), forSegment: 0)
+        sourceKindControl.setLabel(EnhancementText.t("Display", "显示器"), forSegment: 1)
+        sourceKindControl.setLabel(EnhancementText.t("Video File", "视频文件"), forSegment: 2)
+        sourceKindControl.isHidden = SPRifeExperiments.airBeta
+        sourceKindControl.segmentDistribution = .fillEqually
+        sourceStripLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        sourceMetaLabel.font = WorkbenchStyle.captionFont
+        sourceMetaLabel.textColor = .secondaryLabelColor
+        for label in [sourceStripLabel, sourceMetaLabel] {
+            label.lineBreakMode = .byTruncatingTail
+            label.allowsExpansionToolTips = true
+            label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        }
+        let sourceText = NSStackView(views: [sourceStripLabel, sourceMetaLabel])
+        sourceText.orientation = .vertical
+        sourceText.alignment = .leading
+        sourceText.spacing = 1
+        sourceText.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let changeSource = button(EnhancementText.t("Change Window", "更换窗口"), #selector(changeWindow))
+        changeSource.setContentCompressionResistancePriority(.required, for: .horizontal)
+        sourceActionButton = changeSource
+        let current = NSStackView(views: [sourceText, changeSource])
+        current.orientation = .horizontal
+        current.alignment = .centerY
+        current.spacing = 8
+        return column([sourceKindControl, current])
+    }
+
+    private func column(_ views: [NSView], spacing: CGFloat = 8) -> NSStackView {
+        let stack = NSStackView(views: views)
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = spacing
+        stack.detachesHiddenViews = true
+        for view in views { view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
+        return stack
+    }
+
+    private func divider() -> NSBox {
+        let line = NSBox()
+        line.boxType = .separator
+        return line
+    }
+
+    private func sectionHeader(_ title: String, _ toggle: NSView) -> NSView {
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let header = NSStackView(views: [heading(title), spacer, toggle])
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        return header
+    }
+
+    private func readableColumn(_ content: NSView, maxWidth: CGFloat) -> NSView {
+        let host = NSView()
+        content.translatesAutoresizingMaskIntoConstraints = false
+        host.addSubview(content)
+        let fill = content.widthAnchor.constraint(equalTo: host.widthAnchor, constant: -32)
+        fill.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            fill,
+            content.widthAnchor.constraint(lessThanOrEqualToConstant: maxWidth),
+            content.centerXAnchor.constraint(equalTo: host.centerXAnchor),
+            content.topAnchor.constraint(equalTo: host.topAnchor),
+            content.bottomAnchor.constraint(equalTo: host.bottomAnchor),
+        ])
+        return host
     }
 
     private final class Plate: NSView {
@@ -2042,120 +2105,83 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private func inspectorColumn() -> NSView {
         configurePopups()
+        var items: [NSView] = []
         if SPRifeExperiments.airBeta {
-            return airBetaInspector()
-        }
-        func column() -> NSStackView {
-            let stack = NSStackView()
-            stack.orientation = .vertical
-            stack.alignment = .leading
-            stack.spacing = 10
-            stack.detachesHiddenViews = true
-            return stack
-        }
-        func formRow(_ title: String, _ control: NSView) -> NSView {
-            let view = row(title, control)
-            (view as? NSStackView)?.distribution = .fill
-            return view
-        }
-        func card(_ content: NSStackView) -> NSView {
-            let plate = NSBox()
-            plate.boxType = .custom
-            plate.titlePosition = .noTitle
-            plate.isTransparent = false
-            plate.cornerRadius = 12
-            plate.borderWidth = 0.6
-            plate.borderColor = .separatorColor
-            plate.fillColor = .controlBackgroundColor
-            content.translatesAutoresizingMaskIntoConstraints = false
-            plate.contentView!.addSubview(content)
-            NSLayoutConstraint.activate([
-                content.leadingAnchor.constraint(equalTo: plate.leadingAnchor, constant: 14),
-                content.trailingAnchor.constraint(equalTo: plate.trailingAnchor, constant: -14),
-                content.topAnchor.constraint(equalTo: plate.topAnchor, constant: 14),
-                content.bottomAnchor.constraint(equalTo: plate.bottomAnchor, constant: -14),
-            ])
-            return plate
-        }
-        func cardHeader(_ title: String, _ toggle: NSView) -> NSView {
-            let header = NSStackView()
-            header.orientation = .horizontal
-            header.alignment = .centerY
-            header.spacing = 8
-            header.addArrangedSubview(heading(title))
-            header.addArrangedSubview(toggle)
-            let spacer = NSView()
-            spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-            header.addArrangedSubview(spacer)
-            return header
-        }
-        let scale = column()
-        scale.addArrangedSubview(cardHeader(EnhancementText.t("Scale", "缩放 / 超分"), scaleSwitch))
-        scale.addArrangedSubview(formRow(EnhancementText.t("Technology", "技术"), scalePopup))
-        let qualityRow = formRow(EnhancementText.t("Denoising", "降噪"), scaleQualityPopup)
-        scaleQualityRow = qualityRow
-        scale.addArrangedSubview(qualityRow)
-        srInputHelp.bezelStyle = .helpButton
-        srInputHelp.setAccessibilityLabel(EnhancementText.t("SR input size help", "超分输入尺寸帮助"))
-        let srInputControls = NSStackView(views: [srInputPopup, srInputHelp])
-        srInputControls.orientation = .horizontal
-        srInputControls.alignment = .centerY
-        srInputControls.spacing = 4
-        srInputControls.distribution = .fill
-        srInputHelp.setContentHuggingPriority(.required, for: .horizontal)
-        let srRow = formRow(EnhancementText.t("SR input size", "超分输入尺寸"), srInputControls)
-        srInputRow = srRow; scale.addArrangedSubview(srRow)
-        sourceWindowHelp.bezelStyle = .helpButton
-        sourceWindowHelp.setAccessibilityLabel(EnhancementText.t("Source window size help", "来源窗口尺寸帮助"))
-        sourceWindowHelp.toolTip = EnhancementText.t("The selected window is resized before capture. The video must fill that window for the video itself to be 720p; browser toolbars and borders are not video. Requires Accessibility permission and a resizable window. Try 720p first; final clarity depends on the source and engine.", "开始时会调整所选来源窗口，再采集画面。视频须铺满该窗口，视频本身才可能是720p；浏览器工具栏和边框不是视频。需要辅助功能权限且窗口可调整大小。建议先从720p试起，最终清晰度取决于片源与引擎。")
-        let sourceControls = NSStackView(views: [sourceWindowPopup, sourceWindowHelp]); sourceControls.orientation = .horizontal; sourceControls.alignment = .centerY; sourceControls.spacing = 4; sourceControls.distribution = .fill
-        sourceWindowHelp.setContentHuggingPriority(.required, for: .horizontal)
-        let windowRow = formRow(EnhancementText.t("Source window", "来源窗口尺寸"), sourceControls)
-        sourceWindowRow = windowRow; scale.addArrangedSubview(windowRow)
-        sourceWindowHint.stringValue = EnhancementText.t("Use a dedicated or picture-in-picture video window; the video must fill the captured window.", "请使用独立或画中画视频窗口；视频须铺满采集画面。")
-        sourceWindowHint.textColor = .secondaryLabelColor
-        scale.addArrangedSubview(sourceWindowHint)
-        scale.addArrangedSubview(formRow(EnhancementText.t("Output size", "输出尺寸"), sizePopup))
-        scale.addArrangedSubview(formRow("W×H", pair(widthField, heightField)))
+            items.append(airBetaInspector())
+        } else {
+            configPopup.target = self
+            configPopup.action = #selector(configPopupChanged(_:))
+            configPopup.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            (configActions.cell as? NSPopUpButtonCell)?.arrowPosition = .noArrow
+            configActions.setAccessibilityLabel(EnhancementText.t("Manage configs", "管理配置"))
+            let configControls = NSStackView(views: [configPopup, configActions])
+            configControls.spacing = 4
+            items.append(row(EnhancementText.t("Config", "配置"), configControls))
 
-        let frames = column()
-        frames.addArrangedSubview(cardHeader(EnhancementText.t("Frame generation", "帧生成"), interpolationSwitch))
-        frames.addArrangedSubview(formRow(EnhancementText.t("Engine", "引擎"), enginePopup))
-        let frameQuality = formRow(EnhancementText.t("Quality", "质量"), qualityPopup)
-        interpolationQualityRow = frameQuality
-        frames.addArrangedSubview(frameQuality)
-        phaseLabel.maximumNumberOfLines = 0
-        phaseLabel.textColor = .secondaryLabelColor
-        phaseLabel.preferredMaxLayoutWidth = 220
-        frames.addArrangedSubview(phaseLabel)
-        compatibilityButton.target = self
-        compatibilityButton.action = #selector(useFrameRateConversion)
-        frames.addArrangedSubview(compatibilityButton)
-        frames.addArrangedSubview(rateMode)
-        frames.addArrangedSubview(fpsPopup)
-        let customRate = formRow("n/d", pair(fpsNum, fpsDen))
-        customRateRow = customRate
-        frames.addArrangedSubview(customRate)
-        frames.addArrangedSubview(multiplierControl)
-        for column in [scale, frames] {
-            for item in column.arrangedSubviews {
-                item.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
-            }
+            let frameQuality = row(EnhancementText.t("Quality", "质量"), qualityPopup)
+            interpolationQualityRow = frameQuality
+            let customRate = row("n/d", pair(fpsNum, fpsDen))
+            customRateRow = customRate
+            phaseLabel.maximumNumberOfLines = 0
+            phaseLabel.textColor = .secondaryLabelColor
+            phaseLabel.preferredMaxLayoutWidth = WorkbenchStyle.inspectorWidth - 32
+            compatibilityButton.target = self
+            compatibilityButton.action = #selector(useFrameRateConversion)
+            let frames = column([row(EnhancementText.t("Engine", "引擎"), enginePopup), frameQuality,
+                                 phaseLabel, compatibilityButton, rateMode, fpsPopup, customRate, multiplierControl])
+            framesBody = frames
+            let qualityRow = row(EnhancementText.t("Denoising", "降噪"), scaleQualityPopup)
+            scaleQualityRow = qualityRow
+            srInputHelp.bezelStyle = .helpButton
+            srInputHelp.setAccessibilityLabel(EnhancementText.t("SR input size help", "超分输入尺寸帮助"))
+            let srInputControls = NSStackView(views: [srInputPopup, srInputHelp])
+            srInputControls.orientation = .horizontal
+            srInputControls.alignment = .centerY
+            srInputControls.spacing = 4
+            srInputControls.distribution = .fill
+            srInputHelp.setContentHuggingPriority(.required, for: .horizontal)
+            let srRow = row(EnhancementText.t("SR input size", "超分输入尺寸"), srInputControls)
+            srInputRow = srRow
+            sourceWindowHelp.bezelStyle = .helpButton
+            sourceWindowHelp.setAccessibilityLabel(EnhancementText.t("Source window size help", "来源窗口尺寸帮助"))
+            sourceWindowHelp.toolTip = EnhancementText.t("The selected window is resized before capture. The video must fill that window for the video itself to be 720p; browser toolbars and borders are not video. Requires Accessibility permission and a resizable window. Try 720p first; final clarity depends on the source and engine.", "开始时会调整所选来源窗口，再采集画面。视频须铺满该窗口，视频本身才可能是720p；浏览器工具栏和边框不是视频。需要辅助功能权限且窗口可调整大小。建议先从720p试起，最终清晰度取决于片源与引擎。")
+            let sourceControls = NSStackView(views: [sourceWindowPopup, sourceWindowHelp])
+            sourceControls.orientation = .horizontal
+            sourceControls.alignment = .centerY
+            sourceControls.spacing = 4
+            sourceControls.distribution = .fill
+            sourceWindowHelp.setContentHuggingPriority(.required, for: .horizontal)
+            let windowRow = row(EnhancementText.t("Source window", "来源窗口尺寸"), sourceControls)
+            sourceWindowRow = windowRow
+            sourceWindowHint.stringValue = EnhancementText.t("Use a dedicated or picture-in-picture video window; the video must fill the captured window.", "请使用独立或画中画视频窗口；视频须铺满采集画面。")
+            sourceWindowHint.textColor = .secondaryLabelColor
+            sourceWindowHint.maximumNumberOfLines = 0
+            sourceWindowHint.preferredMaxLayoutWidth = WorkbenchStyle.inspectorWidth - 32
+            let scale = column([row(EnhancementText.t("Technology", "技术"), scalePopup), qualityRow,
+                                srRow, windowRow, sourceWindowHint,
+                                row(EnhancementText.t("Output size", "输出尺寸"), sizePopup),
+                                row("W×H", pair(widthField, heightField))])
+            scaleBody = scale
+            items += [divider(), sectionHeader(EnhancementText.t("Frame generation", "帧生成"), interpolationSwitch), frames,
+                      divider(), sectionHeader(EnhancementText.t("Scale", "缩放 / 超分"), scaleSwitch), scale]
         }
+        if p0ControlsEnabled { items += [divider(), p0Controls()] }
+        return column(items, spacing: 12)
+    }
 
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 12
-        let scaleCard = card(scale)
-        let framesCard = card(frames)
-        stack.addArrangedSubview(scaleCard)
-        stack.addArrangedSubview(framesCard)
-        NSLayoutConstraint.activate([
-            scaleCard.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            framesCard.widthAnchor.constraint(equalTo: stack.widthAnchor),
-        ])
-        return stack
+    private func p0Controls() -> NSView {
+        let opaque = NSButton(title: "", target: self, action: #selector(toggleP0OpaqueFromMain))
+        let focus = NSButton(title: "", target: self, action: #selector(toggleP0ActivationFromMain))
+        let cap = NSButton(title: "", target: self, action: #selector(toggleP0CaptureCapFromMain))
+        opaque.identifier = NSUserInterfaceItemIdentifier("p0.main.opaque")
+        focus.identifier = NSUserInterfaceItemIdentifier("p0.main.focus")
+        cap.identifier = NSUserInterfaceItemIdentifier("p0.main.capture")
+        for item in [opaque, focus, cap] { item.bezelStyle = .rounded }
+        p0MainOpaqueButton = opaque
+        p0MainActivateButton = focus
+        p0MainCaptureButton = cap
+        refreshP0ControlTitles()
+        return column([opaque, focus, cap])
     }
 
     private func airBetaInspector() -> NSView {
@@ -2179,73 +2205,38 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         return stack
     }
 
-    private func bottomBar() -> NSView {
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 4
-        let buttons = NSStackView()
-        buttons.orientation = .horizontal
-        buttons.spacing = 8
-        let changeSource = button(EnhancementText.t("Change Window", "更换窗口"), #selector(changeWindow))
-        sourceActionButton = changeSource
+    private func runPanel() -> NSView {
         let start = button(EnhancementText.t("Delayed Enhancement", "延迟增强"), #selector(start), primary: true)
         let stop = button(EnhancementText.t("Stop", "停止"), #selector(stop), primary: true)
         startButton = start
         stopButton = stop
         stop.isHidden = true
-        statusLabel.lineBreakMode = .byTruncatingTail
-        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        planLabel.maximumNumberOfLines = 2
-        planLabel.textColor = .secondaryLabelColor
-        planLabel.preferredMaxLayoutWidth = 520
-        let statusColumn = NSStackView()
-        statusColumn.orientation = .vertical
-        statusColumn.alignment = .leading
-        statusColumn.spacing = 1
-        statusColumn.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        statusColumn.addArrangedSubview(statusLabel)
+        fpsSwitch.state = FPSPreference.enabled(in: .standard) ? .on : .off
+        fpsSwitch.target = self
+        fpsSwitch.action = #selector(fpsVisibilityChanged)
+        let fpsRow = sectionHeader(EnhancementText.t("Show FPS", "显示帧率"), fpsSwitch)
+        statusLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        statusLabel.lineBreakMode = .byWordWrapping
+        statusLabel.maximumNumberOfLines = 2
+        statusLabel.cell?.truncatesLastVisibleLine = true
+        statusLabel.preferredMaxLayoutWidth = WorkbenchStyle.inspectorWidth - 32
         for label in [statsLabel, budgetLabel] {
-            label.font = WorkbenchStyle.captionFont
+            label.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
             label.textColor = .secondaryLabelColor
             label.lineBreakMode = .byTruncatingTail
-            label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-            statusColumn.addArrangedSubview(label)
+            label.allowsExpansionToolTips = true
+            label.isHidden = label.stringValue.isEmpty
         }
-        for label in [statusLabel, statsLabel, budgetLabel] {
-            label.widthAnchor.constraint(lessThanOrEqualTo: statusColumn.widthAnchor).isActive = true
+        let statusColumn = column([statusLabel, statsLabel, budgetLabel], spacing: 2)
+        var views: [NSView] = []
+        if !SPRifeExperiments.airBeta {
+            views += [row(EnhancementText.t("Output to", "输出到"), displayPopup), fullscreenCheck]
         }
-        buttons.setContentCompressionResistancePriority(.required, for: .horizontal)
-        let row = NSStackView()
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 12
-        row.addArrangedSubview(statusColumn)
-        row.addArrangedSubview(NSView())
-        buttons.addArrangedSubview(changeSource)
-        buttons.addArrangedSubview(start)
-        buttons.addArrangedSubview(stop)
-        row.addArrangedSubview(buttons)
-        stack.addArrangedSubview(row)
-        row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        views += [fpsRow, statusColumn, start, stop]
+        let stack = column(views)
+        stack.setCustomSpacing(12, after: fpsRow)
+        stack.setCustomSpacing(10, after: statusColumn)
         return stack
-    }
-
-    private func navButton(_ title: String, _ symbol: String, _ action: Selector) -> NSButton {
-        let button = ConfigNavButton(title: title, target: self, action: action)
-        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
-        button.imagePosition = .imageLeading
-        button.alignment = .left
-        button.bezelStyle = .rounded
-        button.isBordered = false
-        button.translatesAutoresizingMaskIntoConstraints = false
-        button.widthAnchor.constraint(equalToConstant: 168).isActive = true
-        button.heightAnchor.constraint(equalToConstant: 32).isActive = true
-        button.cell?.lineBreakMode = .byTruncatingTail
-        button.toolTip = title
-        button.wantsLayer = true
-        button.layer?.cornerRadius = 8
-        return button
     }
 
     private final class TopDownDocument: NSView {
@@ -2371,12 +2362,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         libraryHost.isHidden = next != 2
         preview.isHidden = next != 0
         preview.refreshVisibilitySnapshot()
-        for (index, button) in navButtons.enumerated() {
-            let selected = index == next
-            button.contentTintColor = selected ? .controlAccentColor : .secondaryLabelColor
-            button.font = .systemFont(ofSize: 13, weight: selected ? .semibold : .regular)
-            button.layer?.backgroundColor = selected ? NSColor.controlAccentColor.withAlphaComponent(0.14).cgColor : NSColor.clear.cgColor
-        }
+        pageControl.selectedSegment = next
         if next == 0 { redrawPreview() }
     }
 
@@ -2392,11 +2378,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     @objc private func changeWindow() {
-        if sourceKindControl.selectedSegment != 0 {
-            sourceKindControl.selectedSegment = 0
-            sourceKindChanged()
-        }
-        chooseWindow()
+        chooseCurrentKind()
     }
 
     @objc private func chooseCurrentKind() {
@@ -2457,34 +2439,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         LiveEngineSelection.normalize(&profile)
     }
 
-    private final class DashedConfigButton: NSButton {
-        private let outline = CAShapeLayer()
-        override init(frame frameRect: NSRect) {
-            super.init(frame: frameRect)
-            isBordered = false
-            wantsLayer = true
-            outline.fillColor = NSColor.clear.cgColor
-            outline.lineWidth = 1
-            outline.lineDashPattern = [4, 3]
-            layer?.addSublayer(outline)
-        }
-        required init?(coder: NSCoder) { nil }
-        override func layout() {
-            super.layout()
-            outline.frame = bounds
-            outline.path = CGPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), cornerWidth: 8, cornerHeight: 8, transform: nil)
-            outline.strokeColor = NSColor.secondaryLabelColor.withAlphaComponent(0.55).cgColor
-        }
-    }
-
-    private final class ConfigNavButton: NSButton {
-        var doubleClick: (() -> Void)?
-        override func mouseDown(with event: NSEvent) {
-            if event.clickCount >= 2, let doubleClick { doubleClick(); return }
-            super.mouseDown(with: event)
-        }
-    }
-
     private final class ConfigRenameField: NSTextField {
         var cancelRename: (() -> Void)?
         override func cancelOperation(_ sender: Any?) { cancelRename?() }
@@ -2492,32 +2446,19 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private func rebuildConfigRows() {
         cancelRename()
-        for item in configRows.arrangedSubviews { configRows.removeArrangedSubview(item); item.removeFromSuperview() }
-        if SPRifeExperiments.airBeta {
-            let mode = NSTextField(wrappingLabelWithString: EnhancementText.t("Air Beta · 2× Interpolation", "Air 实验档 · 2× 插帧"))
-            mode.font = .systemFont(ofSize: 13, weight: .semibold)
-            mode.maximumNumberOfLines = 2
-            mode.preferredMaxLayoutWidth = 168
-            configRows.addArrangedSubview(mode)
-            return
-        }
+        configPopup.removeAllItems()
+        configPopup.menu = NSMenu()
+        configActions.removeAllItems()
+        guard !SPRifeExperiments.airBeta else { return }
         let active = EnhancementProfileStore.resolvedID(profile)
         let metadata = EnhancementProfileStore.metadata()
         func add(_ id: String, _ title: String, _ symbol: String) {
-            let item = navButton(title, symbol, #selector(selectConfig(_:)))
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.representedObject = id
             item.identifier = NSUserInterfaceItemIdentifier(id)
-            if let row = item as? ConfigNavButton { row.doubleClick = { [weak self] in self?.beginRename(id) } }
-            let menu = NSMenu()
-            let rename = NSMenuItem(title: EnhancementText.t("Rename", "重命名"), action: #selector(renameConfig(_:)), keyEquivalent: "")
-            rename.target = self; rename.representedObject = id; menu.addItem(rename)
-            let delete = NSMenuItem(title: EnhancementText.t("Delete", "删除"), action: #selector(deleteConfig(_:)), keyEquivalent: "")
-            delete.target = self; delete.representedObject = id; menu.addItem(delete)
-            item.menu = menu
-            let selected = active == id
-            item.contentTintColor = selected ? .controlAccentColor : .secondaryLabelColor
-            item.font = .systemFont(ofSize: 13, weight: selected ? .semibold : .regular)
-            item.layer?.backgroundColor = selected ? NSColor.controlAccentColor.withAlphaComponent(0.14).cgColor : NSColor.clear.cgColor
-            configRows.addArrangedSubview(item)
+            item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            configPopup.menu?.addItem(item)
+            if id == active { configPopup.select(item) }
         }
         for preset in EnhancementProfileStore.presets where !metadata.hiddenPresets.contains(preset.id) {
             add(preset.id, metadata.titles[preset.id] ?? EnhancementText.t(preset.english, preset.name), preset.symbol)
@@ -2527,26 +2468,45 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             let title = matchesPreset ? name + " · " + EnhancementText.t("Custom", "自定义") : name
             add("custom:" + name, title, "doc.text")
         }
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        let title = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        title.image = NSImage(systemSymbolName: "ellipsis.circle", accessibilityDescription: nil)
+        menu.addItem(title)
+        let add = NSMenuItem(title: EnhancementText.t("New Config…", "新增配置…"), action: #selector(addConfig), keyEquivalent: "")
+        add.target = self
+        menu.addItem(add)
+        let rename = NSMenuItem(title: EnhancementText.t("Rename…", "重命名…"), action: #selector(renameConfig(_:)), keyEquivalent: "")
+        rename.target = self
+        rename.representedObject = active
+        menu.addItem(rename)
+        let delete = NSMenuItem(title: EnhancementText.t("Delete", "删除"), action: #selector(deleteConfig(_:)), keyEquivalent: "")
+        delete.target = self
+        delete.representedObject = active
+        delete.isEnabled = configPopup.numberOfItems > 1
+        menu.addItem(delete)
         if !metadata.hiddenPresets.isEmpty {
-            let restore = navButton(EnhancementText.t("Restore presets", "恢复预设"), "arrow.uturn.backward", #selector(restorePresets(_:)))
-            configRows.addArrangedSubview(restore)
+            let restore = NSMenuItem(title: EnhancementText.t("Restore presets", "恢复预设"), action: nil, keyEquivalent: "")
+            let submenu = NSMenu()
+            for preset in EnhancementProfileStore.presets where metadata.hiddenPresets.contains(preset.id) {
+                let item = NSMenuItem(title: metadata.titles[preset.id] ?? EnhancementText.t(preset.english, preset.name), action: #selector(restorePreset(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = preset.id
+                submenu.addItem(item)
+            }
+            restore.submenu = submenu
+            menu.addItem(restore)
         }
-        let addButton = DashedConfigButton(frame: .zero)
-        addButton.title = EnhancementText.t("＋ Add config", "＋ 新增配置")
-        addButton.target = self
-        addButton.action = #selector(addConfig)
-        addButton.translatesAutoresizingMaskIntoConstraints = false
-        addButton.widthAnchor.constraint(equalToConstant: 168).isActive = true
-        addButton.heightAnchor.constraint(equalToConstant: 36).isActive = true
-        configRows.addArrangedSubview(addButton)
+        configActions.menu = menu
+        configActions.setAccessibilityLabel(EnhancementText.t("Manage configs", "管理配置"))
     }
 
-    @objc private func selectConfig(_ sender: NSButton) {
+    @objc private func configPopupChanged(_ sender: NSPopUpButton) {
         cancelCountdown()
-        guard let id = sender.identifier?.rawValue else { return }
+        guard let id = sender.selectedItem?.representedObject as? String else { return }
         readControls()
-        guard saveCurrentProfile() else { return }
-        activateConfig(id)
+        guard saveCurrentProfile() else { rebuildConfigRows(); return }
+        if !activateConfig(id) { rebuildConfigRows() }
     }
 
     @discardableResult private func activateConfig(_ id: String) -> Bool {
@@ -2595,43 +2555,24 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private func beginRename(_ id: String) {
         cancelCountdown()
         cancelRename()
-        guard let row = configRows.arrangedSubviews.compactMap({ $0 as? NSButton }).first(where: { $0.identifier?.rawValue == id }) else { return }
-        let editor = ConfigRenameField(frame: .zero)
+        let alert = NSAlert()
+        alert.messageText = EnhancementText.t("Rename config", "重命名配置")
+        let editor = ConfigRenameField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
         editor.stringValue = displayName(id)
-        editor.isBezeled = false
-        editor.drawsBackground = false
-        editor.focusRingType = .none
-        editor.font = row.font
-        editor.delegate = self
-        editor.target = self
-        editor.action = #selector(commitRename(_:))
-        editor.cancelRename = { [weak self] in self?.cancelRename() }
-        editor.translatesAutoresizingMaskIntoConstraints = false
-        row.addSubview(editor)
-        renameRow = row
-        renameOriginalTitle = row.title
-        row.title = ""
-        NSLayoutConstraint.activate([
-            editor.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 30),
-            editor.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -6),
-            editor.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            editor.heightAnchor.constraint(lessThanOrEqualTo: row.heightAnchor, constant: -8),
-        ])
+        alert.accessoryView = editor
+        alert.addButton(withTitle: EnhancementText.t("Rename", "重命名"))
+        alert.addButton(withTitle: EnhancementText.t("Cancel", "取消"))
+        alert.window.initialFirstResponder = editor
         renameID = id
         renameEditor = editor
-        window?.makeFirstResponder(editor)
-        editor.currentEditor()?.selectAll(nil)
+        if alert.runModal() == .alertFirstButtonReturn { commitRename(editor) }
+        else { cancelRename() }
     }
 
     private func cancelRename() {
-        let editor = renameEditor
+        renameEditor?.delegate = nil
         renameEditor = nil
         renameID = nil
-        renameRow?.title = renameOriginalTitle
-        renameRow = nil
-        renameOriginalTitle = ""
-        editor?.delegate = nil
-        editor?.removeFromSuperview()
     }
 
     private func endDimensionEditingBeforeClick(_ event: NSEvent) {
@@ -2791,16 +2732,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
     }
 
-    @objc private func restorePresets(_ sender: NSButton) {
-        let meta = EnhancementProfileStore.metadata()
-        let menu = NSMenu()
-        for preset in EnhancementProfileStore.presets where meta.hiddenPresets.contains(preset.id) {
-            let item = NSMenuItem(title: meta.titles[preset.id] ?? EnhancementText.t(preset.english, preset.name), action: #selector(restorePreset(_:)), keyEquivalent: "")
-            item.target = self; item.representedObject = preset.id; menu.addItem(item)
-        }
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.maxY), in: sender)
-    }
-
     @objc private func restorePreset(_ sender: NSMenuItem) {
         cancelCountdown()
         guard let id = sender.representedObject as? String else { return }
@@ -2927,7 +2858,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func refreshSourceBar() {
-        let text = activeSourceTitle.isEmpty ? EnhancementText.t("None selected", "未选择") : activeSourceTitle
+        let text = hasSelectedSource ? activeSourceTitle : EnhancementText.t("No source", "未选择来源")
         sourceLabel.stringValue = text
         sourceStripLabel.stringValue = text
         sourceLabel.textColor = .labelColor
@@ -2938,17 +2869,21 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         case 2: choose = EnhancementText.t("Choose File", "选择文件")
         default: choose = EnhancementText.t("Choose Window", "选择窗口")
         }
-        sourceActionButton?.title = EnhancementText.t("Change Window", "更换窗口")
+        sourceActionButton?.title = [EnhancementText.t("Change Window", "更换窗口"),
+                                      EnhancementText.t("Change Display", "更换显示器"),
+                                      EnhancementText.t("Change File", "更换文件")][max(0, sourceKindControl.selectedSegment)]
         emptySourceButton?.title = choose
-        emptyOverlay.isHidden = capture.running
+        updateSourceChrome(hasSource: hasSelectedSource)
     }
 
     private func refreshActions() {
         let player = selectedFilePlayer()
         let enhancing = profile.sourceKind == "file" ? ((player?.workbenchMotionPlusRequested ?? false) || (player?.workbenchFileLanczosActive ?? false)) :
             (capture.running && (processor.resolvedPlan.interpolationActive || processor.resolvedPlan.scaleActive || (applied.sourceKind == "window" && applied.windowOutputMode != "follow")))
-        startButton?.isHidden = false
-        startButton?.isEnabled = !filePreparing
+        startButton?.isHidden = enhancing && !hasPendingFormChanges && !countdown.active
+            && !delayedWindowSelection && !startImmediatelyAfterPreparation
+        startButton?.isEnabled = hasSelectedSource && !filePreparing
+        startButton?.toolTip = hasSelectedSource ? nil : EnhancementText.t("Choose a source first", "请先选择来源")
         if delayedWindowSelection || startImmediatelyAfterPreparation {
             startButton?.title = EnhancementText.t("Cancel", "取消")
         } else if profile.sourceKind == "window" {
@@ -2965,7 +2900,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         stack.alignment = .centerY
         stack.spacing = 6
         let label = NSTextField(labelWithString: title)
-        label.widthAnchor.constraint(equalToConstant: 82).isActive = true
+        let width = label.widthAnchor.constraint(equalToConstant: WorkbenchStyle.labelWidth)
+        width.isActive = true
+        formLabels.append((label, control, width))
         stack.addArrangedSubview(label)
         control.setContentHuggingPriority(.defaultLow, for: .horizontal)
         control.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -3218,7 +3155,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                     ? EnhancementText.t("Source changed; waiting for the new frame.", "已换源，等待新画面。")
                     : EnhancementText.t("Waiting for the new source frame.", "等待新来源画面。")
                 self.statusLabel.textColor = .labelColor
-                self.emptyOverlay.isHidden = true
+                self.updateSourceChrome(hasSource: true)
             }
         }
         capture.onDiagnostic = { [weak self] text in
@@ -3234,6 +3171,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 self.profile.sourceBundleIdentifier = bundle
                 self.sourceKindControl.selectedSegment = ["window": 0, "display": 1, "file": 2][kind] ?? 0
                 self.showSourceTitle(title)
+                self.applyModeVisibility()
+                self.showPage(0)
+                self.refreshActions()
                 self.persist()
             }
         }
@@ -3379,7 +3319,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         if let width = stats["sourceWidth"] as? Int, let height = stats["sourceHeight"] as? Int, width > 0 {
             let fps = stats["callbackFPS"] as? Double ?? 0
             let label = EnhancementText.t("Capture", "采集回调")
+            setPreviewAspect(CGSize(width: width, height: height))
             sourceMetaLabel.stringValue = fps > 1 && (r7Diagnostics || p0ControlsEnabled) ? "\(width)×\(height) · \(label) \(String(format: "%.0f", fps)) fps" : "\(width)×\(height)"
+            sourceMetaLabel.isHidden = !hasSelectedSource
         }
         if SPRifeExperiments.airBeta { return }
         let presented = (stats["epochPhysicalSynthetic"] as? Int) ?? 0
@@ -3830,6 +3772,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             self.capture.stop()
             (NSApp.delegate as? AppDelegate)?.openPlayerFileFromWorkbench(url)
             self.showSourceTitle(url.lastPathComponent)
+            self.applyModeVisibility()
+            self.showPage(0)
+            self.refreshActions()
             self.persist()
             self.refreshPlanLabel()
         }
@@ -3894,6 +3839,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             profile.sourceBundleIdentifier = box.bundle
         }
         showSourceTitle(profile.sourceTitle)
+        showPage(0)
         persist()
     }
 
@@ -4503,6 +4449,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         if profile.interpolationEngineID == "apple.lowlatency" {
             phaseLabel.stringValue = lowLatencyPhaseText()
         }
+        scaleBody?.isHidden = scaleSwitch.state != .on
+        framesBody?.isHidden = interpolationSwitch.state != .on
+        refreshFormLabels()
     }
 
     @objc private func pendingTextChanged(_ notification: Notification) {
@@ -4511,8 +4460,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         cancelCountdown()
     }
 
-    @objc private func openProjectLink(_ sender: NSButton) {
-        guard let key = sender.identifier?.rawValue,
+    @objc private func openProjectLink(_ sender: Any) {
+        guard let key = (sender as? NSUserInterfaceItemIdentification)?.identifier?.rawValue,
               let value = Bundle.main.object(forInfoDictionaryKey: key) as? String,
               var components = URLComponents(string: value), components.scheme == "https" else { return }
         if key == "ODFFeedbackURL" {
@@ -4533,39 +4482,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                                  styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
             panel.isReleasedWhenClosed = false
             let content = NSView()
-            let icon = NSImageView(image: NSApp.applicationIconImage)
-            icon.imageScaling = .scaleProportionallyUpOrDown
-            icon.widthAnchor.constraint(equalToConstant: 48).isActive = true
-            icon.heightAnchor.constraint(equalToConstant: 48).isActive = true
-            let name = NSTextField(labelWithString: "OpenDuckFrame")
-            name.font = .systemFont(ofSize: 17, weight: .semibold)
-            let brand = NSStackView(views: [icon, name])
-            brand.orientation = .horizontal
-            brand.alignment = .centerY
-            brand.spacing = 12
-
-            func group(_ body: NSView) -> NSBox {
-                let box = NSBox()
-                box.boxType = .custom
-                box.titlePosition = .noTitle
-                box.borderWidth = 0
-                box.isTransparent = false
-                box.cornerRadius = 10
-                box.fillColor = NSColor(name: nil) { appearance in
-                    appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-                        ? NSColor.white.withAlphaComponent(0.06)
-                        : NSColor.black.withAlphaComponent(0.05)
-                }
-                body.translatesAutoresizingMaskIntoConstraints = false
-                box.contentView!.addSubview(body)
-                NSLayoutConstraint.activate([
-                    body.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 14),
-                    body.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -14),
-                    body.topAnchor.constraint(equalTo: box.topAnchor, constant: 14),
-                    body.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -14),
-                ])
-                return box
-            }
             for control in [enhancementDelayControl, languageControl, appearanceControl] {
                 control.segmentDistribution = .fillEqually
                 control.segmentStyle = .rounded
@@ -4592,62 +4508,42 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             for view in [customLabel, enhancementDelayField, enhancementDelayStepper] {
                 enhancementDelayCustomRow.addArrangedSubview(view)
             }
-            let delayBody = NSStackView(views: [heading(EnhancementText.t("Countdown", "倒计时时间")), enhancementDelayControl, enhancementDelayCustomRow])
-            delayBody.orientation = .vertical
-            delayBody.alignment = .leading
-            delayBody.spacing = 10
-            delayBody.detachesHiddenViews = true
-            enhancementDelayControl.widthAnchor.constraint(equalTo: delayBody.widthAnchor).isActive = true
-            enhancementDelayCustomRow.widthAnchor.constraint(equalTo: delayBody.widthAnchor).isActive = true
-            let delayGroup = group(delayBody)
-
-            languageDetail.font = .systemFont(ofSize: 11)
+            let delayBody = column([enhancementDelayControl, enhancementDelayCustomRow])
+            languageDetail.font = WorkbenchStyle.captionFont
             languageDetail.textColor = .secondaryLabelColor
-            let languageRow = row(EnhancementText.t("Language", "语言"), languageControl)
-            (languageRow as? NSStackView)?.distribution = .fill
-            let languageBody = NSStackView(views: [languageRow, languageDetail])
-            languageBody.orientation = .vertical
-            languageBody.alignment = .leading
-            languageBody.spacing = 8
-            languageBody.detachesHiddenViews = true
-            languageRow.widthAnchor.constraint(equalTo: languageBody.widthAnchor).isActive = true
-            languageDetail.widthAnchor.constraint(equalTo: languageBody.widthAnchor).isActive = true
-            let languageGroup = group(languageBody)
-            let appearanceRow = row(EnhancementText.t("Appearance", "外观"), appearanceControl)
-            (appearanceRow as? NSStackView)?.distribution = .fill
-            let appearanceGroup = group(appearanceRow)
-            let divider = NSBox()
-            divider.boxType = .separator
+            let languageBody = column([languageControl, languageDetail])
+            let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+            let about = NSTextField(labelWithString: "OpenDuckFrame " + version)
             let links = NSStackView()
             links.orientation = .horizontal
-            links.distribution = .fillEqually
+            links.spacing = 8
             for (title, key) in [(EnhancementText.t("Website", "官网"), "ODFWebsiteURL"),
                                  ("GitHub", "ODFRepositoryURL"),
                                  (EnhancementText.t("Feedback", "反馈"), "ODFFeedbackURL")] {
-                let link = NSButton(title: title, target: self, action: #selector(openProjectLink(_:)))
+                let link = button(title, #selector(openProjectLink(_:)))
                 link.identifier = NSUserInterfaceItemIdentifier(key)
-                link.bezelStyle = .inline
-                link.isBordered = false
-                link.font = .systemFont(ofSize: 12)
-                link.contentTintColor = .linkColor
                 links.addArrangedSubview(link)
             }
-            let stack = NSStackView(views: [brand, delayGroup, languageGroup, appearanceGroup, divider, links])
-            stack.orientation = .vertical
-            stack.alignment = .leading
-            stack.spacing = 12
-            stack.setCustomSpacing(20, after: brand)
-            stack.setCustomSpacing(24, after: appearanceGroup)
+            let grid = NSGridView(views: [
+                [NSTextField(labelWithString: EnhancementText.t("Appearance", "外观")), appearanceControl],
+                [NSTextField(labelWithString: EnhancementText.t("Language", "语言")), languageBody],
+                [NSTextField(labelWithString: EnhancementText.t("Countdown", "倒计时时间")), delayBody],
+                [NSTextField(labelWithString: EnhancementText.t("About", "关于")), about],
+                [NSGridCell.emptyContentView, links],
+            ])
+            grid.rowSpacing = 12
+            grid.columnSpacing = 12
+            grid.column(at: 0).xPlacement = .trailing
+            grid.column(at: 1).xPlacement = .fill
+            grid.yPlacement = .top
+            let stack = column([grid])
             stack.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(stack)
             NSLayoutConstraint.activate([
-                stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 24),
-                stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 28),
-                stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
+                stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
+                stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+                stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
             ])
-            for view in [delayGroup, languageGroup, appearanceGroup, divider, links] {
-                view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-            }
             panel.contentView = content
             settingsStack = stack
             settingsWindow = panel
@@ -4777,7 +4673,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             EnhancementText.translated(text, chinese: EnhancementText.chinese)
         }
         func visit(_ view: NSView) {
-            if view === configRows || view === recentStack || view === shareStack || view === languageControl { return }
+            if view === configPopup || view === configActions || view === recentStack || view === shareStack || view === languageControl { return }
             if let popup = view as? NSPopUpButton {
                 if popup !== displayPopup {
                     for item in popup.itemArray { item.title = translate(item.title) }
@@ -4800,8 +4696,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         if let root = window?.contentView { visit(root) }
         if let root = settingsWindow?.contentView { visit(root) }
         settingsWindow?.title = EnhancementText.t("Settings", "设置")
-        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
-        window?.title = WorkbenchTitle.text(EnhancementText.t("Quality Workbench", "画质工作台"), version: version)
+        window?.title = "OpenDuckFrame"
+        if let window { installToolbar(on: window) }
+        installWorkbenchMenuEntries()
         outputWindow?.title = EnhancementText.t("Enhanced output", "增强输出")
         if let first = displayPopup.item(at: 0) { first.title = EnhancementText.t("Main display", "主显示器") }
         statusLabel.stringValue = EnhancementText.runtime(translate(statusLabel.stringValue))
@@ -5163,6 +5060,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             || profile.outputWidth != baseline.outputWidth
             || profile.outputHeight != baseline.outputHeight
             || (profile.sourceKind == "file" && (profile.outputDisplayID != baseline.outputDisplayID || profile.outputFullscreen != baseline.outputFullscreen))
+        hasPendingFormChanges = formDiffers
+        refreshActions()
         let pending = formDiffers ? EnhancementText.t("Pending", "待应用") + " \(Self.engineDisplayName(profile.interpolationEngineID, model: profile.modelID)) \(rate)" : ""
         let sizeChain = profile.sourceKind != "file" && capture.running && processor.resolvedPlan.committed
             ? LiveSizeChain.text(lastStats, generation: capture.currentGeneration, config: processor.resolvedPlan.configVersion) : ""
