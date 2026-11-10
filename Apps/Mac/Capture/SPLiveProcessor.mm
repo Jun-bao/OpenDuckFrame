@@ -11,6 +11,7 @@
 #import "SPRifeBridge.h"
 #include "SPAirRobustSourceLead.hpp"
 #include "SPAirWindowOptimization.hpp"
+#include "SPAirMeasurementTrace.hpp"
 #import "SPRateSchedule.hpp"
 #import "SPLiveDisplayQueue.h"
 #import "SPRifePairAffineClock.hpp"
@@ -93,6 +94,15 @@ static bool SPAirRobustSourceLeadRequested() {
 #if ODF_AIR_BETA_DIAGNOSTIC
     const char *value = getenv("ODF_AIR_ROBUST_SOURCE_LEAD_DIAGNOSTIC");
     return value && strcmp(value, "1") == 0;
+#else
+    return false;
+#endif
+}
+
+static bool SPAirFullMeasurementTraceRequested() {
+#if ODF_AIR_BETA_DIAGNOSTIC && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC
+    return SPAirCadenceCausalTraceRequested() &&
+        strcmp(getenv("ODF_AIR_BETA_CAPTURE_DIAGNOSTIC") ?: "", "1") == 0;
 #else
     return false;
 #endif
@@ -947,7 +957,11 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
 // Own pixel buffers from admission until rejection or GPU completion. Pending
 // requests never reserve drawable/GPU tickets and remain strictly bounded.
 @class SPPreparedTextureLease, SPPreparedTextureMapper;
-@interface SPDisplayFrameRequest : NSObject
+@interface SPDisplayFrameRequest : NSObject {
+@public
+    spAirMeasurement::TracePtr _measurementTrace;
+    uint64_t _measurementLeaseID;
+}
 @property(nonatomic, assign) CVPixelBufferRef enhanced;
 @property(nonatomic, assign) CVPixelBufferRef original;
 @property(nonatomic) SPLiveViewMode mode;
@@ -975,6 +989,16 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
 @property(nonatomic, strong) SPPreparedTextureLease *preparedTextureLease;
 @property(nonatomic) int preparedTextureAdmissionReason;
 @end
+static spAirMeasurement::Event SPAirMeasurementFrame(SPDisplayFrameRequest *frame, spAirMeasurement::Kind kind) {
+    spAirMeasurement::Event event;
+    event.kind = kind; event.frameID = frame.frameID; event.generation = frame.generation;
+    event.config = frame.config; event.epoch = frame.epoch; event.clock = frame.clockEpoch;
+    event.ptsNum = frame.ptsNum; event.ptsDen = frame.ptsDen; event.targetHostTicks = frame.logicalTargetHost;
+    event.flags = (frame.synthetic ? 1u : 0u) | (frame.counts ? 2u : 0u) | (frame.redraw ? 4u : 0u) | 8u;
+    event.groupID = frame->_measurementLeaseID;
+    return event;
+}
+
 enum SPPreparedTextureReason { SPPreparedNone, SPPreparedCapacity, SPPreparedNotReady, SPPreparedMapFailed, SPPreparedMismatch, SPPreparedMissing, SPPreparedCancelled };
 static NSString *SPPreparedTextureReasonName(int reason) {
     switch (reason) {
@@ -992,6 +1016,8 @@ enum SPPreparedTexturePhase { SPPreparedQueued, SPPreparedMapping, SPPreparedRea
 @interface SPPreparedTextureLease : NSObject {
 @public
     SPPreparedTextureMapper *_owner;
+    spAirMeasurement::TracePtr _measurementTrace;
+    spAirMeasurement::Event _measurementIdentity;
     std::atomic<int> _phase;
     std::atomic<int64_t> _mapStartedHostTicks, _mapEndedHostTicks;
     CVPixelBufferRef _primary, _secondary;
@@ -1043,6 +1069,10 @@ enum SPPreparedTexturePhase { SPPreparedQueued, SPPreparedMapping, SPPreparedRea
     if (!(self = [super init])) return nil;
     _owner = owner; _phase.store(SPPreparedQueued); _mapStartedHostTicks.store(0); _mapEndedHostTicks.store(0);
     _generation = frame.generation; _config = frame.config; _epoch = frame.epoch; _clockEpoch = frame.clockEpoch; _frameID = frame.frameID; _mode = frame.mode;
+    if (frame->_measurementTrace) {
+        _measurementTrace = frame->_measurementTrace;
+        _measurementIdentity = SPAirMeasurementFrame(frame, spAirMeasurement::Kind::leaseRequest);
+    }
     _enhancedIdentity = frame.enhanced; _originalIdentity = frame.original;
     CVPixelBufferRef primary = frame.mode == SPLiveViewOriginal ? (frame.original ?: frame.enhanced) : frame.enhanced;
     CVPixelBufferRef secondary = frame.original ?: frame.enhanced;
@@ -1066,6 +1096,13 @@ enum SPPreparedTexturePhase { SPPreparedQueued, SPPreparedMapping, SPPreparedRea
     while (phase == SPPreparedQueued || phase == SPPreparedMapping || phase == SPPreparedReady) {
         if (_phase.compare_exchange_weak(phase, SPPreparedAbandoned)) {
             _owner->_cancelled.fetch_add(1);
+            if (_measurementTrace) {
+                auto event = _measurementIdentity;
+                event.kind = spAirMeasurement::Kind::leaseCancel;
+                event.beginHostTicks = event.endHostTicks = SPHostNow();
+                event.values[0] = phase;
+                _measurementTrace->append(event);
+            }
             SPPreparedTextureMapper *owner = _owner;
             dispatch_async(owner->_queue, ^{ [owner recycleLease:self]; });
             return;
@@ -1075,6 +1112,12 @@ enum SPPreparedTexturePhase { SPPreparedQueued, SPPreparedMapping, SPPreparedRea
 - (void)complete {
     int expected = SPPreparedInflight;
     if (!_phase.compare_exchange_strong(expected, SPPreparedRetired)) return;
+    if (_measurementTrace) {
+        auto event = _measurementIdentity;
+        event.kind = spAirMeasurement::Kind::leaseCompleteRequest;
+        event.beginHostTicks = event.endHostTicks = SPHostNow();
+        _measurementTrace->append(event);
+    }
     SPPreparedTextureMapper *owner = _owner;
     dispatch_async(owner->_queue, ^{ [owner recycleLease:self]; });
 }
@@ -1099,11 +1142,30 @@ enum SPPreparedTexturePhase { SPPreparedQueued, SPPreparedMapping, SPPreparedRea
     if (cache) dispatch_async(_queue, ^{ CVMetalTextureCacheFlush(cache, 0); CFRelease(cache); });
 }
 - (SPPreparedTextureLease *)prepareFrame:(SPDisplayFrameRequest *)frame {
+    spAirMeasurement::Event measurement;
+    if (frame->_measurementTrace) {
+        frame->_measurementLeaseID = frame->_measurementTrace->identity();
+        measurement = SPAirMeasurementFrame(frame, spAirMeasurement::Kind::leaseRequest);
+        measurement.beginHostTicks = SPHostNow();
+    }
     uint64_t count = _outstanding.load();
-    do { if (count >= 4) { _capacityRejected.fetch_add(1); frame.preparedTextureAdmissionReason = SPPreparedCapacity; return nil; } }
+    do { if (count >= 4) { _capacityRejected.fetch_add(1); frame.preparedTextureAdmissionReason = SPPreparedCapacity;
+        if (frame->_measurementTrace) {
+            measurement.endHostTicks = SPHostNow();
+            measurement.values[0] = 0;
+            measurement.values[1] = count;
+            frame->_measurementTrace->append(measurement);
+        }
+        return nil; } }
     while (!_outstanding.compare_exchange_weak(count, count + 1));
     uint64_t peak = _peak.load(); while (peak < count + 1 && !_peak.compare_exchange_weak(peak, count + 1)) {}
     _admitted.fetch_add(1);
+    if (frame->_measurementTrace) {
+        measurement.endHostTicks = SPHostNow();
+        measurement.values[0] = 1;
+        measurement.values[1] = count + 1;
+        frame->_measurementTrace->append(measurement);
+    }
     SPPreparedTextureLease *lease = [[SPPreparedTextureLease alloc] initWithOwner:self frame:frame];
     frame.preparedTextureLease = lease;
     dispatch_async(_queue, ^{ [self mapLease:lease]; });
@@ -1129,25 +1191,59 @@ enum SPPreparedTexturePhase { SPPreparedQueued, SPPreparedMapping, SPPreparedRea
     }
     if (_cache) { CVMetalTextureCacheFlush(_cache, 0); _mapFlushes.fetch_add(1); }
     lease->_mapEndedHostTicks.store(SPHostNow());
+    if (lease->_measurementTrace) {
+        auto event = lease->_measurementIdentity; event.kind = spAirMeasurement::Kind::leaseMap;
+        event.beginHostTicks = lease->_mapStartedHostTicks.load(); event.endHostTicks = lease->_mapEndedHostTicks.load();
+        event.values[0] = valid; lease->_measurementTrace->append(event);
+    }
     if (!valid) { _mapFailures.fetch_add(1); lease->_phase.store(SPPreparedFailed); [self recycleLease:lease]; return; }
     expected = SPPreparedMapping;
-    if (!lease->_phase.compare_exchange_strong(expected, SPPreparedReady, std::memory_order_release)) [self recycleLease:lease];
+    const bool measurementReadyPublished = lease->_phase.compare_exchange_strong(expected, SPPreparedReady, std::memory_order_release);
+    if (!measurementReadyPublished) [self recycleLease:lease];
+    if (lease->_measurementTrace) {
+        auto event = lease->_measurementIdentity; event.kind = spAirMeasurement::Kind::leaseReady;
+        event.beginHostTicks = event.endHostTicks = SPHostNow(); event.values[0] = measurementReadyPublished; event.values[1] = lease->_phase.load();
+        lease->_measurementTrace->append(event);
+    }
 }
 - (void)recycleLease:(SPPreparedTextureLease *)lease {
     if (lease->_recycled) return; lease->_recycled = YES;
+    const uint64_t measurementReleaseBegin = lease->_measurementTrace ? SPHostNow() : 0;
     if (lease->_primaryRef) { CFRelease(lease->_primaryRef); lease->_primaryRef = NULL; }
     if (lease->_secondaryRef) { CFRelease(lease->_secondaryRef); lease->_secondaryRef = NULL; }
     if (lease->_primary) { CVPixelBufferRelease(lease->_primary); lease->_primary = NULL; }
     if (lease->_secondary) { CVPixelBufferRelease(lease->_secondary); lease->_secondary = NULL; }
     if (_cache) { CVMetalTextureCacheFlush(_cache, 0); _recycleFlushes.fetch_add(1); }
     _recycled.fetch_add(1);
-    if (_outstanding.fetch_sub(1) == 1 && _cache) _idleFlushes.fetch_add(1);
+    const uint64_t previousOutstanding = _outstanding.fetch_sub(1);
+    if (previousOutstanding == 1 && _cache) _idleFlushes.fetch_add(1);
+    if (lease->_measurementTrace) {
+        auto event = lease->_measurementIdentity; event.kind = spAirMeasurement::Kind::leaseRelease;
+        event.beginHostTicks = measurementReleaseBegin; event.endHostTicks = SPHostNow();
+        event.values[0] = previousOutstanding; event.values[1] = previousOutstanding - 1;
+        event.values[2] = lease->_phase.load(); lease->_measurementTrace->append(event);
+    }
 }
 - (SPPreparedTextureLease *)claimFrame:(SPDisplayFrameRequest *)frame recordSelection:(BOOL)record reason:(int *)reason {
     if (record) _selected.fetch_add(1);
     SPPreparedTextureLease *lease = frame.preparedTextureLease;
     int failure = lease ? SPPreparedNone : (frame.preparedTextureAdmissionReason ?: SPPreparedMissing);
-    if (lease && [lease claimForFrame:frame reason:&failure]) { if (record) _hits.fetch_add(1); *reason = SPPreparedNone; return lease; }
+    if (lease && [lease claimForFrame:frame reason:&failure]) { if (record) _hits.fetch_add(1); *reason = SPPreparedNone;
+        if (frame->_measurementTrace) {
+            auto event = SPAirMeasurementFrame(frame, spAirMeasurement::Kind::leaseClaim);
+            event.beginHostTicks = event.endHostTicks = SPHostNow();
+            event.values[0] = SPPreparedNone;
+            event.values[1] = 1;
+            frame->_measurementTrace->append(event);
+        }
+        return lease; }
+    if (frame->_measurementTrace) {
+        auto event = SPAirMeasurementFrame(frame, spAirMeasurement::Kind::leaseClaim);
+        event.beginHostTicks = event.endHostTicks = SPHostNow();
+        event.values[0] = failure;
+        event.values[1] = 0;
+        frame->_measurementTrace->append(event);
+    }
     if (record) _fallbacks[(size_t)failure].fetch_add(1);
     *reason = failure; [lease cancel]; return nil;
 }
@@ -1504,6 +1600,7 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
     BOOL _airPresentationTimingDiagnostic;
     SPPreparedTextureMapper *_preparedTextures;
     BOOL _airPreparedTextureDiagnostic;
+    spAirMeasurement::TracePtr _measurementTrace;
     std::atomic<bool> _airPerformanceEnabled;
     std::atomic<int64_t> _selectionGuardNs;
     int64_t _diagnosticSelectionGuardNs;
@@ -1531,6 +1628,8 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
         _airSlotCallbacks = std::make_unique<SPAirSlotCallbackRing>(); _airSlotConsumes = std::make_unique<SPAirSlotConsumeRing>();
     }
     _airSlotCallbackUnsupported.store(0);
+    if (SPAirFullMeasurementTraceRequested())
+        _measurementTrace = std::make_shared<spAirMeasurement::Trace>(spAirMeasurement::viewCapacity);
     _airPerformanceEnabled.store(false);
     const BOOL legacyAirRecipe = SPAirBetaEnabled() ||
         (strcmp(getenv("ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC") ?: "", "1") == 0 &&
@@ -2210,6 +2309,7 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
     frame.config = _diagnosticConfig.load(); frame.epoch = _diagnosticEpoch.load(); frame.clockEpoch = _presentationClockEpoch.load();
     frame.surfaceToken = _surfaceToken.load(); frame.ptsNum = ptsNum; frame.ptsDen = ptsDen;
     frame.airPerformanceEnabled = [self airPerformanceEnabled];
+    if (_measurementTrace) frame->_measurementTrace = _measurementTrace;
 #if ODF_AIR_BETA_DIAGNOSTIC
     if (SPAirBetaEnabled() || frame.airPerformanceEnabled) {
         frame.betaCaptureWidth = _airBetaCaptureWidth.load();
@@ -2612,7 +2712,29 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
             }
             std::vector<sp::DisplayQueueFrame> timings;
             for (SPDisplayFrameRequest *pending in _pendingPresentations) timings.push_back(SPDisplayFrameTiming(pending));
+            const uint64_t measurementChoiceBegin = _measurementTrace ? SPHostNow() : 0;
             auto selected = sp::chooseDisplayFrame(timings, (int64_t)(slot.displayTime * 1e9));
+            if (_measurementTrace) {
+                const uint64_t ended = SPHostNow(), group = _measurementTrace->identity();
+                spAirMeasurement::Event event; event.kind = spAirMeasurement::Kind::choiceBegin;
+                event.groupID = group; event.relatedID = slot->timing.token;
+                event.generation = slot->timing.context.generation; event.config = slot->timing.context.config;
+                event.epoch = slot->timing.context.measurementEpoch; event.clock = slot->timing.context.clockEpoch;
+                event.beginHostTicks = measurementChoiceBegin; event.endHostTicks = ended;
+                event.sampleHostTicks = selectionHost; event.values[0] = timings.size();
+                event.values[1] = slot->timing.displayNs; event.values[2] = slot->timing.deadlineNs;
+                _measurementTrace->append(event);
+                for (NSUInteger index = 0; index < _pendingPresentations.count; ++index) {
+                    auto candidate = SPAirMeasurementFrame(_pendingPresentations[index], spAirMeasurement::Kind::choiceCandidate);
+                    candidate.groupID = group; candidate.relatedID = slot->timing.token;
+                    candidate.beginHostTicks = measurementChoiceBegin; candidate.endHostTicks = ended;
+                    candidate.values[0] = index; candidate.values[1] = index == selected ? 1 : (index < selected && selected < timings.size() ? 2 : 0);
+                    _measurementTrace->append(candidate);
+                }
+                event.kind = spAirMeasurement::Kind::choiceEnd; event.values[3] = selected;
+                event.frameID = selected < timings.size() ? timings[selected].frameID : 0;
+                _measurementTrace->append(event);
+            }
             if (selected < timings.size()) {
                 frame = _pendingPresentations[selected];
                 for (NSUInteger index = 0; index < selected; ++index) {
@@ -2806,8 +2928,17 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
     if (fusedSynthetic && !renderPipeline) { reportFailure(@"fused-present-pipeline"); [preparedLease complete]; return; }
 #endif
     int64_t primaryAPIStarted = 0, primaryAPIEnded = 0, secondaryAPIStarted = 0, secondaryAPIEnded = 0;
+    const uint64_t measurementInlineBegin = frame->_measurementTrace && !preparedLease ? SPHostNow() : 0;
     CVMetalTextureRef aRef = preparedLease ? NULL : (timingDiagnostic ? [self createTexture:primary apiStartedHostTicks:&primaryAPIStarted apiEndedHostTicks:&primaryAPIEnded] : [self createTexture:primary]);
     CVMetalTextureRef bRef = !preparedLease && mode == SPLiveViewCompare ? (timingDiagnostic ? [self createTexture:secondary apiStartedHostTicks:&secondaryAPIStarted apiEndedHostTicks:&secondaryAPIEnded] : [self createTexture:secondary]) : NULL;
+    if (frame->_measurementTrace && !preparedLease) {
+        auto event = SPAirMeasurementFrame(frame, spAirMeasurement::Kind::inlineMap);
+        event.beginHostTicks = primaryAPIStarted > 0 ? primaryAPIStarted : measurementInlineBegin;
+        event.endHostTicks = secondaryAPIEnded > 0 ? secondaryAPIEnded : (primaryAPIEnded > 0 ? primaryAPIEnded : SPHostNow());
+        event.values[0] = preparedReason; event.values[1] = aRef != nullptr; event.values[2] = mode == SPLiveViewCompare;
+        event.values[3] = primaryAPIStarted > 0 && primaryAPIEnded > 0;
+        frame->_measurementTrace->append(event);
+    }
     if (timingDiagnostic) {
         note->primaryCVTextureAPIStartedHostTicks.store(primaryAPIStarted); note->primaryCVTextureAPIEndedHostTicks.store(primaryAPIEnded);
         note->secondaryCVTextureAPIStartedHostTicks.store(secondaryAPIStarted); note->secondaryCVTextureAPIEndedHostTicks.store(secondaryAPIEnded);
@@ -2931,6 +3062,12 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
     if (timingDiagnostic) note->encodingEndedHostTicks.store(SPHostNow());
     self->_inflightDraws.fetch_add(1);
     [command addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (frame->_measurementTrace) {
+            auto event = SPAirMeasurementFrame(frame, spAirMeasurement::Kind::gpuCallback);
+            event.beginHostTicks = event.endHostTicks = SPHostNow(); event.values[0] = done.status;
+            event.gpuStartSeconds = done.GPUStartTime; event.gpuEndSeconds = done.GPUEndTime;
+            frame->_measurementTrace->append(event);
+        }
         if (done.status != MTLCommandBufferStatusCompleted) reportFailure(@"gpu");
         note->gpuHost.store((long long)SPHostNow());
 #if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
@@ -3316,6 +3453,8 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 
 @implementation SPLiveProcessor {
     dispatch_queue_t _q;
+    spAirMeasurement::TracePtr _measurementTrace;
+    uint64_t _measurementClockLife, _measurementArm, _measurementFire;
     std::unique_ptr<SPAirFrameRing> _airCadenceCallbacks;
     std::unique_ptr<SPAirBudgetRing> _airCadenceBudget;
     std::unique_ptr<SPAirCurrentStatsRing> _airCurrentStatsCalls;
@@ -3609,6 +3748,8 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 - (instancetype)init {
     if (!(self = [super init])) return nil;
     _airOutputSubmitDeadlineFailures.store(0, std::memory_order_relaxed);
+    if (SPAirFullMeasurementTraceRequested())
+        _measurementTrace = std::make_shared<spAirMeasurement::Trace>(spAirMeasurement::processorCapacity);
     _airRobustSourceLeadRequested = SPAirRobustSourceLeadRequested();
     if (SPAirCadenceCausalTraceRequested()) {
         _airCadenceCallbacks = std::make_unique<SPAirFrameRing>();
@@ -5459,6 +5600,11 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     self->_haveLuma = NO;
     self->_lastPairB = 0;
     if (self->_clock) {
+        if (self->_measurementTrace) {
+            auto event = [self airMeasurementEvent:spAirMeasurement::Kind::timerCancel];
+            event.beginHostTicks = event.endHostTicks = SPHostNow();
+            self->_measurementTrace->append(event);
+        }
         dispatch_source_cancel(self->_clock);
         self->_clock = nil;
     }
@@ -5899,7 +6045,14 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 - (void)ownedContractStabilizePlayout {
     dispatch_sync(_q, ^{
         [self clearPlaySlots];
-        if (self->_clock) { dispatch_source_cancel(self->_clock); self->_clock = nil; }
+        if (self->_clock) {
+            if (self->_measurementTrace) {
+                auto event = [self airMeasurementEvent:spAirMeasurement::Kind::timerCancel];
+                event.beginHostTicks = event.endHostTicks = SPHostNow();
+                self->_measurementTrace->append(event);
+            }
+            dispatch_source_cancel(self->_clock); self->_clock = nil;
+        }
         if (self->_lastEnhanced) { CVPixelBufferRelease(self->_lastEnhanced); self->_lastEnhanced = nullptr; }
         if (self->_lastOriginal) { CVPixelBufferRelease(self->_lastOriginal); self->_lastOriginal = nullptr; }
     });
@@ -6687,11 +6840,54 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     _lastSynthetic = synthetic;
 }
 
+- (void)airMeasurementTarget:(sp::SPRational)pts target:(int64_t)target frame:(uint64_t)frameID
+    job:(uint64_t)jobID phase:(uint64_t)phase synthetic:(BOOL)synthetic computed:(BOOL)computed {
+    spAirMeasurement::Event event; event.kind = spAirMeasurement::Kind::targetCreated;
+    event.beginHostTicks = event.endHostTicks = SPHostNow(); event.frameID = frameID;
+    event.relatedID = jobID; event.groupID = phase; event.ptsNum = pts.num; event.ptsDen = pts.den;
+    event.targetHostTicks = target; event.generation = _sourceGeneration; event.config = _configVersion;
+    event.epoch = _measurementEpoch; event.clock = _clockEpoch; event.flags = (synthetic ? 1u : 0u) | 8u;
+    sp::SPRational delta{};
+    if (computed && _haveAnchor && sp::spSub(pts, _anchorPts, delta)) {
+        event.flags |= 16u; event.values[0] = _delayHost; event.values[1] = _anchorHost;
+        event.values[2] = _anchorPts.num; event.values[3] = _anchorPts.den;
+    }
+    if (_haveInterval && _intervalHost > 0) { event.flags |= 64u; event.sampleHostTicks = _intervalHost; }
+    if (_airTrueSourceIntervalRequested) event.flags |= 128u;
+    _measurementTrace->append(event);
+}
+
+- (spAirMeasurement::Event)airMeasurementEvent:(spAirMeasurement::Kind)kind {
+    spAirMeasurement::Event event; event.kind = kind;
+    event.generation = _sourceGeneration; event.config = _configVersion;
+    event.epoch = _measurementEpoch; event.clock = _clockEpoch;
+    event.clockLifeID = _measurementClockLife; event.armID = _measurementArm;
+    if (!_slots.empty()) { const auto &slot = _slots.front(); event.frameID = slot.frameID;
+        event.ptsNum = slot.pts.num; event.ptsDen = slot.pts.den; event.targetHostTicks = slot.targetHost;
+        event.flags = (slot.synthetic ? 1u : 0u) | 8u; }
+    return event;
+}
+
 - (void)ensureClock {
     if (_clock) return;
     _clock = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, DISPATCH_TIMER_STRICT, _q);
     SPLiveProcessor *strong = self;
+    const uint64_t measurementClockLife = _measurementTrace ? _measurementTrace->identity() : 0;
+    if (_measurementTrace) {
+        _measurementClockLife = measurementClockLife; _measurementArm = 0;
+        auto event = [self airMeasurementEvent:spAirMeasurement::Kind::timerCreate];
+        event.beginHostTicks = event.endHostTicks = SPHostNow(); _measurementTrace->append(event);
+    }
     dispatch_source_set_event_handler(_clock, ^{
+        if (strong->_measurementTrace) {
+            auto event = [strong airMeasurementEvent:spAirMeasurement::Kind::timerFire];
+            event.beginHostTicks = event.endHostTicks = SPHostNow(); event.clockLifeID = measurementClockLife;
+            event.groupID = strong->_measurementTrace->identity(); event.values[0] = strong->_measurementClockLife;
+            if (measurementClockLife == strong->_measurementClockLife && strong->_clock) {
+                event.flags |= 16u; event.values[1] = dispatch_source_get_data(strong->_clock);
+            }
+            strong->_measurementFire = event.groupID; strong->_measurementTrace->append(event);
+        }
         if (strong->_testCapturePlayout && strong->_testTimingTrace.count < 80) {
             if (!strong->_testTimingTrace) strong->_testTimingTrace=[NSMutableArray array];
             int64_t fired=SPHostNow();
@@ -6700,20 +6896,36 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
                 @"lateMs":@(target ? (double)SPHostToNs(fired-target)/1e6 : 0) }];
         }
         [strong drainDue]; [strong publishStats];
+        if (strong->_measurementTrace) strong->_measurementFire = 0;
     });
     dispatch_resume(_clock);
     dispatch_source_set_timer(_clock, DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 0);
+    if (_measurementTrace) {
+        auto event = [self airMeasurementEvent:spAirMeasurement::Kind::timerPark];
+        event.beginHostTicks = event.endHostTicks = SPHostNow();
+        _measurementTrace->append(event);
+    }
 }
 
 - (void)armClockAt:(int64_t)targetHost {
     [self ensureClock];
+    const int64_t measurementRequestedDue = _measurementTrace ? targetHost : 0;
     int64_t now = SPHostNow();
     if (_haveRifeDeferred && _rifeDeferredRetryHost > now && _inflight < 2 && _rifeDeferredRetryHost < targetHost)
         targetHost = _rifeDeferredRetryHost;
     int64_t delta = targetHost > now ? targetHost - now : 0;
     int64_t ns = SPHostToNs(delta);
     if (ns < 0) ns = 0;
-    dispatch_source_set_timer(_clock, dispatch_time(DISPATCH_TIME_NOW, ns), DISPATCH_TIME_FOREVER, 400 * NSEC_PER_USEC);
+    spAirMeasurement::Event measurement;
+    if (_measurementTrace) {
+        measurement = [self airMeasurementEvent:spAirMeasurement::Kind::timerArm];
+        measurement.relatedID = _measurementArm; _measurementArm = _measurementTrace->identity(); measurement.armID = _measurementArm;
+        measurement.sampleHostTicks = now; measurement.values[0] = measurementRequestedDue;
+        measurement.values[1] = targetHost; measurement.values[2] = ns; measurement.beginHostTicks = SPHostNow();
+    }
+    const dispatch_time_t measurementDeadline = dispatch_time(DISPATCH_TIME_NOW, ns);
+    dispatch_source_set_timer(_clock, measurementDeadline, DISPATCH_TIME_FOREVER, 400 * NSEC_PER_USEC);
+    if (_measurementTrace) { measurement.endHostTicks = SPHostNow(); measurement.values[3] = measurementDeadline; _measurementTrace->append(measurement); }
 }
 
 - (double)outputFramesPerSecond {
@@ -7335,6 +7547,11 @@ presentationHost:(int64_t)presentationHost
 
 - (void)drainDue {
     int64_t now = SPHostNow();
+    uint64_t measurementDrainID = 0;
+    if (_measurementTrace) { auto event = [self airMeasurementEvent:spAirMeasurement::Kind::drainEntry];
+        event.beginHostTicks = event.endHostTicks = event.sampleHostTicks = now;
+        event.groupID = _measurementTrace->identity(); measurementDrainID = event.groupID; event.relatedID = _measurementFire;
+        event.values[0] = _slots.size(); event.values[1] = _pending.size(); _measurementTrace->append(event); }
     [self expireDeferredRifeAt:now];
     if (_haveRifeDeferred && _rifeDeferredRetryHost > 0 && _rifeDeferredRetryHost <= now) [self resumeDeferredRife];
     int64_t slop = SPRationalToHost(sp::spMake(1, 1000));
@@ -7382,6 +7599,16 @@ presentationHost:(int64_t)presentationHost
             _marks.erase(slot.frameID);
             SPReleaseSlot(slot);
             continue;
+        }
+        if (_measurementTrace) {
+            auto event = [self airMeasurementEvent:spAirMeasurement::Kind::drainEntry];
+            event.beginHostTicks = event.endHostTicks = SPHostNow(); event.relatedID = measurementDrainID;
+            event.frameID = slot.frameID; event.generation = slot.sourceGeneration; event.config = slot.configVersion;
+            event.epoch = slot.measurementEpoch; event.clock = slot.clockEpoch; event.ptsNum = slot.pts.num;
+            event.ptsDen = slot.pts.den; event.targetHostTicks = slot.targetHost; event.sampleHostTicks = slot.readyHost;
+            event.flags = (slot.synthetic ? 1u : 0u) | 8u | 256u;
+            event.values[0] = observedLeadNs; event.values[1] = prepareLead; event.values[2] = _measurementFire;
+            _measurementTrace->append(event);
         }
         [self showPair:slot.enhanced original:slot.original pts:slot.pts synthetic:slot.synthetic
            captureHost:slot.captureHost geometryHost:slot.geometryHost frameID:slot.frameID
@@ -7476,6 +7703,8 @@ presentationHost:(int64_t)presentationHost
     slot.original = original ?: CVPixelBufferRetain(enhanced);
     slot.frameID = ++_nextFrameID;
     slot.readyHost = SPHostNow();
+    if (_measurementTrace && !synthetic) [self airMeasurementTarget:pts target:slot.targetHost frame:slot.frameID
+        job:jobID phase:0 synthetic:NO computed:![self requestUsesLatestPresentation:_request] && deadlineHost <= 0];
     slot.sourceGeneration = generation;
     slot.configVersion = _configVersion;
     slot.captureHost = captureHost;
@@ -7515,7 +7744,17 @@ presentationHost:(int64_t)presentationHost
             return;
         }
     }
+    const uint64_t measurementInsertBegin = _measurementTrace ? SPHostNow() : 0;
     _slots.insert(at, slot);
+    if (_measurementTrace) {
+        spAirMeasurement::Event event; event.kind = spAirMeasurement::Kind::slotInsert;
+        event.beginHostTicks = measurementInsertBegin; event.endHostTicks = SPHostNow();
+        event.frameID = slot.frameID; event.relatedID = slot.jobID; event.generation = slot.sourceGeneration;
+        event.config = slot.configVersion; event.epoch = slot.measurementEpoch; event.clock = slot.clockEpoch;
+        event.ptsNum = slot.pts.num; event.ptsDen = slot.pts.den; event.targetHostTicks = slot.targetHost;
+        event.flags = (slot.synthetic ? 1u : 0u) | 8u; event.sampleHostTicks = slot.readyHost;
+        event.values[0] = _slots.size() - 1; event.values[1] = _slots.size(); _measurementTrace->append(event);
+    }
     if (_testRecordSRInput) {
         BOOL shape = CVPixelBufferGetWidth(slot.enhanced) == 1920 && CVPixelBufferGetHeight(slot.enhanced) == 1080 && CVPixelBufferGetPixelFormatType(slot.enhanced) == kCVPixelFormatType_32BGRA;
         if (slot.sourceGeneration == 1 && !slot.synthetic && sp::spCmp(slot.pts, sp::spMake(10,1)) == 0 && shape) {
@@ -8020,6 +8259,8 @@ presentationHost:(int64_t)presentationHost
         job->phase[i] = events[(size_t)i].phase;
         job->pairClock[i] = pairClock[i];
         job->targetHost[i] = frozenDeadline > 0 && i == 0 ? frozenDeadline : (pairAffine ? pairClock[i].selectedTargetHost : [self targetHostForPTS:job->pts[i]]);
+        if (_measurementTrace) [self airMeasurementTarget:job->pts[i] target:job->targetHost[i] frame:0
+            job:job->diagnosticID phase:i synthetic:YES computed:!(frozenDeadline > 0 && i == 0) && !pairAffine];
     }
     job->frameA = events.front().frameA;
     job->frameB = events.front().frameB;

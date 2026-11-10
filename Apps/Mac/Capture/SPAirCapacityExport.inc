@@ -71,6 +71,133 @@ static bool SPAirReserveSnapshotPayload(SPAirRetainedPayloadBudget *budget, uint
     return true;
 }
 
+static NSDictionary *SPAirMeasurementRow(const spAirMeasurement::Event &event) {
+    using K = spAirMeasurement::Kind;
+    NSMutableDictionary *row = [@{
+        @"sequence":@(event.sequence), @"kind":@(spAirMeasurement::name(event.kind)),
+        @"beginHostTicks":@(event.beginHostTicks), @"endHostTicks":@(event.endHostTicks), @"recordHostTicks":@(event.recordHostTicks),
+        @"frameID":event.frameID ? @(event.frameID) : (id)NSNull.null,
+        @"generation":@(event.generation), @"configVersion":@(event.config), @"measurementEpoch":@(event.epoch), @"clockEpoch":@(event.clock),
+        @"ptsNum":event.ptsDen ? @(event.ptsNum) : (id)NSNull.null, @"ptsDen":event.ptsDen ? @(event.ptsDen) : (id)NSNull.null,
+        @"targetHostTicks":event.frameID || event.kind == K::targetCreated ? @(event.targetHostTicks) : (id)NSNull.null,
+        @"synthetic":(event.flags & 8) ? @((event.flags & 1) != 0) : (id)NSNull.null,
+        @"sampleHostTicks":event.sampleHostTicks ? @(event.sampleHostTicks) : (id)NSNull.null
+    } mutableCopy];
+    switch (event.kind) {
+        case K::slotInsert:
+            row[@"jobID"] = event.relatedID ? @(event.relatedID) : (id)NSNull.null;
+            row[@"readyMarkerBeforeInsertHostTicks"] = @(event.sampleHostTicks);
+            row[@"queueSizeBefore"] = @(event.values[0]); row[@"queueSizeAfterInsert"] = @(event.values[1]);
+            row[@"insertInstantHostTicks"] = NSNull.null;
+            break;
+        case K::timerArm:
+            row[@"requestedDueHostTicks"] = @(event.values[0]); row[@"effectiveDueHostTicks"] = @(event.values[1]);
+            row[@"delayNanoseconds"] = @(event.values[2]); row[@"dispatchDeadlineToken"] = @(event.values[3]);
+            row[@"previousArmID"] = event.relatedID ? @(event.relatedID) : (id)NSNull.null;
+            break;
+        case K::timerFire:
+            row[@"fireID"] = @(event.groupID); row[@"latestClockLifetimeAtEntry"] = @(event.values[0]);
+            row[@"expirationCountKnown"] = @((event.flags & 16) != 0);
+            row[@"expirationCount"] = (event.flags & 16) ? @(event.values[1]) : (id)NSNull.null;
+            row[@"causalArmID"] = NSNull.null;
+            row[@"armAssociation"] = @"latest-arm-observed-at-entry; actual-triggering-arm-unknown";
+            break;
+        case K::drainEntry:
+            if (event.flags & 256) {
+                row[@"kind"] = @"handoff"; row[@"drainID"] = @(event.relatedID);
+                row[@"observedPreparationLeadNs"] = @(event.values[0]); row[@"actualPrepareLeadHostTicks"] = @(event.values[1]);
+                row[@"enclosingTimerFireID"] = event.values[2] ? @(event.values[2]) : (id)NSNull.null;
+            } else {
+                row[@"drainID"] = @(event.groupID); row[@"enclosingTimerFireID"] = event.relatedID ? @(event.relatedID) : (id)NSNull.null;
+                row[@"queueSize"] = @(event.values[0]); row[@"pendingPhaseCount"] = @(event.values[1]);
+            }
+            break;
+        case K::choiceBegin: case K::choiceCandidate: case K::choiceEnd:
+            row[@"choiceGroupID"] = @(event.groupID); row[@"slotToken"] = @(event.relatedID);
+            if (event.kind == K::choiceCandidate) {
+                row[@"candidateIndex"] = @(event.values[0]);
+                row[@"choiceOutcome"] = event.values[1] == 1 ? @"selected" : (event.values[1] == 2 ? @"superseded" : @"retained-future");
+            } else {
+                row[@"candidateCount"] = @(event.values[0]); row[@"displayTimeMediaNs"] = @(event.values[1]);
+                row[@"deadlineMediaNs"] = @(event.values[2]);
+                if (event.kind == K::choiceEnd) row[@"selectedIndex"] = event.frameID ? @(event.values[3]) : (id)NSNull.null;
+            }
+            break;
+        case K::leaseRequest:
+            row[@"accepted"] = @(event.values[0] != 0); row[@"outstandingAfterAdmission"] = @(event.values[1]); break;
+        case K::leaseClaim:
+            row[@"reason"] = SPPreparedTextureReasonName((int)event.values[0]); row[@"hit"] = @(event.values[1] != 0); break;
+        case K::leaseMap:
+            row[@"mapSucceeded"] = @(event.values[0] != 0); break;
+        case K::leaseReady:
+            row[@"readyPublicationSucceeded"] = @(event.values[0] != 0); row[@"phaseObservedAfterPublication"] = @(event.values[1]); break;
+        case K::leaseCancel:
+            row[@"phaseBeforeCancel"] = @(event.values[0]); break;
+        case K::leaseRelease:
+            row[@"outstandingBeforeDecrement"] = @(event.values[0]); row[@"outstandingAfterDecrement"] = @(event.values[1]);
+            row[@"phaseObservedAtRelease"] = @(event.values[2]); break;
+        case K::inlineMap:
+            row[@"preparedFallbackReason"] = SPPreparedTextureReasonName((int)event.values[0]);
+            row[@"primaryCVReferenceCreated"] = @(event.values[1] != 0); row[@"compareIncludesSecondary"] = @(event.values[2] != 0);
+            row[@"exactCVAPIBracket"] = @(event.values[3] != 0); break;
+        case K::targetCreated:
+            [row removeObjectForKey:@"sampleHostTicks"];
+            row[@"jobID"] = event.relatedID ? @(event.relatedID) : (id)NSNull.null;
+            row[@"phaseIndex"] = @(event.groupID); row[@"basisKnown"] = @((event.flags & 16) != 0);
+            row[@"delayHostTicksUsed"] = (event.flags & 16) ? @((int64_t)event.values[0]) : (id)NSNull.null;
+            row[@"anchorHostTicks"] = (event.flags & 16) ? @(event.values[1]) : (id)NSNull.null;
+            row[@"anchorPTSNum"] = (event.flags & 16) ? @((int64_t)event.values[2]) : (id)NSNull.null;
+            row[@"anchorPTSDen"] = (event.flags & 16) ? @((int64_t)event.values[3]) : (id)NSNull.null;
+            row[@"sourceIntervalHostTicksAtTargetCreation"] = (event.flags & 64) ? @(event.sampleHostTicks) : (id)NSNull.null;
+            row[@"trueSourceIntervalRequested"] = @((event.flags & 128) != 0);
+            row[@"basisScope"] = @"D/anchor read at actual affine target construction on the serial processor queue. Frozen/pair-affine/latest/no-anchor targets have unknown basis. Interval is the source estimate observed at this construction, not an invented input to an earlier D recompute.";
+            break;
+        case K::gpuCallback: {
+            row[@"commandBufferStatus"] = @(event.values[0]);
+            const bool valid = event.values[0] == MTLCommandBufferStatusCompleted && std::isfinite(event.gpuStartSeconds) &&
+                std::isfinite(event.gpuEndSeconds) && event.gpuStartSeconds > 0 && event.gpuEndSeconds >= event.gpuStartSeconds;
+            row[@"GPUStartSeconds"] = valid ? @(event.gpuStartSeconds) : (id)NSNull.null;
+            row[@"GPUEndSeconds"] = valid ? @(event.gpuEndSeconds) : (id)NSNull.null;
+            break;
+        }
+        default: break;
+    }
+    if (event.kind >= K::leaseRequest && event.kind <= K::gpuCallback)
+        row[@"leaseID"] = event.groupID ? @(event.groupID) : (id)NSNull.null;
+    if (event.kind >= K::timerCreate && event.kind <= K::drainEntry) {
+        row[@"clockLifetimeID"] = @(event.clockLifeID);
+        row[@"latestArmIDObserved"] = event.armID ? @(event.armID) : (id)NSNull.null;
+    }
+    return row;
+}
+
+static SPAirCapacityRingMark SPAirMeasurementMark(const spAirMeasurement::TracePtr &trace, uint64_t cutoff,
+    std::vector<spAirMeasurement::Event> &rows) {
+    auto value = trace ? trace->snapshot() : spAirMeasurement::Snapshot{};
+    rows = std::move(value.rows);
+    auto mark = SPAirMarkRows(rows, value.total, trace ? trace->capacity() : 0, cutoff,
+        [](const auto &row) { return row.recordHostTicks; });
+    SPAirMarkRecordingState(mark, value.sealed, value.sealedHostTicks, value.postSealAttempts);
+    NSMutableDictionary *metadata = [mark.metadata mutableCopy];
+    metadata[@"enabled"] = @(trace != nullptr); metadata[@"recordingSchema"] = @"odf-air-measurement-events-v1";
+    metadata[@"recordBytes"] = @(sizeof(spAirMeasurement::Event));
+    metadata[@"completeRetainedPrefix"] = @(value.total <= mark.capacity);
+    uint64_t accepted = 0, released = 0;
+    for (const auto &row : rows) {
+        if (row.kind == spAirMeasurement::Kind::leaseRequest && row.values[0]) ++accepted;
+        if (row.kind == spAirMeasurement::Kind::leaseRelease) ++released;
+    }
+    metadata[@"recordedAcceptedLeaseRequests"] = @(accepted); metadata[@"recordedLeaseReleases"] = @(released);
+    const bool pendingKnown = value.total <= mark.capacity && accepted >= released;
+    metadata[@"pendingRecordedLeases"] = pendingKnown ? @(accepted - released) : (id)NSNull.null;
+    metadata[@"lifecycleClosed"] = @(value.sealed && value.postSealAttempts == 0 && pendingKnown && accepted == released);
+    metadata[@"incomplete"] = @(value.total > mark.capacity || (value.sealed && (!pendingKnown || accepted != released || value.postSealAttempts)));
+
+    metadata[@"scope"] = @"Immutable CPU observations. Intervals preserve both bounds. recordHostTicks is appended under the logger's own lock and defines cutoff inclusion. timer fire reports the captured clock lifetime and latest arm at entry; its actual triggering arm is unknown. GPU seconds are raw Metal clock endpoints, CPU callback arrival and actual lease release are separate. Capacity overflow is incomplete and never changes processing.";
+    mark.metadata = metadata;
+    return mark;
+}
+
 static SPAirFusedRenderPtr SPAirFreezeFusedRecord(const SPAirFusedRenderPtr &source) {
     auto result = std::make_shared<SPAirFusedRenderRecord>();
 #define SP_AIR_COPY(field) result->field = source->field
@@ -113,7 +240,7 @@ static void SPAirApplyFusedTerminal(const SPAirFusedRenderPtr &record, const SPA
 @interface SPAirCapacityViewMark : NSObject {
 @public
     __strong SPLivePreviewView *owner;
-    SPAirCapacityRingMark frames, callbacks, consumes, fused;
+    SPAirCapacityRingMark frames, callbacks, consumes, fused, measurement;
     SPAirSlotSnapshot slotSnapshot;
     BOOL callbackSafe;
     uint64_t unsupported;
@@ -124,6 +251,7 @@ static void SPAirApplyFusedTerminal(const SPAirFusedRenderPtr &record, const SPA
     std::vector<SPAirSlotCallbackEvent> frozenCallbacks;
     std::vector<SPAirSlotConsumeEvent> frozenConsumes;
     std::vector<SPAirFusedRenderPtr> frozenFused;
+    std::vector<spAirMeasurement::Event> frozenMeasurement;
     __strong SPAirRetainedPayloadBudget *payloadBudget;
     uint64_t ownedPayloadBytes;
 }
@@ -134,6 +262,7 @@ static void SPAirApplyFusedTerminal(const SPAirFusedRenderPtr &record, const SPA
     std::vector<SPAirSlotCallbackEvent>().swap(frozenCallbacks);
     std::vector<SPAirSlotConsumeEvent>().swap(frozenConsumes);
     std::vector<SPAirFusedRenderPtr>().swap(frozenFused);
+    std::vector<spAirMeasurement::Event>().swap(frozenMeasurement);
     std::map<uint64_t, SPAirSlotConsumeEvent>().swap(pendingConsumes);
     std::map<uint64_t, SPAirFrozenFusedTerminal>().swap(pendingFused);
     [payloadBudget releaseBytes:ownedPayloadBytes];
@@ -143,7 +272,7 @@ static void SPAirApplyFusedTerminal(const SPAirFusedRenderPtr &record, const SPA
 @interface SPAirCapacityCheckpoint : NSObject {
 @public
     uint64_t cutoff;
-    SPAirCapacityRingMark callbacks, budget, delay, currentStats;
+    SPAirCapacityRingMark callbacks, budget, delay, currentStats, measurement;
     __strong SPAirCapacityViewMark *preview, *output;
     __strong SPRifeBridge *serviceOwner;
     __strong NSObject *serviceMark;
@@ -153,6 +282,7 @@ static void SPAirApplyFusedTerminal(const SPAirFusedRenderPtr &record, const SPA
     std::vector<SPAirBudgetEvent> frozenBudget;
     std::vector<SPAirDelayAlignmentEvent> frozenDelay;
     std::vector<SPAirCurrentStatsEvent> frozenCurrentStats;
+    std::vector<spAirMeasurement::Event> frozenMeasurement;
     __strong SPAirRetainedPayloadBudget *payloadBudget;
     uint64_t ownedPayloadBytes;
 }
@@ -163,6 +293,7 @@ static void SPAirApplyFusedTerminal(const SPAirFusedRenderPtr &record, const SPA
     std::vector<SPAirBudgetEvent>().swap(frozenBudget);
     std::vector<SPAirDelayAlignmentEvent>().swap(frozenDelay);
     std::vector<SPAirCurrentStatsEvent>().swap(frozenCurrentStats);
+    std::vector<spAirMeasurement::Event>().swap(frozenMeasurement);
     [payloadBudget releaseBytes:ownedPayloadBytes];
 }
 @end
@@ -180,12 +311,17 @@ static void SPAirApplyFusedTerminal(const SPAirFusedRenderPtr &record, const SPA
 - (void)copyAirCapacitySlotCallbacks:(std::vector<SPAirSlotCallbackEvent> &)rows;
 - (void)copyAirCapacityConsumes:(std::vector<SPAirSlotConsumeEvent> &)rows;
 - (void)copyAirCapacityFused:(std::vector<SPAirFusedRenderPtr> &)rows;
+- (void)copyAirMeasurementRows:(std::vector<spAirMeasurement::Event> &)rows;
 @end
 
 @implementation SPLivePreviewView (SPAirCapacityPrivate)
+- (void)copyAirMeasurementRows:(std::vector<spAirMeasurement::Event> &)rows {
+    if (_measurementTrace) rows = _measurementTrace->snapshot().rows;
+}
 - (void)sealAirCapacityCollectors {
     uint64_t unsealed = 0;
     _airCapacityViewSealedHostTicks.compare_exchange_strong(unsealed, SPHostNow());
+    if (_measurementTrace) _measurementTrace->seal();
     {
         std::lock_guard<std::mutex> lock(_presentationMutex);
         if (_airCadenceFrames) _airCadenceFrames->sealed = true;
@@ -297,6 +433,12 @@ static void SPAirApplyFusedTerminal(const SPAirFusedRenderPtr &record, const SPA
             [](const auto &row) { return row.host; });
         SPAirMarkRecordingState(mark->fused, _airFusedTraceSealed, _airCapacityViewSealedHostTicks.load(), _airFusedPostSealAttempts);
     }
+    {
+        std::vector<spAirMeasurement::Event> rows;
+        mark->measurement = SPAirMeasurementMark(_measurementTrace, cutoff, rows);
+        if (freeze && !SPAirReserveSnapshotPayload(budget, rows.size() * sizeof(spAirMeasurement::Event), mark->ownedPayloadBytes)) return nil;
+        if (freeze) mark->frozenMeasurement = std::move(rows);
+    }
     NSMutableDictionary *fused = [[self fusedRifePresentationSnapshotIncludeRecords:NO cutoffHostTicks:cutoff] mutableCopy];
     [fused addEntriesFromDictionary:mark->fused.metadata]; fused[@"includeRecords"] = @YES;
     mark->fusedSummary = fused;
@@ -331,6 +473,7 @@ static void SPAirApplyFusedTerminal(const SPAirFusedRenderPtr &record, const SPA
 - (void)resetAirCapacityCollectorsOnQueue:(dispatch_queue_t)queue completion:(dispatch_block_t)completion {
     NSAssert(NSThread.isMainThread, @"Callback reset requires its actual main owner");
     _airCapacityViewSealedHostTicks.store(0);
+    if (_measurementTrace) _measurementTrace->reset();
     if (_airSlotCallbacks) { _airSlotCallbacks->total = 0; _airSlotCallbacks->postSealAttempts = 0; _airSlotCallbacks->sealed = false; }
     _airSlotCallbackUnsupported.store(0);
     dispatch_async(_renderQueue, ^{
@@ -474,6 +617,7 @@ static NSDictionary *SPAirCapacityViewSlots(SPAirCapacityViewMark *mark) {
         if (self->_airCadenceBudget) { self->_airCadenceBudget->total = 0; self->_airCadenceBudget->postSealAttempts = 0; self->_airCadenceBudget->sealed = false; }
         if (self->_airDelayAlignmentEvents) { self->_airDelayAlignmentEvents->total = 0; self->_airDelayAlignmentEvents->postSealAttempts = 0; self->_airDelayAlignmentEvents->sealed = false; }
         if (self->_airCurrentStatsCalls) { self->_airCurrentStatsCalls->total = 0; self->_airCurrentStatsCalls->postSealAttempts = 0; self->_airCurrentStatsCalls->sealed = false; }
+        if (self->_measurementTrace) self->_measurementTrace->reset();
         [self->_rife setKeeperSessionJournal:journal];
         dispatch_async(dispatch_get_main_queue(), ^{
             dispatch_group_t resets = dispatch_group_create();
@@ -531,6 +675,7 @@ static NSDictionary *SPAirCapacityViewSlots(SPAirCapacityViewMark *mark) {
             if (!self->_airCapacitySealedHostTicks) {
                 if (self->_airCadenceCallbacks) self->_airCadenceCallbacks->sealed = true;
                 if (self->_airCurrentStatsCalls) self->_airCurrentStatsCalls->sealed = true;
+            if (self->_measurementTrace) self->_measurementTrace->seal();
                 if (self->_airCadenceBudget) self->_airCadenceBudget->sealed = true;
                 if (self->_airDelayAlignmentEvents) self->_airDelayAlignmentEvents->sealed = true;
                 [self->_rife sealServiceTraceForDiagnostics];
@@ -657,6 +802,12 @@ static NSDictionary *SPAirCapacityViewSlots(SPAirCapacityViewMark *mark) {
             mark->currentStats.metadata = metadata;
             if (freeze) mark->frozenCurrentStats = std::move(rows);
         }
+        {
+            std::vector<spAirMeasurement::Event> rows;
+            mark->measurement = SPAirMeasurementMark(self->_measurementTrace, mark->cutoff, rows);
+            if (freeze && !SPAirReserveSnapshotPayload(budget, rows.size() * sizeof(spAirMeasurement::Event), mark->ownedPayloadBytes)) { mark = nil; return; }
+            if (freeze) mark->frozenMeasurement = std::move(rows);
+        }
         uint64_t overflow = 0;
         for (NSDictionary *item in @[mark->preview->frames.metadata, mark->output->frames.metadata, mark->callbacks.metadata,
             mark->budget.metadata, mark->delay.metadata, mark->preview->callbacks.metadata, mark->output->callbacks.metadata,
@@ -689,6 +840,9 @@ static NSDictionary *SPAirCapacityViewSlots(SPAirCapacityViewMark *mark) {
             @"endpoint":event.output ? @"output" : @"preview", @"visible":@(event.visible), @"held":@(event.held), @"originalSynthetic":@(event.originalSynthetic)}];
         root[@"eventsInCallbackOrder"] = rollingEvents;
         root[@"airCurrentStatsTrace"] = mark->currentStats.metadata;
+        root[@"airMeasurementTrace"] = @{@"schema":@"odf-air-measurement-events-v1", @"enabled":@(self->_measurementTrace != nullptr),
+            @"incomplete":@([mark->measurement.metadata[@"incomplete"] boolValue] || [mark->preview->measurement.metadata[@"incomplete"] boolValue] || [mark->output->measurement.metadata[@"incomplete"] boolValue]),
+            @"processor":mark->measurement.metadata, @"preview":mark->preview->measurement.metadata, @"output":mark->output->measurement.metadata};
         SPRifeBridge *service = self->_rife ?: self->_airResidentRetiredBridge;
         if (service.serviceTraceEnabled) {
             if (session) mark->serviceMark = [service captureServicePrefixForSessionAtCutoffHostTicks:mark->cutoff budget:budget];
@@ -724,6 +878,7 @@ static NSDictionary *SPAirCapacityViewSlots(SPAirCapacityViewMark *mark) {
             [self.preview sealAirCapacityCollectors]; [self.outputPreview sealAirCapacityCollectors];
             if (self->_airCadenceCallbacks) self->_airCadenceCallbacks->sealed = true;
             if (self->_airCurrentStatsCalls) self->_airCurrentStatsCalls->sealed = true;
+            if (self->_measurementTrace) self->_measurementTrace->seal();
             if (self->_airCadenceBudget) self->_airCadenceBudget->sealed = true;
             if (self->_airDelayAlignmentEvents) self->_airDelayAlignmentEvents->sealed = true;
             SPRifeBridge *bridge = self->_rife ?: self->_airResidentRetiredBridge;
@@ -784,6 +939,16 @@ struct SPAirFrozenFusedRow {
         SPLivePreviewView *owner = output ? last->output->owner : last->preview->owner;
         NSString *endpointName = output ? @"output" : @"preview";
         auto selectView = [=](SPAirCapacityCheckpoint *mark) { return output ? mark->output : mark->preview; };
+        {
+            std::vector<spAirMeasurement::Event> liveRows;
+            if (!last->frozenRows) [owner copyAirMeasurementRows:liveRows];
+            const auto &rows = last->frozenRows ? selectView(last)->frozenMeasurement : liveRows;
+            NSDictionary *file = SPAirWriteCapacityRows(directory, [endpointName stringByAppendingString:@"-measurement"], progress,
+                checkpoints, labels, @[@"airMeasurementTrace", endpointName, @"records"], rows,
+                [=](auto mark) { return selectView(mark)->measurement; }, [](auto, const auto &row) { return row; },
+                [](const auto &row) { return row.recordHostTicks; }, [](const auto &row) { return SPAirMeasurementRow(row); }, error);
+            if (!file) return nil; [files addObject:file];
+        }
         {
             std::vector<SPAirFrameEvent> liveRows;
             if (!last->frozenRows) [owner copyAirCapacityFrames:liveRows];
@@ -897,6 +1062,16 @@ struct SPAirFrozenFusedRow {
             [](auto, const auto &row) { return row; }, [](const auto &row) { return row.endHostTicks; },
             [](const auto &row) { return @{ @"sequence": @(row.sequence), @"beginHostTicks": @(row.beginHostTicks),
                 @"endHostTicks": @(row.endHostTicks), @"threadID": @(row.threadID) }; }, error);
+        if (!file) return nil; [files addObject:file];
+    }
+    {
+        std::vector<spAirMeasurement::Event> liveRows;
+        if (!last->frozenRows && _measurementTrace) liveRows = _measurementTrace->snapshot().rows;
+        const auto &rows = last->frozenRows ? last->frozenMeasurement : liveRows;
+        NSDictionary *file = SPAirWriteCapacityRows(directory, @"processor-measurement", progress,
+            checkpoints, labels, @[@"airMeasurementTrace", @"processor", @"records"], rows,
+            [](auto mark) { return mark->measurement; }, [](auto, const auto &row) { return row; },
+            [](const auto &row) { return row.recordHostTicks; }, [](const auto &row) { return SPAirMeasurementRow(row); }, error);
         if (!file) return nil; [files addObject:file];
     }
     if (!last->session) {
