@@ -6,6 +6,31 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>OpenDuckFrame</title>
         <item>
+            <title>0.3.1</title>
+            <pubDate>Tue, 10 Nov 2026 18:20:03 +0800</pubDate>
+            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
+            <sparkle:version>25</sparkle:version>
+            <sparkle:shortVersionString>0.3.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<meta charset="utf-8">
+<h2>OpenDuckFrame 0.3.1</h2>
+<ul>
+<li>现有 RIFE 4.25、Fast、2 倍补帧配置接入 M3 MacBook Air 的窗口优化。连续缓存开启、关闭超分时自动匹配，无需新增模式开关。</li>
+<li>融合画面转换和缩放、复用 GPU 纹理，并优化源帧间隔估计与呈现时机。插入帧按自适应较低尺寸计算后放大，原始帧保留采集尺寸。</li>
+<li>调整帧的交付提前量和保序显示规则，减少刷新时机抖动造成的丢帧。正常补帧时，部分画面会顺延一个刷新周期，60 Hz 下约为 16.7 毫秒。</li>
+<li>已验证普通 SDR BT.709、60 Hz 输出，窗口采集不超过 2648×1668 像素。超出该路径的格式、刷新率或尺寸时显示原因并保留原帧。</li>
+<li>保留窗口、屏幕、本地文件和画质设置入口，延迟增强默认倒计时调整为 3 秒。</li>
+</ul>
+<h3>English</h3>
+<p>The existing RIFE 4.25 / Fast / X2 live-window configuration now selects the optimized pipeline on M3 MacBook Air with stream caching enabled and scaling disabled. Fused conversion, GPU texture reuse and source-aware presentation timing reduce processing cost. Generated pictures use adaptive lower-resolution inference and reconstruction; original pictures retain capture resolution.</p>
+<p>Earlier frame handoff and bounded, PTS-ordered selection reduce losses caused by presentation phase jitter. During normal interpolation, some pictures can be displayed one refresh later, approximately 16.7 milliseconds at 60 Hz.</p>
+<p>The validated envelope is ordinary SDR BT.709 video, a 60 Hz display and capture buffers up to 2648×1668 pixels. Unsupported inputs in this optimized path pass original pictures through with a visible reason. Window, display, local-file and quality controls remain available. The delayed-enhancement countdown defaults to 3 seconds.</p>
+<p>This community build is ad-hoc signed, supports signed in-app updates, and is not Apple notarized. Requires macOS 14 or later on Apple silicon.</p>
+]]></description>
+            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.3.1/OpenDuckFrame-0.3.1.zip" length="43180426" type="application/octet-stream" sparkle:edSignature="wl+MHkCU4rzLY2JQiLwmQRzhlY1POIdzzyFU7ST5L19Vb74oOaMQ/oAlykue11gR9FEsd9KMF+5UvgrSlRHGAg=="/>
+        </item>
+        <item>
             <title>0.3.0</title>
             <pubDate>Fri, 06 Nov 2026 01:24:14 +0800</pubDate>
             <link>https://github.com/Jun-bao/OpenDuckFrame</link>
@@ -51,31 +76,9 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
 ]]></description>
             <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.2.2/OpenDuckFrame-0.2.2.zip" length="42512653" type="application/octet-stream" sparkle:edSignature="8oR3aguNSdKyCj8FH0kYUc1Eh3pZj0/niR/xh+hLHkv+Kq1v3rKUKHCCaYjcgm8WxybEnIca4GrW1sACdVJfCQ=="/>
         </item>
-        <item>
-            <title>0.2.1</title>
-            <pubDate>Wed, 04 Nov 2026 23:02:27 +0800</pubDate>
-            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
-            <sparkle:version>7</sparkle:version>
-            <sparkle:shortVersionString>0.2.1</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<meta charset="utf-8">
-<h2>OpenDuckFrame 0.2.1</h2>
-<ul>
-<li>默认配置使用“跟随来源”，恢复旧默认配置时也会纠正残留的全屏观看状态。</li>
-<li>修复修改“来源窗口尺寸”时自动切换到“全屏观看”、导致网页鼠标操作被阻挡的问题。</li>
-<li>来源窗口尺寸和超分输出尺寸继续按原规则生效；其他配置中明确保存的观看或交互模式保持原选择。</li>
-</ul>
-<p>使用“跟随来源”时，增强画面与原窗口对齐，可直接操作网页。需要全屏观看时仍可手动选择；全屏观看模式不转发鼠标输入。</p>
-<h3>English</h3>
-<p>The default preset now reopens in Follow source mode, including when an older default configuration retained Fullscreen viewer. Changing the source window size no longer silently selects Fullscreen viewer and blocks webpage clicks. Source resizing and scaler output-size behavior are preserved. Explicit modes in other saved configurations are preserved.</p>
-<p>This community build is ad-hoc signed, supports signed in-app updates, and is not Apple notarized. Requires macOS 14 or later on Apple silicon.</p>
-]]></description>
-            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.2.1/OpenDuckFrame-0.2.1.zip" length="42510545" type="application/octet-stream" sparkle:edSignature="TP4f+LiAqeEjdrDGqX6Nmk4W5wf/i0Ob9H97c3uNPcnLVQgaNZr41kQ7JozYKh/BcGHNAzva8kJWPgktbqBwDQ=="/>
-        </item>
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: TsLfWAUVlWWO72X6deeyoBIfP2vmSEUJAlEow0RCS8UJEpm+FlSc+TbOZYNuUVYe+T6u5McZ7gEoJtTWGE93Bw==
-length: 7264
+edSignature: IJkbKw+t01wrnQIK2RBwTWDDBEER8MtcTfD9Hpqu/BXD0WBQv6y/pzOULfMEOW0z14w0SKppDbq1wMwm0LCzBA==
+length: 8142
 -->
