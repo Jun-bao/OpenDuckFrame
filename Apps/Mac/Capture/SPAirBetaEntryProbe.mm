@@ -398,6 +398,37 @@ struct SPProbeSourceUpdate {
 };
 static_assert(std::is_pod<SPProbeSourceUpdate>::value, "source update records must remain POD");
 
+
+// Same binary64 millisecond arithmetic as the user's HTML slotAt(now).
+static uint64_t SPProbeHTMLSlotAt(double nowMilliseconds, double epochMilliseconds, NSUInteger fps) {
+    return fps == 0 ? 0 : (uint64_t)std::floor(std::max(0.0, nowMilliseconds - epochMilliseconds) * (double)fps / 1000.0 + 0.000001);
+}
+
+struct SPProbeSourceClockCallback {
+    uint64_t sequence, callbackOrdinal, callbackHostTicks, contentIDBefore, contentIDAfter, missedSlots;
+    uint64_t sourceUpdateSequence, updateStartedHostTicks, displayReturnedHostTicks;
+    uint64_t drawStartedHostTicks, drawCompletedHostTicks;
+    double timestampSeconds, targetTimestampSeconds, durationSeconds, callbackMediaSeconds;
+    double updateStartedMediaSeconds, displayReturnedMediaSeconds;
+    bool contentUpdated, drawObserved;
+};
+static_assert(std::is_trivially_copyable<SPProbeSourceClockCallback>::value, "source clock callbacks must remain POD");
+using SPProbeSourceClockRing = std::array<SPProbeSourceClockCallback, 131072>;
+static NSDictionary *SPProbeSourceClockCallbackRow(const SPProbeSourceClockCallback &row) {
+    return @{@"sequence":@(row.sequence), @"callbackOrdinal":@(row.callbackOrdinal), @"callbackHostTicks":@(row.callbackHostTicks),
+        @"timestampSeconds":@(row.timestampSeconds), @"targetTimestampSeconds":@(row.targetTimestampSeconds),
+        @"durationSeconds":@(row.durationSeconds), @"callbackMediaSeconds":@(row.callbackMediaSeconds),
+        @"contentIDBefore":@(row.contentIDBefore), @"contentIDAfter":@(row.contentIDAfter), @"missedSlots":@(row.missedSlots),
+        @"contentUpdated":@(row.contentUpdated), @"drawObserved":@(row.drawObserved),
+        @"sourceUpdateSequence":row.sourceUpdateSequence ? @(row.sourceUpdateSequence) : (id)NSNull.null,
+        @"updateStartedHostTicks":row.contentUpdated ? @(row.updateStartedHostTicks) : (id)NSNull.null,
+        @"displayReturnedHostTicks":row.contentUpdated ? @(row.displayReturnedHostTicks) : (id)NSNull.null,
+        @"updateStartedMediaSeconds":row.contentUpdated ? @(row.updateStartedMediaSeconds) : (id)NSNull.null,
+        @"displayReturnedMediaSeconds":row.contentUpdated ? @(row.displayReturnedMediaSeconds) : (id)NSNull.null,
+        @"drawStartedHostTicks":row.drawObserved ? @(row.drawStartedHostTicks) : (id)NSNull.null,
+        @"drawCompletedHostTicks":row.drawObserved ? @(row.drawCompletedHostTicks) : (id)NSNull.null};
+}
+
 // Finalization only. Keep physical Media bins separate from callback-host bins;
 // neither path assumes that mach and Media absolute origins are equal.
 static NSNumber *SPProbeNumber(id value) { return [value isKindOfClass:NSNumber.class] ? value : nil; }
@@ -765,6 +796,11 @@ static NSDictionary *SPProbeStatsWithBoundary(NSDictionary *stats, NSDictionary 
     SPProbePatternView *_pattern;
     SCStream *_stream;
     NSTimer *_tickTimer, *_monitorTimer;
+    CADisplayLink *_sourceDisplayLink;
+    std::unique_ptr<SPProbeSourceClockRing> _sourceClockCallbacks;
+    SPProbeSourceClockCallback _lastSourceClockCallback;
+    uint64_t _sourceClockCallbackTotal, _sourceClockTraceTotal, _sourceClockStartedHostTicks, _sourceClockInvalidatedHostTicks;
+    double _sourceClockEpochMilliseconds;
     NSMutableArray *_notifications;
     NSMutableDictionary *_report;
     NSMutableArray *_timeline, *_phases;
@@ -812,6 +848,8 @@ static NSDictionary *SPProbeStatsWithBoundary(NSDictionary *stats, NSDictionary 
 - (NSDictionary *)processorStatsCheckpoint;
 - (void)primeStatsCache:(NSString *)reason;
 - (NSDictionary *)measurementReadyProof;
+- (void)sourceDisplayLinkDidFire:(CADisplayLink *)link;
+- (NSDictionary *)sourceClockDriverSnapshot;
 - (void)captureSourceEntryPrefixForMarker:(uint64_t)marker phase:(NSMutableDictionary *)phase begin:(BOOL)begin;
 - (void)finalizeAfterCapture:(BOOL)complete format:(NSDictionary *)captureFormat receipts:(NSDictionary *)captureReceipts;
 @end
@@ -894,6 +932,63 @@ static NSDictionary *SPProbeStatsWithBoundary(NSDictionary *stats, NSDictionary 
     event.drawCallsBefore = drawCalls; event.drawCallsAfter = _pattern.drawCalls; event.lastDrawContentID = _pattern.lastDrawContentID;
     event.lastDrawStartedHostTicks = _pattern.lastDrawStartedHostTicks; event.lastDrawCompletedHostTicks = _pattern.lastDrawCompletedHostTicks;
     event.initialContent = initial; _sourceUpdates[(event.sequence - 1) % _sourceUpdates.size()] = event;
+}
+- (NSDictionary *)sourceClockDriverSnapshot {
+    const BOOL displayLinked = _releaseValidation && ![_arm isEqual:@"bare"];
+    const uint64_t retained = _sourceClockCallbacks ? MIN(_sourceClockTraceTotal, (uint64_t)_sourceClockCallbacks->size()) : 0;
+    return @{@"schema":@"odf-release-source-clock-v1", @"driver":displayLinked ? @"NSView.CADisplayLink" : @"NSTimer",
+        @"timeBase":displayLinked ? @"CADisplayLink.timestamp, Core Animation Media seconds" : @"mach host seconds",
+        @"slotFormula":displayLinked ? @"floor(max(0, timestampSeconds*1000 - epochMilliseconds) * fps / 1000 + 0.000001)" : @"floor((hostSeconds-sourceStart)*fps)",
+        @"epochMilliseconds":displayLinked ? @(_sourceClockEpochMilliseconds) : (id)NSNull.null,
+        @"epochAlignedToVsync":@NO, @"requestedCallbackHz":displayLinked ? @60 : @(_sourceFPS),
+        @"configuredContentFPS":@(_sourceFPS), @"callbackCount":@(_sourceClockCallbackTotal),
+        @"legacyTimerTicksMeaning":@"Actual source-driver invocations; CADisplayLink callbacks for Release, NSTimer callbacks otherwise",
+        @"missedSlots":@(_pattern.skippedSlots), @"physicalPresentationMeasured":@NO,
+        @"startedHostTicks":_sourceClockStartedHostTicks ? @(_sourceClockStartedHostTicks) : (id)NSNull.null,
+        @"invalidatedHostTicks":_sourceClockInvalidatedHostTicks ? @(_sourceClockInvalidatedHostTicks) : (id)NSNull.null,
+        @"lastCallback":_sourceClockCallbackTotal ? SPProbeSourceClockCallbackRow(_lastSourceClockCallback) : (id)NSNull.null,
+        @"callbackTrace":@{@"schema":@"odf-release-source-clock-callbacks-v1", @"enabled":@(_sourceClockCallbacks != nullptr),
+            @"capacity":_sourceClockCallbacks ? @((uint64_t)_sourceClockCallbacks->size()) : @0,
+            @"recordStrideBytes":@(sizeof(SPProbeSourceClockCallback)),
+            @"allocatedPayloadBytes":_sourceClockCallbacks ? @(sizeof(SPProbeSourceClockRing)) : @0,
+            @"total":@(_sourceClockTraceTotal), @"exportedCount":@(retained), @"dropped":@(_sourceClockTraceTotal-retained),
+            @"overflow":@(_sourceClockTraceTotal>retained),
+            @"intentionallyOmittedCallbacks":_sourceClockCallbacks ? @0 : @(_sourceClockCallbackTotal)},
+        @"scope":@"Requested callback rate is best effort. Raw targetTimestamp is a future target, not a physical presentation receipt. Source SCK PTS remains in its original capture ledger. Summary mode keeps counters and the last callback only."};
+}
+- (void)sourceDisplayLinkDidFire:(CADisplayLink *)link {
+    NSAssert(NSThread.isMainThread, @"Source display-link drawing belongs to main");
+    if (_stopping.load() || !_releaseValidation || link != _sourceDisplayLink) return;
+    SPProbeSourceClockCallback event{};
+    event.callbackOrdinal = ++_sourceClockCallbackTotal;
+    event.callbackHostTicks = mach_absolute_time(); event.callbackMediaSeconds = CACurrentMediaTime();
+    event.timestampSeconds = link.timestamp; event.targetTimestampSeconds = link.targetTimestamp; event.durationSeconds = link.duration;
+    SPProbePatternView *pattern = _pattern;
+    pattern.timerTicks++;
+    event.contentIDBefore = pattern.frameNumber;
+    const uint64_t slot = SPProbeHTMLSlotAt(event.timestampSeconds * 1000.0, _sourceClockEpochMilliseconds, _sourceFPS);
+    if (slot != pattern.frameNumber) {
+        if (slot > pattern.frameNumber + 1) pattern.skippedSlots += slot - pattern.frameNumber - 1;
+        event.contentUpdated = true; event.updateStartedHostTicks = mach_absolute_time();
+        event.updateStartedMediaSeconds = CACurrentMediaTime();
+        const uint64_t drawsBefore = pattern.drawCalls;
+        pattern.frameNumber = slot; pattern.contentUpdates++;
+        [pattern setNeedsDisplay:YES]; [pattern display];
+        event.displayReturnedHostTicks = mach_absolute_time(); event.displayReturnedMediaSeconds = CACurrentMediaTime();
+        [self recordSourceUpdateStarted:event.updateStartedHostTicks drawCallsBefore:drawsBefore initial:NO];
+        event.sourceUpdateSequence = _summaryOnly ? 0 : _sourceUpdateTotal;
+        event.drawObserved = pattern.drawCalls > drawsBefore && pattern.lastDrawContentID == slot;
+        if (event.drawObserved) {
+            event.drawStartedHostTicks = pattern.lastDrawStartedHostTicks;
+            event.drawCompletedHostTicks = pattern.lastDrawCompletedHostTicks;
+        }
+    }
+    event.contentIDAfter = pattern.frameNumber; event.missedSlots = pattern.skippedSlots;
+    if (_sourceClockCallbacks) {
+        event.sequence = ++_sourceClockTraceTotal;
+        (*_sourceClockCallbacks)[(event.sequence-1)%_sourceClockCallbacks->size()] = event;
+    }
+    _lastSourceClockCallback = event;
 }
 - (void)recordProgress:(NSString *)stage {
     if (![NSThread isMainThread]) { dispatch_async(dispatch_get_main_queue(), ^{ [self recordProgress:stage]; }); return; }
@@ -1436,9 +1531,16 @@ static NSDictionary *SPProbeStatsWithBoundary(NSDictionary *stats, NSDictionary 
     [_outputWindow orderFront:nil]; [_sourceWindow orderFront:nil];
     [_outputView refreshVisibilitySnapshot];
     _sourceStartHostTicks = mach_absolute_time(); _sourceStart = (double)SPProbeNs(_sourceStartHostTicks) / 1e9;
+    if (_releaseValidation && !bare) _sourceClockEpochMilliseconds = CACurrentMediaTime() * 1000.0;
     const uint64_t initialDrawCalls = _pattern.drawCalls; [_pattern display];
     if (!bare) [self recordSourceUpdateStarted:_sourceStartHostTicks drawCallsBefore:initialDrawCalls initial:YES];
-    if (!bare) {
+    if (_releaseValidation && !bare) {
+        if (!_summaryOnly) _sourceClockCallbacks = std::make_unique<SPProbeSourceClockRing>();
+        _sourceDisplayLink = [_pattern displayLinkWithTarget:self selector:@selector(sourceDisplayLinkDidFire:)];
+        _sourceDisplayLink.preferredFrameRateRange = CAFrameRateRangeMake(60, 60, 60);
+        _sourceClockStartedHostTicks = mach_absolute_time();
+        [_sourceDisplayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    } else if (!bare) {
     _tickTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / _sourceFPS repeats:YES block:^(NSTimer *timer) {
         SPSelfWindowCaptureProbe *strong = weakSelf; if (!strong || strong->_stopping.load()) return;
         SPProbePatternView *pattern = strong->_pattern; pattern.timerTicks++;
@@ -1888,6 +1990,19 @@ static NSDictionary *SPProbeStatsWithBoundary(NSDictionary *stats, NSDictionary 
                 }
             }
         }
+        if (!error && self->_sourceClockCallbacks) {
+            spAirDiagnostic::NDJSONWriter clock(directory, @"source-clock-callbacks", self->_exportProgressPath, &error);
+            if (clock.valid()) {
+                const uint64_t retained = MIN(self->_sourceClockTraceTotal, (uint64_t)self->_sourceClockCallbacks->size());
+                for (uint64_t index=self->_sourceClockTraceTotal-retained; index<self->_sourceClockTraceTotal; ++index) {
+                    @autoreleasepool { if (!clock.append(SPProbeSourceClockCallbackRow((*self->_sourceClockCallbacks)[index%self->_sourceClockCallbacks->size()]), &error)) break; }
+                }
+                if (!error) {
+                    NSDictionary *descriptor = spAirDiagnostic::finishSingleView(clock, @[@"sourceClockDriver", @"callbackTrace", @"records"], &error);
+                    if (descriptor) [files addObject:descriptor];
+                }
+            }
+        }
         if (!error) {
             spAirDiagnostic::NDJSONWriter calls(directory, @"snapshot-calls", self->_exportProgressPath, &error);
             if (calls.valid()) {
@@ -2075,6 +2190,11 @@ static NSDictionary *SPProbeStatsWithBoundary(NSDictionary *stats, NSDictionary 
 - (void)finishAfterQuality:(BOOL)complete {
     if (_stopping.exchange(true)) return;
     [_tickTimer invalidate]; [_monitorTimer invalidate];
+    if (_sourceDisplayLink) {
+        [_sourceDisplayLink invalidate]; _sourceDisplayLink = nil;
+        _sourceClockInvalidatedHostTicks = mach_absolute_time();
+    }
+    if (_releaseValidation) _report[@"sourceClockDriver"] = [self sourceClockDriverSnapshot];
     dispatch_async(_captureQueue, ^{
         const uint64_t began = mach_absolute_time();
         NSDictionary *raw = [self->_bridge snapshotAtHostNs:SPProbeNs(began) generation:1][@"normalCapture"] ?: @{};
