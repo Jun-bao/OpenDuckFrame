@@ -1305,8 +1305,18 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         if SPRifeExperiments.available { useRifeComparisonProfile() }
         applyAirBetaPreset(&profile)
         window.delegate = self
+        let contentHost = NSView(frame: NSRect(origin: .zero, size: window.contentLayoutRect.size))
+        contentHost.autoresizingMask = [.width, .height]
+        window.contentView = contentHost
         let content = build()
-        window.contentView = content
+        content.translatesAutoresizingMaskIntoConstraints = false
+        contentHost.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: contentHost.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: contentHost.trailingAnchor),
+            content.topAnchor.constraint(equalTo: contentHost.topAnchor),
+            content.bottomAnchor.constraint(equalTo: contentHost.bottomAnchor),
+        ])
         installToolbar(on: window)
         window.openSettings = { [weak self] in self?.showSettings() }
         let minimumFrameSize = NSSize(width: 840, height: 620)
