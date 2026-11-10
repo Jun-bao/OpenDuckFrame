@@ -43,7 +43,7 @@ private enum WorkbenchStyle {
         return chinese ? pair.zh : pair.en
     }
     static let budgetWarningText = (zh: "电脑跟不上目标帧率，部分画面会保持原画。可降低倍率或缩小采集窗口。",
-                                    en: "This Mac can't keep up with the target rate, so some frames stay original. Try a lower multiplier or a lighter engine.")
+                                    en: "This Mac can't keep up with the target rate, so some frames stay original. Try a lower multiplier or a smaller capture window.")
     static func runtime(_ value: String) -> String {
         if value == LiveRuntimeStatus.interactiveBudgetWarning || value == budgetWarningText.zh || value == budgetWarningText.en {
             return chinese ? budgetWarningText.zh : budgetWarningText.en
@@ -1472,6 +1472,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     func showFileEnhancement(for player: PlayerViewController) {
         guard player.hasOpenMedia, let path = player.openMediaPath else { return }
         cancelCountdown()
+        inputRouter?.stop(reason: "source_changed")
+        interactionArmed = false
+        capture.stop()
         let url = URL(fileURLWithPath: path)
         if fileURL?.standardizedFileURL != url.standardizedFileURL { fileApplied = nil }
         fileURL = url
