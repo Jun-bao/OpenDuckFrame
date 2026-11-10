@@ -7,8 +7,40 @@ import Darwin
 
 private func spKeeperNowNs() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
 
-private enum SPResidentKeepAliveError: Error {
+private enum SPResidentKeepAliveError: LocalizedError {
     case native(String), calibration(String), cancelled, capacity
+
+    var errorDescription: String? {
+        switch self {
+        case .native(let message), .calibration(let message): return message
+        case .cancelled: return "keeper preparation cancelled"
+        case .capacity: return "keeper diagnostic capacity reached"
+        }
+    }
+}
+
+enum SPResidentKeepAliveMetallib {
+    static let diagnosticSHA256 = "ccea3d2f9675947963f446fb08ad3718164ef7624b4075a280f31edff716d67e"
+
+    static func productionSHA256(bundle: Bundle) throws -> String {
+        guard let url = bundle.url(forResource: "gap-fill", withExtension: "sha256") else {
+            throw SPResidentKeepAliveError.native("keeper bundled metallib SHA256 is missing")
+        }
+        let data = try Data(contentsOf: url)
+        guard data.count == 65, data.last == 10,
+              let expected = String(data: data.dropLast(), encoding: .utf8), isValidSHA256(expected) else {
+            throw SPResidentKeepAliveError.native("keeper bundled metallib SHA256 is invalid")
+        }
+        return expected
+    }
+
+    static func isValidSHA256(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+    }
+
+    static func matches(actual: String, expected: String) -> Bool {
+        isValidSHA256(expected) && actual == expected
+    }
 }
 
 struct SPResidentKeepAliveRecord: Encodable {
@@ -269,7 +301,7 @@ struct SPResidentKeepAliveConfiguration: Encodable {
     let deviceName: String
     let queueLabel = "ODF resident keepalive diagnostic"
     let kernel = "air_gap_fill"
-    let metallibSHA256 = "ccea3d2f9675947963f446fb08ad3718164ef7624b4075a280f31edff716d67e"
+    let metallibSHA256: String
     let startAcknowledgement = "Plan state accepted only; worker ownership handoff and GPU submission are asynchronous"
     let deviceHandoffBudgetMs = 100, drainBudgetMs = 100
     let maximumQueuedCommandBuffers = 2
@@ -288,6 +320,15 @@ struct SPResidentKeepAliveConfiguration: Encodable {
     let cpuClock = "DispatchTime.uptimeNanoseconds, same coordinate as real job wall and phase clocks"
     let gpuTimeScope = "Command-buffer residency seconds; single-SIMD-group ALU duration is a process-internal frequency proxy, not active cycles or direct frequency"
     let phaseAssignment = "Phase captured under state lock at commit; phase marks retain actual CPU boundaries. markPhase never drains or joins the worker."
+
+    init(deviceRegistryID: UInt64, deviceName: String, threadsPerThreadgroup: [Int],
+         threadExecutionWidth: Int, scratchBytes: Int,
+         metallibSHA256: String = SPResidentKeepAliveMetallib.diagnosticSHA256) {
+        self.deviceRegistryID = deviceRegistryID; self.deviceName = deviceName
+        self.threadsPerThreadgroup = threadsPerThreadgroup
+        self.threadExecutionWidth = threadExecutionWidth; self.scratchBytes = scratchBytes
+        self.metallibSHA256 = metallibSHA256
+    }
 }
 
 struct SPResidentKeepAlivePhaseMark: Encodable {
@@ -763,11 +804,14 @@ final class SPResidentKeepAlive {
     // Only calibration, then the keeper worker, accesses this queue of own CBs.
     private var pending: [(buffer: MTLCommandBuffer, record: SPResidentKeepAliveRecord)] = []
 
-    init(device: MTLDevice, libraryURL: URL) throws {
+    init(device: MTLDevice, libraryURL: URL,
+         expectedMetallibSHA256: String = SPResidentKeepAliveMetallib.diagnosticSHA256) throws {
         let digest = SHA256.hash(data: try Data(contentsOf: libraryURL)).map { String(format: "%02x", $0) }.joined()
-        guard digest == "ccea3d2f9675947963f446fb08ad3718164ef7624b4075a280f31edff716d67e",
-              let queue = device.makeCommandQueue(maxCommandBufferCount: 2) else {
-            throw SPResidentKeepAliveError.native("keeper pinned metallib/independent queue unavailable")
+        guard SPResidentKeepAliveMetallib.matches(actual: digest, expected: expectedMetallibSHA256) else {
+            throw SPResidentKeepAliveError.native("keeper metallib SHA256 mismatch")
+        }
+        guard let queue = device.makeCommandQueue(maxCommandBufferCount: 2) else {
+            throw SPResidentKeepAliveError.native("keeper independent queue unavailable")
         }
         let library = try device.makeLibrary(URL: libraryURL)
         guard let function = library.makeFunction(name: "air_gap_fill") else {
@@ -786,7 +830,8 @@ final class SPResidentKeepAlive {
         queue.label = "ODF resident keepalive diagnostic"
         scratch.label = "ODF resident keepalive private tracked scratch"
         report = .init(configuration: .init(deviceRegistryID: device.registryID, deviceName: device.name,
-                       threadsPerThreadgroup: [threads, 1, 1], threadExecutionWidth: threads, scratchBytes: bytes))
+                       threadsPerThreadgroup: [threads, 1, 1], threadExecutionWidth: threads,
+                       scratchBytes: bytes, metallibSHA256: digest))
         pending.reserveCapacity(2)
     }
 

@@ -230,6 +230,7 @@ python3 "$ROOT/Scripts/lib/build_manifest.py" write \
 # Debug/Release host apps are intentionally unsandboxed. Do not pass the main
 # app's sandbox entitlements here; AppStore archives apply them in Xcode and do
 # not contain this bundler's BuildManifest.json.
+python3 "$ROOT/Scripts/verify_public_surface.py" --app "$CLEAN_APP"
 codesign -s "$SP_SIGN_ID" $SP_SIGN_OPTS --force "$CLEAN_APP"
 "$ROOT/Scripts/verify_app_bundle.sh" "$CLEAN_APP"
 

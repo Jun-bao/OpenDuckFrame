@@ -419,7 +419,10 @@ final class SPRifeBridge: NSObject {
                       let library = resourceBundle.url(forResource: "gap-fill", withExtension: "metallib") else {
                     throw Self.error(21, "App keeper requires the frozen EF29/Fast/1814x1142/GPU-IO configuration and metallib")
                 }
-                let keeper = try SPResidentKeepAlive(device: device, libraryURL: library)
+                let expectedMetallibSHA256 = try airPerformanceEnabled
+                    ? SPResidentKeepAliveMetallib.productionSHA256(bundle: resourceBundle) : SPResidentKeepAliveMetallib.diagnosticSHA256
+                let keeper = try SPResidentKeepAlive(device: device, libraryURL: library,
+                                                     expectedMetallibSHA256: expectedMetallibSHA256)
                 candidateKeeper = keeper
                 keeper.setSessionIdentity(deviceRegistryID: device.registryID, modelIdentity: identity)
                 state.lock(); let journal = keeperSessionJournal; state.unlock()

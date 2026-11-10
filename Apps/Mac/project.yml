@@ -171,14 +171,17 @@ targets:
           set -euo pipefail
           AIR="${DERIVED_FILE_DIR}/AirResident.air"
           OUT="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/gap-fill.metallib"
+          HASH="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/gap-fill.sha256"
           mkdir -p "$(dirname "${OUT}")"
           xcrun -sdk macosx metal -c -target "air64-apple-macos${MACOSX_DEPLOYMENT_TARGET}" \
             "${ODF_REPO_ROOT}/Experiments/AirSustainedCost/native/GapFill.metal" -o "${AIR}"
           xcrun -sdk macosx metallib "${AIR}" -o "${OUT}"
+          /usr/bin/shasum -a 256 < "${OUT}" | /usr/bin/awk '{print $1}' > "${HASH}"
         inputFiles:
           - $(ODF_REPO_ROOT)/Experiments/AirSustainedCost/native/GapFill.metal
         outputFiles:
           - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/gap-fill.metallib
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/gap-fill.sha256
         basedOnDependencyAnalysis: true
     info:
       path: Info.plist
