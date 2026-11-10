@@ -7503,7 +7503,8 @@ presentationHost:(int64_t)presentationHost
     // This lead does not change logical targets or due-merge eligibility.
     SPLivePreviewView *timedView = self.outputPreview.windowVisibleSnapshot ? self.outputPreview : self.preview;
     int64_t observedLeadNs = MAX((int64_t)16000000, [timedView presentationPreparationLeadNs]);
-    int64_t prepareLead = [self requestUsesLatestPresentation:_request] ? 0 : SPRationalToHost(sp::spMake(observedLeadNs, 1000000000));
+    int64_t prepareLead = [self requestUsesLatestPresentation:_request] ? 0 :
+        SPRationalToHost(sp::spMake(observedLeadNs + (_airPerformanceEnabled ? 3000000 : 0), 1000000000));
     while (!_slots.empty()) {
         int64_t earliest = 0;
         if ([self waitForPendingBefore:_slots.front().pts now:now earliest:&earliest]) {
