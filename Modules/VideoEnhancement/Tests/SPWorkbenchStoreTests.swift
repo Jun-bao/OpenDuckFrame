@@ -19,9 +19,124 @@ private final class SourceSizeControls {
  }
 }
 
+// Exercise the production action-state logic without creating an app window.
+@MainActor private final class WorkbenchActionControls {
+ final class Button {
+  var isHidden = false
+  var isEnabled = true
+  var title = ""
+  var toolTip: String?
+ }
+ struct Capture {
+  var running = false
+  var target: Int?
+ }
+ struct Plan {
+  var interpolationActive = false
+  var scaleActive = false
+ }
+ struct Processor {
+  var resolvedPlan = Plan()
+ }
+ final class Player {
+  var workbenchMotionPlusRequested = false
+  var workbenchFileLanczosActive = false
+ }
+ var profile = EnhancementProfile()
+ var applied = EnhancementProfile()
+ var capture = Capture()
+ var processor = Processor()
+ var activeSourceKind = ""
+ var filePlayer: Player?
+ var filePreparing = false
+ var hasPendingFormChanges = false
+ var countdown = EnhancementCountdown()
+ var delayedWindowSelection = false
+ var startImmediatelyAfterPreparation = false
+ var startButton: Button? = Button()
+ var stopButton: Button? = Button()
+
+ func selectedFilePlayer() -> Player? { filePlayer }
+ var hasSelectedSource: Bool {
+  // ACTUAL_SELECTED_SOURCE
+ }
+ func refreshActions() {
+  // ACTUAL_WORKBENCH_ACTIONS
+ }
+ func hasChanges(relativeTo baseline: EnhancementProfile) -> Bool {
+  // ACTUAL_FORM_DIFFERENCE
+  return formDiffers
+ }
+}
+
 
 @main struct TestRunner {
  @MainActor static func main() throws {
+  let unselectedWindow = WorkbenchActionControls()
+  unselectedWindow.refreshActions()
+  precondition(unselectedWindow.startButton?.isEnabled == true,
+    "Window countdown must allow automatic source selection before a source is chosen")
+
+  let countdownWindow = WorkbenchActionControls()
+  let countdownTicket = countdownWindow.countdown.begin(seconds: 1)!
+  countdownWindow.delayedWindowSelection = true
+  countdownWindow.refreshActions()
+  precondition(countdownWindow.startButton?.isEnabled == true && countdownWindow.startButton?.title == "Cancel")
+  _ = countdownWindow.countdown.tick(countdownTicket)
+  countdownWindow.refreshActions()
+  precondition(countdownWindow.startButton?.isEnabled == true,
+    "Cancel must remain available while source discovery is pending after zero")
+  countdownWindow.delayedWindowSelection = false
+  countdownWindow.startImmediatelyAfterPreparation = true
+  countdownWindow.refreshActions()
+  precondition(countdownWindow.startButton?.isEnabled == true && countdownWindow.startButton?.title == "Cancel")
+
+  let stoppedDisplay = WorkbenchActionControls()
+  stoppedDisplay.profile.sourceKind = "display"
+  stoppedDisplay.activeSourceKind = "display"
+  stoppedDisplay.capture.target = 1
+  stoppedDisplay.refreshActions()
+  precondition(stoppedDisplay.hasSelectedSource && stoppedDisplay.startButton?.isEnabled == true,
+    "A stopped display with a retained source must remain restartable")
+  stoppedDisplay.capture.target = nil
+  stoppedDisplay.refreshActions()
+  precondition(stoppedDisplay.startButton?.isEnabled == false)
+
+  let activeWindow = WorkbenchActionControls()
+  activeWindow.activeSourceKind = "window"
+  activeWindow.capture.target = 1
+  activeWindow.capture.running = true
+  activeWindow.processor.resolvedPlan.interpolationActive = true
+  activeWindow.refreshActions()
+  precondition(activeWindow.startButton?.isHidden == true && activeWindow.stopButton?.isHidden == false)
+  activeWindow.hasPendingFormChanges = true
+  activeWindow.refreshActions()
+  precondition(activeWindow.startButton?.isHidden == false && activeWindow.stopButton?.isHidden == false)
+
+  let preparingFile = WorkbenchActionControls()
+  preparingFile.profile.sourceKind = "file"
+  preparingFile.filePlayer = WorkbenchActionControls.Player()
+  preparingFile.filePreparing = true
+  preparingFile.refreshActions()
+  precondition(preparingFile.startButton?.isEnabled == false && preparingFile.stopButton?.isHidden == false)
+
+  for sourceKind in ["display", "file"] {
+   let outputChanges = WorkbenchActionControls()
+   var baseline = EnhancementProfile()
+   baseline.sourceKind = sourceKind
+   outputChanges.profile = baseline
+   outputChanges.profile.outputDisplayID = 9
+   precondition(outputChanges.hasChanges(relativeTo: baseline), "Output display changes must expose Apply")
+   outputChanges.profile = baseline
+   outputChanges.profile.outputFullscreen = true
+   precondition(outputChanges.hasChanges(relativeTo: baseline), "Fullscreen changes must expose Apply")
+  }
+  let followingWindow = WorkbenchActionControls()
+  followingWindow.profile.outputDisplayID = 9
+  followingWindow.profile.outputFullscreen = true
+  precondition(!followingWindow.hasChanges(relativeTo: EnhancementProfile()),
+    "Follow-window mode does not apply separate output-screen or fullscreen settings")
+
   do {
    let controls = SourceSizeControls()
    controls.profile.sourceWindowPreset = 480
@@ -463,6 +578,6 @@ private final class SourceSizeControls {
   _ = EnhancementText.t("Technology Library","技术库")
   precondition(EnhancementText.translated("技术库",chinese:false)=="Technology Library")
   precondition(EnhancementText.translated("用户来源",chinese:false)=="用户来源")
-  print("{\"ok\":true,\"legacyCollisionPreserved\":true,\"presetSeparate\":true,\"editReadback\":true,\"renameAndRestoreMetadata\":true,\"countdownCancelAndIdempotence\":true,\"fpsPreference\":true,\"browserMetadataSelection\":true,\"onscreenOrderUsed\":true,\"competingNormalWindowHidden\":true,\"auxiliaryAndNonzeroTarget\":true,\"offscreenAndOtherOwner\":true,\"nameValidation\":true,\"isolatedLanguagePreferences\":true,\"fileVideoSRCombinationReadback\":true,\"videoSRLiveFactorBoundary\":true,\"r7RecoveryLifecycle\":true,\"scope\":\"isolated store/timer/CG metadata/preferences contract; no GUI or live user config\"}")
+  print("{\"ok\":true,\"legacyCollisionPreserved\":true,\"presetSeparate\":true,\"editReadback\":true,\"renameAndRestoreMetadata\":true,\"countdownCancelAndIdempotence\":true,\"fpsPreference\":true,\"browserMetadataSelection\":true,\"onscreenOrderUsed\":true,\"competingNormalWindowHidden\":true,\"auxiliaryAndNonzeroTarget\":true,\"offscreenAndOtherOwner\":true,\"nameValidation\":true,\"isolatedLanguagePreferences\":true,\"fileVideoSRCombinationReadback\":true,\"videoSRLiveFactorBoundary\":true,\"r7RecoveryLifecycle\":true,\"workbenchActionStates\":true,\"displayOutputPending\":true,\"scope\":\"isolated store/timer/CG metadata/preferences/actions contract; no GUI or live user config\"}")
  }
 }

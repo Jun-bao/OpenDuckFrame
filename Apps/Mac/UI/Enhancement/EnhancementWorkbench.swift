@@ -1704,7 +1704,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private var hasSelectedSource: Bool {
         if profile.sourceKind == "file" { return selectedFilePlayer() != nil }
-        return capture.running && activeSourceKind == profile.sourceKind
+        return activeSourceKind == profile.sourceKind && capture.target != nil
     }
 
     private func updateSourceChrome(hasSource: Bool) {
@@ -2882,8 +2882,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             (capture.running && (processor.resolvedPlan.interpolationActive || processor.resolvedPlan.scaleActive || (applied.sourceKind == "window" && applied.windowOutputMode != "follow")))
         startButton?.isHidden = enhancing && !hasPendingFormChanges && !countdown.active
             && !delayedWindowSelection && !startImmediatelyAfterPreparation
-        startButton?.isEnabled = hasSelectedSource && !filePreparing
-        startButton?.toolTip = hasSelectedSource ? nil : EnhancementText.t("Choose a source first", "请先选择来源")
+        let canCancel = countdown.active || delayedWindowSelection || startImmediatelyAfterPreparation
+        let canStart = (profile.sourceKind == "window" || hasSelectedSource) && !filePreparing
+        startButton?.isEnabled = canCancel || canStart
+        startButton?.toolTip = canCancel || canStart ? nil : EnhancementText.t("Choose a source first", "请先选择来源")
         if delayedWindowSelection || startImmediatelyAfterPreparation {
             startButton?.title = EnhancementText.t("Cancel", "取消")
         } else if profile.sourceKind == "window" {
@@ -5059,7 +5061,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             || profile.sourceWindowPreset != baseline.sourceWindowPreset
             || profile.outputWidth != baseline.outputWidth
             || profile.outputHeight != baseline.outputHeight
-            || (profile.sourceKind == "file" && (profile.outputDisplayID != baseline.outputDisplayID || profile.outputFullscreen != baseline.outputFullscreen))
+            || (profile.sourceKind != "window" && (profile.outputDisplayID != baseline.outputDisplayID || profile.outputFullscreen != baseline.outputFullscreen))
         hasPendingFormChanges = formDiffers
         refreshActions()
         let pending = formDiffers ? EnhancementText.t("Pending", "待应用") + " \(Self.engineDisplayName(profile.interpolationEngineID, model: profile.modelID)) \(rate)" : ""
