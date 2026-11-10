@@ -70,6 +70,24 @@ private final class SourceSizeControls {
   oldProfile["windowOutputMode"] = "unknown"
   let unknownData = try JSONSerialization.data(withJSONObject:oldProfile)
   precondition(EnhancementProfileStore.decode(unknownData,fallbackName:"legacy")?.windowOutputMode == "follow")
+  for source in ["window", "display", "file"] {
+   for engine in ["apple.frc", "apple.lowlatency", "rife.metal", "distildrba.coreml"] {
+    for quality in ["fast", "balanced", "hq", "normal", "quality", "unknown"] {
+     var saved = EnhancementProfile()
+     saved.sourceKind = source; saved.interpolationEngineID = engine
+     saved.modelID = "rife-v4.26"; saved.interpolationQuality = quality
+     saved.interpolationEnabled = false; saved.rifeStreamEnabled = false
+     saved.scaleEnabled = true; saved.scaleEngineID = "realcugan"; saved.scaleQualityID = "strong"
+     saved.srInputPreset = 720; saved.sourceWindowPreset = 480
+     saved.outputWidth = 2560; saved.outputHeight = 1440; saved.rate = .multiplier(3)
+     var expected = saved
+     expected.interpolationEngineID = "rife.metal"; expected.modelID = "rife-v4.25"
+     expected.interpolationQuality = ["fast", "balanced", "hq"].contains(quality) ? quality : "fast"
+     let restored = EnhancementProfileStore.decode(try JSONEncoder().encode(saved), fallbackName:"legacy")
+     precondition(restored == expected, "Engine migration must preserve every other profile field")
+    }
+   }
+  }
   for preset in [480, 720] {
    for interpolation in [false, true] {
     for scale in [false, true] {
@@ -142,7 +160,7 @@ private final class SourceSizeControls {
   precondition(!decodedLegacy.rifeStreamEnabled && !decodedLegacy.interpolationEnabled)
   var native=EnhancementProfile(); native.interpolationEngineID="apple.lowlatency"; native.scaleEnabled=true; native.outputWidth=1920; native.outputHeight=1080
   applyNativeQualityPreset(&native)
-  precondition(native.interpolationEnabled && native.interpolationEngineID == "apple.frc" && native.modelID == "vt.frc.quality" && native.interpolationQuality == "quality" && native.rate == .multiplier(2) && !native.scaleEnabled && native.outputWidth == 0 && native.outputHeight == 0)
+  precondition(native.interpolationEnabled && native.interpolationEngineID == "rife.metal" && native.modelID == "rife-v4.25" && native.interpolationQuality == "fast" && native.rate == .multiplier(2) && !native.scaleEnabled && native.outputWidth == 0 && native.outputHeight == 0)
   precondition(EnhancementProfileStore.presets.contains { $0.id == "preset:native" })
   let sizeStats: [String: Any] = ["sizeChain": ["sourceGeneration": UInt64(4), "configVersion": UInt64(7), "endpoint": "output", "sourceWidth": 2560, "sourceHeight": 1440, "processingWidth": 1920, "processingHeight": 1080, "bufferWidth": 1920, "bufferHeight": 1080, "drawableWidth": 2560, "drawableHeight": 1440, "downsampled": true]]
   let sizeText=LiveSizeChain.text(sizeStats,generation:4,config:7)
@@ -150,9 +168,11 @@ private final class SourceSizeControls {
   precondition(LiveSizeChain.text(sizeStats,generation:4,config:8).isEmpty && LiveSizeChain.text(sizeStats,generation:5,config:7).isEmpty)
   var custom=EnhancementProfile();custom.configName="游戏";custom.interpolationEngineID="rife.metal";custom.modelID="rife-v4.26";custom.rate = .multiplier(3)
   try EnhancementProfileStore.saveNamed(custom)
+  custom.modelID="rife-v4.25"
   precondition(EnhancementProfileStore.resolvedID(custom)=="custom:游戏")
   var preset=EnhancementProfile();preset.configName="游戏";preset.configID="preset:game";preset.interpolationEngineID="apple.lowlatency"
   try EnhancementProfileStore.savePreset(preset,id:"preset:game")
+  preset.interpolationEngineID="rife.metal"
   precondition(EnhancementProfileStore.loadNamed("游戏")==custom)
   precondition(EnhancementProfileStore.loadPreset("preset:game")==preset)
   custom.configID="custom:游戏";custom.outputWidth=1280;try EnhancementProfileStore.saveNamed(custom);try EnhancementProfileStore.save(custom)
@@ -170,7 +190,7 @@ private final class SourceSizeControls {
   precondition(EnhancementProfileStore.checkRename("Default",excluding:"preset:game") == .duplicate)
   try EnhancementProfileStore.renameNamed("游戏",to:"自定义新名")
   let renamed=EnhancementProfileStore.loadNamed("自定义新名")
-  precondition(renamed?.configID=="custom:自定义新名" && renamed?.modelID=="rife-v4.26" && EnhancementProfileStore.loadNamed("游戏")==nil)
+  precondition(renamed?.configID=="custom:自定义新名" && renamed?.modelID=="rife-v4.25" && EnhancementProfileStore.loadNamed("游戏")==nil)
   precondition(EnhancementProfileStore.loadPreset("preset:game")==preset)
   var selected=renamed!;try EnhancementProfileStore.saveCurrent(selected)
   selected.outputWidth=1440;try EnhancementProfileStore.saveCurrent(selected)
@@ -422,9 +442,11 @@ private final class SourceSizeControls {
   precondition(TargetOverlayPolicy.screenIndex(target:NSRect(x:900,y:50,width:400,height:300),screens:cadenceScreens)==1)
   precondition(TargetOverlayPolicy.screenIndex(target:NSRect(x:2100,y:50,width:100,height:100),screens:cadenceScreens)==nil)
   precondition(VideoSRAvailability.readyFactors(isFile:false,inputReady:true,factors:[2]) == [])
-  let ll=LiveEngineSelection.fromPopup(1,quality:"fast"), rife=LiveEngineSelection.fromPopup(3,quality:"fast")
+  for index in -1...8 {
+   let selected=LiveEngineSelection.fromPopup(index,quality:"normal")
+   precondition(selected.engine=="rife.metal" && selected.model=="rife-v4.25")
+  }
   precondition(LiveCoverage.modelScheduled(total:100,held:100)==0 && LiveCoverage.modelScheduled(total:100,held:40)==60 && LiveCoverage.modelScheduled(total:0,held:1)==0)
-  precondition(ll.engine=="apple.lowlatency" && ll.model=="vt.llfi.temporal" && rife.engine=="rife.metal" && rife.model=="rife-v4.26")
   var tracker=LiveApplyTracker(); let firstRequest=tracker.begin(); let secondRequest=tracker.begin()
   precondition(!tracker.resolve(firstRequest,state:2) && tracker.pending==secondRequest)
   precondition(tracker.resolve(secondRequest,state:1) && tracker.pending==secondRequest)
@@ -435,7 +457,7 @@ private final class SourceSizeControls {
   precondition(VideoSRAvailability.readyFactors(isFile:true,inputReady:true,factors:[4,2]) == [2,4])
   precondition(VideoSRAvailability.readyFactors(isFile:true,inputReady:false,factors:[4]) == [])
   var videoSR=EnhancementProfile();videoSR.sourceKind="file";videoSR.scaleEnabled=true;videoSR.scaleEngineID="apple.video-sr";videoSR.outputWidth=1920;videoSR.outputHeight=1080;videoSR.interpolationEnabled=true;videoSR.interpolationEngineID="rife.metal";videoSR.modelID="rife-v4.26";videoSR.rate = .multiplier(2)
-  try EnhancementProfileStore.save(videoSR);precondition(EnhancementProfileStore.load()==videoSR)
+  try EnhancementProfileStore.save(videoSR);videoSR.modelID="rife-v4.25";precondition(EnhancementProfileStore.load()==videoSR)
   _ = EnhancementText.t("Technology Library","技术库")
   precondition(EnhancementText.translated("技术库",chinese:false)=="Technology Library")
   precondition(EnhancementText.translated("用户来源",chinese:false)=="用户来源")

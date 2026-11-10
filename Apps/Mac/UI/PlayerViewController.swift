@@ -3438,13 +3438,13 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private func applyFrameInterpolationMode(_ mode: SPFrameInterpolationMode, preserveCadence: Bool = false) {
         guard let core else { return }
-        core.selectDefaultFileInterpolationEngine()
-
-        if mode == .doubleRate && !preserveCadence {
-            _ = core.configureFileInterpolationMode(2, numerator: 0, denominator: 1)
+        if mode != .off {
+            guard hasVideoSession else { return }
+            EnhancementWorkbenchController.shared.showFileEnhancement(for: self)
+            return
         }
-
-        core.frameInterpolationMode = hasVideoSession ? mode : .off
+        core.selectDefaultFileInterpolationEngine()
+        core.frameInterpolationMode = .off
         refreshMotionSmoothingControl()
         NotificationCenter.default.post(name: .odfMotionPlusChanged, object: self)
     }
