@@ -24,6 +24,24 @@ The workbench offers target-FPS and multiplier modes. X2 / X3 / X4 are requests;
 engine, frame budget, source cadence and display refresh rate determine actual
 presentation. RIFE stream caching is experimental.
 
+On M3 MacBook Air (Mac15,12 and Mac15,13), live **window** capture with
+RIFE 4.25, Fast, X2, stream caching enabled and scaling disabled automatically
+selects the optimized pipeline. This uses fused conversion, texture reuse,
+adaptive lower-resolution inference for generated pictures, and source-aware
+presentation timing. Original pictures retain their capture resolution.
+The supported envelope is SDR 420v BT.709, a 60 Hz display, and capture buffers
+up to 2648×1668 pixels (1324×834 points at 2× scale). Unsupported inputs in this
+path use original-picture passthrough and report a reason in the status area.
+The active GPU keepalive work can affect power use. Performance measurements
+from this device and envelope do not establish a target rate on every input.
+
+For live RIFE target-FPS mode, original pictures fill nearby output slots and
+only the remaining slots need model inference. Interpolation phases follow the
+source timestamps rather than a rounded integer multiplier. Jobs that cannot
+finish within their output budget are skipped; original-picture fallbacks keep
+playback moving, and repeated pictures do not count as new motion in the FPS
+overlay. Actual presentation remains limited by the Mac and display.
+
 For local files, waiting for a model is bounded by the available playout
 runway and at most one output interval. Missed synthetic frames keep the
 original picture, and late results are discarded instead of delaying source

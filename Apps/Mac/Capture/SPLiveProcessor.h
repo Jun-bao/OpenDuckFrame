@@ -1,12 +1,27 @@
 #import <AppKit/AppKit.h>
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
+#import <dispatch/dispatch.h>
+#import <Metal/Metal.h>
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
+#import "SPAirFusedPreprocessor.h"
+#endif
 
 NS_ASSUME_NONNULL_BEGIN
+
+@class SPPresentedVideoRecorder;
+@class SPAirRetainedPayloadBudget;
 
 typedef NS_ENUM(NSInteger, SPLiveRateKind) {
     SPLiveRateFixedFPS = 1,
     SPLiveRateMultiplier = 2,
+};
+
+typedef NS_ENUM(NSInteger, SPLiveCaptureSourceKind) {
+    SPLiveCaptureSourceKindUnknown = 0,
+    SPLiveCaptureSourceKindWindow = 1,
+    SPLiveCaptureSourceKindDisplay = 2,
+    SPLiveCaptureSourceKindFile = 3,
 };
 
 typedef NS_ENUM(NSInteger, SPLiveScaleEngine) {
@@ -27,9 +42,27 @@ typedef NS_ENUM(NSInteger, SPLiveViewMode) {
 /// Maximum-box preset: 0 keeps capture size, otherwise 480, 720 or 1080.
 FOUNDATION_EXPORT NSSize SPLiveSRInputSize(int width, int height, int preset);
 FOUNDATION_EXPORT BOOL SPLiveCanPrepareMetalFX(int width, int height);
+/// Private beta gates and shared sizing bridge. Ordinary builds return disabled.
+FOUNDATION_EXPORT BOOL SPAirBetaEnabled(void);
+FOUNDATION_EXPORT NSSize SPAirBetaProcessingSize(int captureWidth, int captureHeight);
+FOUNDATION_EXPORT NSString *_Nullable SPAirBetaSizingReason(int captureWidth, int captureHeight);
+
+/// Synchronous spatial scaler. Callers serialize access on their own worker queue.
+@interface SPSpatialScaler : NSObject
+- (nullable instancetype)initWithDevice:(id<MTLDevice>)device
+                                inputW:(int)inputW
+                                inputH:(int)inputH
+                               outputW:(int)outputW
+                               outputH:(int)outputH
+                                engine:(SPLiveScaleEngine)engine
+                                 error:(NSError **)error;
+- (nullable CVPixelBufferRef)scaleBuffer:(CVPixelBufferRef)source error:(NSError **)error CF_RETURNS_RETAINED;
+@property (nonatomic, readonly) SPLiveScaleEngine engine;
+@end
 
 @interface SPLivePlanRequest : NSObject <NSCopying>
 @property (nonatomic) uint64_t requestID;
+@property (nonatomic) SPLiveCaptureSourceKind captureSourceKind;
 @property (nonatomic) BOOL interpolationEnabled;
 @property (nonatomic) NSInteger quality;
 @property (nonatomic) SPLiveRateKind rateKind;
@@ -107,6 +140,10 @@ FOUNDATION_EXPORT BOOL SPLiveCanPrepareMetalFX(int width, int height);
 - (void)setSurfaceToken:(uint64_t)token;
 /// Fill the selected target content rectangle for same-geometry window output.
 - (void)setFollowTargetContent:(BOOL)follow;
+/// Per-instance window recipe. A false return leaves this view on its ordinary path.
+- (BOOL)setAirPerformanceEnabled:(BOOL)enabled captureWidth:(int)width captureHeight:(int)height;
+- (BOOL)airPerformanceEnabled;
+- (int64_t)selectionGuardNs;
 /// Refreshes the atomically read visibility snapshot on the AppKit main thread.
 - (void)refreshVisibilitySnapshot;
 /// Geometry is valid only for a verified target and a matching, visible
@@ -135,15 +172,64 @@ FOUNDATION_EXPORT BOOL SPLiveCanPrepareMetalFX(int width, int height);
 @property (nonatomic, copy, nullable) void (^outputSurfaceHandler)(uint64_t generation, uint64_t configVersion, uint64_t token);
 @property (nonatomic, readonly) SPLiveResolvedPlan *resolvedPlan;
 @property (nonatomic, readonly) NSDictionary<NSString *, id> *stats;
+/// Diagnostic consumer. Samples asynchronously on the processor queue, then
+/// delivers the immutable result asynchronously on replyQueue.
+- (void)requestStatsSnapshotOnQueue:(dispatch_queue_t)replyQueue completion:(void (^)(NSDictionary<NSString *, id> *stats))completion;
+/// Reads only the existing immutable cache under its short mutex. No queue wait.
+- (NSDictionary<NSString *, id> *)cachedStatsSnapshot;
+/// Diagnostic boundary scalars from actual atomics. No stats computation,
+/// queue wait, AppKit query, or history copy.
+- (NSDictionary<NSString *, id> *)statsBoundaryCountersSnapshot;
+/// Session-only observation. Resets diagnostic storage and leaves all
+/// processing, scheduling, geometry and lifetime counters intact.
+- (void)beginAirTraceRecordingSession:(NSString *)sessionID
+    keeperJournal:(nullable NSObject *)keeperJournal
+    payloadBudget:(SPAirRetainedPayloadBudget *)payloadBudget
+    retiredServiceHandler:(nullable void (^)(NSObject *snapshot, NSDictionary<NSString *, id> *context))retiredServiceHandler
+    replyQueue:(dispatch_queue_t)replyQueue completion:(void (^)(NSDictionary<NSString *, id> *receipt))completion
+    NS_SWIFT_NAME(beginAirTraceRecordingSession(_:keeperJournal:payloadBudget:retiredServiceHandler:replyQueue:completion:));
+/// Main-owned callback POD is frozen at the request. Other collectors are
+/// sampled asynchronously with the real cutoff and exclusion witnesses.
+- (void)captureAirTraceCheckpointAtCutoffHostTicks:(uint64_t)cutoff
+    replyQueue:(dispatch_queue_t)replyQueue completion:(void (^)(NSDictionary<NSString *, id> *receipt))completion
+    NS_SWIFT_NAME(captureAirTraceCheckpoint(cutoffHostTicks:replyQueue:completion:));
+/// Seals recording only, including the ordinary720s observation limit.
+- (void)sealAirTraceRecordingForReason:(NSString *)reason replyQueue:(dispatch_queue_t)replyQueue
+    completion:(void (^)(NSDictionary<NSString *, id> *receipt))completion
+    NS_SWIFT_NAME(sealAirTraceRecording(reason:replyQueue:completion:));
+/// Produces an immutable CPU snapshot for the utility writer after sealing.
+- (void)captureSealedAirTraceSnapshotOnQueue:(dispatch_queue_t)replyQueue
+    completion:(void (^)(NSDictionary<NSString *, id> *receipt))completion
+    NS_SWIFT_NAME(captureSealedAirTraceSnapshot(replyQueue:completion:));
+/// Applies the existing stop and observes real pending jobs, rendering and
+/// service exec-tail handoff. Keeper readiness is observed separately by the
+/// session journal. Completion never waits on the calling thread.
+- (void)stopAirTraceSessionWithDeadlineHostTicks:(uint64_t)deadline replyQueue:(dispatch_queue_t)replyQueue
+    completion:(void (^)(NSDictionary<NSString *, id> *receipt))completion
+    NS_SWIFT_NAME(stopAirTraceSession(deadlineHostTicks:replyQueue:completion:));
+/// Utility-only session service export. Each actual producer store keeps its
+/// original sequence and frozen formal/final versions.
+- (nullable NSDictionary *)writeRetiredAirServiceTraces:(NSArray<NSDictionary *> *)entries formal:(nullable id)formal association:(nullable id)association
+    toDirectory:(NSString *)directory progressPath:(NSString *)progressPath error:(NSError *_Nullable *_Nullable)error;
 /// Explicit bounded diagnostic export; events remain in callback arrival order.
 - (NSDictionary<NSString *, id> *)presentationOrderDiagnostics;
 /// Install once after assigning both views, on the main thread.
 - (void)installPresentationHooks;
+/// Private quality-only recording attachment. Ordinary builds ignore it.
+- (void)setPresentedVideoRecorder:(nullable SPPresentedVideoRecorder *)recorder;
+/// Quality-only preparation. Enable after formal measurement and before attachment.
+- (void)setPresentedVideoReadbackEnabled:(BOOL)enabled;
 - (void)awaitOutputSurfaceWithToken:(uint64_t)token;
 /// Require the revealed output to originate at or after this mach host time.
 - (void)awaitOutputSurfaceWithToken:(uint64_t)token minimumCaptureHost:(int64_t)captureHost;
 /// Opt-in isolated-test sampling; records fingerprints, never image files.
 - (void)enablePixelDiagnostics;
+/// Isolated keeper probe controls. No GPU waits; normal builds report disabled.
+- (void)markResidentKeepAlivePhase:(NSString *)phase;
+- (void)requestStopResidentKeepAliveForDiagnostics:(NSString *)reason;
+/// Full records are for post-capture background export only.
+- (NSDictionary<NSString *, id> *)residentKeepAliveSnapshotAtCutoffHostTicks:(uint64_t)cutoff
+                                                           includeRecords:(BOOL)includeRecords;
 
 - (void)updateRequest:(SPLivePlanRequest *)request;
 - (void)setViewMode:(SPLiveViewMode)mode;
@@ -222,11 +308,47 @@ FOUNDATION_EXPORT BOOL SPLiveCanPrepareMetalFX(int width, int height);
 + (NSDictionary<NSString *, id> *)runSourceSizeLifecycleContract;
 /// Deterministic source clock, phase deadlines and stale-work contract.
 + (NSDictionary<NSString *, id> *)runSourceClockSchedulingContract;
++ (NSDictionary<NSString *, id> *)runFixedRateContract;
++ (NSDictionary<NSString *, id> *)runFixedRateModelProbeWithBundle:(NSBundle *)bundle;
 + (NSDictionary<NSString *, id> *)runPendingReplacementContract;
 + (NSDictionary<NSString *, id> *)runRejectedPTSContract;
 + (NSDictionary<NSString *, id> *)runPresentationBudgetContract;
 /// CPU-only production-queue budget, recovery and stale callback contract.
 + (NSDictionary<NSString *, id> *)runR9FRCBudgetContract;
 @end
+
+@interface SPLiveProcessor (SPAirCapacityExport)
+- (id)captureAirTraceSnapshotAtCutoffHostTicks:(uint64_t)cutoff;
+- (id)captureAndSealAirTraceSnapshotAtCutoffHostTicks:(uint64_t)cutoff;
+- (NSDictionary *)airTraceSnapshotMetadata:(id)snapshot;
+@end
+@interface SPLiveProcessor (SPAirCapacityWriteExport)
+- (nullable NSDictionary *)writeAirTraceSnapshotsToDirectory:(NSString *)directory
+    formal:(id)formal association:(id)association final:(id)final
+    progressPath:(NSString *)progressPath error:(NSError * _Nullable * _Nullable)error;
+@end
+
+@interface SPAirDiagnosticWriteBudget : NSObject
+- (instancetype)init NS_UNAVAILABLE;
+- (instancetype)initWithDeadlineHostTicks:(uint64_t)deadline NS_SWIFT_NAME(init(deadlineHostTicks:));
+- (void)cancel;
+- (BOOL)isCancelled NS_SWIFT_NAME(isCancelled());
+- (BOOL)isExpired NS_SWIFT_NAME(isExpired());
+@end
+
+/// Implemented by the shared session export bridge. All serialization and IO
+/// run on utility. The returned budget is a nonblocking cancellation handle.
+@interface SPAirBetaSessionExportBridge : NSObject
++ (SPAirDiagnosticWriteBudget *)writeDocumentWithOptions:(NSDictionary<NSString *, id> *)options
+    completion:(void (^)(NSDictionary<NSString *, id> *receipt))completion
+    NS_SWIFT_NAME(write(options:completion:));
+@end
+
+#ifdef __cplusplus
+namespace spAirDiagnostic { struct WriteBudget; }
+@interface SPAirDiagnosticWriteBudget (SPAirNativeBudget)
+- (spAirDiagnostic::WriteBudget *)nativeWriteBudget;
+@end
+#endif
 
 NS_ASSUME_NONNULL_END

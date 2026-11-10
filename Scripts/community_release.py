@@ -42,6 +42,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--app', type=Path, required=True, help='existing verified Release app; never modified')
     parser.add_argument('--verification-root', type=Path, default=ROOT, help='source checkout holding the matching dependency stamps and Sparkle tools')
+    parser.add_argument('--sparkle-tools', type=Path, help='existing Sparkle helper directory; bundle verification still uses verification-root')
     parser.add_argument('--version', required=True)
     parser.add_argument('--build-number', required=True, type=int)
     parser.add_argument('--binary-source-commit', required=True, help='full commit used to compile the supplied app')
@@ -62,7 +63,7 @@ def main():
     repo, feed, key, account = (config[k] for k in ('repository', 'feedUrl', 'publicKey', 'keychainAccount'))
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo) or not feed.startswith('https://') or not key:
         parser.error('configure a repository, HTTPS appcast and public key first')
-    tools = verification / 'ThirdParty/sparkle-min/bin'
+    tools = args.sparkle_tools.resolve() if args.sparkle_tools else verification / 'ThirdParty/sparkle-min/bin'
     if run([tools / 'generate_keys', '--account', account, '-p']) != key:
         raise SystemExit('Keychain public key does not match the release configuration')
     source = plist(app / 'Contents/Info.plist')

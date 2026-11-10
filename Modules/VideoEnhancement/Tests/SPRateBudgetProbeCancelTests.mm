@@ -5,6 +5,7 @@
 #include "SPFPSMeter.hpp"
 #include "SPRateBudget.hpp"
 #include "SPRateSchedule.hpp"
+#include "SPRifePairAffineClock.hpp"
 #include "SPPresentationBudget.hpp"
 #include "SPLiveHeldPolicy.hpp"
 #include <algorithm>

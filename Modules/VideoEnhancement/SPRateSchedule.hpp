@@ -22,6 +22,9 @@ struct SPRateRequest {
     SPRateKind kind = SPRateKind::Multiplier;
     SPRational fps{60, 1};
     int multiplier = 2;
+    // Live presentation may reuse a source within half an output period.
+    // File conversion retains exact motion timestamps by default.
+    bool reuseSources = false;
 };
 
 struct SPScheduleInput {
@@ -174,6 +177,7 @@ public:
         haveLast_ = false;
         boundaryPending_ = false;
         nextIndex_ = 0;
+        lastReusedIdentity_ = 0;
         previous_ = {};
         anchor_ = {};
         lastPts_ = {};
@@ -283,14 +287,20 @@ private:
     }
 
     bool emitSource(const SPScheduleInput &frame, std::vector<SPScheduleOutput> &out) {
+        return emitSourceAt(frame, frame.pts, out);
+    }
+
+    bool emitSourceAt(const SPScheduleInput &frame, SPRational pts, std::vector<SPScheduleOutput> &out) {
         SPScheduleOutput event;
-        event.pts = frame.pts;
+        event.pts = pts;
         event.action = SPScheduleAction::PresentSource;
         event.sourceIdentity = frame.identity;
         event.frameA = frame.identity;
         event.phase = SPRational{0, 1};
         event.generation = generation_;
-        return emit(event, out);
+        if (!emit(event, out)) return false;
+        lastReusedIdentity_ = frame.identity;
+        return true;
     }
 
     bool emitHold(const SPScheduleInput &frame, SPRational pts, SPScheduleSkipReason reason,
@@ -345,7 +355,37 @@ private:
             SPRational t{};
             if (!spFixedTarget(anchor_, nextIndex_, request_.fps, t)) return false;
             const int againstB = spCmp(t, b.pts);
-            if (againstB > 0) return true;
+            if (againstB > 0) {
+                if (request_.reuseSources && lastReusedIdentity_ != b.identity) {
+                    SPRational untilTick{}, span{}, period{}, halfPeriod{};
+                    if (!spSub(t,b.pts,untilTick) || !spSub(b.pts,a.pts,span) ||
+                        !spFrom128(request_.fps.den,request_.fps.num,period) ||
+                        !spFrom128(request_.fps.den,(__int128)2*request_.fps.num,halfPeriod)) return false;
+                    // A slow source must not wait for frame C before its
+                    // already-captured frame B can occupy the nearest tick.
+                    // Faster sources keep normal downsampling lookahead.
+                    if (spCmp(span,period)>=0 && spCmp(untilTick,halfPeriod)<=0) {
+                        if (!emitSourceAt(b,t,out)) return false;
+                        ++nextIndex_;
+                    }
+                }
+                return true;
+            }
+            if (request_.reuseSources && !blocked && spCmp(t, a.pts) >= 0) {
+                SPRational fromA{}, toB{}, halfPeriod{};
+                if (!spSub(t, a.pts, fromA) || !spSub(b.pts, t, toB) ||
+                    !spFrom128(request_.fps.den, (__int128)2 * request_.fps.num, halfPeriod)) return false;
+                const bool nearerB = spCmp(toB, fromA) <= 0;
+                const auto &nearest = nearerB ? b : a;
+                // Reuse each source once. A tie on the next output tick must
+                // generate its own phase rather than repeat that same source.
+                if (nearest.identity != lastReusedIdentity_ &&
+                    spCmp(nearerB ? toB : fromA, halfPeriod) <= 0) {
+                    if (!emitSourceAt(nearest, t, out)) return false;
+                    ++nextIndex_;
+                    continue;
+                }
+            }
             if (againstB == 0) {
                 if (!emitSource(b, out)) return false;
                 nextIndex_ += 1;
@@ -383,6 +423,7 @@ private:
     bool haveAnchor_ = false;
     bool haveLast_ = false;
     bool boundaryPending_ = false;
+    uint64_t lastReusedIdentity_ = 0;
 };
 
 // Mean absolute difference above 48 and a majority of samples jumping by more

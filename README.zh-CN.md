@@ -78,6 +78,9 @@ open .build/Build/Products/Debug/OpenDuckFrame.app
 Release 还会在仓库根目录生成供本机使用的 `OpenDuckFrame.app`。本地构建采用临时签名，
 Developer ID 签名、公证与 App Store 打包使用独立的 [发行流程](RELEASING.md)。
 
+生成工程前会从固定提交的源码包准备 RifeMetal，并应用本仓的流式输入输出优化补丁。
+来源、许可与生成目录见 [运行库构建说明](ThirdParty/rife-metal/README.md)。
+
 修改工程配置请编辑 [`Apps/Mac/project.yml`](Apps/Mac/project.yml)。默认构建不构建额外的实验运行库，
 相关条件见 [功能说明](docs/features.md#optional-runtimes)。
 

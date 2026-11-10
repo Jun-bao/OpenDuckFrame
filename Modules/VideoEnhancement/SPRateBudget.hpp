@@ -4,8 +4,63 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include <array>
+#include <deque>
 
 namespace sp {
+// Live fixed-rate jobs share a serial model queue. Predict each batch size
+// independently and include already-admitted work before accepting a deadline.
+class FixedRateBudget {
+    struct Work { uint64_t token; int phases; double cost, started; };
+    std::array<std::deque<double>, 4> samples_;
+    std::deque<Work> work_;
+    double lastCompletionMs_ = -1;
+    static double percentile(const std::deque<double> &samples) {
+        std::vector<double> values(samples.begin(), samples.end());
+        std::sort(values.begin(), values.end());
+        return values[(values.size() - 1) * 4 / 5];
+    }
+public:
+    void reset() { samples_ = {}; work_.clear(); lastCompletionMs_ = -1; }
+    double taskMs(int phases) const {
+        if (!samples_[phases].empty()) return percentile(samples_[phases]);
+        double phaseMs = 0;
+        for (int n = 1; n <= 3; ++n) if (!samples_[n].empty())
+            phaseMs = std::max(phaseMs, percentile(samples_[n]) / n);
+        return (phaseMs > 0 ? phaseMs : 25.0) * phases;
+    }
+    bool admit(int phases, double nowMs, double deadlineMs) {
+        if (phases < 1 || phases > 3 || work_.size() >= 2 || deadlineMs <= nowMs) return false;
+        // A cold start or temporary GPU load must not reject every future
+        // batch forever. After two idle seconds, try a fresh bounded estimate;
+        // the reserved source slot still covers a late recovery attempt.
+        if (work_.empty() && lastCompletionMs_ >= 0 && nowMs - lastCompletionMs_ >= 2000) {
+            samples_ = {};
+            lastCompletionMs_ = -1;
+        }
+        double backlog = 0;
+        for (size_t i = 0; i < work_.size(); ++i)
+            backlog += i == 0 ? std::max(0.0, work_[i].cost - (nowMs - work_[i].started)) : work_[i].cost;
+        return backlog + taskMs(phases) + 2.0 <= deadlineMs - nowMs;
+    }
+    void submitted(uint64_t token, int phases, double nowMs) {
+        work_.push_back({token, phases, taskMs(phases), nowMs});
+    }
+    void completed(uint64_t token, double nowMs, double usableTaskMs) {
+        auto found = std::find_if(work_.begin(), work_.end(), [=](const Work &w) { return w.token == token; });
+        if (found == work_.end()) return; // Retired source/configuration.
+        lastCompletionMs_ = nowMs;
+        if (std::isfinite(usableTaskMs) && usableTaskMs > 0) {
+            auto &samples = samples_[found->phases];
+            samples.push_back(usableTaskMs);
+            if (samples.size() > 32) samples.pop_front();
+        }
+        const bool first = found == work_.begin();
+        work_.erase(found);
+        if (first && !work_.empty()) work_.front().started = nowMs;
+    }
+};
+
 inline bool shouldAdmitRife(int inflight, std::size_t sampleCount,
                             double serviceMs, double elapsedMs, double remainingMs) {
     if (inflight >= 2) return false;

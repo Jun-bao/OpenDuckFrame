@@ -13,6 +13,8 @@
 + (NSDictionary *)runStaticHoldContract;
 + (NSDictionary *)runSourceSizeLifecycleContract;
 + (NSDictionary *)runSourceClockSchedulingContract;
++ (NSDictionary *)runFixedRateContract;
++ (NSDictionary *)runFixedRateModelProbeWithBundle:(NSBundle *)bundle;
 + (NSDictionary *)runPendingReplacementContract;
 + (NSDictionary *)runRejectedPTSContract;
 + (NSDictionary *)runPresentationBudgetContract;
@@ -26,7 +28,8 @@
 
 int main(int argc, const char **argv) {
     @autoreleasepool {
-        if ((argc != 3 && argc != 4) || !dlopen(argv[1], RTLD_NOW | RTLD_LOCAL)) { fprintf(stderr,"dlopen: %s\n",dlerror()); return 2; }
+        const BOOL sourceClockFlags=argc>4 && strcmp(argv[3],"source-clock")==0;
+        if ((argc != 3 && argc != 4 && !sourceClockFlags) || !dlopen(argv[1], RTLD_NOW | RTLD_LOCAL)) { fprintf(stderr,"dlopen: %s\n",dlerror()); return 2; }
         id activity = [[NSProcessInfo processInfo] beginActivityWithOptions:(NSActivityLatencyCritical | NSActivityUserInitiated)
                                                                       reason:@"Bounded headless cadence contract"];
         Class type = NSClassFromString(@"SPLiveProcessor");
@@ -51,6 +54,14 @@ int main(int argc, const char **argv) {
         }
         __block NSDictionary *result = nil;
         dispatch_semaphore_t done=dispatch_semaphore_create(0);
+        if (argc == 4 && (strcmp(argv[3], "fixed-rate") == 0 || strcmp(argv[3], "fixed-model") == 0)) {
+            const BOOL model=strcmp(argv[3],"fixed-model")==0;
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0), ^{ result=model?[type runFixedRateModelProbeWithBundle:bundle]:[type runFixedRateContract]; dispatch_semaphore_signal(done); });
+            while (dispatch_semaphore_wait(done,DISPATCH_TIME_NOW) != 0) CFRunLoopRunInMode(kCFRunLoopDefaultMode,0.02,false);
+            NSData *json=[NSJSONSerialization dataWithJSONObject:result options:0 error:nil];
+            fwrite(json.bytes,1,json.length,stdout); putchar('\n');
+            [[NSProcessInfo processInfo] endActivity:activity]; return [result[@"ok"] boolValue] ? 0 : 1;
+        }
         if (argc == 4 && strcmp(argv[3], "p1-source-ack") == 0) {
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0), ^{ result=[type runP1SourceOnlyAckContract]; dispatch_semaphore_signal(done); });
             while (dispatch_semaphore_wait(done,DISPATCH_TIME_NOW) != 0) CFRunLoopRunInMode(kCFRunLoopDefaultMode,0.02,false);
@@ -70,7 +81,7 @@ int main(int argc, const char **argv) {
         BOOL low=argc==4 && strcmp(argv[3],"low120")==0, low2k=argc==4 && strcmp(argv[3],"low2k")==0, switching=argc==4 && strcmp(argv[3],"switch")==0, quality=argc==4 && strcmp(argv[3],"quality")==0, staticHold=argc==4 && strcmp(argv[3],"static")==0;
         BOOL nativeBridge=argc==4 && strcmp(argv[3],"native-bridge")==0;
         BOOL sourceLifecycle=argc==4 && strcmp(argv[3],"source-lifecycle")==0;
-        BOOL sourceClock=argc==4 && strcmp(argv[3],"source-clock")==0;
+        BOOL sourceClock=argc>=4 && strcmp(argv[3],"source-clock")==0;
         BOOL pendingReplacement=argc==4 && strcmp(argv[3],"pending-replacement")==0;
         BOOL rejectedPTS=argc==4 && strcmp(argv[3],"rejected-pts")==0;
         BOOL budget=argc==4 && strcmp(argv[3],"budget")==0;

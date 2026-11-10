@@ -1,0 +1,457 @@
+--- a/Sources/RifeMetal/RifeConfiguration.swift
++++ b/Sources/RifeMetal/RifeConfiguration.swift
+@@ -1,5 +1,8 @@
+ import Foundation
+ import Metal
++import RifeMetalCore
++
++public typealias RifeExperimentOptions = RifeMetalCore.RifeExperimentOptions
+ 
+ /// Quality / performance trade-off knob.
+ ///
+@@ -39,13 +42,16 @@
+     public var modelURL: URL
+     public var qualityTier: RifeQualityTier
+     public var preferredDevice: MTLDevice?
++    public var experimentOptions: RifeExperimentOptions
+ 
+     public init(modelURL: URL,
+                 qualityTier: RifeQualityTier = .hq,
+-                preferredDevice: MTLDevice? = nil) {
++                preferredDevice: MTLDevice? = nil,
++                experimentOptions: RifeExperimentOptions = .init()) {
+         self.modelURL = modelURL
+         self.qualityTier = qualityTier
+         self.preferredDevice = preferredDevice
++        self.experimentOptions = experimentOptions
+     }
+ }
+ 
+@@ -60,9 +66,11 @@
+     /// Configuration that uses the package's bundled rife-v4.25 weights. Most callers
+     /// want this — no need to source weights separately.
+     static func bundled(qualityTier: RifeQualityTier = .hq,
+-                        preferredDevice: MTLDevice? = nil) -> RifeConfiguration {
++                        preferredDevice: MTLDevice? = nil,
++                        experimentOptions: RifeExperimentOptions = .init()) -> RifeConfiguration {
+         RifeConfiguration(modelURL: bundledModelURL,
+                           qualityTier: qualityTier,
+-                          preferredDevice: preferredDevice)
++                          preferredDevice: preferredDevice,
++                          experimentOptions: experimentOptions)
+     }
+ }
+--- a/Sources/RifeMetal/RifeInterpolator.swift
++++ b/Sources/RifeMetal/RifeInterpolator.swift
+@@ -7,6 +7,7 @@
+     private let context: InferenceContext
+     private let weights: WeightStore
+     private let qualityTier: RifeQualityTier
++    private let experimentOptions: RifeExperimentOptions
+     internal let queue = DispatchQueue(label: "rife.metal.interpolator", qos: .userInitiated)
+     internal var graph: IFNetGraph?
+     private var graphResolution: (Int, Int)?
+@@ -25,6 +26,7 @@
+         }
+ 
+         self.qualityTier = configuration.qualityTier
++        self.experimentOptions = configuration.experimentOptions
+     }
+ 
+     public func interpolate(previous: CVPixelBuffer,
+@@ -64,28 +66,18 @@
+             let paddedH = ((prevH + padMul - 1) / padMul) * padMul
+             let needsPad = (paddedW != prevW) || (paddedH != prevH)
+ 
+-            let prevPadded: CVPixelBuffer
+-            let currPadded: CVPixelBuffer
+-            if needsPad {
+-                do {
+-                    prevPadded = try padPixelBufferForStream(previous, paddedW: paddedW, paddedH: paddedH)
+-                    currPadded = try padPixelBufferForStream(current,  paddedW: paddedW, paddedH: paddedH)
+-                } catch {
+-                    throw RifeError.inferenceFailed(String(describing: error))
+-                }
+-            } else {
+-                prevPadded = previous
+-                currPadded = current
+-            }
+-
+             let g = try ensureGraph(width: paddedW, height: paddedH)
++            let prevPadded = try inputForGraph(previous, needsPad: needsPad, paddedW: paddedW, paddedH: paddedH)
++            let currPadded = try inputForGraph(current, needsPad: needsPad, paddedW: paddedW, paddedH: paddedH)
++            let directCrop = needsPad && g.usesDirectCroppedReturn
+ 
+             var results: [CVPixelBuffer] = []
+             results.reserveCapacity(timesteps.count)
+             for t in timesteps {
+                 let outPadded: CVPixelBuffer
+                 do {
+-                    outPadded = try PixelBufferConvert.makeOutputPixelBuffer(width: paddedW, height: paddedH)
++                    outPadded = try PixelBufferConvert.makeOutputPixelBuffer(
++                        width: directCrop ? prevW : paddedW, height: directCrop ? prevH : paddedH)
+                 } catch {
+                     throw RifeError.inferenceFailed(String(describing: error))
+                 }
+@@ -95,7 +87,7 @@
+                 } catch {
+                     throw RifeError.inferenceFailed(String(describing: error))
+                 }
+-                if needsPad {
++                if needsPad && !directCrop {
+                     do {
+                         let cropped = try cropPixelBufferForStream(outPadded, width: prevW, height: prevH)
+                         results.append(cropped)
+@@ -137,38 +129,38 @@
+             let paddedH = ((prevH + padMul - 1) / padMul) * padMul
+ 
+             let needsPad = (paddedW != prevW) || (paddedH != prevH)
+-            let prevPadded: CVPixelBuffer
+-            let currPadded: CVPixelBuffer
+-            let outPadded:  CVPixelBuffer
+-
+-            if needsPad {
+-                do {
+-                    prevPadded = try padPixelBufferForStream(previous, paddedW: paddedW, paddedH: paddedH)
+-                    currPadded = try padPixelBufferForStream(current,  paddedW: paddedW, paddedH: paddedH)
+-                    outPadded  = try PixelBufferConvert.makeOutputPixelBuffer(width: paddedW, height: paddedH)
+-                } catch {
+-                    throw RifeError.inferenceFailed(String(describing: error))
+-                }
+-            } else {
+-                prevPadded = previous
+-                currPadded = current
+-                outPadded  = output
+-            }
+-
+             let g = try ensureGraph(width: paddedW, height: paddedH)
++            let prevPadded = try inputForGraph(previous, needsPad: needsPad, paddedW: paddedW, paddedH: paddedH)
++            let currPadded = try inputForGraph(current, needsPad: needsPad, paddedW: paddedW, paddedH: paddedH)
++            let directCrop = needsPad && g.supportsCroppedOutput
++                && outFmt == kCVPixelFormatType_32BGRA && CVPixelBufferGetIOSurface(output) != nil
++            let outPadded = needsPad && !directCrop
++                ? try PixelBufferConvert.makeOutputPixelBuffer(width: paddedW, height: paddedH) : output
+             do {
+                 try g.run(previous: prevPadded, current: currPadded, output: outPadded)
+             } catch {
+                 throw RifeError.inferenceFailed(String(describing: error))
+             }
+ 
+-            if needsPad {
++            if needsPad && !directCrop {
+                 do {
+                     try cropPixelBufferForStream(outPadded, into: output)
+                 } catch {
+                     throw RifeError.inferenceFailed(String(describing: error))
+                 }
+             }
++        }
++    }
++
++    private func inputForGraph(_ frame: CVPixelBuffer, needsPad: Bool,
++                               paddedW: Int, paddedH: Int) throws -> CVPixelBuffer {
++        if !needsPad || (experimentOptions.gpuIO
++            && CVPixelBufferGetPixelFormatType(frame) == kCVPixelFormatType_32BGRA
++            && CVPixelBufferGetIOSurface(frame) != nil) { return frame }
++        do {
++            return try padPixelBufferForStream(frame, paddedW: paddedW, paddedH: paddedH)
++        } catch {
++            throw RifeError.inferenceFailed(String(describing: error))
+         }
+     }
+ 
+@@ -305,7 +297,8 @@
+         do {
+             let g = try IFNetGraph(context: context, weights: weights,
+                                    width: width, height: height,
+-                                   internalScale: qualityTier.internalScale)
++                                   internalScale: qualityTier.internalScale,
++                                   experimentOptions: experimentOptions)
+             self.graph = g
+             self.graphResolution = (width, height)
+             return g
+--- a/Sources/RifeMetalCore/WeightHeader.swift
++++ b/Sources/RifeMetalCore/WeightHeader.swift
+@@ -11,6 +11,8 @@
+     }
+ 
+     public let model: String
++    public let graphID: String?
++    public let maskUpdate: String?
+     public let ifblockChannels: [Int]
+     public let scaleList: [Int]
+     public let inputLayout: String
+@@ -18,6 +20,8 @@
+ 
+     enum CodingKeys: String, CodingKey {
+         case model
++        case graphID = "graph_id"
++        case maskUpdate = "mask_update"
+         case ifblockChannels = "ifblock_channels"
+         case scaleList = "scale_list"
+         case inputLayout = "input_layout"
+--- a/Sources/RifeMetalCore/WeightStore.swift
++++ b/Sources/RifeMetalCore/WeightStore.swift
+@@ -12,6 +12,8 @@
+ 
+ public final class WeightStore {
+     public let header: RifeWeightHeader
++    public let containerVersion: UInt32
++    public var graphID: String { header.graphID ?? header.model }
+     private let mappedData: Data
+     private let blobOffset: Int
+ 
+@@ -25,7 +27,7 @@
+         }
+ 
+         let version = data.readUInt32LE(at: 4)
+-        guard version == 1 else { throw WeightStoreError.unsupportedVersion(version) }
++        guard version == 1 || version == 2 else { throw WeightStoreError.unsupportedVersion(version) }
+ 
+         let headerLen = Int(data.readUInt32LE(at: 8))
+         guard data.count >= 12 + headerLen else { throw WeightStoreError.fileTooSmall }
+@@ -41,6 +43,16 @@
+         let unpadded = 12 + headerLen
+         let padding = (16 - (unpadded % 16)) % 16
+         self.blobOffset = unpadded + padding
++        guard self.blobOffset <= data.count else { throw WeightStoreError.fileTooSmall }
++        if version == 2 {
++            guard let raw = try JSONSerialization.jsonObject(with: headerData) as? [String: Any] else {
++                throw WeightStoreError.headerParseFailed("student header must be an object")
++            }
++            try StudentGraphContract.validate(raw: raw,
++                alignment: data.subdata(in: unpadded..<self.blobOffset),
++                payloadBytes: data.count - self.blobOffset)
++        }
++        self.containerVersion = version
+         self.mappedData = data
+     }
+ 
+@@ -85,7 +97,7 @@
+ private extension Data {
+     func readUInt32LE(at offset: Int) -> UInt32 {
+         return self.withUnsafeBytes { buf -> UInt32 in
+-            buf.load(fromByteOffset: offset, as: UInt32.self).littleEndian
++            buf.loadUnaligned(fromByteOffset: offset, as: UInt32.self).littleEndian
+         }
+     }
+ }
+--- a/Sources/RifeMetalCore/IFBlockBuilder.swift
++++ b/Sources/RifeMetalCore/IFBlockBuilder.swift
+@@ -81,16 +81,34 @@
+ 
+         // 4. convblock: 8 × ResConv. Each: LeakyReLU(conv(x) * beta + x).
+         for j in 0..<8 {
+-            let w = try loadConst(name: "convblock.\(j).conv.weight")
+-            let b = try loadConst(name: "convblock.\(j).conv.bias")
+-            let conv = g.rifeConv2D(input: x, weight: w, bias: b, stride: 1, padding: 1,
+-                                     name: "\(prefix)convblock.\(j).conv")
++            let scaled: MPSGraphTensor
++            if weights.containerVersion == 2, StudentGraphContract.ranks[weights.graphID] != nil,
++               prefix == "block3." || prefix == "block4." {
++                let down = try loadConst(name: "convblock.\(j).conv_a.weight")
++                let up = try loadConst(name: "convblock.\(j).conv_b.weight")
++                let bias = try loadConst(name: "convblock.\(j).conv_b.bias")
++                let descriptor = MPSGraphConvolution2DOpDescriptor(
++                    strideInX: 1, strideInY: 1, dilationRateInX: 1, dilationRateInY: 1,
++                    groups: 1, paddingLeft: 1, paddingRight: 1, paddingTop: 1, paddingBottom: 1,
++                    paddingStyle: .explicit, dataLayout: .NHWC, weightsLayout: .HWIO)!
++                // A is a genuine bias-free 3x3 convolution. Beta is already folded
++                // into B and its bias; the original skip and LeakyReLU follow below.
++                let reduced = g.convolution2D(x, weights: down, descriptor: descriptor,
++                    name: "\(prefix)convblock.\(j).conv_a")
++                scaled = g.rifeConv2D(input: reduced, weight: up, bias: bias, stride: 1, padding: 0,
++                    name: "\(prefix)convblock.\(j).conv_b")
++            } else {
++                let w = try loadConst(name: "convblock.\(j).conv.weight")
++                let b = try loadConst(name: "convblock.\(j).conv.bias")
++                let conv = g.rifeConv2D(input: x, weight: w, bias: b, stride: 1, padding: 1,
++                                         name: "\(prefix)convblock.\(j).conv")
+ 
+-            // beta is stored in .rmw as [1,1,1,c] (canonical NHWC broadcast shape) by the
+-            // converter's per-name special case for `*.beta` tensors. No runtime reshape needed.
+-            let beta = try loadConst(name: "convblock.\(j).beta")
++                // beta is stored in .rmw as [1,1,1,c] (canonical NHWC broadcast shape) by the
++                // converter's per-name special case for `*.beta` tensors. No runtime reshape needed.
++                let beta = try loadConst(name: "convblock.\(j).beta")
+ 
+-            let scaled = g.multiplication(conv, beta, name: "\(prefix)convblock.\(j).scale")
++                scaled = g.multiplication(conv, beta, name: "\(prefix)convblock.\(j).scale")
++            }
+             let residual = g.addition(scaled, x, name: "\(prefix)convblock.\(j).add")
+             x = g.rifeLeakyReLU(input: residual, negativeSlope: 0.2,
+                                   name: "\(prefix)convblock.\(j).act")
+--- a/Sources/RifeMetalCore/IFNetGraph.swift
++++ b/Sources/RifeMetalCore/IFNetGraph.swift
+@@ -28,11 +28,12 @@
+     private let internalHeight: Int
+     private let internalScale: Double
+     private let scaleList: [Int]
++    private let experimentOptions: RifeExperimentOptions
+     // Fast and Balanced can crop at the final GPU writer; empty-stage models retain the full-size fallback.
+-    package var supportsCroppedOutput: Bool { (internalScale == 0.25 || internalScale == 0.5) && !scaleList.isEmpty }
++    package var supportsCroppedOutput: Bool { experimentOptions.gpuIO && (internalScale == 0.25 || internalScale == 0.5) && !scaleList.isEmpty }
+     package var usesDirectCroppedReturn: Bool { supportsCroppedOutput }
+-    package var supportsGPUInputPadding: Bool { true }
+-    private let paddedFrameConvert: PaddedFrameConvert
++    package var supportsGPUInputPadding: Bool { experimentOptions.gpuIO }
++    private let paddedFrameConvert: PaddedFrameConvert?
+     private let textureCache: CVMetalTextureCache
+ 
+     /// Pre-allocated buffer/texture pool — eliminates per-call GPU heap traffic.
+@@ -62,7 +63,8 @@
+                 weights: WeightStore,
+                 width: Int,
+                 height: Int,
+-                internalScale: Double = 1.0) throws {
++                internalScale: Double = 1.0,
++                experimentOptions: RifeExperimentOptions = .init()) throws {
+         guard internalScale > 0.0 && internalScale <= 1.0 else {
+             throw IFNetError.invalidInternalScale("internalScale must be in (0, 1], got \(internalScale)")
+         }
+@@ -84,7 +86,8 @@
+         self.internalHeight = intH
+         self.internalScale = internalScale
+         self.scaleList = weights.header.scaleList
+-        self.paddedFrameConvert = try PaddedFrameConvert(device: context.device)
++        self.experimentOptions = experimentOptions
++        self.paddedFrameConvert = experimentOptions.gpuIO ? try PaddedFrameConvert(device: context.device) : nil
+ 
+         var cache: CVMetalTextureCache?
+         let err = CVMetalTextureCacheCreate(
+@@ -488,13 +491,18 @@
+             guard let enc = mpsCB.commandBuffer.makeComputeCommandEncoder() else {
+                 throw IFNetError.commandBufferFailed("input convert: makeComputeCommandEncoder failed")
+             }
+-            enc.setComputePipelineState(conv.bgraToRGB)
+-            enc.setTexture(prevTex, index: 0)
+-            enc.setBuffer(p.img0FullBuf, offset: 0, index: 0)
+-            dispatch2D(enc, conv.bgraToRGB, gridW: width, gridH: height)
+-            enc.setTexture(currTex, index: 0)
+-            enc.setBuffer(p.img1FullBuf, offset: 0, index: 0)
+-            dispatch2D(enc, conv.bgraToRGB, gridW: width, gridH: height)
++            if let paddedFrameConvert {
++                paddedFrameConvert.encode(into: enc, input: prevTex, output: p.img0FullBuf, width: width, height: height)
++                paddedFrameConvert.encode(into: enc, input: currTex, output: p.img1FullBuf, width: width, height: height)
++            } else {
++                enc.setComputePipelineState(conv.bgraToRGB)
++                enc.setTexture(prevTex, index: 0)
++                enc.setBuffer(p.img0FullBuf, offset: 0, index: 0)
++                dispatch2D(enc, conv.bgraToRGB, gridW: width, gridH: height)
++                enc.setTexture(currTex, index: 0)
++                enc.setBuffer(p.img1FullBuf, offset: 0, index: 0)
++                dispatch2D(enc, conv.bgraToRGB, gridW: width, gridH: height)
++            }
+ 
+             enc.setComputePipelineState(conv.rgbBufToRGBATex)
+             enc.setBuffer(p.img0FullBuf, offset: 0, index: 0)
+@@ -682,10 +690,21 @@
+                                               inputs: [prevFlowTD, flowRawTD],
+                                               results: [newFlowAccTD],
+                                               executionDescriptor: nil)
+-                _ = addMaskExecutable.encode(to: mpsCB,
+-                                              inputs: [prevMaskTD, maskRawTD],
+-                                              results: [newMaskAccTD],
+-                                              executionDescriptor: nil)
++                if !experimentOptions.replaceMask {
++                    _ = addMaskExecutable.encode(to: mpsCB,
++                                                  inputs: [prevMaskTD, maskRawTD],
++                                                  results: [newMaskAccTD],
++                                                  executionDescriptor: nil)
++                }
++
++                if experimentOptions.replaceMask {
++                    guard let blit = mpsCB.commandBuffer.makeBlitCommandEncoder() else {
++                        throw IFNetError.commandBufferFailed("replace mask blit encoder failed")
++                    }
++                    blit.copy(from: p.maskRawBuf, sourceOffset: 0, to: newMaskAccBuf,
++                              destinationOffset: 0, size: intW * intH * 2)
++                    blit.endEncoding()
++                }
+ 
+                 accFlowTD    = newFlowAccTD
+                 accMaskTD    = newMaskAccTD
+@@ -828,15 +847,21 @@
+                              output: p.finalWarped1Buf,
+                              width: width, height: height)
+ 
++        let cropped = outTex.width != width || outTex.height != height
++        let blendMask = cropped ? conv.blendUpsampleMaskAndPackCropped : conv.blendUpsampleMaskAndPack
++        if cropped {
++            var sourceDim = SIMD2<UInt32>(UInt32(width), UInt32(height))
++            finalEnc.setBytes(&sourceDim, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 4)
++        }
+         if useInternalScale {
+-            finalEnc.setComputePipelineState(conv.blendUpsampleMaskAndPack)
++            finalEnc.setComputePipelineState(blendMask)
+             finalEnc.setBuffer(p.finalWarped0Buf, offset: 0, index: 0)
+             finalEnc.setBuffer(p.finalWarped1Buf, offset: 0, index: 1)
+             finalEnc.setBuffer(resolvedMaskBuf, offset: 0, index: 2)
+             var intDimM: SIMD2<UInt32> = SIMD2(UInt32(intW), UInt32(intH))
+             finalEnc.setBytes(&intDimM, length: MemoryLayout<SIMD2<UInt32>>.size, index: 3)
+             finalEnc.setTexture(outTex, index: 0)
+-            dispatch2D(finalEnc, conv.blendUpsampleMaskAndPack, gridW: width, gridH: height)
++            dispatch2D(finalEnc, blendMask, gridW: outTex.width, gridH: outTex.height)
+         } else {
+             finalEnc.setComputePipelineState(conv.blendAndPack)
+             finalEnc.setBuffer(p.finalWarped0Buf, offset: 0, index: 0)
+@@ -903,8 +928,14 @@
+             guard let enc = mpsCB.commandBuffer.makeComputeCommandEncoder() else {
+                 throw IFNetError.commandBufferFailed("encodeFrame BGRA→RGB: makeComputeCommandEncoder failed")
+             }
+-            paddedFrameConvert.encode(into: enc, input: frameTex, output: imgFullBufOut,
+-                                      width: width, height: height)
++            if let paddedFrameConvert {
++                paddedFrameConvert.encode(into: enc, input: frameTex, output: imgFullBufOut, width: width, height: height)
++            } else {
++                enc.setComputePipelineState(conv.bgraToRGB)
++                enc.setTexture(frameTex, index: 0)
++                enc.setBuffer(imgFullBufOut, offset: 0, index: 0)
++                dispatch2D(enc, conv.bgraToRGB, gridW: width, gridH: height)
++            }
+             enc.endEncoding()
+         }
+ 
+@@ -1052,8 +1083,14 @@
+                 throw IFNetError.commandBufferFailed("input convert: makeComputeCommandEncoder failed")
+             }
+             // BGRA → RGB on curr only.
+-            paddedFrameConvert.encode(into: enc, input: currTex, output: currImgFullBuf,
+-                                      width: width, height: height)
++            if let paddedFrameConvert {
++                paddedFrameConvert.encode(into: enc, input: currTex, output: currImgFullBuf, width: width, height: height)
++            } else {
++                enc.setComputePipelineState(conv.bgraToRGB)
++                enc.setTexture(currTex, index: 0)
++                enc.setBuffer(currImgFullBuf, offset: 0, index: 0)
++                dispatch2D(enc, conv.bgraToRGB, gridW: width, gridH: height)
++            }
+ 
+             // RGB-buf → RGBA texture for BOTH prev and curr (pool textures are scratch,
+             // refreshed every call regardless of which side the underlying buf came from).
+@@ -1247,10 +1284,21 @@
+                                                       inputs: [prevFlowTD, flowRawTD],
+                                                       results: [newFlowAccTD],
+                                                       executionDescriptor: nil)
+-                        _ = addMaskExecutable.encode(to: mpsCB,
+-                                                      inputs: [prevMaskTD, maskRawTD],
+-                                                      results: [newMaskAccTD],
+-                                                      executionDescriptor: nil)
++                        if !experimentOptions.replaceMask {
++                            _ = addMaskExecutable.encode(to: mpsCB,
++                                                          inputs: [prevMaskTD, maskRawTD],
++                                                          results: [newMaskAccTD],
++                                                          executionDescriptor: nil)
++                        }
++                    }
++
++                    if experimentOptions.replaceMask {
++                        guard let blit = mpsCB.commandBuffer.makeBlitCommandEncoder() else {
++                            throw IFNetError.commandBufferFailed("replace mask blit encoder failed")
++                        }
++                        blit.copy(from: p.maskRawBuf, sourceOffset: 0, to: newMaskAccBuf,
++                                  destinationOffset: 0, size: intW * intH * 2)
++                        blit.endEncoding()
+                     }
+ 
+                     accFlowTD    = newFlowAccTD

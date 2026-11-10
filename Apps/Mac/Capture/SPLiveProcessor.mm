@@ -9,7 +9,14 @@
 #import "SPRealCUGAN.h"
 #import "SPDistilDRBA.h"
 #import "SPRifeBridge.h"
+#include "SPAirRobustSourceLead.hpp"
+#include "SPAirWindowOptimization.hpp"
+#include "SPAirMeasurementTrace.hpp"
+#include "SPAirSourceConversion.hpp"
+#include "SPAirDisplayPolicyB.hpp"
 #import "SPRateSchedule.hpp"
+#import "SPLiveDisplayQueue.h"
+#import "SPRifePairAffineClock.hpp"
 #import "SPFPSMeter.hpp"
 #import "SPPresentationBudget.hpp"
 #import "SPRateBudget.hpp"
@@ -21,6 +28,15 @@
 #import "SPSharedGeometry.hpp"
 #import "SPSRResizePolicy.hpp"
 #import "SPLivePixelProbeCV.h"
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
+#include "SPAirFusedPresentation.hpp"
+#endif
+#if ODF_AIR_BETA_DIAGNOSTIC || ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
+#include "SPAirBetaSizing.hpp"
+#endif
+#if ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
+#import "SPPresentedVideoRecorder.h"
+#endif
 
 #import <CoreMedia/CoreMedia.h>
 #import <Metal/Metal.h>
@@ -28,11 +44,15 @@
 #import <VideoToolbox/VideoToolbox.h>
 #import <QuartzCore/QuartzCore.h>
 #import <mach/mach_time.h>
+#import <sys/qos.h>
+#import <sys/sysctl.h>
 
 #include <cstring>
 #include <cfloat>
 #include <atomic>
+#include <array>
 #include <algorithm>
+#include <pthread.h>
 #include <cmath>
 #include <deque>
 #include <mutex>
@@ -40,10 +60,12 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <type_traits>
 
 // Private live-budget bridge entry point; the public adapter API is unchanged.
 @interface SPRifeBridge (SPRateBudgetProbe)
 - (void)resetLiveCacheForRateBudgetProbe;
+- (NSDictionary *)airBetaMeasurementReadiness;
 @end
 
 extern "C" int spRunRateScheduleTests(void);
@@ -51,6 +73,192 @@ extern "C" int spRunRateScheduleTests(void);
 static const void *SPLiveQueueKey = &SPLiveQueueKey;
 
 static int64_t SPHostNow(void) { return (int64_t)mach_absolute_time(); }
+
+static bool SPAirCadenceCausalTraceRequested() {
+#if defined(ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC) && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC == 1
+    const char *value = getenv("ODF_AIR_CADENCE_CAUSAL_TRACE");
+    return value && strcmp(value, "1") == 0;
+#else
+    return false;
+#endif
+}
+
+static bool SPAirBetaSessionRecorderRequested() {
+#if ODF_AIR_BETA_DIAGNOSTIC
+    const char *value = getenv("ODF_AIR_BETA_SESSION_RECORDER");
+    return value && strcmp(value, "1") == 0;
+#else
+    return false;
+#endif
+}
+
+static bool SPAirRobustSourceLeadRequested() {
+#if ODF_AIR_BETA_DIAGNOSTIC
+    const char *value = getenv("ODF_AIR_ROBUST_SOURCE_LEAD_DIAGNOSTIC");
+    return value && strcmp(value, "1") == 0;
+#else
+    return false;
+#endif
+}
+
+static bool SPAirFullMeasurementTraceRequested() {
+#if ODF_AIR_BETA_DIAGNOSTIC && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC
+    return SPAirCadenceCausalTraceRequested() &&
+        strcmp(getenv("ODF_AIR_BETA_CAPTURE_DIAGNOSTIC") ?: "", "1") == 0;
+#else
+    return false;
+#endif
+}
+
+struct SPAirPresentedObservationScope {
+    std::atomic<uint64_t> *pending;
+    explicit SPAirPresentedObservationScope(std::atomic<uint64_t> *counter) : pending(counter) {
+        if (pending) pending->fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~SPAirPresentedObservationScope() {
+        if (pending) pending->fetch_sub(1, std::memory_order_release);
+    }
+};
+
+// Preallocated POD only. Writers use existing mutex/serial-queue ownership, or
+// the explicitly checked main-run-loop-only callback contract below. This
+// container adds no synchronization or hot-path IO.
+template<class T, size_t Capacity> struct SPAirCausalRing {
+    static constexpr size_t capacity = Capacity;
+    std::array<T, Capacity> records{};
+    uint64_t total = 0, postSealAttempts = 0;
+    bool sealed = false;
+    void append(T event) {
+        if (sealed) { ++postSealAttempts; return; }
+        event.sequence = ++total; records[(total - 1) % Capacity] = event;
+    }
+    void copy(std::vector<T> &out) const {
+        const uint64_t count = std::min(total, (uint64_t)Capacity);
+        for (uint64_t i = total - count; i < total; ++i) out.push_back(records[i % Capacity]);
+    }
+};
+struct SPAirCurrentStatsEvent {
+    uint64_t sequence, beginHostTicks, endHostTicks, threadID;
+};
+using SPAirCurrentStatsRing = SPAirCausalRing<SPAirCurrentStatsEvent, 16384>;
+
+enum class SPAirFrameKind : uint8_t { admitted, selected, discarded, rejected, slotExpired, positivePresented, zeroPresented, failureNotification, configurationMarker };
+enum class SPAirFrameReason : uint8_t { none, superseded, configuration, stalePTS, expired, generation, epoch, clock, invisible, deadline, texture, pipeline, command, gpu, notPresented, queueFull, invalidPTS, duplicatePTS, other };
+enum class SPAirFrameStage : uint8_t { admission, selection, cleanup, finalCheck, visibilityCleanup, callback };
+struct SPAirFrameEvent {
+    uint64_t sequence, frameID, generation, config, epoch, clock, slotToken, replacementFrameID;
+    int64_t hostTicks, captureHostTicks, enqueueHostTicks, requestStartHostTicks, logicalTargetHostTicks;
+    int64_t slotDisplayTimeMediaNs, presentedTimeMediaNs, callbackHostTicks;
+    SPAirFrameKind kind; SPAirFrameReason reason; SPAirFrameStage stage;
+    bool synthetic, typeKnown, counts, countsKnown, callbackCountsKnown, redraw, hasSlot, hasReplacement, replacementSynthetic, replacementCounts, output;
+    uint64_t previousConfig, previousEpoch;
+    char reasonText[72];
+};
+struct SPAirBudgetEvent {
+    uint64_t sequence, generation, configBefore, configAfter, epochBefore, epochAfter;
+    uint64_t freshSamples, planned, dropped, probeToken;
+    int64_t hostTicks;
+    double policyMediaTimeSeconds, contentFPS, medianTaskMs, phaseCostBeforeMs, phaseCostAfterMs, refreshHz;
+    int inflight, requested, appliedBefore, appliedAfter, budgetBefore, budgetAfter, displayCap;
+    uint32_t gateMask; // 1 disabled,2 engine,4 session,8 stopped,16 inflight,32 probe,64 fresh<8,128 unchanged/persistence
+    sp::RateBudgetLimit limit;
+    bool suspend, inputAvailable, policyCalled, nativeSuspended;
+};
+static_assert(std::is_pod<SPAirFrameEvent>::value && std::is_pod<SPAirBudgetEvent>::value, "causal trace records must remain POD");
+#if ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
+using SPAirFrameRing = SPAirCausalRing<SPAirFrameEvent, 262144>;
+using SPAirBudgetRing = SPAirCausalRing<SPAirBudgetEvent, 65536>;
+#else
+using SPAirFrameRing = SPAirCausalRing<SPAirFrameEvent, 16384>;
+using SPAirBudgetRing = SPAirCausalRing<SPAirBudgetEvent, 8192>;
+#endif
+
+enum class SPAirSlotCallbackOutcome : uint8_t { createdToken, busy, entryRejected };
+enum class SPAirSlotEntryReject : uint8_t { none, wrongLink, invisible, noGeneration, invalidDeadline, invalidDisplayTime, displayNotAfterDeadline, deadlineReached };
+enum class SPAirSlotOrigin : uint8_t { timerAttempt, callbackReplaced, callbackContextRetired, visibilityRetired, contextCleanupRetired };
+struct SPAirSlotCallbackEvent {
+    uint64_t sequence, generation, config, epoch, clock, createdToken, observedToken;
+    int64_t entryHostTicks, outcomeHostTicks, entryMediaNs;
+    double targetTimestampMediaSeconds, targetPresentationTimestampMediaSeconds;
+    SPAirSlotCallbackOutcome outcome;
+    SPAirSlotEntryReject reject;
+    bool contextUnderPresentationMutex;
+};
+struct SPAirSlotConsumeEvent {
+    uint64_t sequence, token, observedToken, frameID, generation, config, epoch, clock;
+    uint64_t currentGeneration, currentConfig, currentEpoch, currentClock;
+    int64_t entryHostTicks, recordHostTicks, handlerEntryMediaNs, lockAcquiredMediaNs, plannedSelectionMediaNs, deadlineMediaNs, displayTimeMediaNs;
+    uint8_t outcome;
+    SPAirSlotOrigin origin;
+    bool terminal;
+    uint32_t prematureWakeCount;
+    bool prematureWakeCountSaturated;
+};
+struct SPAirSlotSnapshot {
+    int64_t sampleHostTicks, deadlineMediaNs, displayTimeMediaNs;
+    uint64_t token, generation, config, epoch, clock;
+    bool hasPending;
+};
+static_assert(std::is_pod<SPAirSlotCallbackEvent>::value && std::is_pod<SPAirSlotConsumeEvent>::value, "slot trace records must remain POD");
+
+// One immutable terminal row per token. Repeated early wakes update only the
+// token's bounded observation count under the existing presentation mutex.
+template<size_t Capacity> struct SPAirTokenConsumeRing {
+    static constexpr size_t capacity = Capacity;
+    std::array<SPAirSlotConsumeEvent, Capacity> records{};
+    uint64_t total = 0, observations = 0, overwrittenTokens = 0;
+    uint64_t invalidTokens = 0, repeatedAfterTerminal = 0, postSealAttempts = 0;
+    bool sealed = false;
+    void append(SPAirSlotConsumeEvent event) {
+        if (sealed) { ++postSealAttempts; return; }
+        ++observations;
+        if (!event.token) { ++invalidTokens; return; }
+        auto &record = records[(event.token - 1) % Capacity];
+        if (record.token == event.token) {
+            if (record.terminal) { ++repeatedAfterTerminal; return; }
+            event.sequence = record.sequence;
+            event.prematureWakeCount = record.prematureWakeCount;
+            event.prematureWakeCountSaturated = record.prematureWakeCountSaturated;
+        } else {
+            if (record.token) ++overwrittenTokens;
+            event.sequence = ++total;
+        }
+        if (event.outcome == (uint8_t)2) {
+            if (event.prematureWakeCount == UINT32_MAX) event.prematureWakeCountSaturated = true;
+            else ++event.prematureWakeCount;
+        }
+        record = event;
+    }
+    void copy(std::vector<SPAirSlotConsumeEvent> &out) const {
+        for (const auto &record : records) if (record.token) out.push_back(record);
+        std::sort(out.begin(), out.end(), [](const auto &a, const auto &b) { return a.sequence < b.sequence; });
+    }
+};
+
+#if ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
+using SPAirSlotCallbackRing = SPAirCausalRing<SPAirSlotCallbackEvent, 131072>;
+using SPAirSlotConsumeRing = SPAirTokenConsumeRing<131072>;
+#else
+using SPAirSlotCallbackRing = SPAirCausalRing<SPAirSlotCallbackEvent, 16384>;
+using SPAirSlotConsumeRing = SPAirCausalRing<SPAirSlotConsumeEvent, 16384>;
+#endif
+
+static SPAirFrameReason SPAirReason(NSString *value) {
+    if ([value isEqualToString:@"display-slot-superseded"]) return SPAirFrameReason::superseded;
+    if ([value isEqualToString:@"configuration"]) return SPAirFrameReason::configuration;
+    if ([value isEqualToString:@"display-stale-pts"]) return SPAirFrameReason::stalePTS;
+    if ([value isEqualToString:@"generation"]) return SPAirFrameReason::generation;
+    if ([value isEqualToString:@"epoch"]) return SPAirFrameReason::epoch;
+    if ([value isEqualToString:@"clock-retired"]) return SPAirFrameReason::clock;
+    if ([value isEqualToString:@"display-invisible"]) return SPAirFrameReason::invisible;
+    if ([value isEqualToString:@"display-submit-deadline"]) return SPAirFrameReason::deadline;
+    if ([value isEqualToString:@"texture"]) return SPAirFrameReason::texture;
+    if ([value isEqualToString:@"pipeline"]) return SPAirFrameReason::pipeline;
+    if ([value isEqualToString:@"command"]) return SPAirFrameReason::command;
+    if ([value isEqualToString:@"gpu"]) return SPAirFrameReason::gpu;
+    if ([value isEqualToString:@"display-not-presented"]) return SPAirFrameReason::notPresented;
+    return SPAirFrameReason::other;
+}
 
 static int64_t SPHostToNs(int64_t host) {
     static mach_timebase_info_data_t info;
@@ -70,6 +278,9 @@ static BOOL SPR8Enabled(void) {
 }
 static BOOL SPR8FixtureEnabled(void) {
     return SPR8Enabled() && [NSProcessInfo.processInfo.arguments containsObject:@"--odf-r8-fixture-diagnostics"];
+}
+static BOOL SPRifePairAffineClockEnabled(void) {
+    return SPR8Enabled() && [NSProcessInfo.processInfo.arguments containsObject:@"--odf-rife-pair-affine-clock"];
 }
 static int SPR8DecodeFixture(CVPixelBufferRef buffer) {
     if (!buffer) return -1;
@@ -173,6 +384,17 @@ static double SPPercentileMs(std::vector<int64_t> samples) {
     return (double)samples[index] / 1e6;
 }
 
+// Statistics use a fixed recent window. Control-policy percentiles retain
+// their existing full-history helper and sample storage.
+static double SPStatsPercentileMs(const std::vector<int64_t> &samples) {
+    if (samples.empty()) return -1;
+    const size_t count = std::min(samples.size(), size_t{1024});
+    std::vector<int64_t> recent(samples.end() - count, samples.end());
+    const size_t index = (recent.size() - 1) * 95 / 100;
+    std::nth_element(recent.begin(), recent.begin() + index, recent.end());
+    return (double)recent[index] / 1e6;
+}
+
 // R7 diagnostics are enabled only with both isolated profile and log paths.
 static BOOL SPR7Passthrough(void) {
     NSArray<NSString *> *args = NSProcessInfo.processInfo.arguments;
@@ -208,58 +430,77 @@ static NSError *SPLiveError(NSInteger code, NSString *message) {
                            userInfo:@{NSLocalizedDescriptionKey: message ?: @""}];
 }
 
-static void SPForceSDRAttachments(CVPixelBufferRef buffer) {
-    if (!buffer) return;
-    CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceITUR_709);
-    if (space) {
-        CVBufferSetAttachment(buffer, kCVImageBufferCGColorSpaceKey, space, kCVAttachmentMode_ShouldPropagate);
-        CFRelease(space);
-    }
-    CVBufferSetAttachment(buffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2,
-                          kCVAttachmentMode_ShouldPropagate);
-    CVBufferSetAttachment(buffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2,
-                          kCVAttachmentMode_ShouldPropagate);
-    OSType format = CVPixelBufferGetPixelFormatType(buffer);
-    if (format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
-        format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
-        CVBufferSetAttachment(buffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2,
-                              kCVAttachmentMode_ShouldPropagate);
-    }
-    CVBufferRemoveAttachment(buffer, kCVImageBufferMasteringDisplayColorVolumeKey);
-    CVBufferRemoveAttachment(buffer, kCVImageBufferContentLightLevelInfoKey);
-    CVBufferRemoveAttachment(buffer, kCVImageBufferAmbientViewingEnvironmentKey);
-}
-
-static BOOL SPBufferIsHDR(CVPixelBufferRef buffer) {
-    if (!buffer) return NO;
-    OSType format = CVPixelBufferGetPixelFormatType(buffer);
-    if (format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
-        format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange ||
-        format == kCVPixelFormatType_64RGBAHalf ||
-        format == kCVPixelFormatType_ARGB2101010LEPacked) {
-        return YES;
-    }
-    CFTypeRef transfer = CVBufferGetAttachment(buffer, kCVImageBufferTransferFunctionKey, NULL);
-    if (transfer &&
-        (CFEqual(transfer, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ) ||
-         CFEqual(transfer, kCVImageBufferTransferFunction_ITU_R_2100_HLG))) {
-        return YES;
-    }
-    if (CVBufferGetAttachment(buffer, kCVImageBufferMasteringDisplayColorVolumeKey, NULL)) return YES;
+BOOL SPAirBetaEnabled(void) {
+#if ODF_AIR_BETA_DIAGNOSTIC
+    static const BOOL enabled = [NSBundle.mainBundle.infoDictionary[@"ODFAirBeta"] boolValue] &&
+        strcmp(getenv("ODF_AIR_BETA_DIAGNOSTIC") ?: "", "1") == 0;
+    return enabled;
+#else
     return NO;
+#endif
 }
 
-static CVPixelBufferRef SPCreateBuffer(int width, int height, OSType format) {
-    NSDictionary *attrs = @{
-        (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
-        (__bridge NSString *)kCVPixelBufferMetalCompatibilityKey: @YES,
-    };
-    CVPixelBufferRef buffer = NULL;
-    CVReturn result = CVPixelBufferCreate(kCFAllocatorDefault, width, height, format,
-                                          (__bridge CFDictionaryRef)attrs, &buffer);
-    if (result != kCVReturnSuccess) return NULL;
-    return buffer;
+NSSize SPAirBetaProcessingSize(int width, int height) {
+#if ODF_AIR_BETA_DIAGNOSTIC || ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
+    const auto choice = sp::airBetaSize(width, height);
+    if (choice.valid) return NSMakeSize(choice.processingWidth, choice.processingHeight);
+#endif
+    return NSZeroSize;
 }
+
+NSString *SPAirBetaSizingReason(int width, int height) {
+#if ODF_AIR_BETA_DIAGNOSTIC || ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
+    switch (sp::airBetaSize(width, height).failure) {
+        case sp::AirBetaSizeFailure::none: return nil;
+        case sp::AirBetaSizeFailure::invalidCapture: return @"采集宽高须为至少2像素的偶数，现以原帧播放";
+        case sp::AirBetaSizeFailure::outsideEnvelope: return @"窗口超过2648×1668像素的验证范围，现以原帧播放";
+        case sp::AirBetaSizeFailure::invalidProcessing: return @"处理尺寸未能满足面积与偶数约束，现以原帧播放";
+        case sp::AirBetaSizeFailure::paddingExceeded: return @"模型补齐尺寸超过2048×1280，现以原帧播放";
+    }
+#endif
+    return @"Air实验档未启用";
+}
+
+static NSString *SPAirHardwareModel() {
+    static NSString *model;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        char value[128] = {}; size_t length = sizeof(value);
+        model = sysctlbyname("hw.model", value, &length, nullptr, 0) == 0 ?
+            [NSString stringWithUTF8String:value] : @"";
+    });
+    return model;
+}
+
+
+
+
+
+#if ODF_AIR_BETA_DIAGNOSTIC || ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
+static NSString *SPAirBetaFourCC(OSType format) {
+    const char bytes[] = {(char)(format >> 24), (char)(format >> 16), (char)(format >> 8), (char)format};
+    return [[NSString alloc] initWithBytes:bytes length:4 encoding:NSASCIIStringEncoding] ?: @"未知";
+}
+static NSString *SPAirBetaFormatReason(CVPixelBufferRef buffer) {
+    if (SPBufferIsHDR(buffer)) return @"当前为HDR或10位采集，现以原帧播放";
+    CFTypeRef primaries = CVBufferGetAttachment(buffer, kCVImageBufferColorPrimariesKey, NULL);
+    CFTypeRef space = CVBufferGetAttachment(buffer, kCVImageBufferCGColorSpaceKey, NULL);
+    if ((primaries && (CFEqual(primaries, kCVImageBufferColorPrimaries_P3_D65) || CFEqual(primaries, kCVImageBufferColorPrimaries_DCI_P3))) ||
+        (space && CFGetTypeID(space) == CGColorSpaceGetTypeID() && CGColorSpaceIsWideGamutRGB((CGColorSpaceRef)space)))
+        return @"当前为P3或宽色域采集，现以原帧播放";
+    const OSType format = CVPixelBufferGetPixelFormatType(buffer);
+    if (format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+        return [NSString stringWithFormat:@"采集格式为%@，窗口优化只支持420v BT.709 SDR，现以原帧播放", SPAirBetaFourCC(format)];
+    CFTypeRef matrix = CVBufferGetAttachment(buffer, kCVImageBufferYCbCrMatrixKey, NULL);
+    CFTypeRef transfer = CVBufferGetAttachment(buffer, kCVImageBufferTransferFunctionKey, NULL);
+    if (!matrix || !primaries || !transfer || !CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2) ||
+        !CFEqual(primaries, kCVImageBufferColorPrimaries_ITU_R_709_2) || !CFEqual(transfer, kCVImageBufferTransferFunction_ITU_R_709_2))
+        return @"采集未提供完整BT.709 SDR标记，现以原帧播放";
+    return nil;
+}
+#endif
+
+
 
 static void SPSampleLuma(CVPixelBufferRef buffer, uint8_t *out, int count) {
     memset(out, 0, (size_t)count);
@@ -432,6 +673,7 @@ NSSize SPLiveSRInputSize(int width, int height, int preset) {
     copy.modelID = self.modelID ?: @"";
     copy.qualityID = self.qualityID ?: @"";
     copy.rifeStreamEnabled = self.rifeStreamEnabled;
+    copy.captureSourceKind = self.captureSourceKind;
     return copy;
 }
 @end
@@ -446,18 +688,6 @@ NSSize SPLiveSRInputSize(int width, int height, int preset) {
     _colorPath = @"sdr.bt709.8bit";
     return self;
 }
-@end
-
-@interface SPSpatialScaler : NSObject
-- (nullable instancetype)initWithDevice:(id<MTLDevice>)device
-                                  inputW:(int)inputW
-                                  inputH:(int)inputH
-                                 outputW:(int)outputW
-                                 outputH:(int)outputH
-                                  engine:(SPLiveScaleEngine)engine
-                                   error:(NSError **)error;
-- (nullable CVPixelBufferRef)scaleBuffer:(CVPixelBufferRef)source error:(NSError **)error;
-@property (nonatomic, readonly) SPLiveScaleEngine engine;
 @end
 
 @implementation SPSpatialScaler {
@@ -679,8 +909,601 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
     return YES;
 }
 
-@interface SPLivePreviewView ()
+// Own pixel buffers from admission until rejection or GPU completion. Pending
+// requests never reserve drawable/GPU tickets and remain strictly bounded.
+@class SPPreparedTextureLease, SPPreparedTextureMapper;
+@interface SPDisplayFrameRequest : NSObject {
+@public
+    spAirMeasurement::TracePtr _measurementTrace;
+    uint64_t _measurementLeaseID;
+}
+@property(nonatomic, assign) CVPixelBufferRef enhanced;
+@property(nonatomic, assign) CVPixelBufferRef original;
+@property(nonatomic) SPLiveViewMode mode;
+@property(nonatomic) int64_t captureHost;
+@property(nonatomic) uint64_t generation;
+@property(nonatomic) uint64_t config;
+@property(nonatomic) uint64_t epoch;
+@property(nonatomic) uint64_t clockEpoch;
+@property(nonatomic) uint64_t surfaceToken;
+@property(nonatomic) int64_t ptsNum;
+@property(nonatomic) int64_t ptsDen;
+@property(nonatomic) BOOL synthetic;
+@property(nonatomic) uint64_t frameID;
+@property(nonatomic) BOOL counts;
+@property(nonatomic) BOOL redraw;
+@property(nonatomic) BOOL airPerformanceEnabled;
+#if ODF_AIR_BETA_DIAGNOSTIC
+@property(nonatomic) int betaCaptureWidth;
+@property(nonatomic) int betaCaptureHeight;
+#endif
+@property(nonatomic) int64_t logicalTargetHost;
+@property(nonatomic) int64_t enqueueHost;
+@property(nonatomic) int64_t causalEnqueueHostTicks;
+@property(nonatomic, copy) NSDictionary *captureGeometry;
+@property(nonatomic, strong) SPPreparedTextureLease *preparedTextureLease;
+@property(nonatomic) int preparedTextureAdmissionReason;
+@end
+static spAirMeasurement::Event SPAirMeasurementFrame(SPDisplayFrameRequest *frame, spAirMeasurement::Kind kind) {
+    spAirMeasurement::Event event;
+    event.kind = kind; event.frameID = frame.frameID; event.generation = frame.generation;
+    event.config = frame.config; event.epoch = frame.epoch; event.clock = frame.clockEpoch;
+    event.ptsNum = frame.ptsNum; event.ptsDen = frame.ptsDen; event.targetHostTicks = frame.logicalTargetHost;
+    event.flags = (frame.synthetic ? 1u : 0u) | (frame.counts ? 2u : 0u) | (frame.redraw ? 4u : 0u) | 8u;
+    event.groupID = frame->_measurementLeaseID;
+    return event;
+}
+
+enum SPPreparedTextureReason { SPPreparedNone, SPPreparedCapacity, SPPreparedNotReady, SPPreparedMapFailed, SPPreparedMismatch, SPPreparedMissing, SPPreparedCancelled };
+static NSString *SPPreparedTextureReasonName(int reason) {
+    switch (reason) {
+        case SPPreparedNone: return @"none";
+        case SPPreparedCapacity: return @"capacity";
+        case SPPreparedNotReady: return @"not-ready";
+        case SPPreparedMapFailed: return @"map-failed";
+        case SPPreparedMismatch: return @"identity-or-context-mismatch";
+        case SPPreparedCancelled: return @"cancelled";
+        default: return @"missing";
+    }
+}
+enum SPPreparedTexturePhase { SPPreparedQueued, SPPreparedMapping, SPPreparedReady, SPPreparedInflight, SPPreparedRetired, SPPreparedFailed, SPPreparedAbandoned };
+
+@interface SPPreparedTextureLease : NSObject {
+@public
+    SPPreparedTextureMapper *_owner;
+    spAirMeasurement::TracePtr _measurementTrace;
+    spAirMeasurement::Event _measurementIdentity;
+    std::atomic<int> _phase;
+    std::atomic<int64_t> _mapStartedHostTicks, _mapEndedHostTicks;
+    CVPixelBufferRef _primary, _secondary;
+    CVPixelBufferRef _enhancedIdentity, _originalIdentity;
+    CVMetalTextureRef _primaryRef, _secondaryRef;
+    uint64_t _generation, _config, _epoch, _clockEpoch, _frameID;
+    SPLiveViewMode _mode;
+    BOOL _recycled; // mapper queue only
+}
+- (instancetype)initWithOwner:(SPPreparedTextureMapper *)owner frame:(SPDisplayFrameRequest *)frame;
+- (BOOL)claimForFrame:(SPDisplayFrameRequest *)frame reason:(int *)reason;
+- (void)cancel;
+- (void)complete;
+- (id<MTLTexture>)primaryTexture;
+- (id<MTLTexture>)secondaryTexture;
+@end
+
+// Diagnostic-only, fixed-capacity owner. Cache Create/Flush and every owned CF
+// release run on this queue; no view/frame is retained by the owner.
+@interface SPPreparedTextureMapper : NSObject {
+@public
+    dispatch_queue_t _queue;
+    id<MTLDevice> _device;
+    CVMetalTextureCacheRef _cache;
+    std::atomic<uint64_t> _outstanding, _peak, _admitted, _capacityRejected;
+    std::atomic<uint64_t> _maps, _mapFailures, _textureFailures, _cacheFailures, _mapFlushes, _recycleFlushes, _idleFlushes, _recycled, _cancelled;
+    std::atomic<uint64_t> _selected, _hits;
+    std::array<std::atomic<uint64_t>, 7> _fallbacks;
+}
+- (instancetype)initWithDevice:(id<MTLDevice>)device;
+- (SPPreparedTextureLease *)prepareFrame:(SPDisplayFrameRequest *)frame;
+- (SPPreparedTextureLease *)claimFrame:(SPDisplayFrameRequest *)frame recordSelection:(BOOL)record reason:(int *)reason;
+- (void)mapLease:(SPPreparedTextureLease *)lease;
+- (void)recycleLease:(SPPreparedTextureLease *)lease;
+- (NSDictionary *)snapshot;
+- (void)fenceForProbe;
+@end
+
+@implementation SPDisplayFrameRequest
+- (void)dealloc {
+    [_preparedTextureLease cancel];
+    if (_enhanced) CVPixelBufferRelease(_enhanced);
+    if (_original) CVPixelBufferRelease(_original);
+}
+@end
+
+@implementation SPPreparedTextureLease
+- (instancetype)initWithOwner:(SPPreparedTextureMapper *)owner frame:(SPDisplayFrameRequest *)frame {
+    if (!(self = [super init])) return nil;
+    _owner = owner; _phase.store(SPPreparedQueued); _mapStartedHostTicks.store(0); _mapEndedHostTicks.store(0);
+    _generation = frame.generation; _config = frame.config; _epoch = frame.epoch; _clockEpoch = frame.clockEpoch; _frameID = frame.frameID; _mode = frame.mode;
+    if (frame->_measurementTrace) {
+        _measurementTrace = frame->_measurementTrace;
+        _measurementIdentity = SPAirMeasurementFrame(frame, spAirMeasurement::Kind::leaseRequest);
+    }
+    _enhancedIdentity = frame.enhanced; _originalIdentity = frame.original;
+    CVPixelBufferRef primary = frame.mode == SPLiveViewOriginal ? (frame.original ?: frame.enhanced) : frame.enhanced;
+    CVPixelBufferRef secondary = frame.original ?: frame.enhanced;
+    _primary = primary ? CVPixelBufferRetain(primary) : NULL;
+    _secondary = frame.mode == SPLiveViewCompare && secondary ? CVPixelBufferRetain(secondary) : NULL;
+    return self;
+}
+- (BOOL)claimForFrame:(SPDisplayFrameRequest *)frame reason:(int *)reason {
+    if (_generation != frame.generation || _config != frame.config || _epoch != frame.epoch || _clockEpoch != frame.clockEpoch ||
+        _frameID != frame.frameID || _mode != frame.mode || _enhancedIdentity != frame.enhanced || _originalIdentity != frame.original) {
+        *reason = SPPreparedMismatch; return NO;
+    }
+    int expected = SPPreparedReady;
+    if (_phase.compare_exchange_strong(expected, SPPreparedInflight, std::memory_order_acq_rel)) { *reason = SPPreparedNone; return YES; }
+    *reason = expected == SPPreparedFailed ? SPPreparedMapFailed :
+        (expected == SPPreparedAbandoned || expected == SPPreparedRetired ? SPPreparedCancelled : SPPreparedNotReady);
+    return NO;
+}
+- (void)cancel {
+    int phase = _phase.load();
+    while (phase == SPPreparedQueued || phase == SPPreparedMapping || phase == SPPreparedReady) {
+        if (_phase.compare_exchange_weak(phase, SPPreparedAbandoned)) {
+            _owner->_cancelled.fetch_add(1);
+            if (_measurementTrace) {
+                auto event = _measurementIdentity;
+                event.kind = spAirMeasurement::Kind::leaseCancel;
+                event.beginHostTicks = event.endHostTicks = SPHostNow();
+                event.values[0] = phase;
+                _measurementTrace->append(event);
+            }
+            SPPreparedTextureMapper *owner = _owner;
+            dispatch_async(owner->_queue, ^{ [owner recycleLease:self]; });
+            return;
+        }
+    }
+}
+- (void)complete {
+    int expected = SPPreparedInflight;
+    if (!_phase.compare_exchange_strong(expected, SPPreparedRetired)) return;
+    if (_measurementTrace) {
+        auto event = _measurementIdentity;
+        event.kind = spAirMeasurement::Kind::leaseCompleteRequest;
+        event.beginHostTicks = event.endHostTicks = SPHostNow();
+        _measurementTrace->append(event);
+    }
+    SPPreparedTextureMapper *owner = _owner;
+    dispatch_async(owner->_queue, ^{ [owner recycleLease:self]; });
+}
+- (id<MTLTexture>)primaryTexture { return _primaryRef ? CVMetalTextureGetTexture(_primaryRef) : nil; }
+- (id<MTLTexture>)secondaryTexture { return _secondaryRef ? CVMetalTextureGetTexture(_secondaryRef) : nil; }
+@end
+
+@implementation SPPreparedTextureMapper
+- (instancetype)initWithDevice:(id<MTLDevice>)device {
+    if (!(self = [super init])) return nil;
+    _device = device;
+    _queue = dispatch_queue_create("app.openduckframe.air-prepared-texture-map", dispatch_queue_attr_make_with_autorelease_frequency(
+        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0), DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM));
+    _outstanding.store(0); _peak.store(0); _admitted.store(0); _capacityRejected.store(0);
+    _maps.store(0); _mapFailures.store(0); _textureFailures.store(0); _cacheFailures.store(0); _mapFlushes.store(0); _recycleFlushes.store(0);
+    _idleFlushes.store(0); _recycled.store(0); _cancelled.store(0); _selected.store(0); _hits.store(0);
+    for (auto &value : _fallbacks) value.store(0);
+    return self;
+}
+- (void)dealloc {
+    CVMetalTextureCacheRef cache = _cache;
+    if (cache) dispatch_async(_queue, ^{ CVMetalTextureCacheFlush(cache, 0); CFRelease(cache); });
+}
+- (SPPreparedTextureLease *)prepareFrame:(SPDisplayFrameRequest *)frame {
+    spAirMeasurement::Event measurement;
+    if (frame->_measurementTrace) {
+        frame->_measurementLeaseID = frame->_measurementTrace->identity();
+        measurement = SPAirMeasurementFrame(frame, spAirMeasurement::Kind::leaseRequest);
+        measurement.beginHostTicks = SPHostNow();
+    }
+    uint64_t count = _outstanding.load();
+    do { if (count >= 4) { _capacityRejected.fetch_add(1); frame.preparedTextureAdmissionReason = SPPreparedCapacity;
+        if (frame->_measurementTrace) {
+            measurement.endHostTicks = SPHostNow();
+            measurement.values[0] = 0;
+            measurement.values[1] = count;
+            frame->_measurementTrace->append(measurement);
+        }
+        return nil; } }
+    while (!_outstanding.compare_exchange_weak(count, count + 1));
+    uint64_t peak = _peak.load(); while (peak < count + 1 && !_peak.compare_exchange_weak(peak, count + 1)) {}
+    _admitted.fetch_add(1);
+    if (frame->_measurementTrace) {
+        measurement.endHostTicks = SPHostNow();
+        measurement.values[0] = 1;
+        measurement.values[1] = count + 1;
+        frame->_measurementTrace->append(measurement);
+    }
+    SPPreparedTextureLease *lease = [[SPPreparedTextureLease alloc] initWithOwner:self frame:frame];
+    frame.preparedTextureLease = lease;
+    dispatch_async(_queue, ^{ [self mapLease:lease]; });
+    return lease;
+}
+- (void)mapLease:(SPPreparedTextureLease *)lease {
+    int expected = SPPreparedQueued;
+    if (!lease->_phase.compare_exchange_strong(expected, SPPreparedMapping)) { [self recycleLease:lease]; return; }
+    _maps.fetch_add(1); lease->_mapStartedHostTicks.store(SPHostNow());
+    if (!_cache && CVMetalTextureCacheCreate(kCFAllocatorDefault, NULL, _device, NULL, &_cache) != kCVReturnSuccess) _cacheFailures.fetch_add(1);
+    BOOL valid = _cache && lease->_primary;
+    if (valid) {
+        CVReturn result = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, _cache, lease->_primary, NULL,
+            MTLPixelFormatBGRA8Unorm, CVPixelBufferGetWidth(lease->_primary), CVPixelBufferGetHeight(lease->_primary), 0, &lease->_primaryRef);
+        valid = result == kCVReturnSuccess && lease->_primaryRef && CVMetalTextureGetTexture(lease->_primaryRef);
+        if (!valid) _textureFailures.fetch_add(1);
+    }
+    if (valid && lease->_secondary) {
+        CVReturn result = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, _cache, lease->_secondary, NULL,
+            MTLPixelFormatBGRA8Unorm, CVPixelBufferGetWidth(lease->_secondary), CVPixelBufferGetHeight(lease->_secondary), 0, &lease->_secondaryRef);
+        valid = result == kCVReturnSuccess && lease->_secondaryRef && CVMetalTextureGetTexture(lease->_secondaryRef);
+        if (!valid) _textureFailures.fetch_add(1);
+    }
+    if (_cache) { CVMetalTextureCacheFlush(_cache, 0); _mapFlushes.fetch_add(1); }
+    lease->_mapEndedHostTicks.store(SPHostNow());
+    if (lease->_measurementTrace) {
+        auto event = lease->_measurementIdentity; event.kind = spAirMeasurement::Kind::leaseMap;
+        event.beginHostTicks = lease->_mapStartedHostTicks.load(); event.endHostTicks = lease->_mapEndedHostTicks.load();
+        event.values[0] = valid; lease->_measurementTrace->append(event);
+    }
+    if (!valid) { _mapFailures.fetch_add(1); lease->_phase.store(SPPreparedFailed); [self recycleLease:lease]; return; }
+    expected = SPPreparedMapping;
+    const bool measurementReadyPublished = lease->_phase.compare_exchange_strong(expected, SPPreparedReady, std::memory_order_release);
+    if (!measurementReadyPublished) [self recycleLease:lease];
+    if (lease->_measurementTrace) {
+        auto event = lease->_measurementIdentity; event.kind = spAirMeasurement::Kind::leaseReady;
+        event.beginHostTicks = event.endHostTicks = SPHostNow(); event.values[0] = measurementReadyPublished; event.values[1] = lease->_phase.load();
+        lease->_measurementTrace->append(event);
+    }
+}
+- (void)recycleLease:(SPPreparedTextureLease *)lease {
+    if (lease->_recycled) return; lease->_recycled = YES;
+    const uint64_t measurementReleaseBegin = lease->_measurementTrace ? SPHostNow() : 0;
+    if (lease->_primaryRef) { CFRelease(lease->_primaryRef); lease->_primaryRef = NULL; }
+    if (lease->_secondaryRef) { CFRelease(lease->_secondaryRef); lease->_secondaryRef = NULL; }
+    if (lease->_primary) { CVPixelBufferRelease(lease->_primary); lease->_primary = NULL; }
+    if (lease->_secondary) { CVPixelBufferRelease(lease->_secondary); lease->_secondary = NULL; }
+    if (_cache) { CVMetalTextureCacheFlush(_cache, 0); _recycleFlushes.fetch_add(1); }
+    _recycled.fetch_add(1);
+    const uint64_t previousOutstanding = _outstanding.fetch_sub(1);
+    if (previousOutstanding == 1 && _cache) _idleFlushes.fetch_add(1);
+    if (lease->_measurementTrace) {
+        auto event = lease->_measurementIdentity; event.kind = spAirMeasurement::Kind::leaseRelease;
+        event.beginHostTicks = measurementReleaseBegin; event.endHostTicks = SPHostNow();
+        event.values[0] = previousOutstanding; event.values[1] = previousOutstanding - 1;
+        event.values[2] = lease->_phase.load(); lease->_measurementTrace->append(event);
+    }
+}
+- (SPPreparedTextureLease *)claimFrame:(SPDisplayFrameRequest *)frame recordSelection:(BOOL)record reason:(int *)reason {
+    if (record) _selected.fetch_add(1);
+    SPPreparedTextureLease *lease = frame.preparedTextureLease;
+    int failure = lease ? SPPreparedNone : (frame.preparedTextureAdmissionReason ?: SPPreparedMissing);
+    if (lease && [lease claimForFrame:frame reason:&failure]) { if (record) _hits.fetch_add(1); *reason = SPPreparedNone;
+        if (frame->_measurementTrace) {
+            auto event = SPAirMeasurementFrame(frame, spAirMeasurement::Kind::leaseClaim);
+            event.beginHostTicks = event.endHostTicks = SPHostNow();
+            event.values[0] = SPPreparedNone;
+            event.values[1] = 1;
+            frame->_measurementTrace->append(event);
+        }
+        return lease; }
+    if (frame->_measurementTrace) {
+        auto event = SPAirMeasurementFrame(frame, spAirMeasurement::Kind::leaseClaim);
+        event.beginHostTicks = event.endHostTicks = SPHostNow();
+        event.values[0] = failure;
+        event.values[1] = 0;
+        frame->_measurementTrace->append(event);
+    }
+    if (record) _fallbacks[(size_t)failure].fetch_add(1);
+    *reason = failure; [lease cancel]; return nil;
+}
+- (NSDictionary *)snapshot {
+    NSMutableDictionary *reasons = [NSMutableDictionary dictionary]; uint64_t fallback = 0;
+    for (int reason = 1; reason < 7; ++reason) { const uint64_t count = _fallbacks[(size_t)reason].load(); reasons[SPPreparedTextureReasonName(reason)] = @(count); fallback += count; }
+    return @{ @"enabled": @YES, @"capacity": @4, @"outstanding": @(_outstanding.load()), @"peakOutstanding": @(_peak.load()),
+        @"admitted": @(_admitted.load()), @"admissionCapacityRejected": @(_capacityRejected.load()), @"maps": @(_maps.load()),
+        @"selectedRenderRequests": @(_selected.load()), @"hits": @(_hits.load()), @"fallbacks": @(fallback), @"fallbackReasons": reasons,
+        @"mapFailures": @(_mapFailures.load()), @"textureFailures": @(_textureFailures.load()), @"cacheCreateFailures": @(_cacheFailures.load()),
+        @"mapFlushes": @(_mapFlushes.load()), @"recycleFlushes": @(_recycleFlushes.load()), @"lastIdleFlushes": @(_idleFlushes.load()),
+        @"recycled": @(_recycled.load()), @"cancelled": @(_cancelled.load()),
+        @"scope": @"Diagnostic independent serial cache; outstanding includes queued, ready, GPU-inflight and queued cleanup, bounded at four. Hit/fallback denominator is selected render requests only. Cache Create/Flush and lease CF release occur only on mapper queue; no drawable is acquired here." };
+}
+- (void)fenceForProbe { dispatch_sync(_queue, ^{}); }
+@end
+
+static sp::DisplayQueueFrame SPDisplayFrameTiming(SPDisplayFrameRequest *frame) {
+    return {{frame.ptsNum, frame.ptsDen}, frame.logicalTargetHost > 0 ? SPHostToNs(frame.logicalTargetHost) : 0,
+            frame.frameID, (bool)frame.counts, (bool)frame.redraw};
+}
+
+// Only the current prospective slot owns a drawable. Deferred timer blocks
+// retain a weak view and token, never the update or an obsolete drawable.
+@interface SPProspectiveDisplaySlot : NSObject {
+@public
+    sp::DisplaySlotWindow timing;
+    spAirDisplayPolicyB::RefreshHistory ruleBHistory;
+    bool ruleBEnabled;
+    int64_t selectionScanEndedHostTicks;
+    int64_t discardReportsStartedHostTicks, discardReportsEndedHostTicks;
+    uint64_t staleDiscardReportCount, supersededDiscardReportCount;
+    qos_class_t timerHandlerRequestedQoSClass;
+    bool timerHandlerQoSRecorded;
+}
+@property(nonatomic, strong) id<CAMetalDrawable> drawable;
+@property(nonatomic) double deadline;
+@property(nonatomic) double displayTime;
+@property(nonatomic) int64_t callbackHost;
+@end
+@implementation SPProspectiveDisplaySlot
+@end
+
+static SPAirFrameEvent SPAirFrameRecord(SPDisplayFrameRequest *frame, SPAirFrameKind kind, SPAirFrameReason reason,
+                                       SPAirFrameStage stage, SPProspectiveDisplaySlot *slot = nil, SPDisplayFrameRequest *replacement = nil) {
+    SPAirFrameEvent event{}; event.hostTicks = SPHostNow(); event.kind = kind; event.reason = reason; event.stage = stage;
+    if (frame) {
+        event.countsKnown = event.typeKnown = true;
+        event.frameID = frame.frameID; event.generation = frame.generation; event.config = frame.config; event.epoch = frame.epoch; event.clock = frame.clockEpoch;
+        event.captureHostTicks = frame.captureHost; event.enqueueHostTicks = frame.causalEnqueueHostTicks; event.requestStartHostTicks = frame.enqueueHost;
+        event.logicalTargetHostTicks = frame.logicalTargetHost; event.synthetic = frame.synthetic; event.counts = frame.counts; event.redraw = frame.redraw;
+    } else event.countsKnown = false;
+    if (slot) {
+        event.hasSlot = true; event.slotToken = slot->timing.token; event.slotDisplayTimeMediaNs = (int64_t)(slot.displayTime * 1e9);
+        if (!frame) { event.generation = slot->timing.context.generation; event.config = slot->timing.context.config; event.epoch = slot->timing.context.measurementEpoch; event.clock = slot->timing.context.clockEpoch; }
+    }
+    if (replacement) { event.hasReplacement = true; event.replacementFrameID = replacement.frameID; event.replacementSynthetic = replacement.synthetic; event.replacementCounts = replacement.counts; }
+    return event;
+}
+
+static SPAirFrameEvent SPAirCallbackRecord(NSDictionary *info, NSString *endpoint) {
+    SPAirFrameEvent event{}; event.hostTicks = SPHostNow(); event.stage = SPAirFrameStage::callback;
+    event.frameID = [info[@"frameID"] unsignedLongLongValue]; event.generation = [info[@"generation"] unsignedLongLongValue];
+    event.config = [info[@"configVersion"] unsignedLongLongValue]; event.epoch = [info[@"measurementEpoch"] unsignedLongLongValue]; event.clock = [info[@"clockEpoch"] unsignedLongLongValue];
+    event.captureHostTicks = [info[@"captureHost"] longLongValue]; event.requestStartHostTicks = [info[@"presentationEnqueueHost"] longLongValue];
+    event.logicalTargetHostTicks = [info[@"logicalTargetHost"] longLongValue]; event.slotToken = [info[@"displaySlotToken"] unsignedLongLongValue];
+    event.hasSlot = event.slotToken != 0; event.slotDisplayTimeMediaNs = (int64_t)([info[@"displayLinkTargetPresentationTimestamp"] doubleValue] * 1e9);
+    event.synthetic = [info[@"synthetic"] boolValue]; event.typeKnown = info[@"synthetic"] != nil;
+    event.counts = [info[@"counts"] boolValue]; event.callbackCountsKnown = info[@"counts"] != nil; event.countsKnown = false;
+    event.output = [endpoint isEqualToString:@"output"]; event.callbackHostTicks = [info[@"presentedHost"] longLongValue];
+    const double presented = [info[@"presentedTime"] doubleValue];
+    event.presentedTimeMediaNs = std::isfinite(presented) && presented > 0 && presented < (double)INT64_MAX / 1e9 ? (int64_t)(presented * 1e9) : 0;
+    event.countsKnown = event.presentedTimeMediaNs > 0 && event.callbackCountsKnown;
+    return event;
+}
+
+static NSString *SPAirFrameKindName(SPAirFrameKind kind) {
+    switch (kind) {
+        case SPAirFrameKind::admitted: return @"admitted"; case SPAirFrameKind::selected: return @"selected";
+        case SPAirFrameKind::discarded: return @"discarded"; case SPAirFrameKind::rejected: return @"rejected-before-admission";
+        case SPAirFrameKind::slotExpired: return @"slot-expired-no-request-retired";
+        case SPAirFrameKind::positivePresented: return @"positive-presented-callback"; case SPAirFrameKind::zeroPresented: return @"zero-presented-callback";
+        case SPAirFrameKind::failureNotification: return @"failure-notification"; case SPAirFrameKind::configurationMarker: return @"configuration-marker";
+    }
+    return @"unknown";
+}
+static NSString *SPAirFrameReasonName(SPAirFrameReason reason) {
+    switch (reason) {
+        case SPAirFrameReason::none: return @"none"; case SPAirFrameReason::superseded: return @"display-slot-superseded";
+        case SPAirFrameReason::configuration: return @"configuration"; case SPAirFrameReason::stalePTS: return @"stale-pts";
+        case SPAirFrameReason::expired: return @"expired-slot"; case SPAirFrameReason::generation: return @"generation";
+        case SPAirFrameReason::epoch: return @"epoch"; case SPAirFrameReason::clock: return @"clock-retired";
+        case SPAirFrameReason::invisible: return @"invisible"; case SPAirFrameReason::deadline: return @"display-submit-deadline";
+        case SPAirFrameReason::texture: return @"texture"; case SPAirFrameReason::pipeline: return @"pipeline";
+        case SPAirFrameReason::command: return @"command"; case SPAirFrameReason::gpu: return @"gpu";
+        case SPAirFrameReason::notPresented: return @"display-not-presented"; case SPAirFrameReason::queueFull: return @"queue-full";
+        case SPAirFrameReason::invalidPTS: return @"invalid-pts"; case SPAirFrameReason::duplicatePTS: return @"duplicate-pts";
+        case SPAirFrameReason::other: return @"other-see-original-reason";
+    }
+    return @"unknown";
+}
+static NSString *SPAirFrameStageName(SPAirFrameStage stage) {
+    switch (stage) {
+        case SPAirFrameStage::admission: return @"admission"; case SPAirFrameStage::selection: return @"selection";
+        case SPAirFrameStage::cleanup: return @"configuration-or-context-cleanup"; case SPAirFrameStage::finalCheck: return @"final-check-before-commit";
+        case SPAirFrameStage::visibilityCleanup: return @"visibility-cleanup"; case SPAirFrameStage::callback: return @"processor-callback-before-filtering";
+    }
+    return @"unknown";
+}
+static NSDictionary *SPAirRingMetadata(uint64_t total, NSUInteger capacity, NSArray *events) {
+    return @{ @"capacity": @(capacity), @"total": @(total), @"dropped": @(total > capacity ? total - capacity : 0),
+        @"firstseq": events.count ? events.firstObject[@"sequence"] : (id)NSNull.null,
+        @"lastseq": events.count ? events.lastObject[@"sequence"] : (id)NSNull.null, @"exportedCount": @(events.count), @"events": events };
+}
+static NSDictionary *SPAirFrameExport(const std::vector<SPAirFrameEvent> &values, uint64_t total, NSString *endpoint, int64_t cutoff) {
+    NSMutableArray *events = [NSMutableArray arrayWithCapacity:values.size()];
+    for (const auto &e : values) {
+        if (e.hostTicks > cutoff) continue;
+        NSString *owner = endpoint ?: (e.output ? @"output" : @"preview");
+        [events addObject:@{ @"sequence": @(e.sequence), @"kind": SPAirFrameKindName(e.kind), @"reason": SPAirFrameReasonName(e.reason),
+            @"originalReason": e.reasonText[0] ? [NSString stringWithUTF8String:e.reasonText] : (id)NSNull.null,
+            @"stage": SPAirFrameStageName(e.stage), @"endpoint": owner, @"hostTicks": @(e.hostTicks),
+            @"frameID": e.kind == SPAirFrameKind::slotExpired || e.kind == SPAirFrameKind::configurationMarker ? (id)NSNull.null : @(e.frameID), @"generation": @(e.generation), @"configVersion": @(e.config), @"measurementEpoch": @(e.epoch), @"clockEpoch": @(e.clock),
+            @"type": e.typeKnown ? (e.synthetic ? @"synthetic" : @"original") : (id)NSNull.null, @"counts": e.countsKnown ? @(e.counts) : (id)NSNull.null, @"callbackCounts": e.callbackCountsKnown ? @(e.counts) : (id)NSNull.null, @"redraw": @(e.redraw),
+            @"captureHostTicks": e.captureHostTicks ? @(e.captureHostTicks) : (id)NSNull.null,
+            @"enqueueHostTicks": e.enqueueHostTicks ? @(e.enqueueHostTicks) : (id)NSNull.null,
+            @"requestStartHostTicks": e.requestStartHostTicks ? @(e.requestStartHostTicks) : (id)NSNull.null,
+            @"logicalTargetHostTicks": e.logicalTargetHostTicks ? @(e.logicalTargetHostTicks) : (id)NSNull.null,
+            @"slotToken": e.hasSlot ? @(e.slotToken) : (id)NSNull.null, @"slotDisplayTimeMediaNs": e.hasSlot ? @(e.slotDisplayTimeMediaNs) : (id)NSNull.null,
+            @"replacementFrameID": e.hasReplacement ? @(e.replacementFrameID) : (id)NSNull.null,
+            @"replacementType": e.hasReplacement ? (e.replacementSynthetic ? @"synthetic" : @"original") : (id)NSNull.null,
+            @"replacementCounts": e.hasReplacement ? @(e.replacementCounts) : (id)NSNull.null,
+            @"presentedTimeMediaNs": e.presentedTimeMediaNs ? @(e.presentedTimeMediaNs) : (id)NSNull.null,
+            @"callbackHostTicks": e.callbackHostTicks ? @(e.callbackHostTicks) : (id)NSNull.null,
+            @"previousConfigVersion": e.kind == SPAirFrameKind::configurationMarker ? @(e.previousConfig) : (id)NSNull.null,
+            @"previousMeasurementEpoch": e.kind == SPAirFrameKind::configurationMarker ? @(e.previousEpoch) : (id)NSNull.null }];
+    }
+    return SPAirRingMetadata(total, SPAirFrameRing::capacity, events);
+}
+static NSDictionary *SPAirBudgetExport(const std::vector<SPAirBudgetEvent> &values, uint64_t total, int64_t cutoff) {
+    NSMutableArray *events = [NSMutableArray arrayWithCapacity:values.size()];
+    for (const auto &e : values) {
+        if (e.hostTicks > cutoff) continue;
+        NSMutableArray *gates = [NSMutableArray array];
+        NSArray *names = @[@"rate-budget-disabled", @"engine-unavailable", @"session-not-ready", @"stopped", @"application-blocked-inflight", @"application-blocked-probe-inflight", @"fresh-samples-below-eight", @"policy-unchanged-persistence-or-other-inputs"];
+        for (NSUInteger bit = 0; bit < names.count; ++bit) if (e.gateMask & (1u << bit)) [gates addObject:names[bit]];
+        if (e.suspend && e.policyCalled) [gates addObject:@"explicit-suspension-zero-content-fps"];
+        [events addObject:@{ @"sequence": @(e.sequence), @"hostTicks": @(e.hostTicks), @"source": e.suspend ? @"suspendRateBudgetOnQueue" : @"updateRateBudgetOnQueue",
+            @"generation": @(e.generation), @"configBefore": @(e.configBefore), @"configAfter": @(e.configAfter), @"epochBefore": @(e.epochBefore), @"epochAfter": @(e.epochAfter),
+            @"freshSamples": @(e.freshSamples), @"freshSamplesAtLeastEight": @(e.freshSamples >= 8), @"inflight": @(e.inflight), @"probeInFlight": @(e.probeToken != 0), @"probeInFlightToken": @(e.probeToken),
+            @"policyUpdateCalled": @(e.policyCalled), @"policyInputAvailable": @(e.inputAvailable), @"policyMediaTimeSeconds": e.policyCalled ? @(e.policyMediaTimeSeconds) : (id)NSNull.null,
+            @"gateMask": @(e.gateMask), @"evaluationEntryBlocked": @((e.gateMask & 15) != 0), @"applicationGateBlocked": @((e.gateMask & 48) != 0), @"noDecisionReasons": gates, @"nativeEvidenceSuspended": @(e.nativeSuspended),
+            @"requestedMultiplier": @(e.requested), @"appliedMultiplierBefore": @(e.appliedBefore), @"appliedMultiplierAfter": @(e.appliedAfter),
+            @"budgetMultiplierBefore": @(e.budgetBefore), @"budgetMultiplierAfter": @(e.budgetAfter),
+            @"decision": e.budgetBefore != e.budgetAfter ? @"policy-target-changed" : (e.appliedBefore != e.appliedAfter ? @"pending-target-applied" : @"unchanged"),
+            @"contentFPS": @(e.contentFPS), @"medianTaskMs": @(e.medianTaskMs), @"plannedPhases": @(e.planned), @"droppedPhases": @(e.dropped),
+            @"phaseCostBeforeMs": @(e.phaseCostBeforeMs), @"phaseCostAfterMs": @(e.phaseCostAfterMs), @"refreshHz": @(e.refreshHz), @"displayCap": @(e.displayCap),
+            @"limit": [NSString stringWithUTF8String:sp::rateBudgetLimitName(e.limit)] }];
+    }
+    return SPAirRingMetadata(total, SPAirBudgetRing::capacity, events);
+}
+enum class SPDisplayTimerOutcome : uint8_t { selected, noFrame, waiting, staleToken, noCurrentSlot, retired, gpuBusy, expiredConsume, expiredReplaced };
+static_assert((uint8_t)SPDisplayTimerOutcome::waiting == 2, "token logger waiting outcome binding");
+struct SPDisplayTimerTrace {
+    sp::DisplaySlotWindow armed{};
+    uint64_t observedToken = 0, frameID = 0;
+    int64_t handlerEntryNs = 0, lockAcquiredNs = 0;
+    SPDisplayTimerOutcome outcome = SPDisplayTimerOutcome::noCurrentSlot;
+    int64_t handlerEntryHostTicks = 0; // opt-in metadata; existing mach entry sample
+};
+static NSString *SPDisplayTimerOutcomeName(SPDisplayTimerOutcome outcome) {
+    switch (outcome) {
+        case SPDisplayTimerOutcome::selected: return @"selected";
+        case SPDisplayTimerOutcome::noFrame: return @"no-frame";
+        case SPDisplayTimerOutcome::waiting: return @"premature-wake-rearmed";
+        case SPDisplayTimerOutcome::staleToken: return @"stale-token";
+        case SPDisplayTimerOutcome::noCurrentSlot: return @"no-current-slot";
+        case SPDisplayTimerOutcome::retired: return @"retired-context";
+        case SPDisplayTimerOutcome::gpuBusy: return @"gpu-busy";
+        case SPDisplayTimerOutcome::expiredConsume: return @"expired-consume";
+        case SPDisplayTimerOutcome::expiredReplaced: return @"expired-callback-replaced";
+    }
+}
+
+static NSDictionary *SPAirSlotCallbackExport(const std::vector<SPAirSlotCallbackEvent> &values, uint64_t total, int64_t cutoff) {
+    NSMutableArray *events = [NSMutableArray arrayWithCapacity:values.size()];
+    NSArray *reasons = @[@"none", @"wrong-link", @"drawable-invisible", @"zero-generation", @"nonfinite-target-timestamp", @"nonfinite-target-presentation-timestamp", @"display-not-after-deadline", @"deadline-already-reached"];
+    for (const auto &e : values) {
+        if (e.outcomeHostTicks > cutoff) continue;
+        [events addObject:@{ @"sequence": @(e.sequence), @"entryHostTicks": @(e.entryHostTicks), @"outcomeHostTicks": @(e.outcomeHostTicks), @"entryMediaNs": @(e.entryMediaNs),
+            @"targetTimestampMediaSeconds": std::isfinite(e.targetTimestampMediaSeconds) ? @(e.targetTimestampMediaSeconds) : (id)NSNull.null,
+            @"targetPresentationTimestampMediaSeconds": std::isfinite(e.targetPresentationTimestampMediaSeconds) ? @(e.targetPresentationTimestampMediaSeconds) : (id)NSNull.null,
+            @"outcome": e.outcome == SPAirSlotCallbackOutcome::createdToken ? @"created-token" : (e.outcome == SPAirSlotCallbackOutcome::busy ? @"busy" : @"entry-rejected"),
+            @"entryRejectReason": reasons[(NSUInteger)e.reject], @"createdToken": e.createdToken ? @(e.createdToken) : (id)NSNull.null,
+            @"observedToken": e.contextUnderPresentationMutex ? @(e.observedToken) : (id)NSNull.null,
+            @"generation": @(e.generation), @"configVersion": @(e.config), @"measurementEpoch": @(e.epoch), @"clockEpoch": @(e.clock),
+            @"contextUnderPresentationMutex": @(e.contextUnderPresentationMutex) }];
+    }
+    return SPAirRingMetadata(total, SPAirSlotCallbackRing::capacity, events);
+}
+static NSDictionary *SPAirSlotConsumeExport(const std::vector<SPAirSlotConsumeEvent> &values, uint64_t total, int64_t cutoff) {
+    NSMutableArray *events = [NSMutableArray arrayWithCapacity:values.size()];
+    for (const auto &e : values) {
+        if (e.recordHostTicks > cutoff) continue;
+        NSArray *origins = @[@"timer-attempt", @"callback-replaced-expired-slot", @"callback-retired-context", @"visibility-retired-slot", @"context-cleanup-retired-slot"];
+        [events addObject:@{ @"sequence": @(e.sequence), @"token": @(e.token), @"observedToken": @(e.observedToken), @"frameID": e.frameID ? @(e.frameID) : (id)NSNull.null,
+            @"origin": origins[(NSUInteger)e.origin], @"terminalDisposition": @(e.terminal),
+            @"prematureWakeCount": @(e.prematureWakeCount), @"prematureWakeCountSaturated": @(e.prematureWakeCountSaturated),
+            @"entryHostTicks": e.entryHostTicks ? @(e.entryHostTicks) : (id)NSNull.null, @"recordHostTicks": @(e.recordHostTicks),
+            @"handlerEntryMediaNs": e.origin == SPAirSlotOrigin::timerAttempt ? @(e.handlerEntryMediaNs) : (id)NSNull.null,
+            @"lockAcquiredMediaNs": e.origin == SPAirSlotOrigin::timerAttempt ? @(e.lockAcquiredMediaNs) : (id)NSNull.null,
+            @"plannedSelectionMediaNs": @(e.plannedSelectionMediaNs), @"deadlineMediaNs": @(e.deadlineMediaNs), @"displayTimeMediaNs": @(e.displayTimeMediaNs),
+            @"outcome": SPDisplayTimerOutcomeName((SPDisplayTimerOutcome)e.outcome), @"generation": @(e.generation), @"configVersion": @(e.config), @"measurementEpoch": @(e.epoch), @"clockEpoch": @(e.clock),
+            @"currentGeneration": @(e.currentGeneration), @"currentConfigVersion": @(e.currentConfig), @"currentMeasurementEpoch": @(e.currentEpoch), @"currentClockEpoch": @(e.currentClock) }];
+    }
+    return SPAirRingMetadata(total, SPAirSlotConsumeRing::capacity, events);
+}
+static NSDictionary *SPAirSlotSnapshotExport(SPAirSlotSnapshot snapshot) {
+    return @{ @"sampleHostTicks": snapshot.sampleHostTicks ? @(snapshot.sampleHostTicks) : (id)NSNull.null,
+        @"pendingToken": snapshot.hasPending ? @(snapshot.token) : (id)NSNull.null,
+        @"generation": snapshot.hasPending ? @(snapshot.generation) : (id)NSNull.null, @"configVersion": snapshot.hasPending ? @(snapshot.config) : (id)NSNull.null,
+        @"measurementEpoch": snapshot.hasPending ? @(snapshot.epoch) : (id)NSNull.null, @"clockEpoch": snapshot.hasPending ? @(snapshot.clock) : (id)NSNull.null,
+        @"deadlineMediaNs": snapshot.hasPending ? @(snapshot.deadlineMediaNs) : (id)NSNull.null, @"displayTimeMediaNs": snapshot.hasPending ? @(snapshot.displayTimeMediaNs) : (id)NSNull.null };
+}
+
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
+struct SPAirFusedRenderRecord {
+    uint64_t sequence = 0, frameID = 0, generation = 0, config = 0, epoch = 0, clock = 0, slotToken = 0;
+    int64_t selectionHostTicks = 0, requestStartHostTicks = 0, enqueueHostTicks = 0;
+    int bufferWidth = 0, bufferHeight = 0, drawableWidth = 0, drawableHeight = 0;
+    int referenceWidth = 2648, referenceHeight = 1668;
+    std::array<double, 4> imageRect{};
+    bool synthetic = false, counts = false, redraw = false, lanczosFragment = false;
+    std::atomic<bool> gpuObserved{false}, presentedObserved{false}, publicationCancelled{false};
+    std::atomic<uint32_t> gpuStatus{0};
+    std::atomic<int64_t> completedHostTicks{0};
+    std::atomic<double> gpuStartSeconds{0}, gpuEndSeconds{0}, completedMediaTime{0}, presentedTime{0};
+    double displayTargetMediaTime = 0;
+};
+using SPAirFusedRenderPtr = std::shared_ptr<SPAirFusedRenderRecord>;
+static constexpr size_t SPAirFusedRenderCapacity = 131072;
+using SPAirFusedRenderNotes = std::array<SPAirFusedRenderPtr, SPAirFusedRenderCapacity>;
+
+static NSArray *SPAirFusedRect(const SPAirFusedRenderPtr &record) {
+    return record ? @[@(record->imageRect[0]), @(record->imageRect[1]), @(record->imageRect[2]), @(record->imageRect[3])] : nil;
+}
+static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
+    const bool gpu = record->gpuObserved.load(std::memory_order_acquire);
+    const bool presented = record->presentedObserved.load(std::memory_order_acquire);
+    const double start = record->gpuStartSeconds.load(), end = record->gpuEndSeconds.load();
+    const bool validGPU = gpu && std::isfinite(start) && start > 0 && std::isfinite(end) && end >= start;
+    return @{ @"sequence": @(record->sequence), @"frameID": @(record->frameID),
+        @"generation": @(record->generation), @"configVersion": @(record->config),
+        @"measurementEpoch": @(record->epoch), @"clockEpoch": @(record->clock),
+        @"selectionHostTicks": @(record->selectionHostTicks), @"slotToken": @(record->slotToken),
+        @"requestStartHostTicks": @(record->requestStartHostTicks), @"enqueueHostTicks": @(record->enqueueHostTicks),
+        @"synthetic": @(record->synthetic),
+        @"counts": @(record->counts), @"redraw": @(record->redraw),
+        @"bufferPixels": @[@(record->bufferWidth), @(record->bufferHeight)],
+        @"drawablePixels": @[@(record->drawableWidth), @(record->drawableHeight)],
+        @"sourceReferencePixels": @[@(record->referenceWidth), @(record->referenceHeight)], @"outputRectPixels": SPAirFusedRect(record),
+        @"fragment": record->lanczosFragment ? @"spAirPresentLanczos" : @"spPresentFragment",
+        @"gpuObserved": @(gpu), @"gpuStatus": gpu ? @(record->gpuStatus.load()) : (id)NSNull.null,
+        @"gpuStartSeconds": validGPU ? @(start) : (id)NSNull.null,
+        @"gpuEndSeconds": validGPU ? @(end) : (id)NSNull.null,
+        @"completedHostTicks": gpu ? @(record->completedHostTicks.load()) : (id)NSNull.null,
+        @"completedMediaTime": gpu ? @(record->completedMediaTime.load()) : (id)NSNull.null,
+        @"displayTargetMediaTime": @(record->displayTargetMediaTime),
+        @"presentedObserved": @(presented),
+        @"presentedTime": presented ? @(record->presentedTime.load()) : (id)NSNull.null,
+        @"publicationCancelled": @(record->publicationCancelled.load()) };
+}
+#endif
+
+@interface SPLivePreviewView () <CAMetalDisplayLinkDelegate>
+#if ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
+@property (atomic, strong, nullable) SPPresentedVideoRecorder *presentedVideoRecorder;
+#endif
+- (void)setPresentedVideoReadbackEnabled:(BOOL)enabled;
+- (void)setAirBetaCaptureWidth:(int)width height:(int)height;
+- (NSDictionary *)fusedRifePresentationSnapshotIncludeRecords:(BOOL)includeRecords cutoffHostTicks:(int64_t)cutoff;
+- (void)updateDisplayLinkConfiguration;
+- (void)setPresentationClockEpoch:(uint64_t)clockEpoch;
+- (void)prepareWarmSurface:(SPDisplayFrameRequest *)frame targetSize:(CGSize)size;
+- (sp::DisplaySlotContext)displaySlotContext;
+- (void)armDisplaySlotLocked:(uint64_t)token;
+- (void)parkDisplaySlotTimerLocked;
+- (void)resetAirDisplayPolicyLocked;
+- (void)recordDisplayTimerTraceLocked:(SPDisplayTimerTrace)trace;
+- (void)recordAirSlotTraceLocked:(SPDisplayTimerTrace)trace origin:(SPAirSlotOrigin)origin;
+- (void)consumeDisplaySlot:(sp::DisplaySlotWindow)armedSlot;
+- (int64_t)presentationPreparationLeadNs;
+- (NSDictionary *)displaySlotDiagnostics;
+- (NSDictionary *)preparedTextureCountersSnapshot;
+- (void)discardOutdatedPresentations;
+- (void)reportPendingPresentation:(SPDisplayFrameRequest *)frame reason:(NSString *)reason;
+- (void)renderPendingPresentation:(SPDisplayFrameRequest *)frame slot:(SPProspectiveDisplaySlot *)slot selectionHost:(int64_t)selectionHost;
 - (void)observeSourceGeometry:(NSDictionary *)value generation:(uint64_t)generation;
+- (CVMetalTextureRef)createTexture:(CVPixelBufferRef)buffer apiStartedHostTicks:(int64_t *)started apiEndedHostTicks:(int64_t *)ended;
+- (NSDictionary *)runPreparedTextureLifetimeProbe;
+- (void)copyAirCadenceEvents:(std::vector<SPAirFrameEvent> *)events total:(uint64_t *)total;
+- (void)copyAirCadenceEvents:(std::vector<SPAirFrameEvent> *)events total:(uint64_t *)total
+    consumes:(std::vector<SPAirSlotConsumeEvent> *)consumes consumeTotal:(uint64_t *)consumeTotal snapshot:(SPAirSlotSnapshot *)snapshot;
+- (BOOL)copyAirSlotCallbacks:(std::vector<SPAirSlotCallbackEvent> *)events total:(uint64_t *)total
+    mainCallerSynchronouslyOnProcessorQueue:(BOOL)safe unsupported:(uint64_t *)unsupported;
 @end
 
 @implementation SPLivePreviewView {
@@ -688,8 +1511,35 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
     CALayer *_sourceCover;
     id<MTLDevice> _device;
     id<MTLCommandQueue> _commandQueue;
-    dispatch_queue_t _presentQueue;
+    CAMetalDisplayLink *_displayLink;
+    dispatch_queue_t _renderQueue;
+    dispatch_source_t _displaySlotTimer;
+    std::array<SPDisplayTimerTrace, 64> _displayTimerTrace;
+    uint64_t _displayTimerTraceCount;
+    std::atomic<uint64_t> _displaySlotExpiredInConsume, _displaySlotExpiredByCallback;
+    SPProspectiveDisplaySlot *_prospectiveSlot;
+    uint64_t _nextDisplaySlotToken;
+    std::atomic<int64_t> _displayPreparationLeadNs;
+    spAirDisplayPolicyB::RefreshHistory _airDisplayRefreshHistory;
+    spAirDisplayPolicyB::Decision _airRuleBLastDecision;
+    uint64_t _airRuleBDecisionCount;
+    std::size_t _airRuleBLastHistoryCount;
+    std::atomic<uint64_t> _displaySlotExpired, _displaySlotRetired, _displaySlotBusy, _displaySlotNoFrame;
+    std::mutex _presentationMutex;
+    NSMutableArray<SPDisplayFrameRequest *> *_pendingPresentations;
+    sp::SPRational _lastSubmittedPresentationPTS;
+    bool _haveSubmittedPresentationPTS;
     id<MTLRenderPipelineState> _pipeline;
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
+    BOOL _airFusedRifePresentDiagnostic;
+    id<MTLRenderPipelineState> _airFusedPresentPipeline;
+    std::mutex _airFusedNotesMutex;
+    std::unique_ptr<SPAirFusedRenderNotes> _airFusedRenderNotes;
+    uint64_t _airFusedRenderTotal;
+    BOOL _airFusedTraceSealed;
+    uint64_t _airFusedPostSealAttempts;
+    SPAirFusedRenderPtr _airFusedLastPositiveOriginal, _airFusedLastPositiveSynthetic;
+#endif
     CVMetalTextureCacheRef _cache;
     std::atomic<uint64_t> _generation;
     std::mutex _generationMutex;
@@ -702,8 +1552,27 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
     std::atomic<uint32_t> _diagnosticDisplayID;
     std::atomic<uint64_t> _diagnosticConfig;
     std::atomic<uint64_t> _diagnosticEpoch;
+    std::atomic<uint64_t> _presentationClockEpoch;
+    std::atomic<bool> _warmSurfacePending;
     std::atomic<uint64_t> _surfaceToken;
     std::atomic<int> _inflightDraws;
+    BOOL _airSessionObservationEnabled;
+    std::atomic<uint64_t> _airPresentedCallbacksPending;
+    std::atomic<uint64_t> _airCapacityViewSealedHostTicks;
+    BOOL _airPresentationTimingDiagnostic;
+    SPPreparedTextureMapper *_preparedTextures;
+    BOOL _airPreparedTextureDiagnostic;
+    spAirMeasurement::TracePtr _measurementTrace;
+    std::atomic<bool> _airPerformanceEnabled;
+    std::atomic<int64_t> _selectionGuardNs;
+    int64_t _diagnosticSelectionGuardNs;
+    std::unique_ptr<SPAirFrameRing> _airCadenceFrames;
+    std::unique_ptr<SPAirSlotCallbackRing> _airSlotCallbacks; // main-thread writer only
+    std::unique_ptr<SPAirSlotConsumeRing> _airSlotConsumes; // existing presentationMutex only
+    std::atomic<uint64_t> _airSlotCallbackUnsupported;
+#if ODF_AIR_BETA_DIAGNOSTIC
+    std::atomic<int> _airBetaCaptureWidth, _airBetaCaptureHeight;
+#endif
     std::mutex _geometryMutex;
     sp::SharedGeometryAuthority _sharedGeometry;
     int64_t _geometryVerifiedHost;
@@ -711,6 +1580,25 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
 
 - (instancetype)initWithFrame:(NSRect)frame {
     if (!(self = [super initWithFrame:frame])) return nil;
+#if ODF_AIR_BETA_DIAGNOSTIC
+    _airBetaCaptureWidth.store(0); _airBetaCaptureHeight.store(0);
+#endif
+    const char *airTiming = getenv("ODF_AIR_PRESENTATION_TIMING_DIAGNOSTIC");
+    _airPresentationTimingDiagnostic = airTiming && strcmp(airTiming, "1") == 0;
+    if (SPAirCadenceCausalTraceRequested()) {
+        _airCadenceFrames = std::make_unique<SPAirFrameRing>();
+        _airSlotCallbacks = std::make_unique<SPAirSlotCallbackRing>(); _airSlotConsumes = std::make_unique<SPAirSlotConsumeRing>();
+    }
+    _airSlotCallbackUnsupported.store(0);
+    if (SPAirFullMeasurementTraceRequested())
+        _measurementTrace = std::make_shared<spAirMeasurement::Trace>(spAirMeasurement::viewCapacity);
+    _airPerformanceEnabled.store(false);
+    const BOOL legacyAirRecipe = SPAirBetaEnabled() ||
+        (strcmp(getenv("ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC") ?: "", "1") == 0 &&
+         strcmp(getenv("ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC") ?: "", "1") == 0 &&
+         strcmp(getenv("ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC") ?: "", "1") == 0);
+    _diagnosticSelectionGuardNs = legacyAirRecipe ? 2000000 : 1000000;
+    _selectionGuardNs.store(_diagnosticSelectionGuardNs);
     _generation.store(0);
     _highestGeneration = 0;
     _revealedGeneration = 0;
@@ -721,11 +1609,37 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
     _diagnosticDisplayID.store(0);
     _diagnosticConfig.store(0);
     _diagnosticEpoch.store(0);
+    _presentationClockEpoch.store(0);
+    _warmSurfacePending.store(false);
     _surfaceToken.store(0);
     _inflightDraws.store(0);
+    _airSessionObservationEnabled = SPAirBetaSessionRecorderRequested();
+    _airPresentedCallbacksPending.store(0);
+    _airCapacityViewSealedHostTicks.store(0);
     _geometryVerifiedHost = 0;
+    _nextDisplaySlotToken = 0;
+    _displayPreparationLeadNs.store(16000000);
+    _displaySlotExpired.store(0); _displaySlotRetired.store(0); _displaySlotBusy.store(0); _displaySlotNoFrame.store(0);
+    _renderQueue = dispatch_queue_create("app.openduckframe.display-slot-render",
+        dispatch_queue_attr_make_with_autorelease_frequency(
+            dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0),
+            DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM));
+    _displayTimerTraceCount = 0;
+    _displaySlotExpiredInConsume.store(0); _displaySlotExpiredByCallback.store(0);
+    _displaySlotTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, DISPATCH_TIMER_STRICT, _renderQueue);
+    if (_displaySlotTimer) {
+        dispatch_source_set_timer(_displaySlotTimer, DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 50000);
+        dispatch_resume(_displaySlotTimer); // activated once; later arms/parks never suspend it
+    }
+    _pendingPresentations = [NSMutableArray array];
+    _haveSubmittedPresentationPTS = false;
     self.wantsLayer = YES;
     _device = MTLCreateSystemDefaultDevice();
+#if defined(ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC) && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC == 1
+    const char *preparedTextures = getenv("ODF_AIR_PREPARED_TEXTURE_DIAGNOSTIC");
+    _airPreparedTextureDiagnostic = preparedTextures && strcmp(preparedTextures, "1") == 0;
+    if (_airPreparedTextureDiagnostic) _preparedTextures = [[SPPreparedTextureMapper alloc] initWithDevice:_device];
+#endif
     _metalLayer = [CAMetalLayer layer];
     _metalLayer.device = _device;
     _metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -740,8 +1654,6 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
     _sourceCover.hidden = YES;
     [_metalLayer addSublayer:_sourceCover];
     _commandQueue = [_device newCommandQueue];
-    _presentQueue = dispatch_queue_create("app.openduckframe.live-present",
-                                          dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
     if (_device) CVMetalTextureCacheCreate(kCFAllocatorDefault, NULL, _device, NULL, &_cache);
     id<MTLLibrary> library = [_device newDefaultLibrary];
     id<MTLFunction> vertex = [library newFunctionWithName:@"spPresentVertex"];
@@ -753,11 +1665,130 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         _pipeline = [_device newRenderPipelineStateWithDescriptor:desc error:NULL];
     }
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
+    _airFusedRifePresentDiagnostic = strcmp(getenv("ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC") ?: "", "1") == 0 &&
+        strcmp(getenv("ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC") ?: "", "1") == 0 &&
+        strcmp(getenv("ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC") ?: "", "1") == 0;
+    if (SPAirCadenceCausalTraceRequested()) _airFusedRenderNotes = std::make_unique<SPAirFusedRenderNotes>();
+    if (_airFusedRifePresentDiagnostic && vertex) {
+        id<MTLFunction> fusedFragment = [library newFunctionWithName:@"spAirPresentLanczos"];
+        if (fusedFragment) {
+            MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
+            desc.vertexFunction = vertex; desc.fragmentFunction = fusedFragment;
+            desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+            _airFusedPresentPipeline = [_device newRenderPipelineStateWithDescriptor:desc error:NULL];
+        }
+    }
+#endif
+    if (_pipeline && _displaySlotTimer) {
+        _displayLink = [[CAMetalDisplayLink alloc] initWithMetalLayer:_metalLayer];
+        _displayLink.delegate = self;
+        _displayLink.preferredFrameLatency = 1;
+        _displayLink.paused = YES;
+        [_displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    }
     return self;
 }
 
 - (void)dealloc {
+    [_displayLink invalidate];
+    if (_displaySlotTimer) dispatch_source_cancel(_displaySlotTimer);
     if (_cache) CFRelease(_cache);
+}
+
+- (BOOL)setAirPerformanceEnabled:(BOOL)enabled captureWidth:(int)width captureHeight:(int)height {
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC && ODF_AIR_BETA_DIAGNOSTIC
+    if (enabled && !_airFusedPresentPipeline) {
+        id<MTLLibrary> library = [_device newDefaultLibrary];
+        id<MTLFunction> vertex = [library newFunctionWithName:@"spPresentVertex"];
+        id<MTLFunction> fragment = [library newFunctionWithName:@"spAirPresentLanczos"];
+        if (vertex && fragment) {
+            MTLRenderPipelineDescriptor *descriptor = [MTLRenderPipelineDescriptor new];
+            descriptor.vertexFunction = vertex; descriptor.fragmentFunction = fragment;
+            descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+            _airFusedPresentPipeline = [_device newRenderPipelineStateWithDescriptor:descriptor error:NULL];
+        }
+    }
+    if (enabled && (!_airFusedPresentPipeline || !_pipeline)) return NO;
+    if (enabled && !_preparedTextures) _preparedTextures = [[SPPreparedTextureMapper alloc] initWithDevice:_device];
+    [self setAirBetaCaptureWidth:width height:height];
+    _selectionGuardNs.store(enabled ? 2000000 : _diagnosticSelectionGuardNs);
+    {
+        std::lock_guard<std::mutex> lock(_presentationMutex);
+        if (_airPerformanceEnabled.exchange(enabled, std::memory_order_acq_rel) != enabled)
+            [self resetAirDisplayPolicyLocked];
+    }
+    return YES;
+#else
+    _airPerformanceEnabled.store(false);
+    _selectionGuardNs.store(_diagnosticSelectionGuardNs);
+    return !enabled;
+#endif
+}
+
+- (BOOL)airPerformanceEnabled { return _airPerformanceEnabled.load(std::memory_order_acquire); }
+- (int64_t)selectionGuardNs { return _selectionGuardNs.load(); }
+
+- (void)setPresentedVideoReadbackEnabled:(BOOL)enabled {
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
+    if (_airFusedRifePresentDiagnostic) _metalLayer.framebufferOnly = !enabled;
+#endif
+}
+
+- (void)setAirBetaCaptureWidth:(int)width height:(int)height {
+#if ODF_AIR_BETA_DIAGNOSTIC
+    _airBetaCaptureWidth.store(width); _airBetaCaptureHeight.store(height);
+#endif
+}
+
+- (NSDictionary *)fusedRifePresentationSnapshotIncludeRecords:(BOOL)includeRecords cutoffHostTicks:(int64_t)cutoff {
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
+    if (!_airFusedRifePresentDiagnostic && ![self airPerformanceEnabled])
+        return @{ @"compiled": @YES, @"enabled": @NO, @"lanczosPipelineReady": @(_airFusedPresentPipeline != nil) };
+    const int64_t sampled = SPHostNow();
+    uint64_t total = 0;
+    SPAirFusedRenderPtr original, synthetic;
+    std::vector<SPAirFusedRenderPtr> records;
+    if (includeRecords) records.reserve(SPAirFusedRenderCapacity);
+    {
+        std::lock_guard<std::mutex> lock(_airFusedNotesMutex);
+        total = _airFusedRenderTotal;
+        original = _airFusedLastPositiveOriginal; synthetic = _airFusedLastPositiveSynthetic;
+        if (includeRecords && _airFusedRenderNotes) {
+            const uint64_t count = std::min(total, (uint64_t)SPAirFusedRenderCapacity);
+            for (uint64_t index = total - count; index < total; index++)
+                records.push_back((*_airFusedRenderNotes)[index % SPAirFusedRenderCapacity]);
+        }
+    }
+    SPAirFusedRenderPtr latest = original;
+    if (synthetic && (!latest || synthetic->sequence > latest->sequence)) latest = synthetic;
+    NSMutableDictionary *result = [@{ @"schema": @"odf-air-fused-rife-presenter-v1", @"compiled": @YES, @"enabled": @YES,
+        @"sampleHostTicks": @(sampled), @"exportCutoffHostTicks": @(cutoff), @"includeRecords": @(includeRecords),
+        @"capacity": @(SPAirFusedRenderCapacity), @"total": @(total),
+        @"dropped": @(total > SPAirFusedRenderCapacity ? total - SPAirFusedRenderCapacity : 0),
+        @"sourceReferencePixels": latest ? @[@(latest->referenceWidth), @(latest->referenceHeight)] : (id)NSNull.null,
+        @"lanczosPipelineReady": @(_airFusedPresentPipeline != nil),
+        @"actualDrawablePixels": latest ? @[@(latest->drawableWidth), @(latest->drawableHeight)] : (id)NSNull.null,
+        @"actualOriginalBufferPixels": original ? @[@(original->bufferWidth), @(original->bufferHeight)] : (id)NSNull.null,
+        @"actualSyntheticBufferPixels": synthetic ? @[@(synthetic->bufferWidth), @(synthetic->bufferHeight)] : (id)NSNull.null,
+        @"originalPresentedRect": SPAirFusedRect(original) ?: (id)NSNull.null,
+        @"syntheticPresentedRect": SPAirFusedRect(synthetic) ?: (id)NSNull.null,
+        @"originalFragment": original ? (original->lanczosFragment ? @"spAirPresentLanczos" : @"spPresentFragment") : (id)NSNull.null,
+        @"syntheticFragment": synthetic ? (synthetic->lanczosFragment ? @"spAirPresentLanczos" : @"spPresentFragment") : (id)NSNull.null,
+        @"rectsExactlyEqual": original && synthetic ? @(original->imageRect == synthetic->imageRect) : (id)NSNull.null,
+        @"geometryFunction": (SPAirBetaEnabled() || [self airPerformanceEnabled]) ? @"sp::airBetaPresentationGeometry" : @"sp::airFusedPresentationGeometry",
+        @"scope": @"Latest counted non-redraw positive drawable callbacks supply actual summary rectangles and dimensions. Full records retain actual encoded pipeline, buffer shape, drawable shape and rectangle with the request context. No physical screen pixel claim.",
+        @"gpuTimingScope": @"Metal GPU start/end seconds are raw command-buffer residency times. completedHostTicks and completedMediaTime are CPU completion-handler observations, after actual GPU completion. No absolute GPU-to-Media or GPU-to-mach subtraction is assumed. Their CPU callback margin can provide a conservative lower bound under the existing same-context clock bounds.",
+        @"cutoffScope": @"Record inclusion uses selectionHostTicks<=exportCutoffHostTicks. Atomic GPU/presented terminal observations are sampled at export and can be later than that cutoff. They cannot replenish frozen admission or positive-presentation numerators. Unobserved GPU or presentation state is null." } mutableCopy];
+    if (includeRecords) {
+        NSMutableArray *rows = [NSMutableArray arrayWithCapacity:records.size()];
+        for (const auto &record : records) if (record && record->selectionHostTicks <= cutoff) [rows addObject:SPAirFusedRenderExport(record)];
+        result[@"records"] = rows; result[@"exportedCount"] = @(rows.count);
+    }
+    return result;
+#else
+    return @{ @"compiled": @NO, @"enabled": @NO };
+#endif
 }
 
 - (void)layout {
@@ -783,6 +1814,7 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
     _drawableVisible.store(drawable);
     _exposed.store(visible && window.alphaValue >= 0.99);
     _diagnosticDisplayID.store([window.screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue]);
+    [self updateDisplayLinkConfiguration];
     if (!drawable || window.alphaValue < 0.99) {
         std::lock_guard<std::mutex> lock(_geometryMutex);
         _sharedGeometry.observeTarget({}, false);
@@ -802,9 +1834,16 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
         // queued adoption can never roll the view back after a newer source.
         if (generation && generation < _highestGeneration) return;
         if (generation > _highestGeneration) _highestGeneration = generation;
+        std::lock_guard<std::mutex> pendingLock(_presentationMutex);
         old = _generation.exchange(generation);
+        if (generation != old) { _haveSubmittedPresentationPTS = false; [self resetAirDisplayPolicyLocked]; }
     }
-    if (generation != old) { std::lock_guard<std::mutex> lock(_geometryMutex); _sharedGeometry.invalidate(); }
+    if (generation != old) {
+        { std::lock_guard<std::mutex> lock(_geometryMutex); _sharedGeometry.invalidate(); }
+        [self discardOutdatedPresentations];
+        if (NSThread.isMainThread) [self updateDisplayLinkConfiguration];
+        else dispatch_async(dispatch_get_main_queue(), ^{ [self updateDisplayLinkConfiguration]; });
+    }
     if (!generation || generation == old) return;
     void (^cover)(void) = ^{ [self applySourceCoverForGeneration:generation]; };
     if (NSThread.isMainThread) cover(); else dispatch_async(dispatch_get_main_queue(), cover);
@@ -830,10 +1869,33 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
 - (BOOL)sourceCoverVisibleForTesting { return !_sourceCover.hidden; }
 
 - (void)setDiagnosticsConfig:(uint64_t)config epoch:(uint64_t)epoch {
-    uint64_t oldConfig = _diagnosticConfig.exchange(config), oldEpoch = _diagnosticEpoch.exchange(epoch);
-    if (oldConfig != config || oldEpoch != epoch) {
-        std::lock_guard<std::mutex> lock(_geometryMutex); _sharedGeometry.invalidate();
+    uint64_t oldConfig, oldEpoch;
+    {
+        std::lock_guard<std::mutex> generationLock(_generationMutex);
+        std::lock_guard<std::mutex> pendingLock(_presentationMutex);
+        oldConfig = _diagnosticConfig.exchange(config); oldEpoch = _diagnosticEpoch.exchange(epoch);
+        if (_airCadenceFrames && (oldConfig != config || oldEpoch != epoch)) {
+            SPAirFrameEvent event = SPAirFrameRecord(nil, SPAirFrameKind::configurationMarker, SPAirFrameReason::configuration, SPAirFrameStage::cleanup);
+            event.generation = _generation.load(); event.config = config; event.epoch = epoch; event.clock = _presentationClockEpoch.load();
+            event.previousConfig = oldConfig; event.previousEpoch = oldEpoch; _airCadenceFrames->append(event);
+        }
+        if (oldConfig != config || oldEpoch != epoch) { _haveSubmittedPresentationPTS = false; [self resetAirDisplayPolicyLocked]; }
     }
+    if (oldConfig != config || oldEpoch != epoch) {
+        { std::lock_guard<std::mutex> lock(_geometryMutex); _sharedGeometry.invalidate(); }
+        [self discardOutdatedPresentations];
+    }
+}
+
+- (void)setPresentationClockEpoch:(uint64_t)clockEpoch {
+    bool changed;
+    {
+        std::lock_guard<std::mutex> generationLock(_generationMutex);
+        std::lock_guard<std::mutex> pendingLock(_presentationMutex);
+        changed = _presentationClockEpoch.exchange(clockEpoch) != clockEpoch;
+        if (changed) { _haveSubmittedPresentationPTS = false; [self resetAirDisplayPolicyLocked]; }
+    }
+    if (changed) { [self invalidateSharedGeometry]; [self discardOutdatedPresentations]; }
 }
 
 - (void)observeSourceGeometry:(NSDictionary *)value generation:(uint64_t)generation {
@@ -947,11 +2009,18 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
 }
 
 - (CVMetalTextureRef)createTexture:(CVPixelBufferRef)buffer {
+    return [self createTexture:buffer apiStartedHostTicks:nullptr apiEndedHostTicks:nullptr];
+}
+
+- (CVMetalTextureRef)createTexture:(CVPixelBufferRef)buffer apiStartedHostTicks:(int64_t *)started apiEndedHostTicks:(int64_t *)ended {
     if (!buffer || !_cache) return NULL;
     CVMetalTextureRef ref = NULL;
+    const size_t width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer);
+    if (started) *started = SPHostNow();
     CVReturn result = CVMetalTextureCacheCreateTextureFromImage(
         kCFAllocatorDefault, _cache, buffer, NULL, MTLPixelFormatBGRA8Unorm,
-        CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer), 0, &ref);
+        width, height, 0, &ref);
+    if (ended) *ended = SPHostNow();
     if (result != kCVReturnSuccess || !ref) return NULL;
     return ref;
 }
@@ -985,6 +2054,15 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
          frameWidth:(float)fw frameHeight:(float)fh viewport:(MTLViewport)viewport
              buffer:(id<MTLCommandBuffer>)command drawable:(id<CAMetalDrawable>)drawable
                fill:(BOOL)fill geometry:(const sp::OutputGeometry *)geometry {
+    [self drawTexture:texture frameWidth:fw frameHeight:fh viewport:viewport buffer:command
+        drawable:drawable fill:fill geometry:geometry pipeline:_pipeline];
+}
+
+- (void)drawTexture:(id<MTLTexture>)texture
+         frameWidth:(float)fw frameHeight:(float)fh viewport:(MTLViewport)viewport
+             buffer:(id<MTLCommandBuffer>)command drawable:(id<CAMetalDrawable>)drawable
+               fill:(BOOL)fill geometry:(const sp::OutputGeometry *)geometry
+           pipeline:(id<MTLRenderPipelineState>)pipeline {
     float quad[16];
     [self writeQuad:quad viewportWidth:(float)viewport.width height:(float)viewport.height frameWidth:fw frameHeight:fh fill:fill geometry:geometry];
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -993,14 +2071,101 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> enc = [command renderCommandEncoderWithDescriptor:pass];
     [enc setViewport:viewport];
-    [enc setRenderPipelineState:_pipeline];
+    [enc setRenderPipelineState:pipeline];
     [enc setVertexBytes:quad length:sizeof(quad) atIndex:0];
     [enc setFragmentTexture:texture atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
     [enc endEncoding];
 }
 
++ (NSDictionary *)runPreparedTextureLifetimeProbe {
+    __block SPLivePreviewView *view = nil;
+    void (^makeView)(void) = ^{ view = [[SPLivePreviewView alloc] initWithFrame:NSMakeRect(0, 0, 64, 64)]; };
+    if (NSThread.isMainThread) makeView(); else dispatch_sync(dispatch_get_main_queue(), makeView);
+    return [view runPreparedTextureLifetimeProbe];
+}
+
+- (NSDictionary *)runPreparedTextureLifetimeProbe {
+    if (!_preparedTextures) return @{ @"ok": @NO, @"enabled": @NO, @"reason": @"requires diagnostic guard build and ODF_AIR_PREPARED_TEXTURE_DIAGNOSTIC=1" };
+    NSDictionary *attrs = @{ (id)kCVPixelBufferWidthKey:@64, (id)kCVPixelBufferHeightKey:@64,
+        (id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_32BGRA), (id)kCVPixelBufferIOSurfacePropertiesKey:@{}, (id)kCVPixelBufferMetalCompatibilityKey:@YES };
+    NSDictionary *limit = @{ (id)kCVPixelBufferPoolAllocationThresholdKey:@1 };
+    CVPixelBufferPoolRef pool = NULL; CVPixelBufferRef first = NULL, candidate = NULL;
+    CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, (__bridge CFDictionaryRef)attrs, &pool);
+    CVReturn created = pool ? CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault, pool, (__bridge CFDictionaryRef)limit, &first) : kCVReturnError;
+    if (created != kCVReturnSuccess || !first || !_pipeline) { if (first) CVPixelBufferRelease(first); if (pool) CFRelease(pool); return @{ @"ok":@NO, @"reason":@"prepared probe pixel pool/pipeline setup" }; }
+    CVPixelBufferLockBaseAddress(first, 0);
+    for (size_t y = 0; y < 64; ++y) {
+        uint8_t *row = (uint8_t *)CVPixelBufferGetBaseAddress(first) + y * CVPixelBufferGetBytesPerRow(first);
+        for (size_t x = 0; x < 64; ++x) { row[x*4] = 0; row[x*4+1] = 0; row[x*4+2] = 255; row[x*4+3] = 255; }
+    }
+    CVPixelBufferUnlockBaseAddress(first, 0);
+    NSMutableArray<SPDisplayFrameRequest *> *frames = [NSMutableArray array]; BOOL capacityBounded = YES;
+    for (uint64_t i = 0; i < 5; ++i) {
+        SPDisplayFrameRequest *frame = [SPDisplayFrameRequest new]; frame.enhanced = CVPixelBufferRetain(first);
+        frame.generation = 1; frame.config = 1; frame.epoch = 1; frame.clockEpoch = 1; frame.frameID = 9000 + i; frame.mode = SPLiveViewEnhanced;
+        SPPreparedTextureLease *lease = [_preparedTextures prepareFrame:frame];
+        if (i < 4) { capacityBounded = capacityBounded && lease != nil; [frames addObject:frame]; }
+        else capacityBounded = capacityBounded && lease == nil && frame.preparedTextureAdmissionReason == SPPreparedCapacity;
+    }
+    CVPixelBufferRelease(first); first = NULL;
+    [_preparedTextures fenceForProbe];
+    SPDisplayFrameRequest *frame = frames.firstObject;
+    int claimReason = SPPreparedNone;
+    SPPreparedTextureLease *lease = [_preparedTextures claimFrame:frame recordSelection:NO reason:&claimReason];
+    id<MTLTexture> mapped = [lease primaryTexture];
+    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
+    desc.usage = MTLTextureUsageRenderTarget; desc.storageMode = MTLStorageModeShared;
+    id<MTLTexture> output = [_device newTextureWithDescriptor:desc];
+    id<MTLSharedEvent> event = [_device newSharedEvent]; id<MTLCommandBuffer> command = [_commandQueue commandBuffer];
+    BOOL blocked = NO, reusable = NO, gpuCompleted = NO, sampledRed = NO;
+    const BOOL setup = lease && mapped && output && event && command;
+    if (setup) {
+        [command encodeWaitForEvent:event value:1];
+        SPProbeDrawable *surface = [SPProbeDrawable new]; surface.texture = output;
+        MTLRenderPassDescriptor *clear = [MTLRenderPassDescriptor renderPassDescriptor];
+        clear.colorAttachments[0].texture = output; clear.colorAttachments[0].loadAction = MTLLoadActionClear;
+        clear.colorAttachments[0].storeAction = MTLStoreActionStore; [[command renderCommandEncoderWithDescriptor:clear] endEncoding];
+        MTLViewport full = {0,0,64,64,0,1};
+        [self drawTexture:mapped frameWidth:64 frameHeight:64 viewport:full buffer:command drawable:(id<CAMetalDrawable>)surface fill:YES];
+        dispatch_semaphore_t done = dispatch_semaphore_create(0);
+        [command addCompletedHandler:^(id<MTLCommandBuffer> completed) { (void)completed; [lease complete]; dispatch_semaphore_signal(done); }];
+        [command commit];
+        // Drop every request and its original pixel-buffer retain. Only the
+        // inflight lease/texture ownership protects the source until completion.
+        frame = nil; [frames removeAllObjects]; [_preparedTextures fenceForProbe];
+        CVReturn busy = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault, pool, (__bridge CFDictionaryRef)limit, &candidate);
+        blocked = busy == kCVReturnWouldExceedAllocationThreshold && event.signaledValue == 0;
+        if (candidate) { CVPixelBufferRelease(candidate); candidate = NULL; }
+        event.signaledValue = 1;
+        const BOOL completedInTime = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) == 0;
+        gpuCompleted = completedInTime && command.status == MTLCommandBufferStatusCompleted;
+        if (gpuCompleted) {
+            uint8_t pixels[64*64*4] = {};
+            [output getBytes:pixels bytesPerRow:64*4 fromRegion:MTLRegionMake2D(0,0,64,64) mipmapLevel:0];
+            const size_t center = (32*64+32)*4; sampledRed = pixels[center+2] > 240 && pixels[center+1] < 10 && pixels[center] < 10;
+        }
+        mapped = nil; command = nil;
+        if (completedInTime) {
+            [_preparedTextures fenceForProbe];
+            CVReturn available = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault, pool, (__bridge CFDictionaryRef)limit, &candidate);
+            reusable = available == kCVReturnSuccess && candidate != NULL;
+            if (candidate) { CVPixelBufferRelease(candidate); candidate = NULL; }
+        }
+    } else { [lease complete]; frame = nil; [frames removeAllObjects]; [_preparedTextures fenceForProbe]; }
+    if (pool) CFRelease(pool);
+    NSDictionary *stats = [_preparedTextures snapshot];
+    const BOOL clean = [stats[@"outstanding"] unsignedLongLongValue] == 0 && [stats[@"peakOutstanding"] unsignedLongLongValue] == 4 &&
+        [stats[@"mapFailures"] unsignedLongLongValue] == 0 && [stats[@"textureFailures"] unsignedLongLongValue] == 0 && [stats[@"recycled"] unsignedLongLongValue] == 4;
+    return @{ @"ok": @(capacityBounded && setup && blocked && gpuCompleted && sampledRed && reusable && clean), @"enabled": @YES,
+        @"capacityBoundedAtFourAdmissions": @(capacityBounded), @"claimReason": SPPreparedTextureReasonName(claimReason),
+        @"poolBlockedBeforeGPUCompletion": @(blocked), @"gpuCompleted": @(gpuCompleted), @"mappedTextureReadbackRed": @(sampledRed),
+        @"poolReusableAfterGPUCompletionAndMapperFlush": @(reusable), @"preparedTexture": stats,
+        @"scope": @"Bounded independent-cache offscreen GPU read/draw probe with one-buffer pool threshold, four prepared leases and fifth admission rejection. Requests are released before GPU wait is signalled; release/Flush are fenced on mapper queue. No drawable, SCK, model or physical display." };
+}
+
 - (NSDictionary *)runOffscreenDrawAndLifetimeProbe {
+    if (_preparedTextures) return [self runPreparedTextureLifetimeProbe];
     MTLTextureDescriptor *outDesc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:32 mipmapped:NO];
     outDesc.usage=MTLTextureUsageRenderTarget; outDesc.storageMode=MTLStorageModeShared;
     id<MTLTexture> out=[_device newTextureWithDescriptor:outDesc];
@@ -1059,209 +2224,1017 @@ static BOOL SPTargetGeometryValue(NSDictionary *d, sp::GeometryTarget &t) {
                  counts:(BOOL)counts
          captureGeometry:(NSDictionary *)captureGeometry
                  reason:(NSString **)reason {
-    if (generation != _generation) { if (reason) *reason = @"generation"; return NO; }
-    if (!_pipeline) { if (reason) *reason = @"pipeline"; return NO; }
+    return [self presentEnhanced:enhanced original:original mode:mode captureHost:captureHost
+                     generation:generation ptsNum:ptsNum ptsDen:ptsDen synthetic:synthetic
+                        frameID:frameID counts:counts captureGeometry:captureGeometry
+               presentationHost:0 reason:reason];
+}
+
+- (BOOL)presentEnhanced:(CVPixelBufferRef)enhanced
+               original:(CVPixelBufferRef)original
+                   mode:(SPLiveViewMode)mode
+            captureHost:(int64_t)captureHost
+             generation:(uint64_t)generation
+                 ptsNum:(int64_t)ptsNum
+                 ptsDen:(int64_t)ptsDen
+              synthetic:(BOOL)synthetic
+                frameID:(uint64_t)frameID
+                 counts:(BOOL)counts
+         captureGeometry:(NSDictionary *)captureGeometry
+       presentationHost:(int64_t)presentationHost
+                 reason:(NSString **)reason {
+    return [self presentEnhanced:enhanced original:original mode:mode captureHost:captureHost generation:generation
+                          ptsNum:ptsNum ptsDen:ptsDen synthetic:synthetic frameID:frameID counts:counts
+                 captureGeometry:captureGeometry presentationHost:presentationHost redraw:NO reason:reason];
+}
+
+- (BOOL)presentEnhanced:(CVPixelBufferRef)enhanced
+               original:(CVPixelBufferRef)original
+                   mode:(SPLiveViewMode)mode
+            captureHost:(int64_t)captureHost
+             generation:(uint64_t)generation
+                 ptsNum:(int64_t)ptsNum
+                 ptsDen:(int64_t)ptsDen
+              synthetic:(BOOL)synthetic
+                frameID:(uint64_t)frameID
+                 counts:(BOOL)counts
+         captureGeometry:(NSDictionary *)captureGeometry
+       presentationHost:(int64_t)presentationHost
+                 redraw:(BOOL)redraw
+                 reason:(NSString **)reason {
+    if (generation != _generation.load()) { if (reason) *reason = @"generation"; return NO; }
+    if (!_pipeline || !_displayLink) { if (reason) *reason = @"pipeline"; return NO; }
     CVPixelBufferRef primary = mode == SPLiveViewOriginal ? (original ?: enhanced) : enhanced;
-    CVPixelBufferRef secondary = original ?: enhanced;
     if (!primary) { if (reason) *reason = @"input"; return NO; }
-    BOOL windowVisible = _windowVisible.load();
-    BOOL occluded = windowVisible && !_drawableVisible.load();
-    BOOL exposed = _exposed.load();
-    BOOL fillTarget = _followTargetContent.load() && mode != SPLiveViewCompare;
-    uint32_t diagnosticDisplayID = _diagnosticDisplayID.load();
-    if (!counts && (!windowVisible || occluded)) return YES;
-    int pending = _inflightDraws.load();
-    if (pending >= 3) { if (reason) *reason = @"inflight"; return NO; }
-    _inflightDraws.fetch_add(1);
-    if (enhanced) CVPixelBufferRetain(enhanced);
-    if (original) CVPixelBufferRetain(original);
-    uint64_t seen = generation;
-    // Bind each drawable to the plan that submitted it. The notification can
-    // arrive after a new plan has already replaced the view's diagnostics.
-    uint64_t seenConfig = _diagnosticConfig.load();
-    uint64_t seenEpoch = _diagnosticEpoch.load();
-    uint64_t seenSurfaceToken = _surfaceToken.load();
-    void (^reportFailure)(NSString *) = ^(NSString *why) {
-        if (counts && self.presentationFailure) self.presentationFailure(@{ @"reason": why, @"generation": @(seen),
-            @"configVersion": @(seenConfig), @"measurementEpoch": @(seenEpoch), @"frameID": @(frameID) });
-    };
-    struct SPDrawNote {
-        std::atomic<int> ticket;
-        std::atomic<long long> gpuHost;
-        std::atomic<int> refs;
-    };
-    auto *note = new SPDrawNote();
-    note->ticket.store(0);
-    note->gpuHost.store(0);
-    note->refs.store(2);
-    SPLivePreviewView *view = self;
-    void (^releaseTicket)(void) = ^{
-        if (note->ticket.exchange(1) == 0) view->_inflightDraws.fetch_sub(1);
-    };
-    void (^releaseNote)(void) = ^{
-        if (note->refs.fetch_sub(1) == 1) delete note;
-    };
-    void (^abandon)(void) = ^{
-        releaseTicket();
-        delete note;
-    };
-    int width = (int)CVPixelBufferGetWidth(primary);
-    int height = (int)CVPixelBufferGetHeight(primary);
-    int enhancedWidth = enhanced ? (int)CVPixelBufferGetWidth(enhanced) : 0;
-    int enhancedHeight = enhanced ? (int)CVPixelBufferGetHeight(enhanced) : 0;
-    int originalWidth = original ? (int)CVPixelBufferGetWidth(original) : 0;
-    int originalHeight = original ? (int)CVPixelBufferGetHeight(original) : 0;
-    dispatch_async(_presentQueue, ^{
-        if (seen != self->_generation || seenConfig != self->_diagnosticConfig.load() || seenEpoch != self->_diagnosticEpoch.load()) {
-            reportFailure(seen != self->_generation ? @"generation" : (seenConfig != self->_diagnosticConfig.load() ? @"configuration" : @"epoch"));
-            abandon();
-            if (enhanced) CVPixelBufferRelease(enhanced);
-            if (original) CVPixelBufferRelease(original);
-            return;
+    BOOL warmSurface = _surfaceToken.load() != 0 && _windowVisible.load() && !_exposed.load();
+    if (!warmSurface && (!_windowVisible.load() || !_drawableVisible.load())) { if (reason) *reason = @"display-invisible"; return NO; }
+    SPDisplayFrameRequest *frame = [SPDisplayFrameRequest new];
+    frame.enhanced = enhanced ? CVPixelBufferRetain(enhanced) : NULL;
+    frame.original = original ? CVPixelBufferRetain(original) : NULL;
+    frame.mode = mode; frame.captureHost = captureHost; frame.generation = generation;
+    frame.config = _diagnosticConfig.load(); frame.epoch = _diagnosticEpoch.load(); frame.clockEpoch = _presentationClockEpoch.load();
+    frame.surfaceToken = _surfaceToken.load(); frame.ptsNum = ptsNum; frame.ptsDen = ptsDen;
+    frame.airPerformanceEnabled = [self airPerformanceEnabled];
+    if (_measurementTrace) frame->_measurementTrace = _measurementTrace;
+#if ODF_AIR_BETA_DIAGNOSTIC
+    if (SPAirBetaEnabled() || frame.airPerformanceEnabled) {
+        frame.betaCaptureWidth = _airBetaCaptureWidth.load();
+        frame.betaCaptureHeight = _airBetaCaptureHeight.load();
+    }
+#endif
+    frame.synthetic = synthetic; frame.frameID = frameID; frame.counts = counts; frame.redraw = redraw;
+    frame.logicalTargetHost = presentationHost; frame.enqueueHost = SPHostNow();
+    frame.captureGeometry = captureGeometry;
+    if (warmSurface) {
+        if (_warmSurfacePending.exchange(true)) { if (reason) *reason = @"display-warm-inflight"; return NO; }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            CGSize size = self->_metalLayer.drawableSize;
+            dispatch_async(self->_renderQueue, ^{ [self prepareWarmSurface:frame targetSize:size]; });
+        });
+        return YES; // GPU surface preparation only; never a physical presentation success
+    }
+    std::lock_guard<std::mutex> lock(_presentationMutex);
+    if (generation != _generation.load() || frame.config != _diagnosticConfig.load() || frame.epoch != _diagnosticEpoch.load() || frame.clockEpoch != _presentationClockEpoch.load()) {
+        if (_airCadenceFrames) _airCadenceFrames->append(SPAirFrameRecord(frame, SPAirFrameKind::rejected,
+            frame.config != _diagnosticConfig.load() ? SPAirFrameReason::configuration : SPAirFrameReason::other, SPAirFrameStage::admission));
+        if (reason) *reason = @"display-context-changed"; return NO;
+    }
+    std::vector<sp::DisplayQueueFrame> timings;
+    for (SPDisplayFrameRequest *pending in _pendingPresentations) timings.push_back(SPDisplayFrameTiming(pending));
+    auto decision = sp::admitDisplayFrame(timings, SPDisplayFrameTiming(frame), _haveSubmittedPresentationPTS, _lastSubmittedPresentationPTS);
+    if (decision != sp::DisplayAdmission::accepted) {
+        if (_airCadenceFrames) _airCadenceFrames->append(SPAirFrameRecord(frame, SPAirFrameKind::rejected,
+            decision == sp::DisplayAdmission::full ? SPAirFrameReason::queueFull : (decision == sp::DisplayAdmission::duplicatePTS ? SPAirFrameReason::duplicatePTS :
+                (decision == sp::DisplayAdmission::invalidPTS ? SPAirFrameReason::invalidPTS : SPAirFrameReason::stalePTS)), SPAirFrameStage::admission));
+        if (reason) *reason = decision == sp::DisplayAdmission::full ? @"display-queue-full" :
+            (decision == sp::DisplayAdmission::duplicatePTS ? @"display-duplicate-pts" :
+             (decision == sp::DisplayAdmission::invalidPTS ? @"display-invalid-pts" :
+              (decision == sp::DisplayAdmission::redrawNotCurrent ? @"display-redraw-not-current" : @"display-stale-pts")));
+        return NO;
+    }
+    [_pendingPresentations insertObject:frame atIndex:sp::displayFrameInsertionIndex(timings, SPDisplayFrameTiming(frame))];
+    if (_airCadenceFrames) {
+        SPAirFrameEvent event = SPAirFrameRecord(frame, SPAirFrameKind::admitted, SPAirFrameReason::none, SPAirFrameStage::admission);
+        frame.causalEnqueueHostTicks = event.hostTicks; event.enqueueHostTicks = event.hostTicks; _airCadenceFrames->append(event);
+    }
+    if ((frame.airPerformanceEnabled || _airPreparedTextureDiagnostic) && _preparedTextures) [_preparedTextures prepareFrame:frame];
+    return YES; // admitted only; success is still counted exclusively by addPresentedHandler
+}
+
+- (void)updateDisplayLinkConfiguration {
+    NSAssert(NSThread.isMainThread, @"display-link configuration belongs to its main run loop");
+    double maximum = self.window.screen.maximumFramesPerSecond ?: NSScreen.mainScreen.maximumFramesPerSecond;
+    if (maximum <= 0) maximum = 60;
+    float preferred = (float)MAX(1, maximum);
+    _displayLink.preferredFrameRateRange = CAFrameRateRangeMake(preferred, preferred, preferred);
+    _displayLink.paused = !_drawableVisible.load() || _generation.load() == 0;
+    if (!_drawableVisible.load()) {
+        NSArray<SPDisplayFrameRequest *> *discarded;
+        { std::lock_guard<std::mutex> lock(_presentationMutex);
+          if (_airCadenceFrames) for (SPDisplayFrameRequest *frame in _pendingPresentations)
+              _airCadenceFrames->append(SPAirFrameRecord(frame, SPAirFrameKind::discarded, SPAirFrameReason::invisible, SPAirFrameStage::visibilityCleanup));
+          discarded = [_pendingPresentations copy]; [_pendingPresentations removeAllObjects];
+          if (_prospectiveSlot) {
+              if (_airSlotConsumes) [self recordAirSlotTraceLocked:{_prospectiveSlot->timing, _prospectiveSlot->timing.token, 0, 0, 0, SPDisplayTimerOutcome::retired} origin:SPAirSlotOrigin::visibilityRetired];
+              _displaySlotRetired.fetch_add(1); _prospectiveSlot = nil;
+          }
+          [self parkDisplaySlotTimerLocked]; }
+        for (SPDisplayFrameRequest *frame in discarded) [self reportPendingPresentation:frame reason:@"display-invisible"];
+    }
+}
+
+- (void)reportPendingPresentation:(SPDisplayFrameRequest *)frame reason:(NSString *)reason {
+    [self reportPendingPresentation:frame reason:reason details:nil];
+}
+
+- (void)reportPendingPresentation:(SPDisplayFrameRequest *)frame reason:(NSString *)reason details:(NSDictionary *)details {
+    [frame.preparedTextureLease cancel];
+    if (!frame.counts || !self.presentationFailure) return;
+    NSMutableDictionary *info = [@{
+        @"reason": reason, @"generation": @(frame.generation), @"configVersion": @(frame.config),
+        @"measurementEpoch": @(frame.epoch), @"clockEpoch": @(frame.clockEpoch), @"frameID": @(frame.frameID),
+        @"ptsNum": @(frame.ptsNum), @"ptsDen": @(frame.ptsDen), @"synthetic": @(frame.synthetic),
+        @"logicalTargetHost": @(frame.logicalTargetHost), @"presentationEnqueueHost": @(frame.enqueueHost) } mutableCopy];
+    if (details) [info addEntriesFromDictionary:details];
+    self.presentationFailure(info);
+}
+
+- (void)discardOutdatedPresentations {
+    NSMutableArray<SPDisplayFrameRequest *> *discarded = [NSMutableArray array];
+    {
+        std::lock_guard<std::mutex> lock(_presentationMutex);
+        if (_prospectiveSlot && !sp::sameDisplaySlotContext(_prospectiveSlot->timing.context, [self displaySlotContext])) {
+            if (_airSlotConsumes) [self recordAirSlotTraceLocked:{_prospectiveSlot->timing, _prospectiveSlot->timing.token, 0, 0, 0, SPDisplayTimerOutcome::retired} origin:SPAirSlotOrigin::contextCleanupRetired];
+            _displaySlotRetired.fetch_add(1); _prospectiveSlot = nil;
+            [self parkDisplaySlotTimerLocked];
         }
-        int64_t drawableWaitStart = SPHostNow();
-        id<CAMetalDrawable> drawable = [self->_metalLayer nextDrawable];
-        int64_t drawableWaitNs = SPHostToNs(SPHostNow() - drawableWaitStart);
+        for (NSInteger i = (NSInteger)_pendingPresentations.count - 1; i >= 0; --i) {
+            SPDisplayFrameRequest *frame = _pendingPresentations[(NSUInteger)i];
+            if (frame.generation != _generation.load() || frame.config != _diagnosticConfig.load() || frame.epoch != _diagnosticEpoch.load() || frame.clockEpoch != _presentationClockEpoch.load()) {
+                if (_airCadenceFrames) {
+                    const auto reason = frame.generation != _generation.load() ? SPAirFrameReason::generation :
+                        (frame.config != _diagnosticConfig.load() ? SPAirFrameReason::configuration : (frame.epoch != _diagnosticEpoch.load() ? SPAirFrameReason::epoch : SPAirFrameReason::clock));
+                    _airCadenceFrames->append(SPAirFrameRecord(frame, SPAirFrameKind::discarded, reason, SPAirFrameStage::cleanup));
+                }
+                [discarded addObject:frame]; [_pendingPresentations removeObjectAtIndex:(NSUInteger)i];
+            }
+        }
+    }
+    for (SPDisplayFrameRequest *frame in discarded) [self reportPendingPresentation:frame reason:
+        frame.generation != _generation.load() ? @"generation" : (frame.config != _diagnosticConfig.load() ? @"configuration" :
+            (frame.epoch != _diagnosticEpoch.load() ? @"epoch" : @"clock-retired"))];
+}
+
+// A transparent output may receive no display-link updates. Prepare one
+// bounded offscreen surface for its existing token handshake; never present it.
+- (void)prepareWarmSurface:(SPDisplayFrameRequest *)frame targetSize:(CGSize)size {
+    @autoreleasepool {
+        if (frame.generation != _generation.load() || frame.config != _diagnosticConfig.load() ||
+            frame.epoch != _diagnosticEpoch.load() || frame.clockEpoch != _presentationClockEpoch.load() ||
+            frame.surfaceToken != _surfaceToken.load()) {
+            _warmSurfacePending.store(false); [self reportPendingPresentation:frame reason:@"display-warm-context-changed"]; return;
+        }
+        CVPixelBufferRef primary = frame.mode == SPLiveViewOriginal ? (frame.original ?: frame.enhanced) : frame.enhanced;
+        CVPixelBufferRef secondary = frame.original ?: frame.enhanced;
         CVMetalTextureRef aRef = [self createTexture:primary];
-        CVMetalTextureRef bRef = mode == SPLiveViewCompare ? [self createTexture:secondary] : NULL;
-        id<MTLTexture> a = aRef ? CVMetalTextureGetTexture(aRef) : nil;
-        id<MTLTexture> b = bRef ? CVMetalTextureGetTexture(bRef) : nil;
-        if (!drawable || !a || !self->_pipeline) {
-            reportFailure(!drawable ? @"drawable" : (!a ? @"texture" : @"pipeline"));
-            if (aRef) CFRelease(aRef);
-            if (bRef) CFRelease(bRef);
-            abandon();
-            if (enhanced) CVPixelBufferRelease(enhanced);
-            if (original) CVPixelBufferRelease(original);
-            return;
-        }
-        id<MTLCommandBuffer> command = [self->_commandQueue commandBuffer];
-        if (!command) {
-            reportFailure(@"command");
-            if (aRef) CFRelease(aRef);
-            if (bRef) CFRelease(bRef);
-            abandon();
-            if (enhanced) CVPixelBufferRelease(enhanced);
-            if (original) CVPixelBufferRelease(original);
-            return;
+        CVMetalTextureRef bRef = frame.mode == SPLiveViewCompare ? [self createTexture:secondary] : NULL;
+        id<MTLTexture> a = aRef ? CVMetalTextureGetTexture(aRef) : nil, b = bRef ? CVMetalTextureGetTexture(bRef) : nil;
+        MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+            width:MAX((NSUInteger)1,(NSUInteger)size.width) height:MAX((NSUInteger)1,(NSUInteger)size.height) mipmapped:NO];
+        desc.usage = MTLTextureUsageRenderTarget;
+        SPProbeDrawable *surface = [SPProbeDrawable new]; surface.texture = [_device newTextureWithDescriptor:desc];
+        id<MTLCommandBuffer> command = [_commandQueue commandBuffer];
+        if (!a || !surface.texture || !command) {
+            if (aRef) CFRelease(aRef); if (bRef) CFRelease(bRef);
+            _warmSurfacePending.store(false); [self reportPendingPresentation:frame reason:@"display-warm-surface"]; return;
         }
         MTLRenderPassDescriptor *clear = [MTLRenderPassDescriptor renderPassDescriptor];
-        clear.colorAttachments[0].texture = drawable.texture;
-        clear.colorAttachments[0].loadAction = MTLLoadActionClear;
-        clear.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+        clear.colorAttachments[0].texture = surface.texture; clear.colorAttachments[0].loadAction = MTLLoadActionClear;
         clear.colorAttachments[0].storeAction = MTLStoreActionStore;
-        id<MTLRenderCommandEncoder> enc = [command renderCommandEncoderWithDescriptor:clear];
-        [enc endEncoding];
-        CGSize size = CGSizeMake(drawable.texture.width, drawable.texture.height);
-        float fw = (float)CVPixelBufferGetWidth(primary);
-        float fh = (float)CVPixelBufferGetHeight(primary);
-        sp::GeometrySource diagnosticGeometry{};
-        sp::SurfaceCropState cropState{};
-        BOOL diagnosticSource = SPSourceGeometryValue(captureGeometry, diagnosticGeometry);
-        sp::visualOutputGeometry(diagnosticSource ? &diagnosticGeometry : nullptr, seen, (int)fw, (int)fh, size.width, size.height, fillTarget, cropState);
-        NSString *cropStatus = cropState == sp::SurfaceCropState::validated ? @"metadata-valid-unapplied" : (cropState == sp::SurfaceCropState::targetAspectMismatch ? @"target-aspect-mismatch-unapplied" : @"metadata-unavailable-unapplied");
-        sp::SharedGeometry geometryCandidate{};
-        sp::GeometrySource sourceGeometry{};
-        if (counts && mode != SPLiveViewCompare && SPSourceGeometryValue(captureGeometry, sourceGeometry)) {
-            std::lock_guard<std::mutex> lock(self->_geometryMutex);
-            geometryCandidate=self->_sharedGeometry.candidate(sourceGeometry, seen, seenConfig, seenEpoch, diagnosticDisplayID,
-                (int)size.width, (int)size.height, (int)fw, (int)fh, fillTarget);
-        }
-        // If this drawable cannot be tied to the current verified geometry,
-        // no earlier mapping may remain active while it is being presented.
-        if (counts && !geometryCandidate.valid) [self invalidateSharedGeometry];
-        id imageRectPixels = [NSNull null];
-        if (mode != SPLiveViewCompare) {
-            auto geometry = sp::outputGeometry({0,0,size.width,size.height},{0,0,fw,fh},fillTarget,1);
-            if (geometry.valid) imageRectPixels = @[@(geometry.image.x), @(geometry.image.y), @(geometry.image.width), @(geometry.image.height)];
-        }
-        if (mode == SPLiveViewCompare && b) {
-            MTLViewport left = {0, 0, size.width * 0.5, size.height, 0, 1};
-            MTLViewport right = {size.width * 0.5, 0, size.width * 0.5, size.height, 0, 1};
-            [self drawTexture:a frameWidth:fw frameHeight:fh viewport:left buffer:command drawable:drawable fill:NO];
-            [self drawTexture:b frameWidth:(float)CVPixelBufferGetWidth(secondary)
-                  frameHeight:(float)CVPixelBufferGetHeight(secondary)
-                     viewport:right buffer:command drawable:drawable fill:NO];
-        } else {
-            MTLViewport full = {0, 0, size.width, size.height, 0, 1};
-            [self drawTexture:a frameWidth:fw frameHeight:fh viewport:full buffer:command drawable:drawable fill:fillTarget
-                      geometry:geometryCandidate.valid ? &geometryCandidate.render : nullptr];
-        }
-        [command addCompletedHandler:^(id<MTLCommandBuffer> done) {
-            if (done.status != MTLCommandBufferStatusCompleted) reportFailure(@"gpu");
-            note->gpuHost.store((long long)SPHostNow());
-            if (aRef) CFRelease(aRef);
-            if (bRef) CFRelease(bRef);
-            if (enhanced) CVPixelBufferRelease(enhanced);
-            if (original) CVPixelBufferRelease(original);
-            if (seenSurfaceToken && self.surfaceReady) {
-                self.surfaceReady(@{ @"generation": @(seen), @"configVersion": @(seenConfig), @"captureHost": @(captureHost),
-                    @"measurementEpoch": @(seenEpoch), @"surfaceToken": @(seenSurfaceToken),
-                    @"counts": @(counts), @"windowVisible": @(windowVisible),
-                    @"gpuCompleted": @(done.status == MTLCommandBufferStatusCompleted), @"viewMode": @(mode),
-                    @"enhancedWidth": @(enhancedWidth), @"enhancedHeight": @(enhancedHeight),
-                    @"originalWidth": @(originalWidth), @"originalHeight": @(originalHeight) });
-            }
-            releaseTicket();
-            releaseNote();
+        [[command renderCommandEncoderWithDescriptor:clear] endEncoding];
+        MTLViewport full = {0,0,(double)surface.texture.width,(double)surface.texture.height,0,1};
+        if (frame.mode == SPLiveViewCompare && b) {
+            MTLViewport left = full, right = full; left.width *= .5; right.width *= .5; right.originX = left.width;
+            [self drawTexture:a frameWidth:CVPixelBufferGetWidth(primary) frameHeight:CVPixelBufferGetHeight(primary)
+                viewport:left buffer:command drawable:(id<CAMetalDrawable>)surface fill:NO];
+            [self drawTexture:b frameWidth:CVPixelBufferGetWidth(secondary) frameHeight:CVPixelBufferGetHeight(secondary)
+                viewport:right buffer:command drawable:(id<CAMetalDrawable>)surface fill:NO];
+        } else [self drawTexture:a frameWidth:CVPixelBufferGetWidth(primary) frameHeight:CVPixelBufferGetHeight(primary)
+            viewport:full buffer:command drawable:(id<CAMetalDrawable>)surface fill:_followTargetContent.load()];
+        _inflightDraws.fetch_add(1);
+        [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+            if (aRef) CFRelease(aRef); if (bRef) CFRelease(bRef);
+            self->_inflightDraws.fetch_sub(1); self->_warmSurfacePending.store(false);
+            if (frame.clockEpoch != self->_presentationClockEpoch.load()) return;
+            if (completed.status != MTLCommandBufferStatusCompleted) [self reportPendingPresentation:frame reason:@"display-warm-gpu"];
+            if (self.surfaceReady) self.surfaceReady(@{
+                @"generation": @(frame.generation), @"configVersion": @(frame.config), @"measurementEpoch": @(frame.epoch),
+                @"clockEpoch": @(frame.clockEpoch), @"surfaceToken": @(frame.surfaceToken), @"captureHost": @(frame.captureHost),
+                @"frameID": @(frame.frameID), @"counts": @(frame.counts), @"windowVisible": @(self->_windowVisible.load()),
+                @"gpuCompleted": @(completed.status == MTLCommandBufferStatusCompleted), @"surfacePreparationOnly": @YES,
+                @"viewMode": @(frame.mode), @"enhancedWidth": @(frame.enhanced ? CVPixelBufferGetWidth(frame.enhanced) : 0),
+                @"enhancedHeight": @(frame.enhanced ? CVPixelBufferGetHeight(frame.enhanced) : 0),
+                @"originalWidth": @(frame.original ? CVPixelBufferGetWidth(frame.original) : 0),
+                @"originalHeight": @(frame.original ? CVPixelBufferGetHeight(frame.original) : 0) });
         }];
-        if (seen != self->_generation.load()) {
-            reportFailure(@"generation");
-            releaseNote(); // no presented handler will own the second reference
-            [command commit];
-            return;
-        }
-        [drawable addPresentedHandler:^(id<MTLDrawable> presentedDrawable) {
-            long long gpuHost = note->gpuHost.load();
-            releaseNote();
-            BOOL geometryActivated = NO;
-            if (geometryCandidate.valid && counts && windowVisible && exposed && !occluded && presentedDrawable.presentedTime > 0 &&
-                seen==self->_generation.load() && seenConfig==self->_diagnosticConfig.load() && seenEpoch==self->_diagnosticEpoch.load()) {
-                std::lock_guard<std::mutex> lock(self->_geometryMutex);
-                if (seen==self->_generation.load() && seenConfig==self->_diagnosticConfig.load() && seenEpoch==self->_diagnosticEpoch.load() &&
-                    self->_geometryVerifiedHost>0 && SPHostToNs(SPHostNow()-self->_geometryVerifiedHost)<=350000000LL)
-                    geometryActivated=self->_sharedGeometry.activate(geometryCandidate.version,frameID,captureHost);
-            }
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self revealSourceGeneration:seen];
-            });
-            if (!self.presented) return;
-            self.presented(@{
-                @"captureHost": @(captureHost),
-                @"presentedHost": @(SPHostNow()),
-                @"presentedTime": @(presentedDrawable.presentedTime),
-                @"handlerMediaTime": @(CACurrentMediaTime()),
-                @"drawableWaitNs": @(drawableWaitNs),
-                @"gpuHost": @(gpuHost),
-                @"occluded": @(occluded),
-                @"windowVisible": @(windowVisible),
-                @"exposed": @(exposed),
-                @"generation": @(seen),
-                @"configVersion": @(seenConfig),
-                @"measurementEpoch": @(seenEpoch),
-                @"ptsNum": @(ptsNum),
-                @"ptsDen": @(ptsDen),
-                @"synthetic": @(synthetic),
-                @"viewMode": @(mode),
-                @"frameID": @(frameID),
-                @"counts": @(counts),
-                @"width": @(width),
-                @"height": @(height),
-                @"drawableWidth": @((int)size.width),
-                @"drawableHeight": @((int)size.height),
-                @"outputImageRectPixels": imageRectPixels,
-                @"surfaceGeometryAssessment": cropStatus,
-                @"outputDisplayID": diagnosticDisplayID ? @(diagnosticDisplayID) : (id)[NSNull null],
-                @"geometryVersion": geometryActivated ? @(geometryCandidate.version) : (id)[NSNull null],
-                @"enhancedCenter": @(-1),
-                @"originalCenter": @(-1),
-            });
-        }];
-        [command presentDrawable:drawable];
         [command commit];
-        if (self->_cache) CVMetalTextureCacheFlush(self->_cache, 0);
-    });
+    }
+}
+
+- (sp::DisplaySlotContext)displaySlotContext {
+    return {_generation.load(), _diagnosticConfig.load(), _diagnosticEpoch.load(), _presentationClockEpoch.load()};
+}
+
+- (void)resetAirDisplayPolicyLocked {
+    _airDisplayRefreshHistory.reset();
+    _airRuleBLastDecision = {};
+    _airRuleBDecisionCount = 0; _airRuleBLastHistoryCount = 0;
+    if (_prospectiveSlot) _prospectiveSlot->ruleBEnabled = false;
+}
+
+- (void)copyAirCadenceEvents:(std::vector<SPAirFrameEvent> *)events total:(uint64_t *)total {
+    [self copyAirCadenceEvents:events total:total consumes:nullptr consumeTotal:nullptr snapshot:nullptr];
+}
+
+- (void)copyAirCadenceEvents:(std::vector<SPAirFrameEvent> *)events total:(uint64_t *)total
+    consumes:(std::vector<SPAirSlotConsumeEvent> *)consumes consumeTotal:(uint64_t *)consumeTotal snapshot:(SPAirSlotSnapshot *)snapshot {
+    if (!_airCadenceFrames) { *total = 0; return; }
+    events->reserve(SPAirFrameRing::capacity); // controlled export only; allocation precedes existing mutex
+    if (consumes) consumes->reserve(SPAirSlotConsumeRing::capacity);
+    std::lock_guard<std::mutex> lock(_presentationMutex);
+    if (snapshot) {
+        snapshot->sampleHostTicks = SPHostNow(); snapshot->hasPending = _prospectiveSlot != nil;
+        if (_prospectiveSlot) {
+            const auto pending = _prospectiveSlot->timing; snapshot->token = pending.token; snapshot->generation = pending.context.generation; snapshot->config = pending.context.config;
+            snapshot->epoch = pending.context.measurementEpoch; snapshot->clock = pending.context.clockEpoch; snapshot->deadlineMediaNs = pending.deadlineNs; snapshot->displayTimeMediaNs = pending.displayNs;
+        }
+    }
+    _airCadenceFrames->copy(*events); *total = _airCadenceFrames->total;
+    if (consumes && consumeTotal) { _airSlotConsumes->copy(*consumes); *consumeTotal = _airSlotConsumes->total; }
+}
+
+- (BOOL)copyAirSlotCallbacks:(std::vector<SPAirSlotCallbackEvent> *)events total:(uint64_t *)total
+    mainCallerSynchronouslyOnProcessorQueue:(BOOL)safe unsupported:(uint64_t *)unsupported {
+    *unsupported = _airSlotCallbackUnsupported.load();
+    *total = 0;
+    // The controlled main caller is synchronously inside/blocked by its _q
+    // export, so no main-run-loop delegate can write while this copy executes.
+    if (!safe || !dispatch_get_specific(SPLiveQueueKey) || !_airSlotCallbacks) return NO;
+    events->reserve(SPAirSlotCallbackRing::capacity); _airSlotCallbacks->copy(*events); *total = _airSlotCallbacks->total;
     return YES;
+}
+
+- (int64_t)presentationPreparationLeadNs { return _displayPreparationLeadNs.load(); }
+
+- (void)recordDisplayTimerTraceLocked:(SPDisplayTimerTrace)trace {
+    _displayTimerTrace[_displayTimerTraceCount % _displayTimerTrace.size()] = trace;
+    ++_displayTimerTraceCount;
+    if (_airSlotConsumes && (trace.handlerEntryHostTicks || trace.outcome == SPDisplayTimerOutcome::expiredReplaced))
+        [self recordAirSlotTraceLocked:trace origin:trace.handlerEntryHostTicks ? SPAirSlotOrigin::timerAttempt : SPAirSlotOrigin::callbackReplaced];
+}
+
+- (void)recordAirSlotTraceLocked:(SPDisplayTimerTrace)trace origin:(SPAirSlotOrigin)origin {
+    if (_airSlotConsumes) {
+        SPAirSlotConsumeEvent event{}; event.token = trace.armed.token; event.observedToken = trace.observedToken; event.frameID = trace.frameID;
+        event.generation = trace.armed.context.generation; event.config = trace.armed.context.config; event.epoch = trace.armed.context.measurementEpoch; event.clock = trace.armed.context.clockEpoch;
+        const auto current = [self displaySlotContext]; event.currentGeneration = current.generation; event.currentConfig = current.config; event.currentEpoch = current.measurementEpoch; event.currentClock = current.clockEpoch;
+        event.entryHostTicks = trace.handlerEntryHostTicks; event.recordHostTicks = SPHostNow(); event.handlerEntryMediaNs = trace.handlerEntryNs; event.lockAcquiredMediaNs = trace.lockAcquiredNs;
+        event.plannedSelectionMediaNs = trace.armed.deadlineNs - sp::displaySlotSelectionGuardNs(trace.armed); event.deadlineMediaNs = trace.armed.deadlineNs; event.displayTimeMediaNs = trace.armed.displayNs;
+        event.outcome = (uint8_t)trace.outcome; event.origin = origin;
+        event.terminal = trace.outcome == SPDisplayTimerOutcome::selected || trace.outcome == SPDisplayTimerOutcome::noFrame ||
+            trace.outcome == SPDisplayTimerOutcome::expiredConsume || trace.outcome == SPDisplayTimerOutcome::expiredReplaced ||
+            trace.outcome == SPDisplayTimerOutcome::retired || trace.outcome == SPDisplayTimerOutcome::gpuBusy;
+        _airSlotConsumes->append(event);
+    }
+}
+
+- (NSDictionary *)preparedTextureCountersSnapshot {
+    return ([self airPerformanceEnabled] || _airPreparedTextureDiagnostic) && _preparedTextures ? [_preparedTextures snapshot] : @{ @"enabled": @NO, @"capacity": @4 };
+}
+
+- (NSDictionary *)displaySlotDiagnostics {
+    std::array<SPDisplayTimerTrace, 64> history;
+    uint64_t total; NSUInteger pendingFrames; bool pendingSlot;
+    bool ruleBEnabled;
+    spAirDisplayPolicyB::Decision ruleBDecision;
+    uint64_t ruleBDecisionCount; std::size_t ruleBHistoryCount;
+    {
+        std::lock_guard<std::mutex> lock(_presentationMutex);
+        history = _displayTimerTrace; total = _displayTimerTraceCount;
+        pendingFrames = _pendingPresentations.count; pendingSlot = _prospectiveSlot != nil;
+        ruleBEnabled = _airPerformanceEnabled.load(); ruleBDecision = _airRuleBLastDecision;
+        ruleBDecisionCount = _airRuleBDecisionCount; ruleBHistoryCount = _airRuleBLastHistoryCount;
+    }
+    // Build diagnostic objects outside the deadline-sensitive publication lock.
+    NSUInteger count = (NSUInteger)MIN(total, (uint64_t)history.size());
+    NSMutableArray *events = [NSMutableArray arrayWithCapacity:count];
+    for (NSUInteger i = 0; i < count; ++i) {
+        const auto &trace = history[(total - count + i) % history.size()];
+        NSString *expiredOrigin = trace.outcome == SPDisplayTimerOutcome::expiredConsume ? @"consume" :
+            (trace.outcome == SPDisplayTimerOutcome::expiredReplaced ? @"callback-replaced" : nil);
+        [events addObject:@{ @"handlerToken": @(trace.armed.token), @"observedToken": @(trace.observedToken),
+            @"generation": @(trace.armed.context.generation), @"configVersion": @(trace.armed.context.config),
+            @"measurementEpoch": @(trace.armed.context.measurementEpoch), @"clockEpoch": @(trace.armed.context.clockEpoch),
+            @"plannedSelectionNs": @(trace.armed.deadlineNs - sp::displaySlotSelectionGuardNs(trace.armed)),
+            @"deadlineNs": @(trace.armed.deadlineNs), @"scheduledDisplayNs": @(trace.armed.displayNs),
+            @"handlerEntryNs": trace.handlerEntryNs ? @(trace.handlerEntryNs) : (id)[NSNull null],
+            @"lockAcquiredNs": trace.lockAcquiredNs ? @(trace.lockAcquiredNs) : (id)[NSNull null],
+            @"frameID": trace.frameID ? @(trace.frameID) : (id)[NSNull null],
+            @"outcome": SPDisplayTimerOutcomeName(trace.outcome), @"expiredOrigin": expiredOrigin ?: (id)[NSNull null] }];
+    }
+    NSDictionary *result = @{ @"pendingSlots": @(pendingSlot), @"slotCapacity": @1,
+        @"pendingFrames": @(pendingFrames), @"frameCapacity": @(sp::displayQueueCapacity),
+        @"expiredSlotsLifetime": @(_displaySlotExpired.load()),
+        @"expiredInConsumeLifetime": @(_displaySlotExpiredInConsume.load()),
+        @"expiredByCallbackLifetime": @(_displaySlotExpiredByCallback.load()),
+        @"retiredSlotsLifetime": @(_displaySlotRetired.load()), @"busySlotsLifetime": @(_displaySlotBusy.load()),
+        @"noFrameSlotsLifetime": @(_displaySlotNoFrame.load()), @"preparationLeadNs": @(_displayPreparationLeadNs.load()),
+        @"selectionGuardNs": @([self selectionGuardNs]), @"timerLeewayNs": @50000, @"timerStrict": @YES,
+        @"ruleB": @{ @"enabled": @(ruleBEnabled), @"historyCapacity": @8, @"decisionCountInContext": @(ruleBDecisionCount),
+            @"lastDecisionBranch": ruleBDecisionCount ? @((int)ruleBDecision.branch) : (id)NSNull.null,
+            @"lastDecisionRefreshPeriodNs": ruleBDecision.refreshPeriodNs > 0 ? @(ruleBDecision.refreshPeriodNs) : (id)NSNull.null,
+            @"lastDecisionHistoryCount": @(ruleBHistoryCount) },
+        @"timerTraceCapacity": @(history.size()), @"timerTraceTotal": @(total), @"timerTrace": events,
+        @"timerTraceNote": @"bounded slot observations; handler entry includes OS wake and render-queue scheduling, lock acquisition separately includes mutex wait" };
+#if defined(ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC) && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC == 1
+    NSMutableDictionary *diagnostic = [result mutableCopy];
+    diagnostic[@"preparedTexture"] = ([self airPerformanceEnabled] || _airPreparedTextureDiagnostic) && _preparedTextures ? [_preparedTextures snapshot] : @{ @"enabled": @NO, @"capacity": @4 };
+    result = diagnostic;
+#endif
+    return result;
+}
+
+// All arm/park calls own presentationMutex. Publication and arming are one
+// transaction; an old callback cannot rearm after a newer ticket was published.
+- (void)parkDisplaySlotTimerLocked {
+    if (_displaySlotTimer) dispatch_source_set_timer(_displaySlotTimer, DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 50000);
+}
+
+- (void)armDisplaySlotLocked:(uint64_t)token {
+    if (!_prospectiveSlot || !sp::canArmDisplaySlot(_prospectiveSlot->timing, token, [self displaySlotContext])) return;
+    const sp::DisplaySlotWindow armedSlot = _prospectiveSlot->timing;
+    int64_t delayNs = MAX((int64_t)0, armedSlot.deadlineNs - sp::displaySlotSelectionGuardNs(armedSlot) - (int64_t)(CACurrentMediaTime() * 1e9));
+    __weak SPLivePreviewView *weakSelf = self;
+    dispatch_source_set_event_handler(_displaySlotTimer, ^{ [weakSelf consumeDisplaySlot:armedSlot]; });
+    dispatch_source_set_timer(_displaySlotTimer, dispatch_time(DISPATCH_TIME_NOW, delayNs), DISPATCH_TIME_FOREVER, 50000);
+}
+
+- (void)metalDisplayLink:(CAMetalDisplayLink *)link needsUpdate:(CAMetalDisplayLinkUpdate *)update {
+    @autoreleasepool {
+        int64_t callbackHost = SPHostNow();
+        double deadline = update.targetTimestamp, displayTime = update.targetPresentationTimestamp;
+        int64_t nowNs = (int64_t)(CACurrentMediaTime() * 1e9);
+        const BOOL slotTrace = _airSlotCallbacks && NSThread.isMainThread;
+        if (_airSlotCallbacks && !slotTrace) _airSlotCallbackUnsupported.fetch_add(1, std::memory_order_relaxed);
+        SPAirSlotCallbackEvent slotEvent{};
+        if (slotTrace) {
+            slotEvent.entryHostTicks = callbackHost; slotEvent.entryMediaNs = nowNs;
+            slotEvent.targetTimestampMediaSeconds = deadline; slotEvent.targetPresentationTimestampMediaSeconds = displayTime;
+            const auto context = [self displaySlotContext]; slotEvent.generation = context.generation; slotEvent.config = context.config; slotEvent.epoch = context.measurementEpoch; slotEvent.clock = context.clockEpoch;
+        }
+        auto rejected = [&](bool value, SPAirSlotEntryReject reason) { if (value && slotTrace) slotEvent.reject = reason; return value; };
+        auto recordCallback = [&](SPAirSlotCallbackOutcome outcome) {
+            if (slotTrace) { slotEvent.outcome = outcome; slotEvent.outcomeHostTicks = SPHostNow(); _airSlotCallbacks->append(slotEvent); }
+        };
+        // Same short-circuit predicates, evaluation order and return as before;
+        // record only the predicate which actually rejects this callback.
+        if (rejected(link != _displayLink, SPAirSlotEntryReject::wrongLink) || rejected(!_drawableVisible.load(), SPAirSlotEntryReject::invisible) || rejected(!_generation.load(), SPAirSlotEntryReject::noGeneration) ||
+            rejected(!std::isfinite(deadline), SPAirSlotEntryReject::invalidDeadline) || rejected(!std::isfinite(displayTime), SPAirSlotEntryReject::invalidDisplayTime) || rejected(displayTime <= deadline, SPAirSlotEntryReject::displayNotAfterDeadline) ||
+            rejected(deadline * 1e9 <= nowNs, SPAirSlotEntryReject::deadlineReached)) { recordCallback(SPAirSlotCallbackOutcome::entryRejected); return; }
+        SPProspectiveDisplaySlot *slot = [SPProspectiveDisplaySlot new];
+        slot.drawable = update.drawable; slot.deadline = deadline; slot.displayTime = displayTime; slot.callbackHost = callbackHost;
+        {
+            std::lock_guard<std::mutex> lock(_presentationMutex);
+            auto context = [self displaySlotContext];
+            if (slotTrace) {
+                slotEvent.generation = context.generation; slotEvent.config = context.config; slotEvent.epoch = context.measurementEpoch; slotEvent.clock = context.clockEpoch;
+                slotEvent.contextUnderPresentationMutex = true; slotEvent.observedToken = _prospectiveSlot ? _prospectiveSlot->timing.token : 0;
+            }
+            if (_prospectiveSlot && !sp::canReplaceDisplaySlot(_prospectiveSlot->timing, context, nowNs)) {
+                _displaySlotBusy.fetch_add(1); recordCallback(SPAirSlotCallbackOutcome::busy); return; // preserve an older slot that is still usable
+            }
+            if (_prospectiveSlot) {
+                if (sp::sameDisplaySlotContext(_prospectiveSlot->timing.context, context)) {
+                    _displaySlotExpired.fetch_add(1); _displaySlotExpiredByCallback.fetch_add(1);
+                    [self recordDisplayTimerTraceLocked:{_prospectiveSlot->timing, _prospectiveSlot->timing.token, 0, 0,
+                        (int64_t)(CACurrentMediaTime() * 1e9), SPDisplayTimerOutcome::expiredReplaced}];
+                } else {
+                    if (_airSlotConsumes) [self recordAirSlotTraceLocked:{_prospectiveSlot->timing, _prospectiveSlot->timing.token, 0, 0, 0, SPDisplayTimerOutcome::retired} origin:SPAirSlotOrigin::callbackContextRetired];
+                    _displaySlotRetired.fetch_add(1);
+                }
+            }
+            slot->timing = {++_nextDisplaySlotToken, context, (int64_t)(deadline * 1e9), (int64_t)(displayTime * 1e9), [self selectionGuardNs]};
+            slot->ruleBEnabled = [self airPerformanceEnabled];
+            if (slot->ruleBEnabled) {
+                _airDisplayRefreshHistory.observe(slot->timing.displayNs);
+                slot->ruleBHistory = _airDisplayRefreshHistory;
+            }
+            _prospectiveSlot = slot;
+            _displayPreparationLeadNs.store(sp::displayPreparationLeadNs(slot->timing));
+            [self armDisplaySlotLocked:slot->timing.token];
+            if (slotTrace) slotEvent.createdToken = slot->timing.token;
+            recordCallback(SPAirSlotCallbackOutcome::createdToken);
+        }
+    }
+}
+
+- (void)consumeDisplaySlot:(sp::DisplaySlotWindow)armedSlot {
+    @autoreleasepool {
+        int64_t handlerEntryNs = (int64_t)(CACurrentMediaTime() * 1e9);
+        int64_t selectionHost = SPHostNow();
+        const BOOL timingDiagnostic = _airPresentationTimingDiagnostic;
+        const qos_class_t handlerQoS = timingDiagnostic ? qos_class_self() : QOS_CLASS_UNSPECIFIED;
+        const uint64_t token = armedSlot.token;
+        SPProspectiveDisplaySlot *slot;
+        SPDisplayFrameRequest *frame = nil;
+        NSMutableArray<SPDisplayFrameRequest *> *stale = [NSMutableArray array];
+        NSMutableArray<SPDisplayFrameRequest *> *superseded = [NSMutableArray array];
+        {
+            std::lock_guard<std::mutex> lock(_presentationMutex);
+            int64_t lockAcquiredNs = (int64_t)(CACurrentMediaTime() * 1e9);
+            slot = _prospectiveSlot;
+            SPDisplayTimerTrace trace{armedSlot, slot ? slot->timing.token : 0, 0, handlerEntryNs, lockAcquiredNs, SPDisplayTimerOutcome::noCurrentSlot};
+            if (_airSlotConsumes) trace.handlerEntryHostTicks = selectionHost;
+            if (!slot) { [self recordDisplayTimerTraceLocked:trace]; return; }
+            auto decision = sp::displaySlotDecision(slot->timing, token, [self displaySlotContext], lockAcquiredNs);
+            if (decision == sp::DisplaySlotDecision::staleToken) {
+                trace.outcome = SPDisplayTimerOutcome::staleToken; [self recordDisplayTimerTraceLocked:trace]; return;
+            }
+            if (decision == sp::DisplaySlotDecision::waiting) {
+                trace.outcome = SPDisplayTimerOutcome::waiting; [self recordDisplayTimerTraceLocked:trace];
+                [self armDisplaySlotLocked:token]; return; // helper does not acquire this mutex again
+            }
+            _prospectiveSlot = nil; // local ownership lasts only through this selection/render work item
+            [self parkDisplaySlotTimerLocked];
+            if (decision == sp::DisplaySlotDecision::expired) {
+                if (_airCadenceFrames) _airCadenceFrames->append(SPAirFrameRecord(nil, SPAirFrameKind::slotExpired, SPAirFrameReason::expired, SPAirFrameStage::selection, slot));
+                _displaySlotExpired.fetch_add(1); _displaySlotExpiredInConsume.fetch_add(1);
+                trace.outcome = SPDisplayTimerOutcome::expiredConsume; [self recordDisplayTimerTraceLocked:trace]; return;
+            }
+            if (decision == sp::DisplaySlotDecision::retired || !_drawableVisible.load()) {
+                _displaySlotRetired.fetch_add(1); trace.outcome = SPDisplayTimerOutcome::retired; [self recordDisplayTimerTraceLocked:trace]; return;
+            }
+            if (_inflightDraws.load() >= 2) {
+                _displaySlotBusy.fetch_add(1); trace.outcome = SPDisplayTimerOutcome::gpuBusy; [self recordDisplayTimerTraceLocked:trace]; return;
+            }
+            for (NSInteger i = (NSInteger)_pendingPresentations.count - 1; i >= 0; --i) {
+                SPDisplayFrameRequest *pending = _pendingPresentations[(NSUInteger)i];
+                if (pending.generation != slot->timing.context.generation || pending.config != slot->timing.context.config ||
+                    pending.epoch != slot->timing.context.measurementEpoch || pending.clockEpoch != slot->timing.context.clockEpoch) {
+                    if (_airCadenceFrames) {
+                        const auto reason = pending.generation != slot->timing.context.generation ? SPAirFrameReason::generation :
+                            (pending.config != slot->timing.context.config ? SPAirFrameReason::configuration : (pending.epoch != slot->timing.context.measurementEpoch ? SPAirFrameReason::epoch : SPAirFrameReason::clock));
+                        _airCadenceFrames->append(SPAirFrameRecord(pending, SPAirFrameKind::discarded, reason, SPAirFrameStage::selection, slot));
+                    }
+                    [stale addObject:pending]; [_pendingPresentations removeObjectAtIndex:(NSUInteger)i];
+                }
+            }
+            for (NSInteger i = (NSInteger)_pendingPresentations.count - 1; i >= 0; --i) {
+                SPDisplayFrameRequest *pending = _pendingPresentations[(NSUInteger)i];
+                int comparison = _haveSubmittedPresentationPTS ? sp::spCmp({pending.ptsNum,pending.ptsDen}, _lastSubmittedPresentationPTS) : 1;
+                if (_haveSubmittedPresentationPTS && (comparison < 0 || (comparison == 0 && !pending.redraw))) {
+                    if (_airCadenceFrames) _airCadenceFrames->append(SPAirFrameRecord(pending, SPAirFrameKind::discarded, SPAirFrameReason::stalePTS, SPAirFrameStage::selection, slot));
+                    [stale addObject:pending]; [_pendingPresentations removeObjectAtIndex:(NSUInteger)i];
+                }
+            }
+            std::vector<sp::DisplayQueueFrame> timings;
+            for (SPDisplayFrameRequest *pending in _pendingPresentations) timings.push_back(SPDisplayFrameTiming(pending));
+            const uint64_t measurementChoiceBegin = _measurementTrace ? SPHostNow() : 0;
+            const bool ruleBEnabled = slot->ruleBEnabled && [self airPerformanceEnabled];
+            const auto ruleB = spAirDisplayPolicyB::decide(timings, slot->timing.displayNs,
+                slot->ruleBHistory.intervals, slot->ruleBHistory.count, ruleBEnabled);
+            const auto selected = ruleB.selected;
+            if (ruleBEnabled) {
+                _airRuleBLastDecision = ruleB; _airRuleBLastHistoryCount = slot->ruleBHistory.count;
+                ++_airRuleBDecisionCount;
+            }
+            if (_measurementTrace) {
+                const uint64_t ended = SPHostNow(), group = _measurementTrace->identity();
+                spAirMeasurement::Event event; event.kind = spAirMeasurement::Kind::choiceBegin;
+                event.groupID = group; event.relatedID = slot->timing.token;
+                event.generation = slot->timing.context.generation; event.config = slot->timing.context.config;
+                event.epoch = slot->timing.context.measurementEpoch; event.clock = slot->timing.context.clockEpoch;
+                event.beginHostTicks = measurementChoiceBegin; event.endHostTicks = ended;
+                event.sampleHostTicks = selectionHost; event.values[0] = timings.size();
+                event.values[1] = slot->timing.displayNs; event.values[2] = slot->timing.deadlineNs;
+                _measurementTrace->append(event);
+                for (NSUInteger index = 0; index < _pendingPresentations.count; ++index) {
+                    auto candidate = SPAirMeasurementFrame(_pendingPresentations[index], spAirMeasurement::Kind::choiceCandidate);
+                    candidate.groupID = group; candidate.relatedID = slot->timing.token;
+                    candidate.beginHostTicks = measurementChoiceBegin; candidate.endHostTicks = ended;
+                    candidate.values[0] = index; candidate.values[1] = index == selected ? 1 : (index < selected && selected < timings.size() ? 2 : 0);
+                    _measurementTrace->append(candidate);
+                }
+                event.kind = spAirMeasurement::Kind::choiceEnd; event.values[3] = selected;
+                event.frameID = selected < timings.size() ? timings[selected].frameID : 0;
+                event.flags = 512u | (ruleBEnabled ? 1024u : 0u) | ((uint32_t)ruleB.branch << 16);
+                event.clockLifeID = ruleB.refreshPeriodNs; event.armID = slot->ruleBHistory.count;
+                if (selected < timings.size()) {
+                    event.ptsNum = timings[selected].pts.num; event.ptsDen = timings[selected].pts.den;
+                    event.targetHostTicks = _pendingPresentations[selected].logicalTargetHost;
+                }
+                _measurementTrace->append(event);
+            }
+            if (selected < timings.size()) {
+                frame = _pendingPresentations[selected];
+                for (NSUInteger index = 0; index < selected; ++index) {
+                    if (_airCadenceFrames) _airCadenceFrames->append(SPAirFrameRecord(_pendingPresentations[index], SPAirFrameKind::discarded, SPAirFrameReason::superseded, SPAirFrameStage::selection, slot, frame));
+                    [superseded addObject:_pendingPresentations[index]];
+                }
+                [_pendingPresentations removeObjectsInRange:NSMakeRange(0, selected + 1)];
+                if (_airCadenceFrames) _airCadenceFrames->append(SPAirFrameRecord(frame, SPAirFrameKind::selected, SPAirFrameReason::none, SPAirFrameStage::selection, slot));
+            }
+            if (timingDiagnostic) {
+                slot->selectionScanEndedHostTicks = SPHostNow();
+                slot->timerHandlerRequestedQoSClass = handlerQoS;
+                slot->timerHandlerQoSRecorded = true;
+            }
+            trace.frameID = frame ? frame.frameID : 0;
+            trace.outcome = frame ? SPDisplayTimerOutcome::selected : SPDisplayTimerOutcome::noFrame;
+            [self recordDisplayTimerTraceLocked:trace];
+        }
+        int64_t callbackHost = slot.callbackHost;
+        if (timingDiagnostic) {
+            slot->staleDiscardReportCount = stale.count;
+            slot->supersededDiscardReportCount = superseded.count;
+            slot->discardReportsStartedHostTicks = SPHostNow();
+        }
+        for (SPDisplayFrameRequest *discarded in stale) [self reportPendingPresentation:discarded reason:@"display-stale-pts"];
+        for (SPDisplayFrameRequest *discarded in superseded) [self reportPendingPresentation:discarded reason:@"display-slot-superseded"
+            details:@{ @"displayLinkCallbackHost": @(callbackHost), @"displayLinkTargetTimestamp": @(slot.deadline),
+                @"displayLinkTargetPresentationTimestamp": @(slot.displayTime),
+                @"scheduledMinusLogicalTargetNs": discarded.logicalTargetHost > 0 ? @((int64_t)(slot.displayTime * 1e9) - SPHostToNs(discarded.logicalTargetHost)) : (id)[NSNull null] }];
+        if (timingDiagnostic) slot->discardReportsEndedHostTicks = SPHostNow();
+        if (frame) [self renderPendingPresentation:frame slot:slot selectionHost:selectionHost];
+        else _displaySlotNoFrame.fetch_add(1);
+    }
+}
+
+- (void)renderPendingPresentation:(SPDisplayFrameRequest *)frame slot:(SPProspectiveDisplaySlot *)slot selectionHost:(int64_t)selectionHost {
+    const int64_t renderEntryHostTicks = _airPresentationTimingDiagnostic ? SPHostNow() : 0;
+    const double presentDeadline = slot.deadline, scheduledDisplayTime = slot.displayTime;
+    const int64_t callbackHost = slot.callbackHost;
+    const uint64_t slotToken = slot->timing.token;
+    uint64_t seen = frame.generation, seenConfig = frame.config, seenEpoch = frame.epoch, seenClock = frame.clockEpoch;
+    uint64_t seenSurfaceToken = frame.surfaceToken, frameID = frame.frameID;
+    int64_t captureHost = frame.captureHost, ptsNum = frame.ptsNum, ptsDen = frame.ptsDen;
+    int64_t presentationHost = frame.logicalTargetHost;
+    BOOL synthetic = frame.synthetic, counts = frame.counts;
+    SPLiveViewMode mode = frame.mode;
+    NSDictionary *captureGeometry = frame.captureGeometry;
+    CVPixelBufferRef enhanced = frame.enhanced, original = frame.original;
+    CVPixelBufferRef primary = mode == SPLiveViewOriginal ? (original ?: enhanced) : enhanced;
+    CVPixelBufferRef secondary = original ?: enhanced;
+    BOOL windowVisible = _windowVisible.load(), occluded = windowVisible && !_drawableVisible.load(), exposed = _exposed.load();
+    BOOL fillTarget = _followTargetContent.load() && mode != SPLiveViewCompare;
+    uint32_t diagnosticDisplayID = _diagnosticDisplayID.load();
+    int width = (int)CVPixelBufferGetWidth(primary), height = (int)CVPixelBufferGetHeight(primary);
+    int enhancedWidth = enhanced ? (int)CVPixelBufferGetWidth(enhanced) : 0, enhancedHeight = enhanced ? (int)CVPixelBufferGetHeight(enhanced) : 0;
+    int originalWidth = original ? (int)CVPixelBufferGetWidth(original) : 0, originalHeight = original ? (int)CVPixelBufferGetHeight(original) : 0;
+    int64_t drawableWaitNs = 0;
+    id<CAMetalDrawable> drawable = slot.drawable;
+    struct SPDrawNote {
+        std::atomic<long long> gpuHost{0};
+        std::atomic<long long> commitHost{0};
+        std::atomic<long long> scheduledHost{0};
+        std::atomic<double> scheduledMedia{0};
+        std::atomic<double> presentRequestMedia{0};
+        std::atomic<long long> texturePreparationEndedHostTicks{0};
+        std::atomic<long long> encodingEndedHostTicks{0};
+        std::atomic<long long> generationLockRequestedHostTicks{0};
+        std::atomic<long long> generationLockAcquiredHostTicks{0};
+        std::atomic<long long> presentationLockRequestedHostTicks{0};
+        std::atomic<long long> presentationLockAcquiredHostTicks{0};
+        std::atomic<long long> deadlineCheckHostTicks{0};
+        std::atomic<double> deadlineCheckMediaTimeSeconds{0};
+        std::atomic<double> deadlineSlackSeconds{0};
+        std::atomic<long long> selectionScanEndedHostTicks{0};
+        std::atomic<long long> discardReportsStartedHostTicks{0}, discardReportsEndedHostTicks{0};
+        std::atomic<uint64_t> staleDiscardReportCount{0}, supersededDiscardReportCount{0};
+        std::atomic<long long> renderEntryHostTicks{0};
+        std::atomic<long long> primaryCVTextureAPIStartedHostTicks{0}, primaryCVTextureAPIEndedHostTicks{0};
+        std::atomic<long long> secondaryCVTextureAPIStartedHostTicks{0}, secondaryCVTextureAPIEndedHostTicks{0};
+        std::atomic<unsigned int> timerHandlerRequestedQoSClass{0};
+        std::atomic<bool> timerHandlerQoSRecorded{false};
+        std::atomic<bool> preparedTextureEnabled{false}, preparedTextureHit{false};
+        std::atomic<int> preparedTextureFallbackReason{SPPreparedNone};
+        std::atomic<int64_t> preparedMapStartedHostTicks{0}, preparedMapEndedHostTicks{0};
+        std::atomic<uint64_t> preparedMapFrameID{0};
+        NSDictionary *timingMetadata(int64_t selectionHost, double deadline, uint64_t slotToken) const {
+            const auto checkHost = deadlineCheckHostTicks.load();
+            const bool qosRecorded = timerHandlerQoSRecorded.load();
+            NSString *qosName = @"not-recorded";
+            if (qosRecorded) switch (timerHandlerRequestedQoSClass.load()) {
+                case QOS_CLASS_USER_INTERACTIVE: qosName = @"user-interactive"; break;
+                case QOS_CLASS_USER_INITIATED: qosName = @"user-initiated"; break;
+                case QOS_CLASS_DEFAULT: qosName = @"default"; break;
+                case QOS_CLASS_UTILITY: qosName = @"utility"; break;
+                case QOS_CLASS_BACKGROUND: qosName = @"background"; break;
+                case QOS_CLASS_UNSPECIFIED: qosName = @"unspecified"; break;
+                default: qosName = @"unknown"; break;
+            }
+            return @{ @"displaySlotToken": @(slotToken), @"selectionHostTicks": @(selectionHost),
+                @"selectionScanEndedHostTicks": @(selectionScanEndedHostTicks.load()),
+                @"discardReportsStartedHostTicks": @(discardReportsStartedHostTicks.load()),
+                @"discardReportsEndedHostTicks": @(discardReportsEndedHostTicks.load()),
+                @"staleDiscardReportCount": @(staleDiscardReportCount.load()),
+                @"supersededDiscardReportCount": @(supersededDiscardReportCount.load()),
+                @"discardReportCount": @(staleDiscardReportCount.load() + supersededDiscardReportCount.load()),
+                @"renderEntryHostTicks": @(renderEntryHostTicks.load()),
+                @"primaryCVTextureAPIStartedHostTicks": @(primaryCVTextureAPIStartedHostTicks.load()),
+                @"primaryCVTextureAPIEndedHostTicks": @(primaryCVTextureAPIEndedHostTicks.load()),
+                @"secondaryCVTextureAPIStartedHostTicks": @(secondaryCVTextureAPIStartedHostTicks.load()),
+                @"secondaryCVTextureAPIEndedHostTicks": @(secondaryCVTextureAPIEndedHostTicks.load()),
+                @"timerHandlerQoSRecorded": @(qosRecorded),
+                @"timerHandlerRequestedQoSClass": @(timerHandlerRequestedQoSClass.load()),
+                @"timerHandlerRequestedQoSName": qosName,
+                @"preparedTextureEnabled": @(preparedTextureEnabled.load()), @"preparedTextureHit": @(preparedTextureHit.load()),
+                @"preparedTextureFallbackReason": SPPreparedTextureReasonName(preparedTextureFallbackReason.load()),
+                @"preparedMapStartedHostTicks": @(preparedMapStartedHostTicks.load()), @"preparedMapEndedHostTicks": @(preparedMapEndedHostTicks.load()),
+                @"preparedMapFrameID": @(preparedMapFrameID.load()),
+                @"texturePreparationEndedHostTicks": @(texturePreparationEndedHostTicks.load()),
+                @"encodingEndedHostTicks": @(encodingEndedHostTicks.load()),
+                @"generationLockRequestedHostTicks": @(generationLockRequestedHostTicks.load()),
+                @"generationLockAcquiredHostTicks": @(generationLockAcquiredHostTicks.load()),
+                @"presentationLockRequestedHostTicks": @(presentationLockRequestedHostTicks.load()),
+                @"presentationLockAcquiredHostTicks": @(presentationLockAcquiredHostTicks.load()),
+                @"deadlineCheckHostTicks": @(checkHost),
+                @"deadlineCheckMediaTimeSeconds": checkHost ? @(deadlineCheckMediaTimeSeconds.load()) : (id)NSNull.null,
+                @"presentDeadlineMediaTimeSeconds": @(deadline),
+                @"deadlineSlackSeconds": checkHost ? @(deadlineSlackSeconds.load()) : (id)NSNull.null,
+                @"scope": @"Opt-in CPU stages only; HostTicks are mach_absolute_time. Zero means stage not reached, including secondary CV API outside Compare and deadline-path CV API on a preparedTextureHit; zero is not a measured CV duration. Prepared map timestamps belong to the independent mapper job for preparedMapFrameID. CV API stamps bracket only CVMetalTextureCacheCreateTextureFromImage after width/height lookup. Discard counts are calls to the existing reporting helper, whose forwarding guard is unchanged. QoS is qos_class_self's reported requested class, not priority overrides. Deadline CA media time is the actual comparison sample; its HostTicks were sampled immediately before it. Null means comparison not performed. No submission/presentation/GPU success is inferred." };
+        }
+    };
+    auto note = std::make_shared<SPDrawNote>();
+    const BOOL timingDiagnostic = _airPresentationTimingDiagnostic;
+    int preparedReason = SPPreparedNone;
+    const BOOL preparedTextureEnabled = frame.airPerformanceEnabled || _airPreparedTextureDiagnostic;
+    SPPreparedTextureLease *preparedLease = preparedTextureEnabled && _preparedTextures ? [_preparedTextures claimFrame:frame recordSelection:YES reason:&preparedReason] : nil;
+    if (timingDiagnostic) {
+        note->preparedTextureEnabled.store(preparedTextureEnabled && _preparedTextures != nil); note->preparedTextureHit.store(preparedLease != nil);
+        note->preparedTextureFallbackReason.store(preparedReason);
+        if (preparedLease) {
+            note->preparedMapStartedHostTicks.store(preparedLease->_mapStartedHostTicks.load());
+            note->preparedMapEndedHostTicks.store(preparedLease->_mapEndedHostTicks.load()); note->preparedMapFrameID.store(preparedLease->_frameID);
+        }
+    }
+    if (timingDiagnostic) {
+        note->selectionScanEndedHostTicks.store(slot->selectionScanEndedHostTicks);
+        note->discardReportsStartedHostTicks.store(slot->discardReportsStartedHostTicks);
+        note->discardReportsEndedHostTicks.store(slot->discardReportsEndedHostTicks);
+        note->staleDiscardReportCount.store(slot->staleDiscardReportCount);
+        note->supersededDiscardReportCount.store(slot->supersededDiscardReportCount);
+        note->timerHandlerRequestedQoSClass.store((unsigned int)slot->timerHandlerRequestedQoSClass);
+        note->timerHandlerQoSRecorded.store(slot->timerHandlerQoSRecorded);
+        note->renderEntryHostTicks.store(renderEntryHostTicks);
+    }
+    void (^reportFailure)(NSString *) = ^(NSString *why) {
+        if (counts && self.presentationFailure) {
+            NSDictionary *info = @{
+            @"reason": why, @"generation": @(seen), @"configVersion": @(seenConfig), @"measurementEpoch": @(seenEpoch),
+            @"frameID": @(frameID), @"ptsNum": @(ptsNum), @"ptsDen": @(ptsDen), @"synthetic": @(synthetic), @"clockEpoch": @(seenClock),
+            @"logicalTargetHost": @(presentationHost), @"presentationEnqueueHost": @(frame.enqueueHost),
+            @"presentationQueueStartHost": @(callbackHost), @"displayLinkCallbackHost": @(callbackHost),
+            @"displaySelectionHost": @(selectionHost), @"displaySlotToken": @(slotToken),
+            @"displayLinkTargetTimestamp": @(presentDeadline), @"displayLinkTargetPresentationTimestamp": @(scheduledDisplayTime),
+            @"metalCommitHost": @(note->commitHost.load()), @"metalScheduledHost": @(note->scheduledHost.load()),
+            @"metalScheduledMediaTime": @(note->scheduledMedia.load()),
+            @"presentRequestMethod": @"command-buffer-ordinary", @"presentRequestMediaTime": @(note->presentRequestMedia.load()) };
+            if (timingDiagnostic) {
+                NSMutableDictionary *diagnosticInfo = [info mutableCopy];
+                diagnosticInfo[@"airPresentationTiming"] = note->timingMetadata(selectionHost, presentDeadline, slotToken);
+                info = diagnosticInfo;
+            }
+            self.presentationFailure(info);
+        }
+    };
+    void (^releaseTicket)(void) = ^{ self->_inflightDraws.fetch_sub(1); };
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
+    const BOOL fusedPresentation = _airFusedRifePresentDiagnostic || frame.airPerformanceEnabled;
+    const BOOL fusedSynthetic = fusedPresentation && synthetic && mode == SPLiveViewEnhanced;
+    id<MTLRenderPipelineState> renderPipeline = fusedSynthetic ? _airFusedPresentPipeline : _pipeline;
+    int expectedWidth = synthetic ? 1814 : 2648, expectedHeight = synthetic ? 1142 : 1668;
+#if ODF_AIR_BETA_DIAGNOSTIC
+    if (SPAirBetaEnabled() || frame.airPerformanceEnabled) {
+        const auto choice = sp::airBetaSize(frame.betaCaptureWidth, frame.betaCaptureHeight);
+        expectedWidth = synthetic ? choice.processingWidth : frame.betaCaptureWidth;
+        expectedHeight = synthetic ? choice.processingHeight : frame.betaCaptureHeight;
+    }
+#endif
+    if (fusedPresentation && counts && mode == SPLiveViewEnhanced &&
+        (width != expectedWidth || height != expectedHeight)) {
+        reportFailure(@"fused-present-buffer-shape"); [preparedLease complete]; return;
+    }
+    if (fusedSynthetic && !renderPipeline) { reportFailure(@"fused-present-pipeline"); [preparedLease complete]; return; }
+#endif
+    int64_t primaryAPIStarted = 0, primaryAPIEnded = 0, secondaryAPIStarted = 0, secondaryAPIEnded = 0;
+    const uint64_t measurementInlineBegin = frame->_measurementTrace && !preparedLease ? SPHostNow() : 0;
+    CVMetalTextureRef aRef = preparedLease ? NULL : (timingDiagnostic ? [self createTexture:primary apiStartedHostTicks:&primaryAPIStarted apiEndedHostTicks:&primaryAPIEnded] : [self createTexture:primary]);
+    CVMetalTextureRef bRef = !preparedLease && mode == SPLiveViewCompare ? (timingDiagnostic ? [self createTexture:secondary apiStartedHostTicks:&secondaryAPIStarted apiEndedHostTicks:&secondaryAPIEnded] : [self createTexture:secondary]) : NULL;
+    if (frame->_measurementTrace && !preparedLease) {
+        auto event = SPAirMeasurementFrame(frame, spAirMeasurement::Kind::inlineMap);
+        event.beginHostTicks = primaryAPIStarted > 0 ? primaryAPIStarted : measurementInlineBegin;
+        event.endHostTicks = secondaryAPIEnded > 0 ? secondaryAPIEnded : (primaryAPIEnded > 0 ? primaryAPIEnded : SPHostNow());
+        event.values[0] = preparedReason; event.values[1] = aRef != nullptr; event.values[2] = mode == SPLiveViewCompare;
+        event.values[3] = primaryAPIStarted > 0 && primaryAPIEnded > 0;
+        frame->_measurementTrace->append(event);
+    }
+    if (timingDiagnostic) {
+        note->primaryCVTextureAPIStartedHostTicks.store(primaryAPIStarted); note->primaryCVTextureAPIEndedHostTicks.store(primaryAPIEnded);
+        note->secondaryCVTextureAPIStartedHostTicks.store(secondaryAPIStarted); note->secondaryCVTextureAPIEndedHostTicks.store(secondaryAPIEnded);
+    }
+    id<MTLTexture> a = preparedLease ? [preparedLease primaryTexture] : (aRef ? CVMetalTextureGetTexture(aRef) : nil);
+    id<MTLTexture> b = preparedLease ? [preparedLease secondaryTexture] : (bRef ? CVMetalTextureGetTexture(bRef) : nil);
+    if (timingDiagnostic) note->texturePreparationEndedHostTicks.store(SPHostNow());
+    if (!drawable || !a || !self->_pipeline) {
+        reportFailure(!drawable ? @"drawable" : (!a ? @"texture" : @"pipeline"));
+        if (aRef) CFRelease(aRef);
+        if (bRef) CFRelease(bRef);
+        [preparedLease complete];
+        return;
+    }
+    id<MTLCommandBuffer> command = [self->_commandQueue commandBuffer];
+    if (!command) {
+        reportFailure(@"command");
+        if (aRef) CFRelease(aRef);
+        if (bRef) CFRelease(bRef);
+        [preparedLease complete];
+        return;
+    }
+    MTLRenderPassDescriptor *clear = [MTLRenderPassDescriptor renderPassDescriptor];
+    clear.colorAttachments[0].texture = drawable.texture;
+    clear.colorAttachments[0].loadAction = MTLLoadActionClear;
+    clear.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    clear.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> enc = [command renderCommandEncoderWithDescriptor:clear];
+    [enc endEncoding];
+    CGSize size = CGSizeMake(drawable.texture.width, drawable.texture.height);
+    float fw = (float)CVPixelBufferGetWidth(primary);
+    float fh = (float)CVPixelBufferGetHeight(primary);
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
+    auto fusedGeometry = sp::airFusedPresentationGeometry({0,0,size.width,size.height}, width, height,
+        fillTarget, fusedPresentation);
+#if ODF_AIR_BETA_DIAGNOSTIC
+    if (SPAirBetaEnabled() || frame.airPerformanceEnabled) fusedGeometry = sp::airBetaPresentationGeometry({0,0,size.width,size.height},
+        frame.betaCaptureWidth, frame.betaCaptureHeight, fillTarget);
+#endif
+    if (fusedPresentation) {
+        fw = (float)fusedGeometry.sourceCrop.width;
+        fh = (float)fusedGeometry.sourceCrop.height;
+    }
+#endif
+    sp::GeometrySource diagnosticGeometry{};
+    sp::SurfaceCropState cropState{};
+    BOOL diagnosticSource = SPSourceGeometryValue(captureGeometry, diagnosticGeometry);
+    sp::visualOutputGeometry(diagnosticSource ? &diagnosticGeometry : nullptr, seen, (int)fw, (int)fh, size.width, size.height, fillTarget, cropState);
+    NSString *cropStatus = cropState == sp::SurfaceCropState::validated ? @"metadata-valid-unapplied" : (cropState == sp::SurfaceCropState::targetAspectMismatch ? @"target-aspect-mismatch-unapplied" : @"metadata-unavailable-unapplied");
+    sp::SharedGeometry geometryCandidate{};
+    sp::GeometrySource sourceGeometry{};
+    if (counts && mode != SPLiveViewCompare && SPSourceGeometryValue(captureGeometry, sourceGeometry)) {
+        std::lock_guard<std::mutex> lock(self->_geometryMutex);
+        geometryCandidate=self->_sharedGeometry.candidate(sourceGeometry, seen, seenConfig, seenEpoch, diagnosticDisplayID,
+            (int)size.width, (int)size.height, (int)fw, (int)fh, fillTarget);
+    }
+    // If this drawable cannot be tied to the current verified geometry,
+    // no earlier mapping may remain active while it is being presented.
+    if (counts && !geometryCandidate.valid) [self invalidateSharedGeometry];
+    id imageRectPixels = [NSNull null];
+    if (mode != SPLiveViewCompare) {
+        auto geometry = sp::outputGeometry({0,0,size.width,size.height},{0,0,fw,fh},fillTarget,1);
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
+        if (fusedPresentation) geometry = geometryCandidate.valid ? geometryCandidate.render : fusedGeometry;
+#endif
+        if (geometry.valid) imageRectPixels = @[@(geometry.image.x), @(geometry.image.y), @(geometry.image.width), @(geometry.image.height)];
+    }
+    if (mode == SPLiveViewCompare && b) {
+        MTLViewport left = {0, 0, size.width * 0.5, size.height, 0, 1};
+        MTLViewport right = {size.width * 0.5, 0, size.width * 0.5, size.height, 0, 1};
+        [self drawTexture:a frameWidth:fw frameHeight:fh viewport:left buffer:command drawable:drawable fill:NO];
+        [self drawTexture:b frameWidth:(float)CVPixelBufferGetWidth(secondary)
+              frameHeight:(float)CVPixelBufferGetHeight(secondary)
+                 viewport:right buffer:command drawable:drawable fill:NO];
+    } else {
+        MTLViewport full = {0, 0, size.width, size.height, 0, 1};
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
+        [self drawTexture:a frameWidth:fw frameHeight:fh viewport:full buffer:command drawable:drawable fill:fillTarget
+                  geometry:geometryCandidate.valid ? &geometryCandidate.render : (fusedPresentation ? &fusedGeometry : nullptr)
+                  pipeline:renderPipeline];
+#else
+        [self drawTexture:a frameWidth:fw frameHeight:fh viewport:full buffer:command drawable:drawable fill:fillTarget
+                  geometry:geometryCandidate.valid ? &geometryCandidate.render : nullptr];
+#endif
+    }
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
+    SPAirFusedRenderPtr fusedRecord;
+    if (_airFusedRenderNotes && fusedPresentation && mode != SPLiveViewCompare) {
+        fusedRecord = std::make_shared<SPAirFusedRenderRecord>();
+        fusedRecord->frameID = frameID; fusedRecord->generation = seen; fusedRecord->config = seenConfig;
+        fusedRecord->epoch = seenEpoch; fusedRecord->clock = seenClock; fusedRecord->slotToken = slotToken;
+        fusedRecord->selectionHostTicks = selectionHost; fusedRecord->requestStartHostTicks = frame.enqueueHost;
+        fusedRecord->enqueueHostTicks = frame.causalEnqueueHostTicks;
+        fusedRecord->bufferWidth = width; fusedRecord->bufferHeight = height;
+        fusedRecord->referenceWidth = (int)fw; fusedRecord->referenceHeight = (int)fh;
+        fusedRecord->drawableWidth = (int)size.width; fusedRecord->drawableHeight = (int)size.height;
+        if ([imageRectPixels isKindOfClass:NSArray.class]) {
+            NSArray *rectangle = imageRectPixels;
+            for (int index = 0; index < 4; index++) fusedRecord->imageRect[index] = [rectangle[index] doubleValue];
+        }
+        fusedRecord->synthetic = synthetic; fusedRecord->counts = counts; fusedRecord->redraw = frame.redraw;
+        fusedRecord->lanczosFragment = renderPipeline == _airFusedPresentPipeline;
+        fusedRecord->displayTargetMediaTime = scheduledDisplayTime;
+        std::lock_guard<std::mutex> lock(_airFusedNotesMutex);
+        if (_airFusedTraceSealed) ++_airFusedPostSealAttempts;
+        else {
+            fusedRecord->sequence = ++_airFusedRenderTotal;
+            (*_airFusedRenderNotes)[(fusedRecord->sequence - 1) % SPAirFusedRenderCapacity] = fusedRecord;
+        }
+    }
+    SPPresentedRenderSnapshot *qualitySnapshot = nil;
+    if (fusedPresentation && counts && !frame.redraw && mode == SPLiveViewEnhanced) {
+        SPPresentedVideoRecorder *recorder = self.presentedVideoRecorder;
+        if (recorder && ptsDen > 0 && ptsDen <= INT32_MAX) {
+            qualitySnapshot = [recorder encodeRenderCopyFromTexture:drawable.texture sourceOrigin:MTLOriginMake(0,0,0)
+                commandBuffer:command frameID:frameID pts:CMTimeMake(ptsNum,(int32_t)ptsDen)
+                synthetic:synthetic error:NULL];
+        }
+    }
+#endif
+    if (timingDiagnostic) note->encodingEndedHostTicks.store(SPHostNow());
+    self->_inflightDraws.fetch_add(1);
+    [command addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (frame->_measurementTrace) {
+            auto event = SPAirMeasurementFrame(frame, spAirMeasurement::Kind::gpuCallback);
+            event.beginHostTicks = event.endHostTicks = SPHostNow(); event.values[0] = done.status;
+            event.gpuStartSeconds = done.GPUStartTime; event.gpuEndSeconds = done.GPUEndTime;
+            frame->_measurementTrace->append(event);
+        }
+        if (done.status != MTLCommandBufferStatusCompleted) reportFailure(@"gpu");
+        note->gpuHost.store((long long)SPHostNow());
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
+        if (fusedRecord) {
+            fusedRecord->completedHostTicks.store(SPHostNow());
+            fusedRecord->completedMediaTime.store(CACurrentMediaTime());
+            fusedRecord->gpuStatus.store((uint32_t)done.status);
+            fusedRecord->gpuStartSeconds.store(done.GPUStartTime); fusedRecord->gpuEndSeconds.store(done.GPUEndTime);
+            fusedRecord->gpuObserved.store(true, std::memory_order_release);
+        }
+#endif
+        if (aRef) CFRelease(aRef);
+        if (bRef) CFRelease(bRef);
+        [preparedLease complete];
+        uint64_t completedFrameID = frame.frameID; // retains the admitted buffers through GPU completion
+        if (seenSurfaceToken && self.surfaceReady && seenClock == self->_presentationClockEpoch.load()) {
+            self.surfaceReady(@{ @"generation": @(seen), @"configVersion": @(seenConfig), @"captureHost": @(captureHost),
+                @"measurementEpoch": @(seenEpoch), @"clockEpoch": @(seenClock), @"surfaceToken": @(seenSurfaceToken), @"frameID": @(completedFrameID),
+                @"counts": @(counts), @"windowVisible": @(windowVisible),
+                @"gpuCompleted": @(done.status == MTLCommandBufferStatusCompleted), @"viewMode": @(mode),
+                @"enhancedWidth": @(enhancedWidth), @"enhancedHeight": @(enhancedHeight),
+                @"originalWidth": @(originalWidth), @"originalHeight": @(originalHeight) });
+        }
+        releaseTicket();
+    }];
+    [drawable addPresentedHandler:^(id<MTLDrawable> presentedDrawable) {
+        SPAirPresentedObservationScope callbackObservation(self->_airSessionObservationEnabled ? &self->_airPresentedCallbacksPending : nullptr);
+        long long gpuHost = note->gpuHost.load();
+        BOOL physicallyPresented = std::isfinite(presentedDrawable.presentedTime) && presentedDrawable.presentedTime > 0;
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
+        [qualitySnapshot presentedAtTime:presentedDrawable.presentedTime];
+        if (fusedRecord) {
+            fusedRecord->presentedTime.store(presentedDrawable.presentedTime);
+            fusedRecord->presentedObserved.store(true, std::memory_order_release);
+            if (physicallyPresented && counts && !frame.redraw && mode == SPLiveViewEnhanced) {
+                std::lock_guard<std::mutex> lock(self->_airFusedNotesMutex);
+                (synthetic ? self->_airFusedLastPositiveSynthetic : self->_airFusedLastPositiveOriginal) = fusedRecord;
+            }
+        }
+#endif
+#if ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
+        if (physicallyPresented && counts && !frame.redraw && mode == SPLiveViewEnhanced
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
+            && !fusedPresentation
+#endif
+        ) {
+            SPPresentedVideoRecorder *recorder = self.presentedVideoRecorder;
+            // Capturing frame in this handler retains the exact admitted primary
+            // buffer even when its command-buffer completion has already fired.
+            CVPixelBufferRef recordedBuffer = frame.enhanced;
+            if (recorder && recordedBuffer && ptsDen > 0 && ptsDen <= INT32_MAX) {
+                [recorder recordPresentedBuffer:recordedBuffer frameID:frameID
+                    pts:CMTimeMake(ptsNum, (int32_t)ptsDen) synthetic:synthetic
+                    presentedTime:presentedDrawable.presentedTime];
+            }
+        }
+#endif
+        if (!physicallyPresented) reportFailure(@"display-not-presented");
+        BOOL geometryActivated = NO;
+        if (geometryCandidate.valid && counts && windowVisible && exposed && !occluded && presentedDrawable.presentedTime > 0 &&
+            seen==self->_generation.load() && seenConfig==self->_diagnosticConfig.load() && seenEpoch==self->_diagnosticEpoch.load() && seenClock==self->_presentationClockEpoch.load()) {
+            std::lock_guard<std::mutex> lock(self->_geometryMutex);
+            if (seen==self->_generation.load() && seenConfig==self->_diagnosticConfig.load() && seenEpoch==self->_diagnosticEpoch.load() && seenClock==self->_presentationClockEpoch.load() &&
+                self->_geometryVerifiedHost>0 && SPHostToNs(SPHostNow()-self->_geometryVerifiedHost)<=350000000LL)
+                geometryActivated=self->_sharedGeometry.activate(geometryCandidate.version,frameID,captureHost);
+        }
+        if (physicallyPresented) dispatch_async(dispatch_get_main_queue(), ^{
+            [self revealSourceGeneration:seen];
+        });
+        if (!self.presented) return;
+        NSDictionary *info = @{
+            @"captureHost": @(captureHost),
+            @"presentedHost": @(SPHostNow()),
+            @"presentedTime": @(presentedDrawable.presentedTime),
+            @"handlerMediaTime": @(CACurrentMediaTime()),
+            @"drawableWaitNs": @(drawableWaitNs),
+            @"presentationEnqueueHost": @(frame.enqueueHost),
+            @"presentationQueueStartHost": @(callbackHost),
+            @"displaySelectionHost": @(selectionHost), @"displaySlotToken": @(slotToken),
+            @"metalCommitHost": @(note->commitHost.load()),
+            @"metalScheduledHost": @(note->scheduledHost.load()),
+            @"metalScheduledMediaTime": @(note->scheduledMedia.load()),
+            @"presentRequestMethod": @"command-buffer-ordinary",
+            @"displayLinkCallbackHost": @(callbackHost),
+            @"displayLinkTargetTimestamp": @(presentDeadline),
+            @"displayLinkTargetPresentationTimestamp": @(scheduledDisplayTime),
+            @"logicalTargetHost": @(presentationHost),
+            @"scheduledMinusLogicalTargetNs": presentationHost > 0 ? @((int64_t)(scheduledDisplayTime * 1e9) - SPHostToNs(presentationHost)) : (id)[NSNull null],
+            @"actualMinusScheduledDisplayNs": physicallyPresented ? @((int64_t)((presentedDrawable.presentedTime - scheduledDisplayTime) * 1e9)) : (id)[NSNull null],
+            @"actualMinusLogicalTargetNs": physicallyPresented && presentationHost > 0 ? @((int64_t)(presentedDrawable.presentedTime * 1e9) - SPHostToNs(presentationHost)) : (id)[NSNull null],
+            @"presentRequestMediaTime": @(note->presentRequestMedia.load()),
+            @"gpuHost": @(gpuHost),
+            @"occluded": @(occluded),
+            @"windowVisible": @(windowVisible),
+            @"exposed": @(exposed),
+            @"generation": @(seen),
+            @"configVersion": @(seenConfig),
+            @"measurementEpoch": @(seenEpoch), @"clockEpoch": @(seenClock),
+            @"ptsNum": @(ptsNum),
+            @"ptsDen": @(ptsDen),
+            @"synthetic": @(synthetic),
+            @"viewMode": @(mode),
+            @"frameID": @(frameID),
+            @"counts": @(counts && physicallyPresented),
+            @"width": @(width),
+            @"height": @(height),
+            @"drawableWidth": @((int)size.width),
+            @"drawableHeight": @((int)size.height),
+            @"outputImageRectPixels": imageRectPixels,
+            @"surfaceGeometryAssessment": cropStatus,
+            @"outputDisplayID": diagnosticDisplayID ? @(diagnosticDisplayID) : (id)[NSNull null],
+            @"geometryVersion": geometryActivated ? @(geometryCandidate.version) : (id)[NSNull null],
+            @"enhancedCenter": @(-1),
+            @"originalCenter": @(-1),
+        };
+        if (timingDiagnostic) {
+            NSMutableDictionary *diagnosticInfo = [info mutableCopy];
+            diagnosticInfo[@"airPresentationTiming"] = note->timingMetadata(selectionHost, presentDeadline, slotToken);
+            info = diagnosticInfo;
+        }
+        self.presented(info);
+    }];
+    // The update's present deadline differs from its future display target.
+    // Ordinary command-buffer presentation waits for GPU scheduling before
+    // invoking drawable.present(). Timed presents assert for these drawables.
+    {
+        if (timingDiagnostic) note->generationLockRequestedHostTicks.store(SPHostNow());
+        std::lock_guard<std::mutex> generationLock(_generationMutex);
+        if (timingDiagnostic) note->generationLockAcquiredHostTicks.store(SPHostNow());
+        if (timingDiagnostic) note->presentationLockRequestedHostTicks.store(SPHostNow());
+        std::lock_guard<std::mutex> pendingLock(_presentationMutex);
+        if (timingDiagnostic) note->presentationLockAcquiredHostTicks.store(SPHostNow());
+        NSString *invalid = seen != _generation.load() ? @"generation" :
+            (seenConfig != _diagnosticConfig.load() ? @"configuration" : (seenEpoch != _diagnosticEpoch.load() ? @"epoch" :
+                (seenClock != _presentationClockEpoch.load() ? @"clock-retired" : nil)));
+        if (!invalid) {
+            const int64_t checkHost = timingDiagnostic ? SPHostNow() : 0;
+            // This single existing CA clock sample remains the decision input.
+            const double checkMediaTime = CACurrentMediaTime();
+            if (timingDiagnostic) {
+                note->deadlineCheckHostTicks.store(checkHost);
+                note->deadlineCheckMediaTimeSeconds.store(checkMediaTime);
+                note->deadlineSlackSeconds.store(presentDeadline - checkMediaTime);
+            }
+            if (checkMediaTime >= presentDeadline) invalid = @"display-submit-deadline";
+        }
+        if (invalid) {
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
+            if (fusedRecord) fusedRecord->publicationCancelled.store(true);
+            [qualitySnapshot cancelPublication];
+#endif
+            if (_airCadenceFrames) _airCadenceFrames->append(SPAirFrameRecord(frame, SPAirFrameKind::discarded, SPAirReason(invalid), SPAirFrameStage::finalCheck, slot));
+            [command commit]; reportFailure(invalid); return;
+        }
+        [command addScheduledHandler:^(id<MTLCommandBuffer> scheduled) {
+            (void)scheduled;
+            note->scheduledHost.store(SPHostNow());
+            note->scheduledMedia.store(CACurrentMediaTime());
+        }];
+        // This records wrapper registration, not the private present call.
+        note->presentRequestMedia.store(CACurrentMediaTime());
+        [command presentDrawable:drawable];
+        note->commitHost.store(SPHostNow());
+        [command commit];
+        _lastSubmittedPresentationPTS = {ptsNum,ptsDen}; _haveSubmittedPresentationPTS = true;
+    }
+    if (_cache) CVMetalTextureCacheFlush(_cache, 0);
 }
 
 @end
@@ -1275,6 +3248,7 @@ struct SPLiveHeld {
     sp::SPRational pts{};
     int pins = 0;
     uint64_t previousIdentity = 0;
+    sp::RifeSourceClockTarget pairClockSource{};
 };
 
 struct SPLiveInbound {
@@ -1296,6 +3270,7 @@ struct SPLiveJob {
     sp::SPRational pts[3]{};
     sp::SPRational phase[3]{};
     int64_t targetHost[3]{};
+    sp::RifePairClockTarget pairClock[3]{};
     uint64_t clockEpoch = 0;
     int count = 0;
     uint64_t frameA = 0;
@@ -1337,6 +3312,7 @@ struct SPPlaySlot {
     int64_t targetHost = 0;
     int64_t readyHost = 0;
     BOOL synthetic = NO;
+    BOOL fixedFallback = NO;
     CVPixelBufferRef enhanced = nullptr;
     CVPixelBufferRef original = nullptr;
     uint64_t frameID = 0;
@@ -1390,13 +3366,135 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     slot.original = nullptr;
 }
 
+static NSDictionary *SPRifeSourceClockValue(const sp::RifeSourceClockTarget &target) {
+    return @{ @"frozen":@(target.frozen), @"targetHost":@(target.targetHost), @"frozenDelayHost":@(target.delayHost),
+        @"ptsNum":@(target.pts.num), @"ptsDen":@(target.pts.den), @"generation":@(target.context.generation),
+        @"configVersion":@(target.context.config), @"measurementEpoch":@(target.context.measurement), @"clockEpoch":@(target.context.clock) };
+}
+static NSDictionary *SPRifePairClockValue(const sp::RifePairClockTarget &target, uint64_t frameA, uint64_t frameB) {
+    NSString *binding=@"unbound-missing-endpoint";
+    switch(target.binding) {
+        case sp::RifePairClockBinding::bound: binding=@"bound"; break;
+        case sp::RifePairClockBinding::contextMismatch: binding=@"unbound-context"; break;
+        case sp::RifePairClockBinding::unorderedEndpoints: binding=@"unbound-endpoint-order"; break;
+        case sp::RifePairClockBinding::invalidPhase: binding=@"unbound-phase"; break;
+        case sp::RifePairClockBinding::overflow: binding=@"unbound-overflow"; break;
+        case sp::RifePairClockBinding::frozenOnly: binding=@"unbound-external-frozen-deadline"; break;
+        case sp::RifePairClockBinding::missingEndpoint: break;
+    }
+    return @{ @"frameA":@(frameA), @"frameB":@(frameB), @"ptsNum":@(target.pts.num), @"ptsDen":@(target.pts.den),
+        @"generation":@(target.context.generation), @"configVersion":@(target.context.config),
+        @"measurementEpoch":@(target.context.measurement), @"clockEpoch":@(target.context.clock),
+        @"binding":binding, @"alphaTimeNum":target.alphaTimeValid ? @(target.alphaTime.num) : (id)NSNull.null,
+        @"alphaTimeDen":target.alphaTimeValid ? @(target.alphaTime.den) : (id)NSNull.null,
+        @"legacyCandidateTargetHost":target.legacyTargetHost>0 ? @(target.legacyTargetHost) : (id)NSNull.null,
+        @"legacyFrozenDelayHost":target.legacyTargetHost>0 ? @(target.legacyDelayHost) : (id)NSNull.null,
+        @"endpointA":SPRifeSourceClockValue(target.endpointA), @"endpointB":SPRifeSourceClockValue(target.endpointB),
+        @"selectedTargetHost":@(target.selectedTargetHost), @"frozenDeadlineOverride":@(target.deadlineOverride),
+        @"selectedMinusLegacyHost":target.legacyTargetHost>0 ? @(target.selectedTargetHost-target.legacyTargetHost) : (id)NSNull.null,
+        @"metricScope":@"opt-in target remapping; legacy candidate and selected target must be evaluated separately" };
+}
+static NSArray *SPRifeJobPairClockValues(const SPLiveJob *job) {
+    NSMutableArray *values=[NSMutableArray array];
+    for(int i=0;i<job->count;++i) if(job->pairClock[i].recorded)
+        [values addObject:SPRifePairClockValue(job->pairClock[i],job->frameA,job->frameB)];
+    return values;
+}
+
+@interface SPLiveProcessor (SPRifePairClockPrivate)
+- (void)airDetachSessionServiceTrace:(nullable SPRifeBridge *)bridge reason:(NSString *)reason;
+- (void)submitEventGroup:(const std::vector<sp::SPScheduleOutput> &)events generation:(uint64_t)generation
+    frozenDeadline:(int64_t)frozenDeadline frozenPairClock:(const sp::RifePairClockTarget *)frozenPairClock;
+- (BOOL)deferRifeEvent:(const sp::SPScheduleOutput &)event generation:(uint64_t)generation
+    deadline:(int64_t)deadline retryHost:(int64_t)retryHost frozenPairClock:(const sp::RifePairClockTarget *)frozenPairClock;
+@end
+
+struct SPAirDelayAlignmentEvent {
+    uint64_t sequence, generation, config, epochBefore, epochAfter;
+    int64_t hostTicks, intervalNs, modelNs, processNs, presentationLeadNs, renderMarginNs;
+    int64_t wantedNs, capNs, queueLimitNs, roundedNs, finalNs;
+    int64_t oldSourceLeadNs, actualSourceLeadNs, positiveIntervalP95Ns;
+    uint64_t positiveIntervalHistoryCount, positiveIntervalObservedCount;
+    int requestedMultiplier, effectiveMultiplier;
+    bool calculated, activeX2, sourceOnly, timeClamped, byteClamped;
+    bool robustSourceLeadRequested, robustSourceLeadApplied;
+};
+#if ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
+using SPAirDelayAlignmentRing = SPAirCausalRing<SPAirDelayAlignmentEvent, 131072>;
+#else
+using SPAirDelayAlignmentRing = SPAirCausalRing<SPAirDelayAlignmentEvent, 16384>;
+#endif
+static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlignmentEvent> &values, uint64_t total, int64_t cutoff) {
+    NSMutableArray *events = [NSMutableArray arrayWithCapacity:values.size()];
+    for (const auto &e : values) {
+        if (e.hostTicks > cutoff) continue;
+        [events addObject:@{ @"sequence": @(e.sequence), @"hostTicks": @(e.hostTicks), @"generation": @(e.generation),
+            @"configVersion": @(e.config), @"epochBefore": @(e.epochBefore), @"epochAfter": @(e.epochAfter),
+            @"calculated": @(e.calculated), @"activeX2": @(e.activeX2), @"sourceOnly": @(e.sourceOnly),
+            @"requestedMultiplier": @(e.requestedMultiplier), @"effectiveMultiplier": @(e.effectiveMultiplier),
+            @"intervalNs": e.calculated ? @(e.intervalNs) : (id)NSNull.null,
+            @"robustSourceLeadRequested": @(e.robustSourceLeadRequested), @"robustSourceLeadApplied": @(e.robustSourceLeadApplied),
+            @"robustSourceLeadBootstrap": @(e.robustSourceLeadApplied && e.positiveIntervalHistoryCount == 0),
+            @"oldSourceLeadNs": e.calculated ? @(e.oldSourceLeadNs) : (id)NSNull.null,
+            @"actualSourceLeadNs": e.calculated ? @(e.actualSourceLeadNs) : (id)NSNull.null,
+            @"positiveIntervalP95Ns": e.robustSourceLeadApplied && e.positiveIntervalHistoryCount ? @(e.positiveIntervalP95Ns) : (id)NSNull.null,
+            @"positiveIntervalHistoryCount": @(e.positiveIntervalHistoryCount), @"positiveIntervalObservedCount": @(e.positiveIntervalObservedCount),
+            @"modelNs": e.calculated ? @(e.modelNs) : (id)NSNull.null,
+            @"processNs": e.calculated ? @(e.processNs) : (id)NSNull.null,
+            @"presentationLeadNs": e.activeX2 ? @(e.presentationLeadNs) : (id)NSNull.null,
+            @"renderMarginNs": e.calculated ? @(e.renderMarginNs) : (id)NSNull.null,
+            @"wantedNs": e.calculated ? @(e.wantedNs) : (id)NSNull.null,
+            @"capNs": @(e.capNs), @"queueLimitNs": e.calculated ? @(e.queueLimitNs) : (id)NSNull.null,
+            @"roundedNs": e.calculated ? @(e.roundedNs) : (id)NSNull.null,
+            @"finalNs": @(e.finalNs), @"timeClamped": @(e.timeClamped), @"byteClamped": @(e.byteClamped) }];
+    }
+    return SPAirRingMetadata(total, SPAirDelayAlignmentRing::capacity, events);
+}
+
 @implementation SPLiveProcessor {
     dispatch_queue_t _q;
+    spAirMeasurement::TracePtr _measurementTrace;
+    uint64_t _measurementClockLife, _measurementArm, _measurementFire;
+    std::unique_ptr<SPAirFrameRing> _airCadenceCallbacks;
+    std::unique_ptr<SPAirBudgetRing> _airCadenceBudget;
+    std::unique_ptr<SPAirCurrentStatsRing> _airCurrentStatsCalls;
+    NSString *_airTraceSessionID;
+    NSObject *_airTraceKeeperJournal;
+    SPAirRetainedPayloadBudget *_airTracePayloadBudget;
+    void (^_airTraceRetiredServiceHandler)(NSObject *, NSDictionary *);
+    dispatch_queue_t _airTraceReplyQueue;
+    NSHashTable<SPRifeBridge *> *_airTraceDetachedBridges;
+    uint64_t _airTraceDetachPending, _airTraceDetachDropped, _airTraceServiceOrdinal, _airTraceUntrackedJobsAtBegin, _airTraceSessionBeginHostTicks;
+    BOOL _airTraceSessionActive, _airTraceRecordingSaturated;
+    std::atomic<uint64_t> _airOutputSubmitDeadlineFailures;
+    BOOL _airDelayAlignmentRequested, _airDelayAlignmentActiveX2;
+    BOOL _airDelayAlignmentDiagnosticRequested, _airTrueSourceIntervalDiagnosticRequested, _airRobustSourceLeadDiagnosticRequested;
+    SPLivePlanRequest *_airPerformanceRecipe;
+    BOOL _airPerformanceCandidate, _airPerformanceRequested, _airPerformanceEnabled, _airPerformanceFormatKnown, _airPerformanceEligibilityKnown;
+    SPLiveCaptureSourceKind _airActualSourceKind;
+    NSString *_airPerformanceReason, *_airPerformanceFormatReason, *_airPerformanceEligibilityReason;
+    NSDictionary *_airPerformanceSelection;
+    BOOL _airTrueSourceIntervalRequested, _airInteractiveCap125msRequested;
+    int64_t _airDelayAlignmentLeadNs, _airDelayAlignmentMarginNs;
+    std::unique_ptr<SPAirDelayAlignmentRing> _airDelayAlignmentEvents;
     SPLivePlanRequest *_request;
+#if ODF_AIR_BETA_DIAGNOSTIC
+    SPLivePlanRequest *_airBetaRecipe;
+    NSString *_airBetaFormatReason, *_airBetaFormatDescription, *_airBetaFallbackReason, *_airBetaOriginalFailure;
+    NSString *_airBetaEligibilityReason;
+    BOOL _airBetaFormatKnown, _airBetaEligibilityKnown;
+    double _airBetaObservedRefreshHz;
+#endif
     SPLiveResolvedPlan *_resolved;
     SPFRCEngine *_engine;
     SPLowLatencyEngine *_lowLatency;
     SPRifeBridge *_rife;
+#if ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC
+    SPRifeBridge *_airResidentRetiredBridge;
+    uint64_t _airCapacitySealedHostTicks;
+    uint64_t _airResidentPlanToken;
+    NSString *_airResidentInstallFailure;
+#endif
     SPDistilDRBA *_distil;
     SPAppleLowLatencySR *_appleSR;
     SPAppleVideoSR *_videoSR;
@@ -1426,6 +3524,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     BOOL _testSRBaselineMatches, _testSRIdentityMatches;
     NSString *_testSRError;
     VTPixelTransferSessionRef _transfer;
+    SPAirSourceConversionWorker *_sourceConverter;
+    spAirSourceConversion::State _sourceConversions;
+    std::array<uint64_t, 8> _sourceConversionInvalidated;
+    uint64_t _sourceConversionDelivered, _sourceConversionFrames, _sourceConversionFailures;
     std::vector<SPPlaySlot> _slots;
     std::vector<SPPendingPhase> _pending;
     std::vector<sp::SPScheduleOutput> _rifePending;
@@ -1433,6 +3535,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     BOOL _haveRifeDeferred;
     sp::SPScheduleOutput _rifeDeferredEvent;
     int64_t _rifeDeferredDeadline;
+    sp::RifePairClockTarget _rifeDeferredPairClock;
     int64_t _rifeDeferredRetryHost;
     uint64_t _rifeDeferredGeneration, _rifeDeferredClockEpoch;
     uint64_t _rifeDeferredAccepted, _rifeDeferredExpired, _rifeDeferredStale, _rifeDeferredCapacityDrops;
@@ -1440,8 +3543,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     BOOL _rifeSlowMode;
     BOOL _lowPrescaleSlowMode;
     BOOL _testCapturePlayout;
+    BOOL _testExactFixedSchedule;
     BOOL _testKeepLowRealtime;
     std::vector<std::pair<sp::SPRational, bool>> _testPlayout;
+    std::vector<sp::SPRational> _testHoldPlayout;
     NSMutableArray *_testPendingTrace;
     NSMutableArray *_testTimingTrace;
     std::unordered_map<uint64_t, SPFrameMark> _marks;
@@ -1459,6 +3564,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     int64_t _delayHost;
     int64_t _intervalHost;
     BOOL _haveInterval;
+    BOOL _airRobustSourceLeadRequested;
+    sp::AirRobustSourceLead _airRobustSourceLeadHistory;
+    sp::AirSourceLeadEvaluation _airSourceLeadEvaluation;
+    BOOL _airRobustSourceLeadApplied;
     double _frcEwmaSec;
     double _scaleEwmaSec;
     BOOL _delayClamped;
@@ -1472,6 +3581,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     BOOL _lastSynthetic;
     sp::SPRational _lastRedrawPts;
     int64_t _lastRedrawGeometryHost;
+    int64_t _lastRedrawTargetHost;
     uint64_t _nextFrameID;
     uint64_t _outputSurfaceToken;
     int64_t _outputSurfaceMinimumCaptureHost;
@@ -1542,10 +3652,13 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     int64_t _r9RateHost;
     double _r9GeneratedFPS, _r9OnTimeSyntheticFPS;
     sp::RateBudget _rateBudget;
+    sp::FixedRateBudget _fixedRateBudget;
+    int _fixedMaxBatchCount;
     int _effectiveMultiplier;
     BOOL _rateBudgetPassthrough;
     int64_t _rifeBusySinceHost;
     uint64_t _rifeBudgetRejectedPhases, _rateBudgetSkippedPhases;
+    uint64_t _fixedSourceReused, _fixedFallbackPresented, _fixedFallbackReplaced;
     std::deque<SPRateBudgetWindowSample> _rateBudgetWindow;
     std::vector<sp::SPRational> _rateBudgetDropPTS;
     std::deque<int64_t> _rateBudgetCompletedHosts;
@@ -1605,6 +3718,9 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     std::vector<int64_t> _queueNs;
     std::vector<int64_t> _playheadNs;
     std::vector<int64_t> _drawableWaitNs;
+    std::vector<int64_t> _presentationAdmissionToCallbackNs;
+    std::vector<int64_t> _metalCommitToDisplayNs;
+    std::vector<int64_t> _displayScheduledTargetOffsetNs;
     std::vector<int64_t> _presentGapNs;
     std::vector<int64_t> _presentMediaLagNs;
     std::vector<int64_t> _gpuToDisplayNs;
@@ -1635,6 +3751,33 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 
 - (instancetype)init {
     if (!(self = [super init])) return nil;
+    _airOutputSubmitDeadlineFailures.store(0, std::memory_order_relaxed);
+    if (SPAirFullMeasurementTraceRequested())
+        _measurementTrace = std::make_shared<spAirMeasurement::Trace>(spAirMeasurement::processorCapacity);
+    _airRobustSourceLeadRequested = SPAirRobustSourceLeadRequested();
+    if (SPAirCadenceCausalTraceRequested()) {
+        _airCadenceCallbacks = std::make_unique<SPAirFrameRing>();
+        _airCadenceBudget = std::make_unique<SPAirBudgetRing>();
+#if defined(ODF_AIR_BETA_DIAGNOSTIC) && ODF_AIR_BETA_DIAGNOSTIC == 1
+        const char *statsDiagnostic = getenv("ODF_AIR_BETA_CAPTURE_DIAGNOSTIC");
+        if (statsDiagnostic && strcmp(statsDiagnostic, "1") == 0)
+            _airCurrentStatsCalls = std::make_unique<SPAirCurrentStatsRing>();
+#else
+        _airCurrentStatsCalls = std::make_unique<SPAirCurrentStatsRing>();
+#endif
+    }
+#if defined(ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC) && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC == 1
+    const char *alignDelay = getenv("ODF_AIR_DELAY_ALIGNMENT_DIAGNOSTIC");
+    _airDelayAlignmentRequested = alignDelay && strcmp(alignDelay, "1") == 0;
+    const char *trueInterval = getenv("ODF_AIR_TRUE_SOURCE_INTERVAL_DIAGNOSTIC");
+    _airTrueSourceIntervalRequested = trueInterval && strcmp(trueInterval, "1") == 0;
+    const char *cap125ms = getenv("ODF_AIR_INTERACTIVE_CAP_125MS_DIAGNOSTIC");
+    _airInteractiveCap125msRequested = cap125ms && strcmp(cap125ms, "1") == 0;
+#endif
+    _airDelayAlignmentDiagnosticRequested = _airDelayAlignmentRequested;
+    _airTrueSourceIntervalDiagnosticRequested = _airTrueSourceIntervalRequested;
+    _airRobustSourceLeadDiagnosticRequested = _airRobustSourceLeadRequested;
+    if (_airDelayAlignmentRequested && _airCadenceCallbacks) _airDelayAlignmentEvents = std::make_unique<SPAirDelayAlignmentRing>();
     _capturePressureQueued = false;
     _capturePressureGeneration = 0;
     _q = dispatch_queue_create("app.openduckframe.live",
@@ -1707,6 +3850,44 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     return value ?: @{};
 }
 
+- (void)requestStatsSnapshotOnQueue:(dispatch_queue_t)replyQueue completion:(void (^)(NSDictionary<NSString *, id> *))completion {
+    dispatch_async(_q, ^{
+        NSDictionary *value = [self rememberStats:[self currentStats]];
+        dispatch_async(replyQueue, ^{ completion(value); });
+    });
+}
+
+- (NSDictionary<NSString *, id> *)cachedStatsSnapshot {
+    NSDictionary *value;
+    {
+        std::lock_guard<std::mutex> lock(_statsMx);
+        value = _statsSnapshot;
+    }
+    const uint64_t readHost = SPHostNow();
+    NSDictionary *sampling = value[@"statsSampling"];
+    const uint64_t end = [sampling[@"endHostTicks"] unsignedLongLongValue];
+    const int64_t age = end && readHost >= end ? SPHostToNs(readHost - end) : -1;
+    return @{ @"available": @(value != nil), @"stats": value ?: @{},
+        @"sampleBeginHostTicks": sampling[@"beginHostTicks"] ?: (id)NSNull.null,
+        @"sampleEndHostTicks": sampling[@"endHostTicks"] ?: (id)NSNull.null,
+        @"threadID": sampling[@"threadID"] ?: (id)NSNull.null,
+        @"readHostTicks": @(readHost), @"ageNs": age >= 0 ? @(age) : (id)NSNull.null,
+        @"snapshotStale": @(age < 0 || age > 1500000000LL) };
+}
+
+- (NSDictionary<NSString *, id> *)statsBoundaryCountersSnapshot {
+    const uint64_t begin = SPHostNow();
+    uint64_t threadID = 0;
+    pthread_threadid_np(nullptr, &threadID);
+    NSDictionary *prepared = [self.outputPreview preparedTextureCountersSnapshot] ?: @{};
+    const uint64_t deadline = _airOutputSubmitDeadlineFailures.load(std::memory_order_relaxed);
+    const uint64_t end = SPHostNow();
+    return @{ @"enabled": @(_airCurrentStatsCalls != nullptr),
+        @"sampleBeginHostTicks": @(begin), @"sampleEndHostTicks": @(end), @"threadID": @(threadID),
+        @"presentationSlots": @{ @"output": @{ @"preparedTexture": prepared } },
+        @"presentationFailuresLifetime": @{ @"output.display-submit-deadline": @(deadline) } };
+}
+
 - (int)inboundCount {
     std::lock_guard<std::mutex> lock(_inMx);
     return (int)_inbound.size();
@@ -1739,6 +3920,11 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         _request.rateKind == SPLiveRateMultiplier && _request.multiplier >= 2 && _request.multiplier <= 4;
 }
 
+- (BOOL)usesFixedSourceReuse {
+    return !_testExactFixedSchedule && _request.interpolationEnabled && _request.rateKind == SPLiveRateFixedFPS &&
+        [_request.engineID isEqualToString:@"rife.metal"];
+}
+
 - (void)clearRateBudgetWindow {
     _rateBudgetWindow.clear();
     _rateBudgetDropPTS.clear();
@@ -1748,10 +3934,13 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     [self cancelRateBudgetProbe];
     int requested = _request.rateKind == SPLiveRateMultiplier ? (int)_request.multiplier : 1;
     _rateBudget.reset(requested);
+    _fixedRateBudget.reset();
+    _fixedMaxBatchCount = 0;
     _effectiveMultiplier = _rateBudget.snapshot().effectiveMultiplier;
     _rateBudgetPassthrough = NO;
     _rifeBudgetRejectedPhases = 0;
     _rateBudgetSkippedPhases = 0;
+    _fixedSourceReused = _fixedFallbackPresented = _fixedFallbackReplaced = 0;
     _rifeBusySinceHost = 0;
     _rateBudgetCompletedHosts.clear();
     _rateBudgetLastDecision = @{};
@@ -1901,6 +4090,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     ++_inflight;
     _rifeBusySinceHost = SPHostNow();
     SPLiveProcessor *selfRef = self;
+#if ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC
+    if (_rife.serviceTraceEnabled) [_rife setServiceTraceToken:job->diagnosticID configVersion:job->configVersion
+        measurementEpoch:job->measurementEpoch probe:YES probeIndex:job->probeIndex probeRound:job->probeRound];
+#endif
     BOOL submitted = [_rife submitLivePrevious:job->probeSourceA current:job->probeSourceB
         previousID:job->frameA currentID:job->frameB
         previousPTS:job->probePreviousPTS currentPTS:job->probeCurrentPTS
@@ -1969,19 +4162,51 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 }
 
 - (void)suspendRateBudgetOnQueue {
+    SPAirBudgetEvent trace{};
+    if (_airCadenceBudget) {
+        trace.hostTicks = SPHostNow(); trace.suspend = true; trace.generation = _sourceGeneration; trace.configBefore = _configVersion; trace.epochBefore = _measurementEpoch;
+        trace.appliedBefore = _effectiveMultiplier; trace.budgetBefore = _rateBudget.snapshot().effectiveMultiplier;
+        trace.phaseCostBeforeMs = _rateBudget.snapshot().phaseCostMs; trace.inflight = _inflight; trace.probeToken = _rateBudgetProbeInFlightToken;
+        trace.requested = (int)_request.multiplier;
+    }
     [self cancelRateBudgetProbe];
     _rateBudgetCompletedHosts.clear();
-    if (![self rateBudgetEnabled]) return;
-    (void)_rateBudget.update({CACurrentMediaTime(), 0, (int)_request.multiplier, 0, 0, 0});
+    if (![self rateBudgetEnabled]) {
+        if (_airCadenceBudget) { trace.gateMask = 1; trace.appliedAfter = _effectiveMultiplier; const auto after = _rateBudget.snapshot(); trace.budgetAfter = after.effectiveMultiplier; trace.phaseCostAfterMs = after.phaseCostMs; trace.displayCap = after.displayCap; trace.limit = after.limit; trace.configAfter = _configVersion; trace.epochAfter = _measurementEpoch; _airCadenceBudget->append(trace); }
+        return;
+    }
+    const double policyNow = CACurrentMediaTime();
+    (void)_rateBudget.update({policyNow, 0, (int)_request.multiplier, 0, 0, 0});
     [self clearRateBudgetWindow];
+    if (_airCadenceBudget) {
+        trace.policyCalled = trace.inputAvailable = true; trace.policyMediaTimeSeconds = policyNow; trace.requested = (int)_request.multiplier;
+        trace.appliedAfter = _effectiveMultiplier; const auto after = _rateBudget.snapshot(); trace.budgetAfter = after.effectiveMultiplier; trace.phaseCostAfterMs = after.phaseCostMs; trace.displayCap = after.displayCap; trace.limit = after.limit;
+        trace.configAfter = _configVersion; trace.epochAfter = _measurementEpoch; _airCadenceBudget->append(trace);
+    }
 }
 
 - (void)updateRateBudgetOnQueue {
-    if (![self rateBudgetEnabled] || !_rife || !_sessionReady || _stopped) {
+    SPAirBudgetEvent trace{};
+    if (_airCadenceBudget) {
+        trace.hostTicks = SPHostNow(); trace.generation = _sourceGeneration; trace.configBefore = _configVersion; trace.epochBefore = _measurementEpoch;
+        trace.appliedBefore = _effectiveMultiplier; trace.budgetBefore = _rateBudget.snapshot().effectiveMultiplier; trace.phaseCostBeforeMs = _rateBudget.snapshot().phaseCostMs;
+        trace.inflight = _inflight; trace.probeToken = _rateBudgetProbeInFlightToken; trace.requested = (int)_request.multiplier;
+        for (int64_t completed : _rateBudgetCompletedHosts) if (SPHostToNs(trace.hostTicks - completed) <= 2000000000LL) ++trace.freshSamples;
+    }
+    auto finishTrace = [&](uint32_t gates) {
+        if (!_airCadenceBudget) return;
+        trace.gateMask |= gates; trace.appliedAfter = _effectiveMultiplier; trace.configAfter = _configVersion; trace.epochAfter = _measurementEpoch;
+        const auto after = _rateBudget.snapshot(); trace.budgetAfter = after.effectiveMultiplier; trace.phaseCostAfterMs = after.phaseCostMs; trace.displayCap = after.displayCap; trace.limit = after.limit;
+        _airCadenceBudget->append(trace);
+    };
+    const BOOL budgetEnabled = [self rateBudgetEnabled];
+    if (!budgetEnabled || !_rife || !_sessionReady || _stopped) {
         [self cancelRateBudgetProbe];
+        finishTrace((!budgetEnabled ? 1 : 0) | (!_rife ? 2 : 0) | (!_sessionReady ? 4 : 0) | (_stopped ? 8 : 0));
         return;
     }
     if ([self nativeBudgetForSnapshot:[self nativeCadenceSnapshot]]) {
+        if (_airCadenceBudget) trace.nativeSuspended = true;
         // Native bypass still suspends compute evidence, but the display cap
         // must observe continuous content cadence across native-gate changes.
         [self cancelRateBudgetProbe];
@@ -1998,11 +4223,14 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     double median = [self rateBudgetMedianTaskMs];
     double fps = _fpsMeter.inputRate((int64_t)(CACurrentMediaTime() * 1e9));
     uint64_t fresh = [self rateBudgetFreshSampleCount];
+    if (_airCadenceBudget) { trace.inputAvailable = true; trace.contentFPS = fps; trace.medianTaskMs = median; trace.planned = planned; trace.dropped = dropped; trace.freshSamples = fresh; trace.refreshHz = _request.displayRefreshHz; }
     if (!std::isfinite(fps) || fps <= 0) [self cancelRateBudgetProbe];
     auto budget = _rateBudget.snapshot();
     if (budget.effectiveMultiplier == _effectiveMultiplier) {
-        budget = _rateBudget.update({CACurrentMediaTime(), fps, (int)_request.multiplier,
+        const double policyNow = CACurrentMediaTime();
+        budget = _rateBudget.update({policyNow, fps, (int)_request.multiplier,
                                     median, planned, dropped, fresh, _request.displayRefreshHz});
+        if (_airCadenceBudget) { trace.policyCalled = true; trace.policyMediaTimeSeconds = policyNow; }
         if (budget.effectiveMultiplier != _effectiveMultiplier) {
             _rateBudgetLastDecision = @{ @"host": @(now), @"from": @(_effectiveMultiplier),
                 @"to": @(budget.effectiveMultiplier), @"medianMs": @(median),
@@ -2014,10 +4242,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     }
     if (budget.limit != sp::RateBudgetLimit::Compute && _rateBudgetProbeActive)
         [self cancelRateBudgetProbe];
-    if (budget.effectiveMultiplier == _effectiveMultiplier) return;
+    if (budget.effectiveMultiplier == _effectiveMultiplier) { finishTrace((fresh < 8 ? 64 : 0) | 128); return; }
     // Reuse the loaded engine. Let its bounded serial queue drain before
     // changing ownership epochs; admission rejects new jobs during this gap.
-    if (_inflight > 0 || _rateBudgetProbeInFlightToken) return;
+    if (_inflight > 0 || _rateBudgetProbeInFlightToken) { finishTrace((_inflight > 0 ? 16 : 0) | (_rateBudgetProbeInFlightToken ? 32 : 0)); return; }
     int previous = _effectiveMultiplier;
     _effectiveMultiplier = budget.effectiveMultiplier;
     _rateBudgetPassthrough = _effectiveMultiplier == 1;
@@ -2043,6 +4271,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"requested": @(_request.multiplier), @"previous": @(previous), @"effective": @(_effectiveMultiplier),
         @"config": @(_configVersion), @"medianTaskMs": @(median),
         @"plannedPhases": @(planned), @"droppedPhases": @(dropped) }];
+    finishTrace(0);
 }
 
 - (void)applyObservedCaptureEnvironment {
@@ -2085,13 +4314,17 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 }
 
 - (NSDictionary *)currentStats {
-    std::vector<int64_t> samples = _latencyNs;
-    std::sort(samples.begin(), samples.end());
-    double p95 = -1;
-    if (!samples.empty()) {
-        size_t index = (size_t)((samples.size() - 1) * 95 / 100);
-        p95 = (double)samples[index] / 1e6;
+    uint64_t statsBegin = 0, statsThread = 0;
+    if (_airCurrentStatsCalls) {
+        statsBegin = SPHostNow();
+        pthread_threadid_np(nullptr, &statsThread);
     }
+    NSDictionary *windowOptimization = [self airWindowOptimizationSnapshot];
+#if ODF_AIR_BETA_DIAGNOSTIC
+    NSDictionary *airBeta = SPAirBetaEnabled() ? [self airBetaSnapshot] : @{};
+    NSDictionary *measurementReadiness = [self airBetaMeasurementReadiness];
+#endif
+    const double p95 = SPStatsPercentileMs(_latencyNs);
     NSMutableArray *epochHistogram = [NSMutableArray arrayWithCapacity:201];
     for (int i = 0; i < 201; ++i) [epochHistogram addObject:@(_epochHist[i])];
     double seconds = (double)SPHostToNs(SPHostNow() - _windowStart) / 1e9;
@@ -2102,12 +4335,20 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     if (!_nativeBudgetActive) _nativeBGRADirectActive = NO;
     NSDictionary *copiedCadence = [self copiedCadenceStats];
     NSDictionary *rifeDiagnostics = _rife ? [_rife streamDiagnostics] : @{};
+    int processingWidth = _resolved.interpolationActive ? (_lowLatency ? _lowLatency.width : _width) : 0;
+    int processingHeight = _resolved.interpolationActive ? (_lowLatency ? _lowLatency.height : _height) : 0;
+#if ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
+    if (_resolved.interpolationActive && _rife.rifePrescaleEnabled) {
+        processingWidth = _rife.processingWidth; processingHeight = _rife.processingHeight;
+    }
+#endif
     double requestedFPS = -1;
     if (_resolved.committed && _resolved.interpolationActive && _request.interpolationEnabled && _request.rateKind == SPLiveRateFixedFPS && _request.fpsDenominator > 0)
         requestedFPS = (double)_request.fpsNumerator / (double)_request.fpsDenominator;
     else if (_resolved.committed && _resolved.interpolationActive && _request.interpolationEnabled && _request.rateKind == SPLiveRateMultiplier && inputFPS > 0)
         requestedFPS = inputFPS * _request.multiplier;
-    return @{
+    NSDictionary *result = @{
+        @"airWindowOptimization": windowOptimization,
         @"pumpedInputSequence": @(_processedSequence),
         @"capturePressureEvents": @(_capturePressureEvents),
         @"lastProcessedHost": @(_lastProcessedHost),
@@ -2124,6 +4365,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"rateRequestedMultiplier": @(_request.rateKind == SPLiveRateMultiplier ? _request.multiplier : 0),
         @"rateEffectiveMultiplier": @(_request.rateKind == SPLiveRateMultiplier ? ([self rateBudgetEnabled] ? _effectiveMultiplier : _request.multiplier) : 0),
         @"rateBudgetPassthrough": @(_rateBudgetPassthrough),
+        @"fixedSourceReuse": @([self usesFixedSourceReuse]),
+        @"fixedSourceReused": @(_fixedSourceReused),
+        @"fixedFallbackPresented": @(_fixedFallbackPresented),
+        @"fixedFallbackReplaced": @(_fixedFallbackReplaced),
         @"rateBudgetLimit": [NSString stringWithUTF8String:sp::rateBudgetLimitName(_rateBudget.snapshot().limit)],
         @"rateBudgetDisplayCap": @(_rateBudget.snapshot().displayCap),
         @"rateBudgetDisplayCapChanges": @(_rateBudget.snapshot().displayCapChanges),
@@ -2138,6 +4383,14 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"rateBudgetProbeJobs": @(_rateBudgetProbeJobs),
         @"rateBudgetProbeMedianMs": @(_rateBudgetProbeMedianMs),
         @"rifeRecentJobs": rifeDiagnostics[@"rifeRecentJobs"] ?: @[],
+#if ODF_AIR_BETA_DIAGNOSTIC
+        @"airBeta": airBeta,
+        @"airBetaMeasurementReadiness": measurementReadiness,
+        @"airWindowOptimizationReadiness": measurementReadiness,
+#endif
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
+        @"airFusedRifePresenter": [self.outputPreview fusedRifePresentationSnapshotIncludeRecords:NO cutoffHostTicks:SPHostNow()] ?: @{},
+#endif
         @"processThermalState": @([NSProcessInfo processInfo].thermalState),
         @"processLowPowerMode": @([NSProcessInfo processInfo].lowPowerModeEnabled),
         @"nativeBudgetSkippedPhases": @(_nativeBudgetSkippedPhases),
@@ -2205,8 +4458,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"deadlineDrops": @(_deadlineDrops),
         @"lateReadyDrops": @(_lateReadyDrops), @"staleReadyDrops": @(_staleReadyDrops),
         @"dueMergeDrops": @(_dueMergeDrops), @"pendingExpiredDrops": @(_pendingExpiredDrops),
-        @"slotEvictionDrops": @(_slotEvictionDrops), @"captureToModelReadyP95ms": @(SPPercentileMs(_captureToModelReadyNs)),
-        @"captureToOutputReadyP95ms": @(SPPercentileMs(_captureToOutputReadyNs)),
+        @"slotEvictionDrops": @(_slotEvictionDrops), @"captureToModelReadyP95ms": @(SPStatsPercentileMs(_captureToModelReadyNs)),
+        @"captureToOutputReadyP95ms": @(SPStatsPercentileMs(_captureToOutputReadyNs)),
         @"sceneSkips": @(_sceneSkips),
         @"queueDrops": @(_queueDrops),
         @"sourceMissingDrops": @(_sourceMissingDrops), @"sourceConversionDrops": @(_sourceConversionDrops),
@@ -2249,7 +4502,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"epochDeadline": @(_epochDeadline),
         @"epochQueueDrops": @(_epochQueueDrops),
         @"phaseBatchSplits": @(_phaseBatchSplits),
-        @"copyEntryP95ms": @(SPPercentileMs(_copyEntryNs)),
+        @"copyEntryP95ms": @(SPStatsPercentileMs(_copyEntryNs)),
         @"latencyHistogramMs": epochHistogram,
         @"presentedCallbacks": @(_presentedCallbacks),
         @"inflight": @(_inflight),
@@ -2260,21 +4513,40 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"queued": @([self inboundCount]),
         @"p95ms": @(p95),
         @"delayMs": @((double)SPHostToNs(_delayHost) / 1e6),
+        @"delayAlignmentRequested": @(_airDelayAlignmentRequested),
+        @"delayAlignmentActiveX2": @(_airDelayAlignmentActiveX2),
+        @"delayAlignmentPresentationLeadNs": @(_airDelayAlignmentLeadNs),
+        @"delayAlignmentRenderMarginNs": @(_airDelayAlignmentMarginNs),
+        @"airRobustSourceLead": @{ @"schema": @"odf-air-source-lead-max-p95-v1", @"policy": @"max-old-lead-type7-p95-half", @"quantileType": @7,
+            @"requested": @(_airRobustSourceLeadRequested),
+            @"applied": @(_airRobustSourceLeadApplied), @"maximumHistoryCount": @32,
+            @"bootstrap": @(_airRobustSourceLeadApplied && _airSourceLeadEvaluation.historyCount == 0),
+            @"historyCount": @(_airSourceLeadEvaluation.historyCount), @"observedIntervals": @(_airSourceLeadEvaluation.observedIntervals),
+            @"oldLeadNs": @((int64_t)llround(_airSourceLeadEvaluation.oldLeadSeconds * 1e9)),
+            @"actualLeadNs": @((int64_t)llround(_airSourceLeadEvaluation.leadSeconds * 1e9)),
+            @"positiveIntervalP95Ns": _airRobustSourceLeadApplied && _airSourceLeadEvaluation.historyCount
+                ? @((int64_t)llround(_airSourceLeadEvaluation.p95IntervalSeconds * 1e9)) : (id)NSNull.null },
         @"delayClamped": @(_delayClamped),
         @"delayTimeClamped": @(_delayTimeClamped), @"delayByteClamped": @(_delayByteClamped),
         @"interactiveCapMs": @(_request.quality == SPFRCQualityHigh ? SPQualityCapSec * 1000.0 : SPInteractiveCapSec * 1000.0),
         @"interactiveTier": _request.quality == SPFRCQualityHigh ? @"quality" : @"normal",
-        @"frcP95ms": @(SPPercentileMs(_frcNs)),
-        @"scaleP95ms": @(SPPercentileMs(_scaleNs)),
-        @"transferP95ms": @(SPPercentileMs(_transferNs)),
-        @"queueP95ms": @(SPPercentileMs(_queueNs)),
-        @"playheadP95ms": @(SPPercentileMs(_playheadNs)),
-        @"drawableWaitP95ms": @(SPPercentileMs(_drawableWaitNs)),
-        @"notifyGapP95ms": @(SPPercentileMs(_presentGapNs)),
-        @"presentGapP95ms": @(SPPercentileMs(_presentGapNs)),
-        @"presentMediaLagP95ms": @(SPPercentileMs(_presentMediaLagNs)),
-        @"gpuToDisplayP95ms": @(SPPercentileMs(_gpuToDisplayNs)),
-        @"captureToDisplayP95ms": @(SPPercentileMs(_captureToDisplayNs)),
+        @"frcP95ms": @(SPStatsPercentileMs(_frcNs)),
+        @"scaleP95ms": @(SPStatsPercentileMs(_scaleNs)),
+        @"airSourceConversion": [self airSourceConversionSnapshot],
+        @"transferP95ms": @(SPStatsPercentileMs(_transferNs)),
+        @"queueP95ms": @(SPStatsPercentileMs(_queueNs)),
+        @"playheadP95ms": @(SPStatsPercentileMs(_playheadNs)),
+        @"drawableWaitP95ms": @(SPStatsPercentileMs(_drawableWaitNs)),
+        @"presentationDriver": @"CAMetalDisplayLink",
+        @"presentationSlots": @{ @"preview": [self.preview displaySlotDiagnostics] ?: @{}, @"output": [self.outputPreview displaySlotDiagnostics] ?: @{} },
+        @"presentationAdmissionToCallbackP95ms": @(SPStatsPercentileMs(_presentationAdmissionToCallbackNs)),
+        @"metalCommitToDisplayP95ms": @(SPStatsPercentileMs(_metalCommitToDisplayNs)),
+        @"displayScheduledTargetOffsetP95ms": @(SPStatsPercentileMs(_displayScheduledTargetOffsetNs)),
+        @"notifyGapP95ms": @(SPStatsPercentileMs(_presentGapNs)),
+        @"presentGapP95ms": @(SPStatsPercentileMs(_presentGapNs)),
+        @"presentMediaLagP95ms": @(SPStatsPercentileMs(_presentMediaLagNs)),
+        @"gpuToDisplayP95ms": @(SPStatsPercentileMs(_gpuToDisplayNs)),
+        @"captureToDisplayP95ms": @(SPStatsPercentileMs(_captureToDisplayNs)),
         @"displayTimingNote": @"CAMetalDrawable.presentedTime and CACurrentMediaTime share media time; subtract callback delivery lag from mach host intervals. Existing capture-to-callback metric is unchanged.",
         @"occludedPresents": @(_occludedPresents),
         @"engineID": _resolved.engineID ?: @"",
@@ -2292,6 +4564,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"centerSamples": @(_centerSamples),
         @"queueByteBudget": @([self r8QueueByteBudget]),
         @"r8QualityDiagnostic": @(SPR8Enabled()),
+        @"rifePairAffineClock": @([self usesRifePairAffineClock]),
         @"r8ExperimentActive": @([self r8CanExperiment]),
         @"r8AdmissionLimit": @([self r8AdmissionLimit]),
         @"r8SessionsRequested": @(SPR8Option(@"--odf-r8-sessions", 2, @[@1,@2,@3,@4])),
@@ -2312,8 +4585,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"srInputHeight": @((int)SPLiveSRInputSize(_width, _height, _request.scaleEnabled ? _request.srInputPreset : 0).height),
         @"lowLatencyPreScale": @([self requestUsesLowPrescale:_request width:_width height:_height]),
         @"lowLatencyPrescaledInputs": @(_lowPrescaleInputs), @"lowLatencySyntheticNoRescale": @(_lowSyntheticNoRescale),
-        @"processingWidth": @(_resolved.interpolationActive ? (_lowLatency ? _lowLatency.width : _width) : 0),
-        @"processingHeight": @(_resolved.interpolationActive ? (_lowLatency ? _lowLatency.height : _height) : 0),
+        @"processingWidth": @(processingWidth),
+        @"processingHeight": @(processingHeight),
         @"lowLatencyProcessingWidth": @(_lowLatency ? _lowLatency.width : 0),
         @"lowLatencyProcessingHeight": @(_lowLatency ? _lowLatency.height : 0),
         @"lowLatencyProcessingOrder": [self requestUsesLowPrescale:_request width:_width height:_height] ? @"lanczos-before-low-latency" : @"interpolation-before-scale",
@@ -2329,6 +4602,15 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"scaleActive": @(_resolved.scaleActive),
         @"configVersion": @(_configVersion),
     };
+    if (!_airCurrentStatsCalls) return result;
+    NSMutableDictionary *measured = [result mutableCopy];
+    NSMutableDictionary *sampling = [@{ @"beginHostTicks": @(statsBegin), @"threadID": @(statsThread),
+        @"scope": @"currentStats through snapshot construction; end tagging and trace append follow the bracket" } mutableCopy];
+    measured[@"statsSampling"] = sampling;
+    const uint64_t statsEnd = SPHostNow();
+    sampling[@"endHostTicks"] = @(statsEnd);
+    _airCurrentStatsCalls->append({0, statsBegin, statsEnd, statsThread});
+    return measured;
 }
 
 - (void)publishStats {
@@ -2344,9 +4626,9 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         } else { _r9GeneratedFPS = -1; _r9OnTimeSyntheticFPS = -1; }
         _r9RateHost = now; _r9RateSyntheticBaseline = _syntheticOK; _r9RateOnTimeBaseline = _r9OnTimeSynthetic;
     }
-    NSDictionary *stats = [self currentStats];
     void (^handler)(NSDictionary *) = self.statsHandler;
     if (!handler) return;
+    NSDictionary *stats = [self currentStats];
     dispatch_async(dispatch_get_main_queue(), ^{ handler(stats); });
 }
 
@@ -2434,11 +4716,81 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     _engine = nil;
     [_lowLatency invalidate];
     _lowLatency = nil;
+    [self airRetireResidentKeeperForBridge:_rife reason:@"engines_retired"];
     [_rife invalidate];
     _rife = nil;
     [_distil invalidate];
     _distil = nil;
     _metal = nil;
+}
+
+- (void)airRetireResidentKeeperForBridge:(SPRifeBridge *)bridge reason:(NSString *)reason {
+    if (_airTraceSessionActive && bridge) {
+        [bridge recordKeeperRetirementForDiagnostics:reason];
+        [self airDetachSessionServiceTrace:bridge reason:reason];
+    }
+#if ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC
+    if (!bridge.residentKeepAliveEnabled) return;
+    [bridge requestStopKeeperForPlanToken:0 reason:reason];
+    _airResidentRetiredBridge = bridge;
+#endif
+}
+
+- (void)airStartInstalledResidentKeeper {
+#if ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC
+    if (!_rife.residentKeepAliveEnabled || !_sessionReady || !_resolved.committed ||
+        !_request.interpolationEnabled || !_request.rifeStreamEnabled ||
+        _request.rateKind != SPLiveRateMultiplier || _request.multiplier != 2) return;
+    _airResidentPlanToken = _prepareToken;
+    if (![_rife startKeeperForPlanToken:_airResidentPlanToken generation:_sourceGeneration configVersion:_configVersion] &&
+        !_airResidentInstallFailure) _airResidentInstallFailure = @"Installed keeper start was rejected";
+#endif
+}
+
+- (void)markResidentKeepAlivePhase:(NSString *)phase {
+#if ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC
+    NSString *name = [phase copy];
+    dispatch_async(_q, ^{ [self->_rife markKeeperPhase:name forPlanToken:self->_airResidentPlanToken]; });
+#endif
+}
+
+- (void)requestStopResidentKeepAliveForDiagnostics:(NSString *)reason {
+#if ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC
+    NSString *text = [reason copy];
+    dispatch_async(_q, ^{
+        if (self->_airTraceSessionActive) {
+            // A keeper-only request does not retire the RIFE producer. Its
+            // service trace is detached at the existing actual bridge stop.
+            [self->_rife recordKeeperRetirementForDiagnostics:text];
+            if (self->_rife.residentKeepAliveEnabled) {
+                [self->_rife requestStopKeeperForPlanToken:0 reason:text];
+                self->_airResidentRetiredBridge = self->_rife;
+            }
+        } else [self airRetireResidentKeeperForBridge:self->_rife reason:text];
+    });
+#endif
+}
+
+- (NSDictionary *)residentKeepAliveSnapshotAtCutoffHostTicks:(uint64_t)cutoff includeRecords:(BOOL)includeRecords {
+#if ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC
+    __block NSDictionary *result;
+    void (^capture)(void) = ^{
+        NSDictionary *active = [self->_rife snapshotKeeperAtCutoffHostTicks:cutoff includeRecords:includeRecords];
+        NSDictionary *retired = self->_airResidentRetiredBridge != self->_rife
+            ? [self->_airResidentRetiredBridge snapshotKeeperAtCutoffHostTicks:cutoff includeRecords:includeRecords] : nil;
+        result = @{ @"schema": @"odf-app-resident-keepalive-processor-v1", @"compiled": @YES,
+            @"enabled": @(self->_rife.residentKeepAliveEnabled || self->_airResidentRetiredBridge.residentKeepAliveEnabled),
+            @"installedPlanToken": @(self->_airResidentPlanToken), @"sourceGenerationAtSnapshot": @(self->_sourceGeneration),
+            @"configVersionAtSnapshot": @(self->_configVersion), @"stopped": @(self->_stopped),
+            @"firstFailure": self->_airResidentInstallFailure ?: (id)NSNull.null,
+            @"active": active ?: @{}, @"retired": retired ?: @{},
+            @"exportCutoffHostTicks": @(cutoff), @"scope": @"CPU metadata/export only; no GPU wait. Retired bridge stays readable after processor stop." };
+    };
+    if (dispatch_get_specific(SPLiveQueueKey) == (__bridge void *)self) capture(); else dispatch_sync(_q, capture);
+    return result;
+#else
+    return @{ @"compiled": @NO, @"enabled": @NO };
+#endif
 }
 
 - (BOOL)requestUsesAsyncEngine:(SPLivePlanRequest *)request {
@@ -2490,14 +4842,21 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     [self erasePending:_rifeDeferredEvent.pts];
     _haveRifeDeferred = NO;
     _rifeDeferredRetryHost = 0;
+    _rifeDeferredPairClock = {};
 }
 
 - (BOOL)deferRifeEvent:(const sp::SPScheduleOutput &)event generation:(uint64_t)generation
                deadline:(int64_t)deadline retryHost:(int64_t)retryHost {
+    return [self deferRifeEvent:event generation:generation deadline:deadline retryHost:retryHost frozenPairClock:nullptr];
+}
+
+- (BOOL)deferRifeEvent:(const sp::SPScheduleOutput &)event generation:(uint64_t)generation
+    deadline:(int64_t)deadline retryHost:(int64_t)retryHost frozenPairClock:(const sp::RifePairClockTarget *)frozenPairClock {
     auto a=_held.find(event.frameA), b=_held.find(event.frameB);
     if (_haveRifeDeferred || a==_held.end() || b==_held.end() || deadline<=SPHostNow() ||
         (_haveLastPts && sp::spCmp(event.pts,_lastPresentedPts)<=0)) return NO;
     _haveRifeDeferred=YES; _rifeDeferredEvent=event; _rifeDeferredDeadline=deadline;
+    _rifeDeferredPairClock = frozenPairClock ? *frozenPairClock : sp::RifePairClockTarget{};
     _rifeDeferredGeneration=generation; _rifeDeferredClockEpoch=_clockEpoch; _rifeDeferredRetryHost=retryHost; _rifeDeferredAccepted++;
     a->second.pins++; b->second.pins++;
     SPPendingPhase phase; phase.pts=event.pts; phase.targetHost=deadline; phase.generation=generation;
@@ -2507,7 +4866,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 
 - (void)expireDeferredRifeAt:(int64_t)now {
     if (!_haveRifeDeferred) return;
-    if (_rifeDeferredGeneration != _sourceGeneration || _rifeDeferredClockEpoch != _clockEpoch) {
+    if (_rifeDeferredGeneration != _sourceGeneration || _rifeDeferredClockEpoch != _clockEpoch ||
+        (_rifeDeferredPairClock.recorded && !sp::sameRifePairClockContext(_rifeDeferredPairClock.context,[self rifePairClockContext]))) {
         [self clearDeferredRife]; return;
     }
     BOOL stale = _haveLastPts && sp::spCmp(_rifeDeferredEvent.pts, _lastPresentedPts) <= 0;
@@ -2531,8 +4891,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     auto event = _rifeDeferredEvent;
     int64_t deadline = _rifeDeferredDeadline;
     uint64_t generation = _rifeDeferredGeneration;
+    const auto frozenPairClock = _rifeDeferredPairClock;
     [self clearDeferredRife];
-    [self submitEventGroup:{event} generation:generation frozenDeadline:deadline];
+    [self submitEventGroup:{event} generation:generation frozenDeadline:deadline
+        frozenPairClock:frozenPairClock.recorded ? &frozenPairClock : nullptr];
 }
 
 - (void)resetAsyncScaleOnQueue {
@@ -2580,6 +4942,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     BOOL ok = [self buildOnQueue:&error];
     if (!ok) {
         [lowLatency invalidate];
+        [self airDetachSessionServiceTrace:rife reason:@"failed-installation"];
         [rife invalidate];
         [distil invalidate];
         [appleSR invalidate];
@@ -2606,6 +4969,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         _resolved.scaleActive = oldScaleActive;
         _resolved.committed = oldCommitted;
         _resolved.unavailableReason = reason;
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if (SPAirBetaEnabled() && request.interpolationEnabled) { [self airBetaUsePassthrough:reason]; return; }
+#endif
+        if (_airPerformanceEnabled && request.interpolationEnabled) { [self airPerformanceUsePassthrough:reason]; return; }
         [self publishStatus:reason failed:YES];
         [self publishPlanState:0 reason:reason];
         return;
@@ -2613,6 +4980,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     _sourceSizeConstraintFailed = NO;
     [oldEngine invalidate];
     [oldLow invalidate];
+    [self airRetireResidentKeeperForBridge:oldRife reason:@"plan_replaced"];
     [oldRife invalidate];
     [oldDistil invalidate];
     [oldSR invalidate];
@@ -2642,10 +5010,271 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     _resolved.committed = YES;
     _resolved.configVersion = _configVersion;
     [self beginMeasurementEpoch];
+    [self airStartInstalledResidentKeeper];
+#if ODF_AIR_BETA_DIAGNOSTIC
+    if (SPAirBetaEnabled() && rife && _airResidentInstallFailure) {
+        [self airBetaUsePassthrough:[NSString stringWithFormat:@"Air保活启动失败，现以原帧播放：%@", _airResidentInstallFailure]];
+        return;
+    }
+#endif
+#if ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC
+    if (_airPerformanceEnabled && rife && _airResidentInstallFailure) {
+        [self airPerformanceUsePassthrough:[NSString stringWithFormat:@"窗口优化保活启动失败，现以原帧播放：%@", _airResidentInstallFailure]];
+        return;
+    }
+#endif
     [self publishPlanState:2 reason:_resolved.activeSummary ?: @"增强运行"];
 }
 
+#if ODF_AIR_BETA_DIAGNOSTIC
+- (NSString *)airBetaEnvironmentReason {
+    if (!_airBetaFormatKnown) return @"等待实际采集格式，当前以原帧播放";
+    NSString *sizeReason = SPAirBetaSizingReason(_sourceWidth, _sourceHeight);
+    if (sizeReason) return sizeReason;
+    if (_airBetaFormatReason) return _airBetaFormatReason;
+    const auto raw = [self nativeCadenceSnapshot];
+    const double refresh = _airBetaObservedRefreshHz > 1 ? _airBetaObservedRefreshHz : (raw.configured ? raw.refreshHz : _request.displayRefreshHz);
+    if (!std::isfinite(refresh) || refresh != 60.0)
+        return [NSString stringWithFormat:@"当前显示器为%.2fHz，Air实验档只支持60Hz，现以原帧播放", refresh];
+    for (const char *key : {"ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC", "ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC", "ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC"}) {
+        if (strcmp(getenv(key) ?: "", "1") != 0) return @"Air融合处理或保活配方未启用，现以原帧播放";
+    }
+    NSDictionary *presenter = [self.outputPreview fusedRifePresentationSnapshotIncludeRecords:NO cutoffHostTicks:SPHostNow()];
+    if (![presenter[@"lanczosPipelineReady"] boolValue]) return @"Air呈现器尚未就绪，现以原帧播放";
+    return nil;
+}
+
+- (void)airBetaUsePassthrough:(NSString *)reason {
+    _prepareToken += 1; _preparing = NO; _asyncPrepareFailed = YES;
+    [self retireEngines];
+    if (_lastEnhanced) { CVPixelBufferRelease(_lastEnhanced); _lastEnhanced = NULL; }
+    if (_lastOriginal) { CVPixelBufferRelease(_lastOriginal); _lastOriginal = NULL; }
+    _haveLastPts = NO;
+    SPLivePlanRequest *original = [(_airBetaRecipe ?: _request) copy];
+    original.interpolationEnabled = NO; original.scaleEnabled = NO;
+    _airBetaFallbackReason = [reason copy];
+    if (_width < 2 || _height < 2) {
+        _request = original; _sessionReady = YES;
+        _resolved.committed = YES; _resolved.interpolationActive = NO; _resolved.scaleActive = NO;
+    } else {
+        [self installRequest:original lowLatency:nil rife:nil distil:nil appleSR:nil videoSR:nil animeSR:nil cuganSR:nil];
+    }
+    _resolved.interpolationActive = NO;
+    _resolved.unavailableReason = reason;
+    [self publishStatus:reason failed:NO];
+    [self publishPlanState:2 reason:reason];
+}
+
+- (NSDictionary *)airBetaSnapshot {
+    NSDictionary *runtime = _rife ? [_rife airBetaRuntimeState] : @{};
+    if ([runtime[@"keeper"] isEqual:@"failed"] && _request.interpolationEnabled) {
+        [self airBetaUsePassthrough:[NSString stringWithFormat:@"Air保活失败，现以原帧播放：%@", runtime[@"reason"] ?: @"未知错误"]];
+        runtime = @{};
+    }
+    NSString *keeper = runtime[@"keeper"] ?: (_preparing ? @"preparing" : @"inactive");
+    const BOOL active = _resolved.interpolationActive && _rife && [keeper isEqual:@"active"];
+    const NSInteger factor = active && !_nativeBudgetActive && !_rateBudgetPassthrough
+        ? ([self rateBudgetEnabled] ? _effectiveMultiplier : _request.multiplier) : 1;
+    NSString *reason = _airBetaOriginalFailure ?: _airBetaFallbackReason;
+    if (!reason.length) reason = _preparing ? @"正在准备Air实验档，当前显示原帧" :
+        (active ? (factor > 1 ? @"Air实验档已生效" : @"当前按1×播放，保活保持运行") : @"等待保活启动，当前显示原帧");
+    return @{ @"enabled": @YES, @"capturePixels": @[@(_sourceWidth), @(_sourceHeight)],
+        @"processingPixels": _rife ? @[@(_rife.processingWidth), @(_rife.processingHeight)] : @[@0, @0],
+        @"format": _airBetaFormatDescription ?: @"待采集", @"keeper": keeper,
+        @"effectiveFactor": @(MAX(1, factor)), @"fps": @(_fpsMeter.outputRate((int64_t)(CACurrentMediaTime() * 1e9))),
+        @"reason": reason, @"sourceGeneration": @(_sourceGeneration), @"configVersion": @(_configVersion) };
+}
+
+- (NSDictionary *)airBetaMeasurementReadiness {
+    NSDictionary *runtime = _rife ? [_rife airBetaMeasurementReadiness] : @{};
+    NSDictionary *keeper = runtime[@"keeper"] ?: @{};
+    const BOOL finalPlan = (SPAirBetaEnabled() || _airPerformanceEnabled) && _sessionReady && _resolved.committed && _resolved.interpolationActive &&
+        !_preparing && _rife && _airResidentPlanToken != 0 && _airResidentPlanToken == _prepareToken &&
+        _request.interpolationEnabled && !_request.scaleEnabled && [_request.engineID isEqual:@"rife.metal"] &&
+        [_request.modelID isEqual:@"rife-v4.25"] && [_request.qualityID isEqual:@"fast"] &&
+        _request.rifeStreamEnabled && _request.rateKind == SPLiveRateMultiplier && _request.multiplier == 2;
+    id failure = runtime[@"firstFailure"];
+    const BOOL noRuntimeFailure = failure == NSNull.null || ([failure isKindOfClass:NSString.class] && [failure length] == 0);
+    const BOOL actual = finalPlan && [runtime[@"compiled"] boolValue] && [runtime[@"hasInterpolator"] boolValue] &&
+        [runtime[@"loadedModelID"] isEqual:@"rife-v4.25"] && [runtime[@"loadedQuality"] isEqual:@"fast"] &&
+        [runtime[@"preparedGPUInputOutput"] boolValue] && [runtime[@"liveStreamEnabled"] boolValue] && noRuntimeFailure;
+    const BOOL keeperMatches = [keeper[@"available"] boolValue] &&
+        [keeper[@"planToken"] unsignedLongLongValue] == _airResidentPlanToken &&
+        [keeper[@"generation"] unsignedLongLongValue] == _sourceGeneration &&
+        [keeper[@"configVersion"] unsignedLongLongValue] == _configVersion;
+    const BOOL operational = [keeper[@"operational"] boolValue];
+    NSString *reason = !finalPlan ? @"current final X2 plan is not installed" :
+        (!actual ? @"prepared runtime identity or GPU-IO/stream state is not ready" :
+        (!keeperMatches ? @"keeper plan context does not match" : (!operational ? @"keeper first operational command is not observed" : @"ready")));
+    return @{ @"schema": @"odf-air-beta-measurement-readiness-v1", @"enabled": @(SPAirBetaEnabled() || _airPerformanceEnabled),
+        @"productionOptimizationEnabled": @(_airPerformanceEnabled),
+        @"sourceGeneration": @(_sourceGeneration), @"configVersion": @(_configVersion),
+        @"measurementEpoch": @(_measurementEpoch), @"clockEpoch": @(_clockEpoch),
+        @"planToken": @(_airResidentPlanToken), @"prepareToken": @(_prepareToken),
+        @"sessionReady": @(_sessionReady), @"committed": @(_resolved.committed), @"interpolationActive": @(_resolved.interpolationActive),
+        @"preparing": @(_preparing), @"hasRifeBridge": @(_rife != nil), @"nativeActualFinalX2": @(actual),
+        @"keeperPlanMatchesContext": @(keeperMatches), @"keeperOperational": @(operational),
+        @"ready": @(actual && keeperMatches && operational), @"reason": reason, @"runtime": runtime,
+        @"observedHostTicks": @(SPHostNow()) };
+}
+#endif
+
+- (void)airSetPerformanceMode:(BOOL)enabled {
+    _airPerformanceEnabled = enabled;
+    _airDelayAlignmentRequested = _airDelayAlignmentDiagnosticRequested || enabled;
+    _airTrueSourceIntervalRequested = _airTrueSourceIntervalDiagnosticRequested || enabled;
+    _airRobustSourceLeadRequested = _airRobustSourceLeadDiagnosticRequested || enabled;
+    if (_airDelayAlignmentRequested && _airCadenceCallbacks && !_airDelayAlignmentEvents)
+        _airDelayAlignmentEvents = std::make_unique<SPAirDelayAlignmentRing>();
+    [self.outputPreview setAirPerformanceEnabled:enabled captureWidth:_sourceWidth captureHeight:_sourceHeight];
+    [self.preview setAirPerformanceEnabled:enabled captureWidth:_sourceWidth captureHeight:_sourceHeight];
+}
+
+- (void)airConfigurePerformanceRequest:(SPLivePlanRequest *)request {
+    const BOOL wasCandidate = _airPerformanceCandidate;
+    _airPerformanceSelection = [SPRifeBridge airPerformanceSelectionStatus];
+    sp::AirWindowOptimizationInput input;
+    input.hardware = SPAirHardwareModel().UTF8String;
+    input.sourceKind = request.captureSourceKind;
+    input.interpolation = request.interpolationEnabled;
+    input.rife425 = [request.engineID isEqual:@"rife.metal"] && [request.modelID isEqual:@"rife-v4.25"];
+    input.fast = [request.qualityID isEqual:@"fast"];
+    input.multiplierRate = request.rateKind == SPLiveRateMultiplier;
+    input.multiplier = request.multiplier;
+    input.stream = request.rifeStreamEnabled;
+    input.scale = request.scaleEnabled;
+    input.original = [_airPerformanceSelection[@"originalEF29"] boolValue];
+    input.gpuIO = [_airPerformanceSelection[@"gpuIO"] boolValue];
+    input.accumulate = [_airPerformanceSelection[@"accumulate"] boolValue];
+#if ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC && ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC && ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC && ODF_AIR_BETA_DIAGNOSTIC
+    input.compiled = true;
+#endif
+    const char *reason = sp::airWindowOptimizationReason(input);
+    _airPerformanceCandidate = !SPAirBetaEnabled() && !reason;
+    if (_airPerformanceCandidate && !wasCandidate) _airPerformanceFormatKnown = NO;
+    _airPerformanceRecipe = _airPerformanceCandidate ? [request copy] : nil;
+    _airPerformanceRequested = _airPerformanceCandidate && _airActualSourceKind == SPLiveCaptureSourceKindWindow;
+    _airPerformanceReason = reason ? [NSString stringWithUTF8String:reason] : @"等待实际窗口采集";
+    _airPerformanceEligibilityKnown = NO;
+    if (!_airPerformanceCandidate) [self airSetPerformanceMode:NO];
+}
+
+- (NSString *)airPerformanceEnvironmentReason {
+#if ODF_AIR_BETA_DIAGNOSTIC || ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
+    if (!_airPerformanceFormatKnown) return @"等待实际窗口采集";
+    if (_airActualSourceKind != SPLiveCaptureSourceKindWindow) return @"actual-source-is-not-window";
+    if (_airPerformanceFormatReason) return _airPerformanceFormatReason;
+    NSString *sizeReason = SPAirBetaSizingReason(_sourceWidth, _sourceHeight);
+    if (sizeReason) return sizeReason;
+    const auto raw = [self nativeCadenceSnapshot];
+    const double refresh = raw.configured ? raw.refreshHz : (_airPerformanceRecipe ?: _request).displayRefreshHz;
+    if (!std::isfinite(refresh) || refresh != 60.0) return @"窗口优化需要60Hz显示，现以原帧播放";
+    if (!self.outputPreview) return @"等待窗口呈现器，当前以原帧播放";
+    return nil;
+#else
+    return @"feature-not-compiled";
+#endif
+}
+
+- (void)airPerformanceUsePassthrough:(NSString *)reason {
+    _prepareToken += 1; _preparing = NO; _asyncPrepareFailed = YES;
+    [self retireEngines];
+    [self airSetPerformanceMode:NO];
+    if (_lastEnhanced) { CVPixelBufferRelease(_lastEnhanced); _lastEnhanced = NULL; }
+    if (_lastOriginal) { CVPixelBufferRelease(_lastOriginal); _lastOriginal = NULL; }
+    _haveLastPts = NO;
+    SPLivePlanRequest *original = [(_airPerformanceRecipe ?: _request) copy];
+    original.interpolationEnabled = NO; original.scaleEnabled = NO;
+    _airPerformanceReason = [reason copy];
+    if (_width < 2 || _height < 2) {
+        _request = original; _sessionReady = YES;
+        _resolved.committed = YES; _resolved.interpolationActive = NO; _resolved.scaleActive = NO;
+    } else {
+        [self installRequest:original lowLatency:nil rife:nil distil:nil appleSR:nil videoSR:nil animeSR:nil cuganSR:nil];
+    }
+    _resolved.interpolationActive = NO; _resolved.unavailableReason = reason;
+    [self publishStatus:reason failed:NO];
+    [self publishPlanState:2 reason:reason];
+}
+
+- (NSDictionary *)airWindowOptimizationSnapshot {
+    NSDictionary *runtime = _rife ? [_rife airBetaRuntimeState] : @{};
+    if (_airPerformanceEnabled && [runtime[@"keeper"] isEqual:@"failed"]) {
+        [self airPerformanceUsePassthrough:[NSString stringWithFormat:@"窗口优化保活失败，现以原帧播放：%@", runtime[@"reason"] ?: @"未知错误"]];
+        runtime = @{};
+    }
+    const BOOL bridgeEnabled = _rife && _rife.airPerformanceEnabled;
+    const BOOL active = _airPerformanceEnabled && bridgeEnabled && _resolved.interpolationActive &&
+        [runtime[@"keeper"] isEqual:@"active"];
+    NSString *reason = _airPerformanceReason ?: @"configuration-not-eligible";
+    if (_airPerformanceEnabled) reason = active ? @"窗口优化已生效" : (_preparing ? @"正在准备窗口优化" : @"等待保活启动");
+    NSDictionary *prepared = [self.outputPreview preparedTextureCountersSnapshot] ?: @{};
+    uint64_t planToken = 0;
+    NSDictionary *retired = @{};
+#if ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC
+    planToken = _airResidentPlanToken;
+    if (_airResidentRetiredBridge) retired = [_airResidentRetiredBridge airBetaMeasurementReadiness] ?: @{};
+#endif
+    return @{ @"schema": @"odf-air-window-optimization-v1", @"hardware": SPAirHardwareModel(),
+        @"hardwareSupported": @(sp::airWindowHardwareSupported(SPAirHardwareModel().UTF8String)),
+        @"requestEligible": @(_airPerformanceCandidate), @"candidate": @(_airPerformanceRequested),
+        @"enabled": @(_airPerformanceEnabled), @"active": @(active), @"reason": reason,
+        @"requestedSourceKind": @((_airPerformanceRecipe ?: _request).captureSourceKind), @"actualSourceKind": @(_airActualSourceKind),
+        @"selection": _airPerformanceSelection ?: @{}, @"selectionGuardNs": @([self.outputPreview selectionGuardNs]),
+        @"sourceGeneration": @(_sourceGeneration), @"configVersion": @(_configVersion),
+        @"measurementEpoch": @(_measurementEpoch), @"clockEpoch": @(_clockEpoch), @"planToken": @(planToken),
+        @"capturePixels": @[@(_sourceWidth), @(_sourceHeight)],
+        @"processingPixels": _rife ? @[@(_rife.processingWidth), @(_rife.processingHeight)] : @[@0,@0],
+        @"applied": @{ @"prescale": @(bridgeEnabled && _rife.rifePrescaleEnabled),
+            @"fusedPreprocessAndPresent": @(bridgeEnabled && _rife.fusedRifePresentEnabled),
+            @"presenter": @([self.outputPreview airPerformanceEnabled]),
+            @"keeper": @(bridgeEnabled && _rife.residentKeepAliveEnabled),
+            @"preparedTexture": prepared,
+            @"delayAlignmentRequested": @(_airDelayAlignmentRequested), @"delayAlignmentActiveX2": @(_airDelayAlignmentActiveX2),
+            @"trueSourceIntervalRequested": @(_airTrueSourceIntervalRequested),
+            @"robustSourceLeadRequested": @(_airRobustSourceLeadRequested), @"robustSourceLeadApplied": @(_airRobustSourceLeadApplied),
+            @"interactiveCapNs": @((int64_t)llround((_request.quality == SPFRCQualityHigh ? SPQualityCapSec : SPInteractiveCapSec) * 1e9)) },
+        @"runtime": runtime, @"retiredRuntime": retired,
+        @"traceAllocated": @{ @"callbacks": @(_airCadenceCallbacks != nullptr), @"budget": @(_airCadenceBudget != nullptr),
+            @"delay": @(_airDelayAlignmentEvents != nullptr), @"stats": @(_airCurrentStatsCalls != nullptr) } };
+}
+
 - (void)startAsyncEngine:(SPLivePlanRequest *)request {
+#if ODF_AIR_BETA_DIAGNOSTIC
+    if (SPAirBetaEnabled()) {
+        if (![request.engineID isEqual:@"rife.metal"] || ![request.modelID isEqual:@"rife-v4.25"] ||
+            ![request.qualityID isEqual:@"fast"] || !request.rifeStreamEnabled || request.rateKind != SPLiveRateMultiplier ||
+            request.multiplier != 2 || request.scaleEnabled) {
+            [self airBetaUsePassthrough:@"Air实验档配方不符，现以原帧播放"]; return;
+        }
+        NSString *reason = [self airBetaEnvironmentReason];
+        if (reason) { [self airBetaUsePassthrough:reason]; return; }
+        _airBetaFallbackReason = nil; _airBetaOriginalFailure = nil;
+        _airResidentInstallFailure = nil;
+    }
+#endif
+    if (_airPerformanceCandidate) {
+        if (!_airPerformanceFormatKnown) {
+            _request = request; _sessionReady = NO; _resolved.committed = NO;
+            _airPerformanceReason = @"等待实际窗口采集";
+            return;
+        }
+        if (_airPerformanceRequested) {
+            NSString *reason = [self airPerformanceEnvironmentReason];
+            if (reason) { [self airPerformanceUsePassthrough:reason]; return; }
+            if (![self.outputPreview setAirPerformanceEnabled:YES captureWidth:_sourceWidth captureHeight:_sourceHeight]) {
+                [self airPerformanceUsePassthrough:@"窗口呈现器未就绪，现以原帧播放"]; return;
+            }
+            [self airSetPerformanceMode:YES];
+            _airPerformanceReason = @"正在准备窗口优化";
+#if ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC
+            _airResidentInstallFailure = nil;
+#endif
+        } else {
+            [self airSetPerformanceMode:NO];
+            _airPerformanceReason = @"actual-source-is-not-window";
+        }
+    }
     _asyncPrepareFailed = NO;
     if (_width < 2 || _height < 2) {
         _request = request;
@@ -2665,10 +5294,14 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     int height = _height;
     SPLivePlanRequest *copy = [request copy];
     NSString *engine = copy.engineID.length ? copy.engineID : @"apple.frc";
+    NSObject *sessionJournal = _airTraceSessionActive ? _airTraceKeeperJournal : nil;
+    const BOOL sessionRecordingSealed = _airTraceRecordingSaturated;
+    const BOOL performanceEnabled = _airPerformanceEnabled;
     [self publishStatus:@"正在准备引擎" failed:NO];
     [self publishPlanState:1 reason:@"正在准备引擎，当前画面仍用上一份已生效的计划"];
     dispatch_async(_prepareQ, ^{
         NSError *error = nil;
+        BOOL sessionPreparationTraceLost = NO;
         SPLowLatencyEngine *lowLatency = nil;
         SPRifeBridge *rife = nil;
         SPDistilDRBA *distil = nil;
@@ -2686,8 +5319,14 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             if (!copy.modelID.length) copy.modelID = @"rife-v4.25";
             if (!copy.qualityID.length) copy.qualityID = @"balanced";
             rife = [[SPRifeBridge alloc] init];
+            rife.airPerformanceEnabled = performanceEnabled;
+            if (sessionJournal) [rife setKeeperSessionJournal:sessionJournal];
+            if (sessionRecordingSealed) [rife sealServiceTraceForDiagnostics];
             rife.liveStreamEnabled = copy.rifeStreamEnabled;
-            if (![rife prepareModelID:copy.modelID quality:copy.qualityID width:width height:height error:&error]) rife = nil;
+            if (![rife prepareModelID:copy.modelID quality:copy.qualityID width:width height:height error:&error]) {
+                if (sessionJournal) sessionPreparationTraceLost = YES;
+                rife = nil;
+            }
         } else if (copy.interpolationEnabled && [engine isEqualToString:@"distildrba.coreml"]) {
             copy.modelID = @"distildrba.v1.720p";
             distil = [[SPDistilDRBA alloc] init];
@@ -2720,8 +5359,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             }
         }
         dispatch_async(self->_q, ^{
+            if (sessionPreparationTraceLost && self->_airTraceSessionActive) ++self->_airTraceDetachDropped;
             if (token != self->_prepareToken) {
                 [lowLatency invalidate];
+                [self airDetachSessionServiceTrace:rife reason:@"stale-preparation"];
                 [rife invalidate];
                 [distil invalidate];
                 [appleSR invalidate];
@@ -2732,7 +5373,18 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             }
             self->_preparing = NO;
             if (error || (needsAsyncInterpolation && !lowLatency && !rife && !distil) || ([self requestUsesAsyncScale:copy] && !appleSR && !videoSR && !animeSR && !cuganSR)) {
+                [self airDetachSessionServiceTrace:rife reason:@"failed-preparation"];
                 [lowLatency invalidate]; [rife invalidate]; [distil invalidate]; [appleSR invalidate]; [videoSR invalidate]; [animeSR invalidate]; [cuganSR invalidate];
+#if ODF_AIR_BETA_DIAGNOSTIC
+                if (SPAirBetaEnabled()) {
+                    [self airBetaUsePassthrough:[NSString stringWithFormat:@"Air初始化失败，现以原帧播放：%@", error.localizedDescription ?: @"融合处理器或保活未准备成功"]];
+                    return;
+                }
+#endif
+                if (performanceEnabled) {
+                    [self airPerformanceUsePassthrough:[NSString stringWithFormat:@"窗口优化初始化失败，现以原帧播放：%@", error.localizedDescription ?: @"处理器未准备成功"]];
+                    return;
+                }
                 self->_asyncPrepareFailed = YES;
                 NSString *reason = error.localizedDescription ?: @"准备失败，仍使用上一份可用计划";
                 self->_resolved.unavailableReason = reason;
@@ -2763,6 +5415,26 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             [self publishStatus:reason failed:YES];
             [self publishPlanState:0 reason:reason];
             return;
+        }
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if (SPAirBetaEnabled()) {
+            self->_airBetaRecipe = copy.interpolationEnabled ? [copy copy] : nil;
+            self->_airBetaEligibilityKnown = NO;
+            self->_airBetaOriginalFailure = nil;
+            if (copy.interpolationEnabled) { [self startAsyncEngine:copy]; return; }
+            self->_airBetaFallbackReason = @"Air实验档已关闭，当前显示原帧";
+        }
+#endif
+        const BOOL wasPerformanceEnabled = self->_airPerformanceEnabled;
+        [self airConfigurePerformanceRequest:copy];
+        if (wasPerformanceEnabled) {
+            [self retireEngines];
+            [self airSetPerformanceMode:NO];
+            self->_sessionReady = NO; self->_resolved.interpolationActive = NO;
+            [self clearPendingRife]; [self clearPlaySlots];
+            [self.outputPreview invalidateSharedGeometry];
+            ++self->_configVersion; self->_inflightEpoch = self->_configVersion; self->_inflight = 0;
+            [self beginMeasurementEpoch];
         }
         if (SPR7Passthrough()) {
             self->_request = copy;
@@ -2851,6 +5523,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         self->_sourceSizeConstraintFailed = NO;
         [oldEngine invalidate];
         [oldLow invalidate];
+        [self airRetireResidentKeeperForBridge:oldRife reason:@"plan_replaced"];
         [oldRife invalidate];
         [oldDistil invalidate];
         [oldSR invalidate];
@@ -2898,7 +5571,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         self->_request.viewMode = mode;
         if (!self->_lastEnhanced && !self->_lastOriginal) return;
         [self showPair:self->_lastEnhanced original:self->_lastOriginal pts:self->_lastRedrawPts
-             synthetic:self->_lastSynthetic captureHost:0 geometryHost:self->_lastRedrawGeometryHost frameID:0 redraw:YES];
+             synthetic:self->_lastSynthetic captureHost:0 geometryHost:self->_lastRedrawGeometryHost frameID:0 presentationHost:self->_lastRedrawTargetHost redraw:YES];
     });
 }
 
@@ -2923,6 +5596,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     self->_haveAnchor = NO;
     self->_haveLastPts = NO;
     self->_havePreviousSourcePts = NO;
+    self->_airRobustSourceLeadHistory.reset();
     self->_previousSourceIdentity = 0;
     self->_processedSequence = 0;
     self->_lastProcessedHost = 0;
@@ -2931,6 +5605,11 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     self->_haveLuma = NO;
     self->_lastPairB = 0;
     if (self->_clock) {
+        if (self->_measurementTrace) {
+            auto event = [self airMeasurementEvent:spAirMeasurement::Kind::timerCancel];
+            event.beginHostTicks = event.endHostTicks = SPHostNow();
+            self->_measurementTrace->append(event);
+        }
         dispatch_source_cancel(self->_clock);
         self->_clock = nil;
     }
@@ -2961,6 +5640,27 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             [self->_preview setGeneration:generation];
             [self->_outputPreview setGeneration:generation];
             return;
+        }
+        [self airRetireResidentKeeperForBridge:self->_rife reason:@"source_generation_changed"];
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if (SPAirBetaEnabled()) {
+            [self->_rife invalidate]; self->_rife = nil;
+            self->_sessionReady = NO; self->_resolved.interpolationActive = NO;
+            self->_sourceWidth = 0; self->_sourceHeight = 0;
+            self->_airBetaFormatKnown = NO; self->_airBetaEligibilityKnown = NO;
+            self->_airBetaFormatDescription = nil;
+            self->_airBetaFallbackReason = @"等待新来源的实际采集格式，当前显示原帧";
+        }
+#endif
+        if (self->_airPerformanceCandidate || self->_airPerformanceEnabled) {
+            [self->_rife invalidate]; self->_rife = nil;
+            [self airSetPerformanceMode:NO];
+            self->_sessionReady = NO; self->_resolved.interpolationActive = NO;
+            self->_sourceWidth = 0; self->_sourceHeight = 0;
+            self->_airPerformanceFormatKnown = NO; self->_airPerformanceEligibilityKnown = NO;
+            self->_airActualSourceKind = SPLiveCaptureSourceKindUnknown;
+            self->_airPerformanceRequested = NO;
+            if (self->_airPerformanceRecipe) self->_request = [self->_airPerformanceRecipe copy];
         }
         self->_prepareToken += 1;
         self->_preparing = NO;
@@ -3013,6 +5713,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     } else {
         rate.kind = sp::SPRateKind::FixedFPS;
         rate.fps = sp::spMake(_request.fpsNumerator, _request.fpsDenominator);
+        rate.reuseSources = [self usesFixedSourceReuse];
         _resolved.targetNumerator = _request.fpsNumerator;
         _resolved.targetDenominator = _request.fpsDenominator;
         if (_request.fpsNumerator <= 0 || _request.fpsDenominator <= 0) valid = NO;
@@ -3077,6 +5778,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 
 - (void)stop {
     void (^stopOnQueue)(void) = ^{
+        [self airRetireResidentKeeperForBridge:self->_rife reason:@"plan_stopped"];
         self->_stopped = YES;
         self->_r9FRCBudgetGate.reset();
         self->_r9RequiredBudgetMs = 0; self->_r9AllowedBudgetMs = 0;
@@ -3348,7 +6050,14 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 - (void)ownedContractStabilizePlayout {
     dispatch_sync(_q, ^{
         [self clearPlaySlots];
-        if (self->_clock) { dispatch_source_cancel(self->_clock); self->_clock = nil; }
+        if (self->_clock) {
+            if (self->_measurementTrace) {
+                auto event = [self airMeasurementEvent:spAirMeasurement::Kind::timerCancel];
+                event.beginHostTicks = event.endHostTicks = SPHostNow();
+                self->_measurementTrace->append(event);
+            }
+            dispatch_source_cancel(self->_clock); self->_clock = nil;
+        }
         if (self->_lastEnhanced) { CVPixelBufferRelease(self->_lastEnhanced); self->_lastEnhanced = nullptr; }
         if (self->_lastOriginal) { CVPixelBufferRelease(self->_lastOriginal); self->_lastOriginal = nullptr; }
     });
@@ -3460,8 +6169,19 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 
 - (void)updateDisplayRefreshHz:(double)refreshHz {
     dispatch_async(_q, ^{
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if (SPAirBetaEnabled()) self->_airBetaObservedRefreshHz = refreshHz;
+#endif
         if (refreshHz <= 1 || self->_request.displayRefreshHz == refreshHz) return;
         self->_request.displayRefreshHz = refreshHz;
+        if (self->_airPerformanceRecipe && !self->_stopped) {
+            self->_airPerformanceRecipe.displayRefreshHz = refreshHz;
+            self->_airPerformanceEligibilityKnown = NO;
+            [self startAsyncEngine:self->_airPerformanceRecipe];
+        }
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if (SPAirBetaEnabled() && self->_airBetaRecipe && !self->_stopped) [self startAsyncEngine:self->_airBetaRecipe];
+#endif
         [self refreshResolvedOnQueue];
         [self publishStats];
     });
@@ -3520,29 +6240,17 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 }
 
 - (CVPixelBufferRef)transfer:(CVPixelBufferRef)source format:(OSType)format {
-    if (!source || !_transfer) return NULL;
-    if (CVPixelBufferGetPixelFormatType(source) == format && !SPBufferIsHDR(source)) {
-        CVPixelBufferRetain(source);
-        return source;
+    int64_t began = 0, ended = 0;
+    OSStatus status = noErr;
+    CVPixelBufferRef result = SPAirTransferWithSession(_transfer, source, format,
+        SPAirBetaEnabled() || _airPerformanceRequested, began, ended, status);
+    if (began) SPPushSample(_transferNs, SPHostToNs(ended - began));
+#if ODF_AIR_BETA_DIAGNOSTIC
+    if (!result && began && SPAirBetaEnabled()) {
+        _airBetaOriginalFailure = [NSString stringWithFormat:@"%@；原帧转换失败（%d），来源窗口继续播放", _airBetaFallbackReason ?: @"Air实验档已旁路", (int)status];
     }
-    int width = (int)CVPixelBufferGetWidth(source);
-    int height = (int)CVPixelBufferGetHeight(source);
-    width &= ~1;
-    height &= ~1;
-    if (width < 2 || height < 2) return NULL;
-    CVPixelBufferRef destination = SPCreateBuffer(width, height, format);
-    if (!destination) return NULL;
-    SPForceSDRAttachments(source);
-    SPForceSDRAttachments(destination);
-    int64_t transferStart = SPHostNow();
-    OSStatus status = VTPixelTransferSessionTransferImage(_transfer, source, destination);
-    SPPushSample(_transferNs, SPHostToNs(SPHostNow() - transferStart));
-    if (status != noErr) {
-        CVPixelBufferRelease(destination);
-        return NULL;
-    }
-    SPForceSDRAttachments(destination);
-    return destination;
+#endif
+    return result;
 }
 
 - (CVPixelBufferRef)yuvForIdentity:(uint64_t)identity {
@@ -3590,20 +6298,51 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 }
 
 - (void)recordPresentationFailure:(NSString *)reason endpoint:(NSString *)endpoint generation:(uint64_t)generation config:(uint64_t)config epoch:(uint64_t)epoch frame:(uint64_t)frame {
+    [self recordPresentationFailure:reason endpoint:endpoint generation:generation config:config epoch:epoch frame:frame details:nil];
+}
+
+- (void)recordPresentationFailure:(NSString *)reason endpoint:(NSString *)endpoint generation:(uint64_t)generation config:(uint64_t)config epoch:(uint64_t)epoch frame:(uint64_t)frame details:(NSDictionary *)details {
+    if (_airCadenceCallbacks) {
+        SPAirFrameEvent event = SPAirCallbackRecord(details, endpoint); event.kind = SPAirFrameKind::failureNotification; event.reason = SPAirReason(reason);
+        event.frameID = frame; event.generation = generation; event.config = config; event.epoch = epoch;
+        [reason getCString:event.reasonText maxLength:sizeof(event.reasonText) encoding:NSUTF8StringEncoding]; event.reasonText[sizeof(event.reasonText)-1] = 0; _airCadenceCallbacks->append(event);
+    }
     NSString *key = [NSString stringWithFormat:@"%@.%@", endpoint, reason ?: @"unknown"];
-    NSDictionary *sample = @{ @"reason": reason ?: @"unknown", @"endpoint": endpoint, @"frameID": @(frame),
-        @"generation": @(generation), @"configVersion": @(config), @"measurementEpoch": @(epoch), @"observedHost": @(SPHostNow()) };
+    NSMutableDictionary *sample = [@{ @"reason": reason ?: @"unknown", @"endpoint": endpoint, @"frameID": @(frame),
+        @"generation": @(generation), @"configVersion": @(config), @"measurementEpoch": @(epoch), @"observedHost": @(SPHostNow()) } mutableCopy];
     auto mark = _marks.find(frame);
+    if (mark != _marks.end()) {
+        sample[@"logicalTargetHost"] = @(mark->second.targetHost);
+    }
+    if (details) [sample addEntriesFromDictionary:details];
+    if (SPR8FixtureEnabled() && [endpoint isEqualToString:@"output"]) {
+        if (!_r8OutputTimeline) _r8OutputTimeline = [NSMutableArray array];
+        sample[@"kind"] = @"presentationFailure";
+        [_r8OutputTimeline addObject:[sample copy]];
+        if (_r8OutputTimeline.count > 512) [_r8OutputTimeline removeObjectAtIndex:0];
+    }
     if (mark != _marks.end() && mark->second.jobID) [self recordR7JobEvent:@"presentationFailure" detail:@{
         @"id": @(mark->second.jobID), @"frameID": @(frame), @"reason": reason ?: @"unknown",
         @"endpoint": endpoint ?: @"unknown", @"generation": @(generation), @"config": @(config),
         @"clockEpoch": @(mark->second.clockEpoch), @"measurementEpoch": @(epoch) }];
     _presentationFailuresLifetime[key] = @([_presentationFailuresLifetime[key] unsignedLongLongValue] + 1);
+    if (_airCurrentStatsCalls && [key isEqualToString:@"output.display-submit-deadline"])
+        _airOutputSubmitDeadlineFailures.fetch_add(1, std::memory_order_relaxed);
     if (!_firstPresentationFailureLifetime[endpoint]) _firstPresentationFailureLifetime[endpoint] = sample;
     if (generation == _sourceGeneration && config == _configVersion && epoch == _measurementEpoch) {
         _presentationFailuresEpoch[key] = @([_presentationFailuresEpoch[key] unsignedLongLongValue] + 1);
         if (!_firstPresentationFailureEpoch[endpoint]) _firstPresentationFailureEpoch[endpoint] = sample;
     }
+}
+
+- (void)setPresentedVideoRecorder:(SPPresentedVideoRecorder *)recorder {
+#if ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
+    self.outputPreview.presentedVideoRecorder = recorder;
+#endif
+}
+
+- (void)setPresentedVideoReadbackEnabled:(BOOL)enabled {
+    [self.outputPreview setPresentedVideoReadbackEnabled:enabled];
 }
 
 - (void)installPresentationHooks {
@@ -3614,7 +6353,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     void (^failure)(NSString *, NSDictionary *) = ^(NSString *endpoint, NSDictionary *info) {
         dispatch_async(strong->_q, ^{ [strong recordPresentationFailure:info[@"reason"] endpoint:endpoint
             generation:[info[@"generation"] unsignedLongLongValue] config:[info[@"configVersion"] unsignedLongLongValue]
-            epoch:[info[@"measurementEpoch"] unsignedLongLongValue] frame:[info[@"frameID"] unsignedLongLongValue]]; });
+            epoch:[info[@"measurementEpoch"] unsignedLongLongValue] frame:[info[@"frameID"] unsignedLongLongValue] details:info]; });
     };
     self.preview.presentationFailure = ^(NSDictionary *info) { failure(@"preview", info); };
     self.outputPreview.presentationFailure = ^(NSDictionary *info) { failure(@"output", info); };
@@ -3726,8 +6465,11 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 }
 
 - (NSDictionary *)presentationOrderDiagnostics {
+    const BOOL callerWasMain = NSThread.isMainThread;
+    const BOOL callerWasProcessorQueue = dispatch_get_specific(SPLiveQueueKey) == (__bridge void *)self;
     __block NSDictionary *result;
     void (^capture)(void) = ^{
+        const int64_t causalCutoff = self->_airCadenceCallbacks ? SPHostNow() : 0;
         NSMutableArray *events = [NSMutableArray arrayWithCapacity:self->_presentationOrder.events().size()];
         for (const auto &e : self->_presentationOrder.events()) {
             [events addObject:@{ @"ptsNs": @(e.pts), @"presentedTimeNs": @(e.presented), @"frameID": @(e.frame),
@@ -3735,21 +6477,131 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         }
         result = @{ @"summary": [self presentationOrderSummary], @"sourceGeneration": @(self->_sourceGeneration),
                     @"configVersion": @(self->_configVersion), @"measurementEpoch": @(self->_measurementEpoch), @"eventsInCallbackOrder": events };
+        if (self->_airCadenceCallbacks) {
+            std::vector<SPAirFrameEvent> preview, output, callbacks; std::vector<SPAirBudgetEvent> budgets;
+            std::vector<SPAirSlotCallbackEvent> previewSlotCallbacks, outputSlotCallbacks;
+            std::vector<SPAirSlotConsumeEvent> previewSlotConsumes, outputSlotConsumes;
+            SPAirSlotSnapshot previewSlotSnapshot{}, outputSlotSnapshot{};
+            uint64_t previewTotal = 0, outputTotal = 0;
+            uint64_t previewCallbackTotal = 0, outputCallbackTotal = 0, previewConsumeTotal = 0, outputConsumeTotal = 0, previewUnsupported = 0, outputUnsupported = 0;
+            [self.preview copyAirCadenceEvents:&preview total:&previewTotal consumes:&previewSlotConsumes consumeTotal:&previewConsumeTotal snapshot:&previewSlotSnapshot];
+            [self.outputPreview copyAirCadenceEvents:&output total:&outputTotal consumes:&outputSlotConsumes consumeTotal:&outputConsumeTotal snapshot:&outputSlotSnapshot];
+            const BOOL captureWasProcessorQueue = dispatch_get_specific(SPLiveQueueKey) == (__bridge void *)self;
+            const BOOL mainCallerSyncExport = callerWasMain && !callerWasProcessorQueue && captureWasProcessorQueue;
+            const BOOL previewCallbackSafe = [self.preview copyAirSlotCallbacks:&previewSlotCallbacks total:&previewCallbackTotal mainCallerSynchronouslyOnProcessorQueue:mainCallerSyncExport unsupported:&previewUnsupported];
+            const BOOL outputCallbackSafe = [self.outputPreview copyAirSlotCallbacks:&outputSlotCallbacks total:&outputCallbackTotal mainCallerSynchronouslyOnProcessorQueue:mainCallerSyncExport unsupported:&outputUnsupported];
+            const BOOL callbackExportSafe = mainCallerSyncExport && previewCallbackSafe && outputCallbackSafe;
+            callbacks.reserve(16384); self->_airCadenceCallbacks->copy(callbacks);
+            budgets.reserve(8192); self->_airCadenceBudget->copy(budgets);
+            NSDictionary *previewExport = SPAirFrameExport(preview, previewTotal, @"preview", causalCutoff);
+            NSDictionary *outputExport = SPAirFrameExport(output, outputTotal, @"output", causalCutoff);
+            NSDictionary *callbackExport = SPAirFrameExport(callbacks, self->_airCadenceCallbacks->total, nil, causalCutoff);
+            NSDictionary *budgetExport = SPAirBudgetExport(budgets, self->_airCadenceBudget->total, causalCutoff);
+            NSDictionary *unavailableCallbacks = @{ @"capacity": @16384, @"total": NSNull.null, @"dropped": NSNull.null,
+                @"firstseq": NSNull.null, @"lastseq": NSNull.null, @"exportedCount": @0, @"events": @[], @"unsupported": @YES };
+            NSDictionary *previewCallbackExport = previewCallbackSafe ? SPAirSlotCallbackExport(previewSlotCallbacks, previewCallbackTotal, causalCutoff) : unavailableCallbacks;
+            NSDictionary *outputCallbackExport = outputCallbackSafe ? SPAirSlotCallbackExport(outputSlotCallbacks, outputCallbackTotal, causalCutoff) : unavailableCallbacks;
+            NSDictionary *previewConsumeExport = SPAirSlotConsumeExport(previewSlotConsumes, previewConsumeTotal, causalCutoff);
+            NSDictionary *outputConsumeExport = SPAirSlotConsumeExport(outputSlotConsumes, outputConsumeTotal, causalCutoff);
+            NSDictionary *delayExport = nil;
+            uint64_t delayOverflow = 0;
+            if (self->_airDelayAlignmentEvents) {
+                std::vector<SPAirDelayAlignmentEvent> delayEvents; delayEvents.reserve(16384);
+                self->_airDelayAlignmentEvents->copy(delayEvents);
+                delayExport = SPAirDelayAlignmentExport(delayEvents, self->_airDelayAlignmentEvents->total, causalCutoff);
+                delayOverflow = [delayExport[@"dropped"] unsignedLongLongValue];
+            }
+            const uint64_t slotOverflow = [previewConsumeExport[@"dropped"] unsignedLongLongValue] + [outputConsumeExport[@"dropped"] unsignedLongLongValue] +
+                (previewCallbackSafe ? [previewCallbackExport[@"dropped"] unsignedLongLongValue] : 0) + (outputCallbackSafe ? [outputCallbackExport[@"dropped"] unsignedLongLongValue] : 0);
+            const uint64_t overflow = [previewExport[@"dropped"] unsignedLongLongValue] + [outputExport[@"dropped"] unsignedLongLongValue] +
+                [callbackExport[@"dropped"] unsignedLongLongValue] + [budgetExport[@"dropped"] unsignedLongLongValue] + slotOverflow + delayOverflow;
+            NSMutableDictionary *extended = [result mutableCopy];
+            extended[@"airCadenceCausalTrace"] = @{ @"enabled": @YES, @"exportCutoffHostTicks": @(causalCutoff),
+                @"overflowCount": @(overflow), @"overflowCountKnown": @(callbackExportSafe), @"ringsComplete": @(overflow == 0 && callbackExportSafe && previewUnsupported == 0 && outputUnsupported == 0), @"preview": previewExport, @"output": outputExport,
+                @"callbacks": callbackExport, @"rateBudget": budgetExport,
+                @"delayAlignment": @{ @"enabled": @(self->_airDelayAlignmentEvents != nullptr),
+                    @"trueSourceIntervalRequested": @(self->_airTrueSourceIntervalRequested),
+                    @"interactiveCap125msRequested": @(self->_airInteractiveCap125msRequested),
+                    @"recomputes": delayExport ?: @{},
+                    @"scope": @"POD per-recompute inputs and result; nanoseconds except HostTicks. Source-only early return has calculated=false and uncomputed fields null. capNs is the actual logical cap: normal interactive 90ms, explicit guard-build diagnostic 125ms; quality cap is unchanged. True-source-interval diagnostic only removes the 1/30 upper clamp; initial fallback and source-estimate validity rule are unchanged. Capture-to-positive-presented latency is measured separately, not bounded by finalNs." },
+                @"slots": @{ @"callbackExportSafe": @(callbackExportSafe), @"valid": @(callbackExportSafe && previewUnsupported == 0 && outputUnsupported == 0 && slotOverflow == 0),
+                    @"overflowCount": @(slotOverflow), @"overflowCountKnown": @(callbackExportSafe),
+                    @"callerWasMain": @(callerWasMain), @"callerWasProcessorQueue": @(callerWasProcessorQueue), @"captureWasProcessorQueue": @(captureWasProcessorQueue),
+                    @"unsupported": @(previewUnsupported + outputUnsupported),
+                    @"preview": @{ @"callbackExportSafe": @(previewCallbackSafe), @"unsupported": @(previewUnsupported), @"callbacks": previewCallbackExport, @"consumes": previewConsumeExport, @"pendingSlotSnapshot": SPAirSlotSnapshotExport(previewSlotSnapshot) },
+                    @"output": @{ @"callbackExportSafe": @(outputCallbackSafe), @"unsupported": @(outputUnsupported), @"callbacks": outputCallbackExport, @"consumes": outputConsumeExport, @"pendingSlotSnapshot": SPAirSlotSnapshotExport(outputSlotSnapshot) },
+                    @"scope": @"Separate preallocated rings: display-link callback is main-thread-only; unexpected off-main callbacks increment only an atomic unsupported counter and invalidate coverage. Callback copy requires an originating main caller synchronously exporting on its processor queue, so the main run loop cannot deliver another callback (including inline dispatch_sync execution). Otherwise its ring is not read and total/dropped remain unknown. Consume attempts and proactive token dispositions write/copy only under existing presentationMutex; consume, frame and pending-slot snapshot copies share one lock region. origin distinguishes timer attempts, callback replacement and visibility/context cleanup. terminalDisposition is true only when the old state clears/replaces that token; stale/no-current/waiting attempts are nonterminal. pendingSlotSnapshot has its own sampleHostTicks after global cutoff, not an atomic state at exportCutoffHostTicks; filtered post-cutoff dispositions leave an unknown tail for offline accounting. Early-reject context is an entry atomic snapshot, while created/busy context is read under presentationMutex. Guard reasons are the first true original short-circuit predicate. HostTicks and CA MediaNs/MediaSeconds are separate clocks. Overflow invalidates completeness." },
+                @"sourceStoppedScope": @"Controlled caller contract: SelfProbe exports after SCK stop completion and before processor.stop. This method does not verify capture state, wait for GPU, flush, or stop any queue. Records are filtered by record host <= exportCutoffHostTicks; GPU/callback tail remains unknown.",
+                @"scope": @"Trace-only diagnostic library. Preallocated POD rings never reset with configuration/measurement epochs. View writes use existing presentationMutex regions; processor writes use existing serial queue. No trace arrays are exported in periodic stats. Capacity overflow makes evidence incomplete. enqueueHostTicks is actual bounded-queue admission, requestStartHostTicks preserves the prior request timestamp. Unassigned cleanup slot/replacement are null. Callback metadata may lack original counts/capture/admission time; join to its admission using endpoint/generation/config/epoch/clock/frameID/requestStartHostTicks. endingInflight is unresolved at cutoff, not confirmed hardware work. Raw positive presented callbacks are recorded before score/context filtering; this is not physical/human acceptance. Budget caller gates are exact; fresh<8 is input evidence, internal persistence/cooldown reasons are not introspected." };
+            result = extended;
+        }
+#if ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC
+        if (self->_airDelayAlignmentRequested && [self->_request.engineID isEqualToString:@"apple.frc"]) {
+            NSMutableDictionary *extended = [result mutableCopy];
+            extended[@"appleFRCIdentity"] = @{ @"requestedEngineID": self->_request.engineID ?: @"",
+                @"resolvedEngineID": self->_resolved.engineID ?: @"", @"resolvedModelID": self->_resolved.modelID ?: @"",
+                @"qualityID": self->_request.qualityID ?: @"", @"quality": @(self->_request.quality),
+                @"OSVersion": NSProcessInfo.processInfo.operatingSystemVersionString,
+                @"isSupportedIfResolved": @([SPFRCEngine availabilityIfResolved]),
+                @"engineInstanceCreated": @(self->_engine != nil), @"actualEngineClass": self->_engine ? NSStringFromClass(self->_engine.class) : (id)NSNull.null,
+                @"sessionsActual": @(self->_engine ? self->_engine.sessionCount : 0), @"width": @(self->_width), @"height": @(self->_height),
+                @"sourcePixelFormat": @(self->_sourcePixelFormat), @"rifeStreamEnabled": @(self->_request.rifeStreamEnabled),
+                @"captureToOutputReadyOrigin": @"B source captureHost; includes B-side capture/copy/queue, input/VT/output conversions and delivery; excludes the A-to-B source interval. No extra I subtraction.",
+                @"scope": @"Guard-build explicit delay-alignment diagnostic snapshot of the actual configured processor instance; capability alone is not session or performance acceptance." };
+            result = extended;
+        }
+        if (self->_rife.serviceTraceEnabled) {
+            NSMutableDictionary *extended = [result mutableCopy];
+            const uint64_t serviceCutoff = causalCutoff > 0 ? (uint64_t)causalCutoff : (uint64_t)SPHostNow();
+            extended[@"airServiceTrace"] = [self->_rife serviceTraceSnapshotAtCutoffHostTicks:serviceCutoff];
+            result = extended;
+        }
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
+        if (self->_outputPreview) {
+            NSMutableDictionary *extended = [result mutableCopy];
+            extended[@"airFusedRifePresenter"] = [self->_outputPreview fusedRifePresentationSnapshotIncludeRecords:YES cutoffHostTicks:SPHostNow()];
+            result = extended;
+        }
+#endif
+#endif
     };
     if (dispatch_get_specific(SPLiveQueueKey) == (__bridge void *)self) capture(); else dispatch_sync(_q, capture);
     return result;
 }
 
 - (void)notePresented:(NSDictionary *)info {
+    if (_airCadenceCallbacks) {
+        SPAirFrameEvent event = SPAirCallbackRecord(info, info[@"endpoint"]);
+        event.kind = event.presentedTimeMediaNs > 0 ? SPAirFrameKind::positivePresented : SPAirFrameKind::zeroPresented;
+        event.reason = event.presentedTimeMediaNs > 0 ? SPAirFrameReason::none : SPAirFrameReason::notPresented;
+        _airCadenceCallbacks->append(event);
+    }
     if (SPR8FixtureEnabled() && [info[@"endpoint"] isEqual:@"output"]) {
         if (!_r8OutputTimeline) _r8OutputTimeline = [NSMutableArray array];
         [_r8OutputTimeline addObject:@{ @"kind": @"presented", @"frameID": info[@"frameID"] ?: @0,
             @"generation": info[@"generation"] ?: @0, @"configVersion": info[@"configVersion"] ?: @0,
-            @"measurementEpoch": info[@"measurementEpoch"] ?: @0,
+            @"measurementEpoch": info[@"measurementEpoch"] ?: @0, @"clockEpoch": info[@"clockEpoch"] ?: @0,
             @"presentedTime": info[@"presentedTime"] ?: @0, @"counts": info[@"counts"] ?: @NO,
             @"windowVisible": info[@"windowVisible"] ?: @NO, @"exposed": info[@"exposed"] ?: @NO,
             @"occluded": info[@"occluded"] ?: @NO, @"synthetic": info[@"synthetic"] ?: @NO,
             @"callbackHost": info[@"presentedHost"] ?: @0, @"handlerMediaTime": info[@"handlerMediaTime"] ?: @0,
+            @"presentationEnqueueHost": info[@"presentationEnqueueHost"] ?: @0,
+            @"presentationQueueStartHost": info[@"presentationQueueStartHost"] ?: @0,
+            @"metalCommitHost": info[@"metalCommitHost"] ?: @0,
+            @"metalScheduledHost": info[@"metalScheduledHost"] ?: @0,
+            @"metalScheduledMediaTime": info[@"metalScheduledMediaTime"] ?: @0,
+            @"presentRequestMethod": info[@"presentRequestMethod"] ?: @"drawable-immediate",
+            @"gpuHost": info[@"gpuHost"] ?: @0,
+            @"displayLinkCallbackHost": info[@"displayLinkCallbackHost"] ?: @0,
+            @"displaySelectionHost": info[@"displaySelectionHost"] ?: @0,
+            @"displaySlotToken": info[@"displaySlotToken"] ?: @0,
+            @"displayLinkTargetTimestamp": info[@"displayLinkTargetTimestamp"] ?: @0,
+            @"displayLinkTargetPresentationTimestamp": info[@"displayLinkTargetPresentationTimestamp"] ?: @0,
+            @"logicalTargetHost": info[@"logicalTargetHost"] ?: @0,
+            @"scheduledMinusLogicalTargetNs": info[@"scheduledMinusLogicalTargetNs"] ?: [NSNull null],
+            @"actualMinusScheduledDisplayNs": info[@"actualMinusScheduledDisplayNs"] ?: [NSNull null],
+            @"actualMinusLogicalTargetNs": info[@"actualMinusLogicalTargetNs"] ?: [NSNull null],
+            @"presentRequestMediaTime": info[@"presentRequestMediaTime"] ?: @0,
             @"drawablePixels": @[info[@"drawableWidth"] ?: @0, info[@"drawableHeight"] ?: @0],
             @"outputImageRectPixels": info[@"outputImageRectPixels"] ?: [NSNull null],
             @"outputDisplayID": info[@"outputDisplayID"] ?: [NSNull null], @"geometryVersion": info[@"geometryVersion"] ?: [NSNull null] }];
@@ -3760,7 +6612,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     NSString *ignored = ![info[@"counts"] boolValue] ? @"redrawOrUnscored" :
         ([info[@"generation"] unsignedLongLongValue] != _sourceGeneration ? @"generation" :
          (configVersion != 0 && configVersion != _configVersion ? @"configuration" :
-          (epoch != 0 && epoch != _measurementEpoch ? @"epoch" : nil)));
+          (epoch != 0 && epoch != _measurementEpoch ? @"epoch" :
+           (info[@"clockEpoch"] && [info[@"clockEpoch"] unsignedLongLongValue] != _clockEpoch ? @"clock" : nil))));
     if (ignored) {
         if ([info[@"endpoint"] isEqual:@"output"] && _pixelPendingOutput &&
             [info[@"frameID"] unsignedLongLongValue] == [_pixelPendingOutput[@"frameID"] unsignedLongLongValue]) {
@@ -3814,6 +6667,9 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             sample.sourceWidth = _sourceWidth; sample.sourceHeight = _sourceHeight;
             sample.processingWidth = _lowLatency ? _lowLatency.width : _width;
             sample.processingHeight = _lowLatency ? _lowLatency.height : _height;
+#if ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
+            if (_rife.rifePrescaleEnabled) { sample.processingWidth = _rife.processingWidth; sample.processingHeight = _rife.processingHeight; }
+#endif
             sample.bufferWidth = [info[@"width"] intValue]; sample.bufferHeight = [info[@"height"] intValue];
             sample.drawableWidth = [info[@"drawableWidth"] intValue]; sample.drawableHeight = [info[@"drawableHeight"] intValue];
             sample.presentedTimeNs = (int64_t)(presentTime * 1e9);
@@ -3876,6 +6732,17 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     int64_t presentedHost = [info[@"presentedHost"] longLongValue];
     int64_t latencyNs = (captureHost > 0 && presentedHost > captureHost) ? SPHostToNs(presentedHost - captureHost) : -1;
     if ([info[@"occluded"] boolValue]) _occludedPresents += 1;
+    int64_t admissionHost = [info[@"presentationEnqueueHost"] longLongValue];
+    int64_t queueStartHost = [info[@"presentationQueueStartHost"] longLongValue];
+    if (admissionHost > 0 && queueStartHost >= admissionHost)
+        SPPushSample(_presentationAdmissionToCallbackNs, SPHostToNs(queueStartHost - admissionHost));
+    int64_t commitHost = [info[@"metalCommitHost"] longLongValue];
+    double scheduledDisplay = [info[@"displayLinkTargetPresentationTimestamp"] doubleValue];
+    if (presentTime > 0 && commitHost > 0 && presentTime * 1e9 >= SPHostToNs(commitHost))
+        SPPushSample(_metalCommitToDisplayNs, (int64_t)(presentTime * 1e9) - SPHostToNs(commitHost));
+    id scheduleOffset = info[@"scheduledMinusLogicalTargetNs"];
+    if (scheduledDisplay > 0 && [scheduleOffset isKindOfClass:NSNumber.class])
+        SPPushSample(_displayScheduledTargetOffsetNs, [scheduleOffset longLongValue]);
     int64_t drawableWait = [info[@"drawableWaitNs"] longLongValue];
     if (drawableWait > 0) SPPushSample(_drawableWaitNs, drawableWait);
     int64_t gpuHost = [info[@"gpuHost"] longLongValue];
@@ -3946,25 +6813,70 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 }
 
 - (void)clearPlaySlots {
+    [self cancelSourceConversions];
     for (auto &slot : _slots) SPReleaseSlot(slot);
     _slots.clear();
 }
 
-- (void)rememberPair:(CVPixelBufferRef)enhanced original:(CVPixelBufferRef)original pts:(sp::SPRational)pts synthetic:(BOOL)synthetic geometryHost:(int64_t)geometryHost {
+- (void)rememberPair:(CVPixelBufferRef)enhanced original:(CVPixelBufferRef)original pts:(sp::SPRational)pts synthetic:(BOOL)synthetic geometryHost:(int64_t)geometryHost targetHost:(int64_t)targetHost {
     if (_lastEnhanced) CVPixelBufferRelease(_lastEnhanced);
     if (_lastOriginal) CVPixelBufferRelease(_lastOriginal);
     _lastEnhanced = enhanced ? CVPixelBufferRetain(enhanced) : nullptr;
     _lastOriginal = original ? CVPixelBufferRetain(original) : nullptr;
     _lastRedrawPts = pts;
     _lastRedrawGeometryHost = geometryHost;
+    _lastRedrawTargetHost = targetHost;
     _lastSynthetic = synthetic;
+}
+
+- (void)airMeasurementTarget:(sp::SPRational)pts target:(int64_t)target frame:(uint64_t)frameID
+    job:(uint64_t)jobID phase:(uint64_t)phase synthetic:(BOOL)synthetic computed:(BOOL)computed {
+    spAirMeasurement::Event event; event.kind = spAirMeasurement::Kind::targetCreated;
+    event.beginHostTicks = event.endHostTicks = SPHostNow(); event.frameID = frameID;
+    event.relatedID = jobID; event.groupID = phase; event.ptsNum = pts.num; event.ptsDen = pts.den;
+    event.targetHostTicks = target; event.generation = _sourceGeneration; event.config = _configVersion;
+    event.epoch = _measurementEpoch; event.clock = _clockEpoch; event.flags = (synthetic ? 1u : 0u) | 8u;
+    sp::SPRational delta{};
+    if (computed && _haveAnchor && sp::spSub(pts, _anchorPts, delta)) {
+        event.flags |= 16u; event.values[0] = _delayHost; event.values[1] = _anchorHost;
+        event.values[2] = _anchorPts.num; event.values[3] = _anchorPts.den;
+    }
+    if (_haveInterval && _intervalHost > 0) { event.flags |= 64u; event.sampleHostTicks = _intervalHost; }
+    if (_airTrueSourceIntervalRequested) event.flags |= 128u;
+    _measurementTrace->append(event);
+}
+
+- (spAirMeasurement::Event)airMeasurementEvent:(spAirMeasurement::Kind)kind {
+    spAirMeasurement::Event event; event.kind = kind;
+    event.generation = _sourceGeneration; event.config = _configVersion;
+    event.epoch = _measurementEpoch; event.clock = _clockEpoch;
+    event.clockLifeID = _measurementClockLife; event.armID = _measurementArm;
+    if (!_slots.empty()) { const auto &slot = _slots.front(); event.frameID = slot.frameID;
+        event.ptsNum = slot.pts.num; event.ptsDen = slot.pts.den; event.targetHostTicks = slot.targetHost;
+        event.flags = (slot.synthetic ? 1u : 0u) | 8u; }
+    return event;
 }
 
 - (void)ensureClock {
     if (_clock) return;
     _clock = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, DISPATCH_TIMER_STRICT, _q);
     SPLiveProcessor *strong = self;
+    const uint64_t measurementClockLife = _measurementTrace ? _measurementTrace->identity() : 0;
+    if (_measurementTrace) {
+        _measurementClockLife = measurementClockLife; _measurementArm = 0;
+        auto event = [self airMeasurementEvent:spAirMeasurement::Kind::timerCreate];
+        event.beginHostTicks = event.endHostTicks = SPHostNow(); _measurementTrace->append(event);
+    }
     dispatch_source_set_event_handler(_clock, ^{
+        if (strong->_measurementTrace) {
+            auto event = [strong airMeasurementEvent:spAirMeasurement::Kind::timerFire];
+            event.beginHostTicks = event.endHostTicks = SPHostNow(); event.clockLifeID = measurementClockLife;
+            event.groupID = strong->_measurementTrace->identity(); event.values[0] = strong->_measurementClockLife;
+            if (measurementClockLife == strong->_measurementClockLife && strong->_clock) {
+                event.flags |= 16u; event.values[1] = dispatch_source_get_data(strong->_clock);
+            }
+            strong->_measurementFire = event.groupID; strong->_measurementTrace->append(event);
+        }
         if (strong->_testCapturePlayout && strong->_testTimingTrace.count < 80) {
             if (!strong->_testTimingTrace) strong->_testTimingTrace=[NSMutableArray array];
             int64_t fired=SPHostNow();
@@ -3973,20 +6885,36 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
                 @"lateMs":@(target ? (double)SPHostToNs(fired-target)/1e6 : 0) }];
         }
         [strong drainDue]; [strong publishStats];
+        if (strong->_measurementTrace) strong->_measurementFire = 0;
     });
     dispatch_resume(_clock);
     dispatch_source_set_timer(_clock, DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 0);
+    if (_measurementTrace) {
+        auto event = [self airMeasurementEvent:spAirMeasurement::Kind::timerPark];
+        event.beginHostTicks = event.endHostTicks = SPHostNow();
+        _measurementTrace->append(event);
+    }
 }
 
 - (void)armClockAt:(int64_t)targetHost {
     [self ensureClock];
+    const int64_t measurementRequestedDue = _measurementTrace ? targetHost : 0;
     int64_t now = SPHostNow();
     if (_haveRifeDeferred && _rifeDeferredRetryHost > now && _inflight < 2 && _rifeDeferredRetryHost < targetHost)
         targetHost = _rifeDeferredRetryHost;
     int64_t delta = targetHost > now ? targetHost - now : 0;
     int64_t ns = SPHostToNs(delta);
     if (ns < 0) ns = 0;
-    dispatch_source_set_timer(_clock, dispatch_time(DISPATCH_TIME_NOW, ns), DISPATCH_TIME_FOREVER, 400 * NSEC_PER_USEC);
+    spAirMeasurement::Event measurement;
+    if (_measurementTrace) {
+        measurement = [self airMeasurementEvent:spAirMeasurement::Kind::timerArm];
+        measurement.relatedID = _measurementArm; _measurementArm = _measurementTrace->identity(); measurement.armID = _measurementArm;
+        measurement.sampleHostTicks = now; measurement.values[0] = measurementRequestedDue;
+        measurement.values[1] = targetHost; measurement.values[2] = ns; measurement.beginHostTicks = SPHostNow();
+    }
+    const dispatch_time_t measurementDeadline = dispatch_time(DISPATCH_TIME_NOW, ns);
+    dispatch_source_set_timer(_clock, measurementDeadline, DISPATCH_TIME_FOREVER, 400 * NSEC_PER_USEC);
+    if (_measurementTrace) { measurement.endHostTicks = SPHostNow(); measurement.values[3] = measurementDeadline; _measurementTrace->append(measurement); }
 }
 
 - (double)outputFramesPerSecond {
@@ -4062,6 +6990,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 }
 
 - (void)beginMeasurementEpoch {
+    [self cancelSourceConversions];
     _r9FRCBudgetGate.reset();
     _r9RequiredBudgetMs = 0; _r9AllowedBudgetMs = 0;
     _r9OnTimeSynthetic = 0; _r9LatePhysicalSynthetic = 0; _r9TimingUnknownSynthetic = 0;
@@ -4085,6 +7014,9 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     _queueNs.clear();
     _playheadNs.clear();
     _drawableWaitNs.clear();
+    _presentationAdmissionToCallbackNs.clear();
+    _metalCommitToDisplayNs.clear();
+    _displayScheduledTargetOffsetNs.clear();
     _presentGapNs.clear();
     _presentMediaLagNs.clear();
     _gpuToDisplayNs.clear();
@@ -4152,6 +7084,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 // model/SR work remains bounded and its callback is rejected by clockEpoch.
 - (void)retireClockTimeline {
     ++_clockEpoch;
+    [self.preview setPresentationClockEpoch:_clockEpoch];
+    [self.outputPreview setPresentationClockEpoch:_clockEpoch];
     _fpsMeter.resetOutput();
     _fpsObservationEpoch += 1;
     for (const auto &pending : _pending) {
@@ -4173,6 +7107,25 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 }
 
 - (void)recomputeInteractiveDelay {
+    double cap = _request.quality == SPFRCQualityHigh ? SPQualityCapSec : SPInteractiveCapSec;
+#if defined(ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC) && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC == 1
+    if (_airInteractiveCap125msRequested && _request.quality != SPFRCQualityHigh) cap = 0.125;
+#endif
+    SPAirDelayAlignmentEvent alignmentEvent{};
+    if (_airDelayAlignmentEvents) {
+        alignmentEvent.hostTicks = SPHostNow(); alignmentEvent.generation = _sourceGeneration;
+        alignmentEvent.config = _configVersion; alignmentEvent.epochBefore = _measurementEpoch;
+        alignmentEvent.requestedMultiplier = (int)_request.multiplier; alignmentEvent.effectiveMultiplier = _effectiveMultiplier;
+        alignmentEvent.capNs = (int64_t)llround(cap * 1e9);
+        alignmentEvent.robustSourceLeadRequested = _airRobustSourceLeadRequested;
+        alignmentEvent.positiveIntervalHistoryCount = _airRobustSourceLeadHistory.historyCount();
+        alignmentEvent.positiveIntervalObservedCount = _airRobustSourceLeadHistory.observedIntervals();
+    }
+    _airRobustSourceLeadApplied = NO;
+    _airSourceLeadEvaluation = _airRobustSourceLeadHistory.evaluate(0, false);
+    _airDelayAlignmentActiveX2 = NO;
+    _airDelayAlignmentLeadNs = 0;
+    _airDelayAlignmentMarginNs = 0;
     // There is no future temporal phase to wait for in source-only output.
     // Scaling finishes before enqueue; its actual cost is not an extra queue
     // delay. In-flight work remains owned by its original epoch.
@@ -4184,6 +7137,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         _delayTimeClamped = NO;
         _delayByteClamped = NO;
         _delayClampNoted = NO;
+        if (_airDelayAlignmentEvents) {
+            alignmentEvent.sourceOnly = true; alignmentEvent.epochAfter = _measurementEpoch;
+            alignmentEvent.finalNs = SPHostToNs(_delayHost); _airDelayAlignmentEvents->append(alignmentEvent);
+        }
         return;
     }
     double interval = 1.0 / 30.0;
@@ -4191,8 +7148,16 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         double seconds = (double)SPHostToNs(_intervalHost) / 1e9;
         if (seconds > 0.001) interval = seconds;
     }
+#if defined(ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC) && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC == 1
+    if (!_airTrueSourceIntervalRequested && interval > 1.0 / 30.0) interval = 1.0 / 30.0;
+#else
     if (interval > 1.0 / 30.0) interval = 1.0 / 30.0;
+#endif
     double lead = [self informationLeadSeconds:interval];
+    _airRobustSourceLeadApplied = _airRobustSourceLeadRequested && (SPAirBetaEnabled() || _airPerformanceEnabled) &&
+        [_request.engineID isEqualToString:@"rife.metal"] && _request.rateKind == SPLiveRateMultiplier && _request.multiplier == 2;
+    _airSourceLeadEvaluation = _airRobustSourceLeadHistory.evaluate(lead, _airRobustSourceLeadApplied);
+    lead = _airSourceLeadEvaluation.leadSeconds;
     double frc = _frcEwmaSec;
     if (_frcNs.size() >= 8) {
         std::vector<int64_t> recent = _frcNs;
@@ -4202,6 +7167,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         frc = MAX(frc, (double)recent[index] / 1e9);
     }
     double process = frc + (_request.scaleEnabled ? _scaleEwmaSec : 0);
+    if ([self usesFixedSourceReuse] && _fixedMaxBatchCount > 0)
+        process = MAX(process, _fixedRateBudget.taskMs(_fixedMaxBatchCount) / 1000.0 + (_request.scaleEnabled ? _scaleEwmaSec : 0));
     if ([_request.engineID isEqualToString:@"apple.frc"] && _captureToOutputReadyNs.size() >= 8) {
         // This includes input wait, model, output conversion and scaling up to
         // enqueue-ready; callback-only model latency is not output readiness.
@@ -4211,8 +7178,20 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         process = MAX(process, (double)recent[(recent.size() - 1) * 80 / 100] / 1e9);
     }
     if (process < 0.008) process = 0.008;
-    double cap = _request.quality == SPFRCQualityHigh ? SPQualityCapSec : SPInteractiveCapSec;
-    double wanted = lead + process + 0.016;
+    double renderMargin = 0.016;
+    if (_airDelayAlignmentRequested && _request.rateKind == SPLiveRateMultiplier && _request.multiplier == 2 &&
+        _effectiveMultiplier == 2 && ([_request.engineID isEqualToString:@"rife.metal"]
+#if defined(ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC) && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC == 1
+        || [_request.engineID isEqualToString:@"apple.frc"]
+#endif
+        )) {
+        SPLivePreviewView *timedView = self.outputPreview.windowVisibleSnapshot ? self.outputPreview : self.preview;
+        _airDelayAlignmentLeadNs = MAX((int64_t)16000000, [timedView presentationPreparationLeadNs]);
+        _airDelayAlignmentMarginNs = _airDelayAlignmentLeadNs + 3000000;
+        _airDelayAlignmentActiveX2 = YES;
+        renderMargin = (double)_airDelayAlignmentMarginNs / 1e9;
+    }
+    double wanted = lead + process + renderMargin;
     if (_lowLatency && [self requestUsesLowPrescale:_request width:_width height:_height] && _captureToOutputReadyNs.size() >= 8) {
         // Include actual capture-to-ready time, which also covers pre-scaling,
         // conversion, asynchronous delivery and comparison baseline work.
@@ -4240,6 +7219,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         clamped = YES;
     }
     int64_t next = SPRationalToHost(sp::spMake((int64_t)llround(delay * 1000.0), 1000));
+    const int64_t roundedDelayHost = next;
     if (_delayHost > next) {
         double current = (double)SPHostToNs(_delayHost) / 1e9;
         if (current > cap + 0.001) {
@@ -4276,6 +7256,20 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     _delayTimeClamped = timeClamped;
     _delayByteClamped = byteClamped;
     _delayHost = next;
+    if (_airDelayAlignmentEvents) {
+        alignmentEvent.calculated = true; alignmentEvent.activeX2 = _airDelayAlignmentActiveX2;
+        alignmentEvent.epochAfter = _measurementEpoch;
+        alignmentEvent.intervalNs = (int64_t)llround(interval * 1e9); alignmentEvent.modelNs = (int64_t)llround(frc * 1e9);
+        alignmentEvent.processNs = (int64_t)llround(process * 1e9); alignmentEvent.presentationLeadNs = _airDelayAlignmentLeadNs;
+        alignmentEvent.robustSourceLeadApplied = _airRobustSourceLeadApplied;
+        alignmentEvent.oldSourceLeadNs = (int64_t)llround(_airSourceLeadEvaluation.oldLeadSeconds * 1e9);
+        alignmentEvent.actualSourceLeadNs = (int64_t)llround(_airSourceLeadEvaluation.leadSeconds * 1e9);
+        alignmentEvent.positiveIntervalP95Ns = (int64_t)llround(_airSourceLeadEvaluation.p95IntervalSeconds * 1e9);
+        alignmentEvent.renderMarginNs = (int64_t)llround(renderMargin * 1e9); alignmentEvent.wantedNs = (int64_t)llround(wanted * 1e9);
+        alignmentEvent.queueLimitNs = (int64_t)llround(queueLimit * 1e9); alignmentEvent.roundedNs = SPHostToNs(roundedDelayHost);
+        alignmentEvent.finalNs = SPHostToNs(_delayHost); alignmentEvent.timeClamped = timeClamped; alignmentEvent.byteClamped = byteClamped;
+        _airDelayAlignmentEvents->append(alignmentEvent);
+    }
 }
 
 - (int64_t)targetHostForPTS:(sp::SPRational)pts {
@@ -4283,6 +7277,65 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     sp::SPRational delta{};
     if (!sp::spSub(pts, _anchorPts, delta)) return SPHostNow() + _delayHost;
     return _anchorHost + SPRationalToHost(delta) + _delayHost;
+}
+
+- (BOOL)usesRifePairAffineClock {
+    return SPRifePairAffineClockEnabled() && _request.interpolationEnabled &&
+        [_request.engineID isEqualToString:@"rife.metal"] && _request.rateKind == SPLiveRateMultiplier;
+}
+
+- (sp::RifePairClockContext)rifePairClockContext {
+    return {_sourceGeneration, _configVersion, _measurementEpoch, _clockEpoch};
+}
+
+// The caller has observed this accepted real source before entering here. The
+// endpoint is immutable; B remains the same endpoint when it becomes the next A.
+- (void)freezeRifeSourceClockIdentity:(uint64_t)identity generation:(uint64_t)generation {
+    auto found=_held.find(identity);
+    if(generation!=_sourceGeneration || found==_held.end() || found->second.pairClockSource.frozen) return;
+    int64_t delay=_delayHost, candidate=[self targetHostForPTS:found->second.pts];
+    if(!sp::freezeRifeSourceClockTarget(found->second.pairClockSource,[self rifePairClockContext],found->second.pts,candidate,delay)) return;
+    NSDictionary *value=@{ @"sourceIdentity":@(identity), @"source":SPRifeSourceClockValue(found->second.pairClockSource) };
+    [self recordR7JobEvent:@"pairAffineSourceFrozen" detail:value];
+    if(_testCapturePlayout) {
+        if(!_testTimingTrace) _testTimingTrace=[NSMutableArray array];
+        if(_testTimingTrace.count<80) { NSMutableDictionary *trace=[value mutableCopy]; trace[@"kind"]=@"pairAffineSourceFrozen"; [_testTimingTrace addObject:trace]; }
+    }
+}
+
+- (sp::RifePairClockTarget)rifePairClockTargetForEvent:(const sp::SPScheduleOutput &)event {
+    int64_t delay=_delayHost, candidate=[self targetHostForPTS:event.pts];
+    auto a=_held.find(event.frameA), b=_held.find(event.frameB);
+    return sp::rifePairClockTarget([self rifePairClockContext],event.pts,candidate,delay,
+        a==_held.end() ? nullptr : &a->second.pairClockSource,
+        b==_held.end() ? nullptr : &b->second.pairClockSource);
+}
+
+- (void)recordRifePairClockPlan:(NSArray *)targets {
+    NSDictionary *value=@{ @"targets":targets, @"rifePairAffineClock":@YES };
+    [self recordR7JobEvent:@"pairAffinePlan" detail:value];
+    if(!_r8OutputTimeline) _r8OutputTimeline=[NSMutableArray array];
+    NSMutableDictionary *event=[value mutableCopy]; event[@"kind"]=@"pairAffinePlan"; event[@"host"]=@(SPHostNow());
+    [_r8OutputTimeline addObject:event];
+    if(_r8OutputTimeline.count>512) [_r8OutputTimeline removeObjectAtIndex:0];
+}
+
+- (void)recordRifeSourceEnqueueClock:(uint64_t)identity pts:(sp::SPRational)pts selected:(int64_t)selected stage:(NSString *)stage {
+    auto source=_held.find(identity);
+    if(source==_held.end()) return;
+    const int64_t delay=_delayHost, legacy=[self targetHostForPTS:pts];
+    NSDictionary *value=@{ @"sourceIdentity":@(identity),@"ptsNum":@(pts.num),@"ptsDen":@(pts.den),
+        @"generation":@(_sourceGeneration),@"configVersion":@(_configVersion),@"measurementEpoch":@(_measurementEpoch),@"clockEpoch":@(_clockEpoch),
+        @"captureHost":@(source->second.host),@"candidateStage":stage,
+        @"legacyCandidateTargetHost":@(legacy),@"legacyCandidateDelayHost":@(delay),
+        @"canonicalSource":SPRifeSourceClockValue(source->second.pairClockSource),
+        @"selectedTargetHost":@(selected>0 ? selected : legacy),
+        @"selectedMinusLegacyHost":@((selected>0 ? selected : legacy)-legacy) };
+    [self recordR7JobEvent:@"pairAffineSourceEnqueue" detail:value];
+    if(!_r8OutputTimeline) _r8OutputTimeline=[NSMutableArray array];
+    NSMutableDictionary *event=[value mutableCopy]; event[@"kind"]=@"pairAffineSourceEnqueue"; event[@"host"]=@(SPHostNow());
+    [_r8OutputTimeline addObject:event];
+    if(_r8OutputTimeline.count>512) [_r8OutputTimeline removeObjectAtIndex:0];
 }
 
 - (void)noteSourceClock:(sp::SPRational)pts host:(int64_t)host {
@@ -4312,6 +7365,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     if (_havePreviousSourcePts) {
         sp::SPRational delta{};
         if (sp::spSub(pts, _previousSourcePts, delta) && sp::spCmp(delta, sp::spMake(0, 1)) > 0) {
+            if (_airRobustSourceLeadRequested || _airPerformanceRequested)
+                _airRobustSourceLeadHistory.observePositiveInterval((double)delta.num / (double)delta.den);
             int64_t interval = SPRationalToHost(delta);
             if (interval > 0) {
                 _intervalHost = _haveInterval ? (_intervalHost * 3 + interval) / 4 : interval;
@@ -4426,9 +7481,12 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
      captureHost:(int64_t)captureHost
     geometryHost:(int64_t)geometryHost
          frameID:(uint64_t)frameID
+presentationHost:(int64_t)presentationHost
           redraw:(BOOL)redraw {
     [self.preview setDiagnosticsConfig:_configVersion epoch:_measurementEpoch];
     [self.outputPreview setDiagnosticsConfig:_configVersion epoch:_measurementEpoch];
+    [self.preview setPresentationClockEpoch:_clockEpoch];
+    [self.outputPreview setPresentationClockEpoch:_clockEpoch];
     BOOL outputVisible = self.outputPreview.windowVisibleSnapshot;
     if (_scoreOutput != outputVisible) { _fpsMeter.resetOutput(); _fpsObservationEpoch += 1; _presentationGeometry.reset(); }
     _scoreOutput = outputVisible;
@@ -4440,8 +7498,9 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         BOOL accepted = [self.preview presentEnhanced:enhanced original:original mode:_request.viewMode
                                           captureHost:captureHost generation:generation
                                                ptsNum:pts.num ptsDen:pts.den synthetic:synthetic
-                                              frameID:frameID counts:previewCounts captureGeometry:nil reason:&reason];
-        if (!accepted && previewCounts) { _renderDrops += 1; [self recordPresentationFailure:reason endpoint:@"preview" generation:generation config:_configVersion epoch:_measurementEpoch frame:frameID]; }
+                                              frameID:frameID counts:previewCounts captureGeometry:nil presentationHost:presentationHost redraw:redraw reason:&reason];
+        if (!accepted && previewCounts) { _renderDrops += 1; [self recordPresentationFailure:reason endpoint:@"preview" generation:generation config:_configVersion epoch:_measurementEpoch frame:frameID
+            details:@{ @"ptsNum": @(pts.num), @"ptsDen": @(pts.den), @"logicalTargetHost": @(presentationHost), @"synthetic": @(synthetic) }]; }
     }
     if (self.outputPreview) {
         if (SPR8FixtureEnabled() && outputCounts) {
@@ -4452,6 +7511,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             [_r8OutputTimeline addObject:@{ @"kind": @"submitted", @"frameID": @(frameID),
                 @"generation": @(generation), @"configVersion": @(_configVersion), @"measurementEpoch": @(_measurementEpoch),
                 @"captureHost": @(captureHost), @"submitHost": @(SPHostNow()), @"clockEpoch": @(_clockEpoch),
+                @"logicalTargetHost": @(presentationHost),
                 @"geometryVersion": [NSNull null], @"ptsNum": @(pts.num), @"ptsDen": @(pts.den),
                 @"synthetic": @(synthetic), @"decoded": @(code >= 0), @"frameNumber": @(code), @"motion": motion }];
             if (_r8OutputTimeline.count > 512) [_r8OutputTimeline removeObjectAtIndex:0];
@@ -4462,7 +7522,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         BOOL accepted = [self.outputPreview presentEnhanced:enhanced original:original mode:_request.viewMode
                                                 captureHost:captureHost generation:generation
                                                      ptsNum:pts.num ptsDen:pts.den synthetic:synthetic
-                                                    frameID:frameID counts:outputCounts captureGeometry:_geometryInputs[@(captureHost)] reason:&reason];
+                                                    frameID:frameID counts:outputCounts captureGeometry:_geometryInputs[@(captureHost)] presentationHost:presentationHost redraw:redraw reason:&reason];
         if (_pixelPendingOutput && [_pixelPendingOutput[@"frameID"] unsignedLongLongValue] == frameID) {
             NSMutableDictionary *submitted = [_pixelPendingOutput mutableCopy];
             submitted[@"submissionState"] = accepted ? @"accepted" : @"rejected";
@@ -4470,23 +7530,35 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             _pixelLastOutputSubmitted = [submitted copy];
             _pixelPendingOutput = accepted ? _pixelLastOutputSubmitted : nil;
         }
-        if (!accepted && outputCounts) { _renderDrops += 1; [self recordPresentationFailure:reason endpoint:@"output" generation:generation config:_configVersion epoch:_measurementEpoch frame:frameID]; }
+        if (!accepted && outputCounts) { _renderDrops += 1; [self recordPresentationFailure:reason endpoint:@"output" generation:generation config:_configVersion epoch:_measurementEpoch frame:frameID
+            details:@{ @"ptsNum": @(pts.num), @"ptsDen": @(pts.den), @"logicalTargetHost": @(presentationHost), @"synthetic": @(synthetic) }]; }
     }
 }
 
 - (void)drainDue {
     int64_t now = SPHostNow();
+    uint64_t measurementDrainID = 0;
+    if (_measurementTrace) { auto event = [self airMeasurementEvent:spAirMeasurement::Kind::drainEntry];
+        event.beginHostTicks = event.endHostTicks = event.sampleHostTicks = now;
+        event.groupID = _measurementTrace->identity(); measurementDrainID = event.groupID; event.relatedID = _measurementFire;
+        event.values[0] = _slots.size(); event.values[1] = _pending.size(); _measurementTrace->append(event); }
     [self expireDeferredRifeAt:now];
     if (_haveRifeDeferred && _rifeDeferredRetryHost > 0 && _rifeDeferredRetryHost <= now) [self resumeDeferredRife];
     int64_t slop = SPRationalToHost(sp::spMake(1, 1000));
+    // Hand ready buffers to the bounded display-link queue ahead of time.
+    // This lead does not change logical targets or due-merge eligibility.
+    SPLivePreviewView *timedView = self.outputPreview.windowVisibleSnapshot ? self.outputPreview : self.preview;
+    int64_t observedLeadNs = MAX((int64_t)16000000, [timedView presentationPreparationLeadNs]);
+    int64_t prepareLead = [self requestUsesLatestPresentation:_request] ? 0 :
+        SPRationalToHost(sp::spMake(observedLeadNs + (_airPerformanceEnabled ? 3000000 : 0), 1000000000));
     while (!_slots.empty()) {
         int64_t earliest = 0;
         if ([self waitForPendingBefore:_slots.front().pts now:now earliest:&earliest]) {
             [self armClockAt:earliest];
             return;
         }
-        if (_slots.front().targetHost > now + slop) {
-            [self armClockAt:_slots.front().targetHost];
+        if (_slots.front().targetHost > now + slop + prepareLead) {
+            [self armClockAt:_slots.front().targetHost - prepareLead];
             return;
         }
         while (_slots.size() > 1 && _slots[1].targetHost <= now + slop) {
@@ -4500,8 +7572,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             _slots.erase(_slots.begin());
         }
         if (_slots.empty()) break;
-        if (_slots.front().targetHost > now + slop) {
-            [self armClockAt:_slots.front().targetHost];
+        if (_slots.front().targetHost > now + slop + prepareLead) {
+            [self armClockAt:_slots.front().targetHost - prepareLead];
             return;
         }
         SPPlaySlot slot = _slots.front();
@@ -4519,10 +7591,33 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             SPReleaseSlot(slot);
             continue;
         }
+        if (_measurementTrace) {
+            auto event = [self airMeasurementEvent:spAirMeasurement::Kind::drainEntry];
+            event.beginHostTicks = event.endHostTicks = SPHostNow(); event.relatedID = measurementDrainID;
+            event.frameID = slot.frameID; event.generation = slot.sourceGeneration; event.config = slot.configVersion;
+            event.epoch = slot.measurementEpoch; event.clock = slot.clockEpoch; event.ptsNum = slot.pts.num;
+            event.ptsDen = slot.pts.den; event.targetHostTicks = slot.targetHost; event.sampleHostTicks = slot.readyHost;
+            event.flags = (slot.synthetic ? 1u : 0u) | 8u | 256u;
+            event.values[0] = observedLeadNs; event.values[1] = prepareLead; event.values[2] = _measurementFire;
+            _measurementTrace->append(event);
+        }
         [self showPair:slot.enhanced original:slot.original pts:slot.pts synthetic:slot.synthetic
-           captureHost:slot.captureHost geometryHost:slot.geometryHost frameID:slot.frameID redraw:NO];
-        if (_testCapturePlayout) _testPlayout.emplace_back(slot.pts, slot.synthetic);
-        [self rememberPair:slot.enhanced original:slot.original pts:slot.pts synthetic:slot.synthetic geometryHost:slot.geometryHost];
+           captureHost:slot.captureHost geometryHost:slot.geometryHost frameID:slot.frameID
+       presentationHost:slot.targetHost redraw:NO];
+        if (slot.fixedFallback) {
+            _fixedFallbackPresented++;
+            for (const auto &pending : _pending) if (sp::spCmp(pending.pts, slot.pts) == 0) {
+                if ([self noteUniqueSyntheticDrop:slot.pts]) _pendingExpiredDrops++;
+                break;
+            }
+            [self erasePending:slot.pts];
+        }
+        if (_testCapturePlayout) {
+            _testPlayout.emplace_back(slot.pts, slot.synthetic);
+            auto mark = _marks.find(slot.frameID);
+            if (mark != _marks.end() && mark->second.held) _testHoldPlayout.push_back(slot.pts);
+        }
+        [self rememberPair:slot.enhanced original:slot.original pts:slot.pts synthetic:slot.synthetic geometryHost:slot.geometryHost targetHost:slot.targetHost];
         _lastPresentedPts = slot.pts;
         _haveLastPts = YES;
         SPReleaseSlot(slot);
@@ -4530,7 +7625,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             [self armClockAt:now + SPRationalToHost(sp::spMake(1, 10))];
             return;
         }
-        [self armClockAt:_slots.front().targetHost];
+        [self armClockAt:_slots.front().targetHost - prepareLead];
         return;
     }
     [self armClockAt:now + SPRationalToHost(sp::spMake(1, 10))];
@@ -4561,6 +7656,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 }
 
 - (void)enqueueReadyEnhanced:(CVPixelBufferRef)enhanced original:(CVPixelBufferRef)original pts:(sp::SPRational)pts synthetic:(BOOL)synthetic held:(BOOL)held captureHost:(int64_t)captureHost generation:(uint64_t)generation deadlineHost:(int64_t)deadlineHost jobID:(uint64_t)jobID geometryHost:(int64_t)geometryHost {
+    [self enqueueReadyEnhanced:enhanced original:original pts:pts synthetic:synthetic held:held captureHost:captureHost generation:generation deadlineHost:deadlineHost jobID:jobID geometryHost:geometryHost fixedFallback:NO];
+}
+
+- (void)enqueueReadyEnhanced:(CVPixelBufferRef)enhanced original:(CVPixelBufferRef)original pts:(sp::SPRational)pts synthetic:(BOOL)synthetic held:(BOOL)held captureHost:(int64_t)captureHost generation:(uint64_t)generation deadlineHost:(int64_t)deadlineHost jobID:(uint64_t)jobID geometryHost:(int64_t)geometryHost fixedFallback:(BOOL)fixedFallback {
     if (!enhanced || generation != _sourceGeneration) {
         if (enhanced) CVPixelBufferRelease(enhanced);
         if (original) CVPixelBufferRelease(original);
@@ -4590,10 +7689,13 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     slot.measurementEpoch = _measurementEpoch;
     slot.targetHost = [self requestUsesLatestPresentation:_request] ? SPHostNow() : (deadlineHost > 0 ? deadlineHost : [self targetHostForPTS:pts]);
     slot.synthetic = synthetic;
+    slot.fixedFallback = fixedFallback;
     slot.enhanced = enhanced;
     slot.original = original ?: CVPixelBufferRetain(enhanced);
     slot.frameID = ++_nextFrameID;
     slot.readyHost = SPHostNow();
+    if (_measurementTrace && !synthetic) [self airMeasurementTarget:pts target:slot.targetHost frame:slot.frameID
+        job:jobID phase:0 synthetic:NO computed:![self requestUsesLatestPresentation:_request] && deadlineHost <= 0];
     slot.sourceGeneration = generation;
     slot.configVersion = _configVersion;
     slot.captureHost = captureHost;
@@ -4601,7 +7703,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     if (synthetic && !slot.jobID) for (const auto &pending : _pending) {
         if (pending.generation == generation && sp::spCmp(pending.pts, pts) == 0) { slot.jobID = pending.jobID; break; }
     }
-    [self erasePending:pts];
+    if (!fixedFallback) [self erasePending:pts];
     if (synthetic && ![self requestUsesLatestPresentation:_request] && slot.targetHost + SPRationalToHost(sp::spMake(2, 1000)) < slot.readyHost) {
         if ([self noteUniqueSyntheticDrop:pts]) {
             _lateReadyDrops++;
@@ -4621,7 +7723,29 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     auto at = std::lower_bound(_slots.begin(), _slots.end(), slot, [](const SPPlaySlot &a, const SPPlaySlot &b) {
         return sp::spCmp(a.pts, b.pts) < 0;
     });
+    if (at != _slots.end() && sp::spCmp(at->pts, pts) == 0 && [self usesFixedSourceReuse]) {
+        if (synthetic && at->fixedFallback) {
+            _marks.erase(at->frameID);
+            SPReleaseSlot(*at);
+            at = _slots.erase(at);
+            _fixedFallbackReplaced++;
+        } else {
+            // A standby image must never replace an already-ready model frame.
+            SPReleaseSlot(slot);
+            return;
+        }
+    }
+    const uint64_t measurementInsertBegin = _measurementTrace ? SPHostNow() : 0;
     _slots.insert(at, slot);
+    if (_measurementTrace) {
+        spAirMeasurement::Event event; event.kind = spAirMeasurement::Kind::slotInsert;
+        event.beginHostTicks = measurementInsertBegin; event.endHostTicks = SPHostNow();
+        event.frameID = slot.frameID; event.relatedID = slot.jobID; event.generation = slot.sourceGeneration;
+        event.config = slot.configVersion; event.epoch = slot.measurementEpoch; event.clock = slot.clockEpoch;
+        event.ptsNum = slot.pts.num; event.ptsDen = slot.pts.den; event.targetHostTicks = slot.targetHost;
+        event.flags = (slot.synthetic ? 1u : 0u) | 8u; event.sampleHostTicks = slot.readyHost;
+        event.values[0] = _slots.size() - 1; event.values[1] = _slots.size(); _measurementTrace->append(event);
+    }
     if (_testRecordSRInput) {
         BOOL shape = CVPixelBufferGetWidth(slot.enhanced) == 1920 && CVPixelBufferGetHeight(slot.enhanced) == 1080 && CVPixelBufferGetPixelFormatType(slot.enhanced) == kCVPixelFormatType_32BGRA;
         if (slot.sourceGeneration == 1 && !slot.synthetic && sp::spCmp(slot.pts, sp::spMake(10,1)) == 0 && shape) {
@@ -4660,7 +7784,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     NSUInteger cap = [self slotCap];
     while (_slots.size() > cap || ([self r8CanExperiment] && [self r8ReportedSlotBytes] > [self r8QueueByteBudget])) {
         if ([self r8CanExperiment] && [self r8ReportedSlotBytes] > [self r8QueueByteBudget]) _r8BudgetEvictions++;
-        auto victim = std::find_if(_slots.begin(), _slots.end(), [](const SPPlaySlot &item) { return item.synthetic; });
+        auto victim = std::find_if(_slots.begin(), _slots.end(), [](const SPPlaySlot &item) { return item.fixedFallback; });
+        if (victim == _slots.end()) victim = std::find_if(_slots.begin(), _slots.end(), [](const SPPlaySlot &item) { return item.synthetic; });
         if (victim == _slots.end()) victim = _slots.begin();
         if (victim->synthetic && [self noteUniqueSyntheticDrop:victim->pts]) {
             _slotEvictionDrops++; [self recordR9SlotDrop:*victim reason:@"slotEvictionDrop"];
@@ -4822,14 +7947,153 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     [self publishStatus:reason failed:YES];
 }
 
+- (spAirSourceConversion::Context)airSourceConversionContext {
+    return {_sourceGeneration, _configVersion, _measurementEpoch, _clockEpoch, _sourceConversions.cancellation};
+}
+
+- (NSDictionary *)airSourceConversionSnapshot {
+    NSMutableDictionary *invalidated = [NSMutableDictionary dictionary];
+    const char *names[] = {"none", "stopped", "generation", "config", "measurement", "clock", "cancellation", "mode"};
+    for (size_t index = 1; index < _sourceConversionInvalidated.size(); ++index)
+        invalidated[@(names[index])] = @(_sourceConversionInvalidated[index]);
+    return @{ @"enabled": @(_airPerformanceEnabled && _airPerformanceRequested && !_request.scaleEnabled &&
+            _airActualSourceKind == SPLiveCaptureSourceKindWindow && ![self requestUsesLatestPresentation:_request] && _sourcePixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        @"workerCreated": @(_sourceConverter != nil), @"sourcePixelFormat": @(_sourcePixelFormat),
+        @"active": @(_sourceConversions.active != nullptr), @"waiting": @(_sourceConversions.waitingCount),
+        @"outstanding": @(_sourceConversions.outstanding()), @"waitingCapacity": @2,
+        @"reservedBytes": @(_sourceConversions.ownedBytes), @"byteLimit": @(SPQueueByteBudget),
+        @"admitted": @(_sourceConversions.admitted), @"completed": @(_sourceConversions.completed),
+        @"enqueueAttempts": @(_sourceConversionDelivered), @"createdFrames": @(_sourceConversionFrames), @"failures": @(_sourceConversionFailures),
+        @"canceledWaiting": @(_sourceConversions.canceledWaiting), @"invalidated": invalidated,
+        @"capacitySyncFallbacks": @(_sourceConversions.capacitySyncFallbacks),
+        @"cancellation": @(_sourceConversions.cancellation),
+        @"scope": @"One active plus two waiting. Byte reservations conservatively include input plus eight bytes per output pixel. Full capacity restores the old synchronous source path without merging or dropping a source." };
+}
+
+- (void)airRecordSourceConversion:(const spAirSourceConversion::JobPtr &)job kind:(spAirMeasurement::Kind)kind
+    frame:(uint64_t)frameID reason:(spAirSourceConversion::StaleReason)reason {
+    if (!_measurementTrace || !job->traceEnabled) return;
+    auto event = [self airMeasurementEvent:kind];
+    event.frameID = frameID; event.generation = job->context.generation; event.config = job->context.config;
+    event.epoch = job->context.measurement; event.clock = job->context.clock; event.groupID = job->identity;
+    event.relatedID = job->sourceID; event.ptsNum = job->pts.num; event.ptsDen = job->pts.den;
+    event.targetHostTicks = job->targetHost; event.flags = 8u;
+    if (kind == spAirMeasurement::Kind::sourceConvertRequested) {
+        event.beginHostTicks = event.endHostTicks = job->requestedHost;
+        if (job->basisKnown) event.flags |= 16u;
+        event.values[0] = job->delayHost; event.values[1] = job->anchorHost;
+        event.values[2] = job->anchorPTS.num; event.values[3] = job->anchorPTS.den;
+        event.sampleHostTicks = job->sourceIntervalHost;
+        if (!job->identity) event.flags |= 256u;
+    } else if (kind == spAirMeasurement::Kind::sourceConvertFinished) {
+        event.beginHostTicks = job->workerBeginHost; event.endHostTicks = job->workerEndHost;
+        event.sampleHostTicks = job->processorReturnHost;
+        event.values[0] = (uint64_t)(int64_t)job->status; event.values[1] = job->transferBeginHost;
+        event.values[2] = job->transferEndHost; event.values[3] = job->context.cancellation;
+        if (job->output) event.flags |= 16u;
+    } else {
+        event.endHostTicks = SPHostNow();
+        event.beginHostTicks = job->processorReturnHost ?: event.endHostTicks;
+        event.sampleHostTicks = job->processorReturnHost;
+        event.values[0] = (uint64_t)reason; event.values[1] = _sourceConversions.outstanding();
+        event.values[2] = _sourceConversions.ownedBytes; event.values[3] = job->context.cancellation;
+        if (frameID) event.flags |= 16u;
+    }
+    _measurementTrace->append(event);
+}
+
+- (void)cancelSourceConversions {
+    using R = spAirSourceConversion::StaleReason;
+    for (size_t index = 0; index < _sourceConversions.waitingCount; ++index) {
+        const auto &job = _sourceConversions.waiting[index];
+        auto reason = spAirSourceConversion::staleReason(job->context, [self airSourceConversionContext], _stopped);
+        if (reason == R::none) reason = R::cancellation;
+        ++_sourceConversionInvalidated[(size_t)reason];
+        if (reason == R::stopped) ++_stoppedDrops;
+        else if (reason == R::generation) ++_generationDrops;
+        else ++_sourceStaleDrops;
+        [self airRecordSourceConversion:job kind:spAirMeasurement::Kind::sourceConvertDelivered frame:0 reason:reason];
+    }
+    _sourceConversions.cancel();
+}
+
+- (void)drainSourceConversions {
+    auto job = _sourceConversions.active;
+    if (!job || job->started) return;
+    job->started = true;
+    if (!_sourceConverter) _sourceConverter = [SPAirSourceConversionWorker new];
+    [_sourceConverter convert:job completion:^{
+        dispatch_async(self->_q, ^{
+            if (job->traceEnabled) job->processorReturnHost = SPHostNow();
+            using R = spAirSourceConversion::StaleReason;
+            [self airRecordSourceConversion:job kind:spAirMeasurement::Kind::sourceConvertFinished frame:0 reason:R::none];
+            auto reason = spAirSourceConversion::staleReason(job->context, [self airSourceConversionContext], self->_stopped);
+            if (reason == R::none && (!self->_airPerformanceEnabled || self->_request.scaleEnabled ||
+                self->_airActualSourceKind != SPLiveCaptureSourceKindWindow)) reason = R::mode;
+            uint64_t frameID = 0;
+            if (reason != R::none) {
+                ++self->_sourceConversionInvalidated[(size_t)reason];
+                if (reason == R::stopped) ++self->_stoppedDrops;
+                else if (reason == R::generation) ++self->_generationDrops;
+                else ++self->_sourceStaleDrops;
+            } else if (!job->output) {
+                ++self->_sourceConversionFailures; ++self->_sourceConversionDrops;
+            } else {
+                if (job->transferBeginHost) SPPushSample(self->_transferNs, SPHostToNs(job->transferEndHost - job->transferBeginHost));
+                CVPixelBufferRef converted = job->output; job->output = NULL;
+                const uint64_t previousFrameID = self->_nextFrameID;
+                [self enqueueReadyEnhanced:converted original:CVPixelBufferRetain(converted) pts:job->pts synthetic:NO held:job->held
+                    captureHost:job->captureHost generation:job->context.generation deadlineHost:job->targetHost jobID:0 geometryHost:job->geometryHost];
+                if (self->_nextFrameID != previousFrameID) { frameID = self->_nextFrameID; ++self->_sourceConversionFrames; }
+                ++self->_sourceConversionDelivered;
+            }
+            [self airRecordSourceConversion:job kind:spAirMeasurement::Kind::sourceConvertDelivered frame:frameID reason:reason];
+            if (job->output) { CVPixelBufferRelease(job->output); job->output = NULL; }
+            self->_sourceConversions.finish(job);
+            [self drainSourceConversions];
+        });
+    }];
+}
+
+- (BOOL)enqueueSourceConversion:(CVPixelBufferRef)source identity:(uint64_t)identity pts:(sp::SPRational)pts
+    held:(BOOL)held host:(int64_t)host generation:(uint64_t)generation deadline:(int64_t)deadline {
+    if (!_airPerformanceEnabled || !_airPerformanceRequested || _airActualSourceKind != SPLiveCaptureSourceKindWindow ||
+        _request.scaleEnabled || generation != _sourceGeneration || [self requestUsesLatestPresentation:_request] ||
+        CVPixelBufferGetPixelFormatType(source) != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) return NO;
+    auto job = std::make_shared<spAirSourceConversion::Job>(source);
+    job->context = [self airSourceConversionContext]; job->sourceID = identity; job->pts = pts;
+    job->held = held; job->captureHost = host; job->geometryHost = host;
+    job->targetHost = deadline > 0 ? deadline : [self targetHostForPTS:pts];
+    job->delayHost = _delayHost; job->anchorHost = _anchorHost; job->anchorPTS = _anchorPts;
+    sp::SPRational anchorDelta{};
+    job->basisKnown = deadline <= 0 && _haveAnchor && sp::spSub(pts, _anchorPts, anchorDelta);
+    job->sourceIntervalHost = _haveInterval ? _intervalHost : 0;
+    job->bytes = CVPixelBufferGetDataSize(source) + (uint64_t)CVPixelBufferGetWidth(source) * CVPixelBufferGetHeight(source) * 8;
+    job->traceEnabled = _measurementTrace != nullptr;
+    job->requestedHost = job->traceEnabled ? SPHostNow() : 0;
+    const BOOL accepted = _sourceConversions.admit(job, SPQueueByteBudget);
+    [self airRecordSourceConversion:job kind:spAirMeasurement::Kind::sourceConvertRequested frame:0 reason:spAirSourceConversion::StaleReason::none];
+    if (!accepted) return NO;
+#if ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
+    SPRifeBridge *bridge = _rife;
+    if (bridge.rifePrescaleEnabled) job->recordDimensions = ^(int width, int height) { [bridge recordPrescaleOriginalWidth:width height:height]; };
+#endif
+    [self drainSourceConversions];
+    return YES;
+}
+
 - (void)enqueueSourceIdentity:(uint64_t)identity
                           pts:(sp::SPRational)pts
                          host:(int64_t)host
                    generation:(uint64_t)generation
                         force:(BOOL)force {
+    [self enqueueSourceIdentity:identity pts:pts host:host generation:generation force:force retimed:NO];
+}
+
+- (void)enqueueSourceIdentity:(uint64_t)identity pts:(sp::SPRational)pts host:(int64_t)host generation:(uint64_t)generation force:(BOOL)force retimed:(BOOL)retimed {
     auto found = _held.find(identity);
     if (found == _held.end()) { _sourceMissingDrops++; return; }
-    BOOL held = sp::spCmp(pts, found->second.pts) != 0;
+    BOOL held = !retimed && sp::spCmp(pts, found->second.pts) != 0;
     // Unscaled BGRA aliases a capture-owned buffer. Once fresh native cadence
     // is confirmed, a RIFE midpoint is not needed and the normal interpolation
     // lead can otherwise occupy this small capture pool.
@@ -4852,6 +8116,11 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         }
     }
     if (!held) [self observeSourceIdentity:identity];
+    int64_t pairClockDeadline=0;
+    if([self usesRifePairAffineClock] && !held && !retimed &&
+        found->second.pairClockSource.frozen && sp::spCmp(pts,found->second.pairClockSource.pts)==0 &&
+        sp::sameRifePairClockContext(found->second.pairClockSource.context,[self rifePairClockContext]))
+        pairClockDeadline=found->second.pairClockSource.targetHost;
     // Distil and low-prescale retain their existing independent policy. RIFE
     // sources always share the deadline queue with its synthetic phases.
     if (!force && (_distil || (_lowLatency && _lowPrescaleSlowMode)) && _resolved.interpolationActive && _sessionReady && _lastEnhanced && _request.viewMode != SPLiveViewOriginal) { _sourcePolicyDrops++; return; }
@@ -4863,11 +8132,15 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         [self enqueueReadyEnhanced:enhanced original:original pts:pts synthetic:NO held:held captureHost:host generation:generation deadlineHost:0];
         return;
     }
+    if ([self enqueueSourceConversion:found->second.source identity:identity pts:pts held:held
+        host:host generation:generation deadline:pairClockDeadline]) return;
     CVPixelBufferRef bgra = [self bgraFromSource:found->second.source];
     if (!bgra) { _sourceConversionDrops++; return; }
     if ([self requestUsesAsyncScale:_request] && _sessionReady && (_appleSR || _videoSR || _animeSR || _cuganSR)) {
         CVPixelBufferRef original = _request.viewMode != SPLiveViewEnhanced ? [self scaleBuffer:bgra with:_baselineScaler] : NULL;
-        [self enqueueAsyncScale:bgra original:original pts:pts synthetic:NO held:held captureHost:host generation:generation deadlineHost:0];
+        if([self usesRifePairAffineClock] && !held && !retimed)
+            [self recordRifeSourceEnqueueClock:identity pts:pts selected:pairClockDeadline stage:@"source-enqueue-before-async-scale"];
+        [self enqueueAsyncScale:bgra original:original pts:pts synthetic:NO held:held captureHost:host generation:generation deadlineHost:pairClockDeadline];
         return;
     }
     CVPixelBufferRef scaleInput = [self scaleBuffer:bgra with:_request.scaleEnabled ? _srInputScaler : nil];
@@ -4881,8 +8154,43 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     CVPixelBufferRelease(bgra);
     if (!enhanced) enhanced = original ? CVPixelBufferRetain(original) : NULL;
     if (!original && enhanced) original = CVPixelBufferRetain(enhanced);
+#if ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
+    if (enhanced && _rife.rifePrescaleEnabled) {
+        [_rife recordPrescaleOriginalWidth:(int)CVPixelBufferGetWidth(enhanced)
+                                   height:(int)CVPixelBufferGetHeight(enhanced)];
+    }
+#endif
     if (nativeDirect) _nativeBGRADirectFrames++;
-    [self enqueueReadyEnhanced:enhanced original:original pts:pts synthetic:NO held:held captureHost:host generation:generation deadlineHost:nativeDirect ? SPHostNow() : 0];
+    if([self usesRifePairAffineClock] && !held && !retimed) {
+        int64_t sourceDeadline=nativeDirect ? SPHostNow() : pairClockDeadline;
+        [self recordRifeSourceEnqueueClock:identity pts:pts selected:sourceDeadline stage:@"source-enqueue-ready"];
+        [self enqueueReadyEnhanced:enhanced original:original pts:pts synthetic:NO held:held captureHost:host generation:generation deadlineHost:sourceDeadline];
+    } else {
+        [self enqueueReadyEnhanced:enhanced original:original pts:pts synthetic:NO held:held captureHost:host generation:generation deadlineHost:nativeDirect ? SPHostNow() : 0];
+    }
+}
+
+// Reserve a cheap, owned source image at each model deadline. On-time model
+// output replaces this slot; an overloaded/failed job leaves it for playout.
+// Standby images count as holds, never as additional motion frames.
+- (void)enqueueFixedFallbacks:(const std::vector<sp::SPScheduleOutput> &)events generation:(uint64_t)generation {
+    uint64_t cachedID = 0;
+    CVPixelBufferRef cached = nil;
+    for (const auto &event : events) {
+        const uint64_t identity = sp::spCmp(event.phase, sp::spMake(1, 2)) < 0 ? event.frameA : event.frameB;
+        auto found = _held.find(identity);
+        if (found == _held.end() || !found->second.source) continue;
+        if (identity != cachedID) {
+            if (cached) CVPixelBufferRelease(cached);
+            cached = [self bgraFromSource:found->second.source];
+            cachedID = identity;
+        }
+        if (!cached) continue;
+        [self enqueueReadyEnhanced:CVPixelBufferRetain(cached) original:nil pts:event.pts synthetic:NO held:YES
+                       captureHost:found->second.host generation:generation deadlineHost:[self targetHostForPTS:event.pts]
+                             jobID:0 geometryHost:found->second.host fixedFallback:YES];
+    }
+    if (cached) CVPixelBufferRelease(cached);
 }
 
 // Shared by live FRC admission and its deterministic production-queue contract.
@@ -4910,6 +8218,11 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 }
 
 - (void)submitEventGroup:(const std::vector<sp::SPScheduleOutput> &)events generation:(uint64_t)generation frozenDeadline:(int64_t)frozenDeadline {
+    [self submitEventGroup:events generation:generation frozenDeadline:frozenDeadline frozenPairClock:nullptr];
+}
+
+- (void)submitEventGroup:(const std::vector<sp::SPScheduleOutput> &)events generation:(uint64_t)generation
+    frozenDeadline:(int64_t)frozenDeadline frozenPairClock:(const sp::RifePairClockTarget *)frozenPairClock {
     // A phase depends on frame B; observe its real source clock before its
     // deadline is calculated, including callers which submit a pair directly.
     if (!events.empty() && generation == _sourceGeneration) [self observeSourceIdentity:events.front().frameB];
@@ -4927,11 +8240,23 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     BOOL wantLow = [_request.engineID isEqualToString:@"apple.lowlatency"];
     BOOL wantRife = [_request.engineID isEqualToString:@"rife.metal"];
     BOOL wantDistil = [_request.engineID isEqualToString:@"distildrba.coreml"];
+    sp::RifePairClockTarget pairClock[3]{};
+    const BOOL pairAffine=[self usesRifePairAffineClock];
+    if(pairAffine) {
+        NSMutableArray *targets=[NSMutableArray array];
+        for(size_t i=0;i<MIN((size_t)3,events.size());++i) {
+            pairClock[i]=frozenDeadline>0 && i==0
+                ? sp::reuseRifePairClockTarget(frozenPairClock,[self rifePairClockContext],events[i].pts,frozenDeadline)
+                : [self rifePairClockTargetForEvent:events[i]];
+            [targets addObject:SPRifePairClockValue(pairClock[i],events[i].frameA,events[i].frameB)];
+        }
+        [self recordRifePairClockPlan:targets];
+    }
     BOOL haveEngine = wantLow ? (_lowLatency != nil) : (wantRife ? (_rife != nil) : (wantDistil ? (_distil != nil) : (_engine != nil)));
     BOOL slowPair=wantLow && _lowPrescaleSlowMode;
     if (wantRife && haveEngine && !events.empty()) {
         int64_t now = SPHostNow();
-        int64_t deadline = frozenDeadline > 0 ? frozenDeadline : [self targetHostForPTS:events.front().pts];
+        int64_t deadline = frozenDeadline > 0 ? frozenDeadline : (pairAffine ? pairClock[0].selectedTargetHost : [self targetHostForPTS:events.front().pts]);
         BOOL changingRate = [self rateBudgetEnabled] &&
             (_rateBudgetPassthrough || _rateBudget.snapshot().effectiveMultiplier != _effectiveMultiplier);
         size_t count = MIN((size_t)32, _frcNs.size());
@@ -4945,7 +8270,9 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         double remainingMs = SPHostToNs(deadline - now) / 1e6;
         int rifeInflight = _inflight + ((_rateBudgetProbeInFlightToken &&
             _rateBudgetProbeInFlightEpoch != _inflightEpoch) ? 1 : 0);
-        BOOL admitted = sp::shouldAdmitRife(rifeInflight, count, serviceMs, elapsedMs, remainingMs);
+        BOOL admitted = [self usesFixedSourceReuse]
+            ? _fixedRateBudget.admit((int)events.size(), SPHostToNs(now) / 1e6, SPHostToNs(deadline) / 1e6)
+            : sp::shouldAdmitRife(rifeInflight, count, serviceMs, elapsedMs, remainingMs);
         BOOL missesBudget = !admitted && rifeInflight < 2;
         if (changingRate || !admitted) {
             _queueDrops += events.size(); _epochQueueDrops += events.size();
@@ -5058,7 +8385,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     for (int i = 0; i < job->count; ++i) {
         job->pts[i] = events[(size_t)i].pts;
         job->phase[i] = events[(size_t)i].phase;
-        job->targetHost[i] = frozenDeadline > 0 && i == 0 ? frozenDeadline : [self targetHostForPTS:job->pts[i]];
+        job->pairClock[i] = pairClock[i];
+        job->targetHost[i] = frozenDeadline > 0 && i == 0 ? frozenDeadline : (pairAffine ? pairClock[i].selectedTargetHost : [self targetHostForPTS:job->pts[i]]);
+        if (_measurementTrace) [self airMeasurementTarget:job->pts[i] target:job->targetHost[i] frame:0
+            job:job->diagnosticID phase:i synthetic:YES computed:!(frozenDeadline > 0 && i == 0) && !pairAffine];
     }
     job->frameA = events.front().frameA;
     job->frameB = events.front().frameB;
@@ -5098,6 +8428,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         if (heldA != _held.end() && heldB != _held.end()) {
             const auto pa = heldA->second.pts, pb = heldB->second.pts;
             if (pa.den > 0 && pa.den <= INT32_MAX && pb.den > 0 && pb.den <= INT32_MAX) {
+#if ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC
+                if (_rife.serviceTraceEnabled) [_rife setServiceTraceToken:job->diagnosticID configVersion:job->configVersion
+                    measurementEpoch:job->measurementEpoch probe:NO probeIndex:-1 probeRound:0];
+#endif
                 submitted = [_rife submitLivePrevious:a current:b previousID:job->frameA currentID:job->frameB
                     previousPTS:CMTimeMake(pa.num, (int32_t)pa.den) currentPTS:CMTimeMake(pb.num, (int32_t)pb.den)
                     generation:generation clockEpoch:_clockEpoch timesteps:phases token:token completion:finish];
@@ -5144,6 +8478,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     } else {
         _submitted += 1;
         int64_t submittedHost = SPHostNow();
+        if (wantRife && [self usesFixedSourceReuse])
+            _fixedRateBudget.submitted(token, job->count, SPHostToNs(submittedHost) / 1e6);
         if (_r7JobHosts.size() < 32) _r7JobHosts[token] = {submittedHost, _configVersion};
         else _r7JobUntracked++;
         _r7LastJobSubmitted = @{ @"id": @(token), @"host": @(submittedHost),
@@ -5151,6 +8487,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             @"captureHost": @(job->captureHost), @"generation": @(generation), @"config": @(_configVersion),
             @"clockEpoch": @(job->clockEpoch), @"measurementEpoch": @(job->measurementEpoch), @"deadlineHost": @(job->targetHost[0]),
             @"deadlineSlackMs": @(job->targetHost[0] ? (double)SPHostToNs(job->targetHost[0] - submittedHost) / 1e6 : 0) };
+        if(job->pairClock[0].recorded) {
+            NSMutableDictionary *detail=[_r7LastJobSubmitted mutableCopy];
+            detail[@"pairAffineTargets"]=SPRifeJobPairClockValues(job); _r7LastJobSubmitted=detail;
+        }
         [self recordR7JobEvent:@"submitted" detail:_r7LastJobSubmitted];
         for (int phaseIndex = 0; phaseIndex < job->count; ++phaseIndex) {
             const auto &event = events[(size_t)phaseIndex];
@@ -5202,12 +8542,21 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"callbackHost": @(job->callbackHost),
         @"callbackDeliveryMs": @(job->callbackHost ? (double)SPHostToNs(completedHost - job->callbackHost) / 1e6 : -1),
         @"captureToReadyMs": @(job->captureHost ? (double)SPHostToNs(completedHost - job->captureHost) / 1e6 : -1) };
+    if(job->pairClock[0].recorded) {
+        NSMutableDictionary *detail=[_r7LastJobCompleted mutableCopy];
+        detail[@"pairAffineTargets"]=SPRifeJobPairClockValues(job); _r7LastJobCompleted=detail;
+    }
     [self recordR7JobEvent:@"completed" detail:_r7LastJobCompleted];
     (void)token;
     BOOL releasedCapacity = job->inflightEpoch == _inflightEpoch && _inflight > 0;
     if (releasedCapacity) {
         _inflight -= 1;
         if (_rife) _rifeBusySinceHost = _inflight > 0 ? completedHost : 0;
+    }
+    if ([self usesFixedSourceReuse]) {
+        const bool usable = job->configVersion == _configVersion && job->generation == _sourceGeneration &&
+            job->clockEpoch == _clockEpoch && !error && outputs.count > 0;
+        _fixedRateBudget.completed(job->diagnosticID, SPHostToNs(completedHost) / 1e6, usable ? latency * 1000 : 0);
     }
     [self unpinJob:job];
     if (job->configVersion != _configVersion || job->generation != _sourceGeneration || _stopped) {
@@ -5220,6 +8569,18 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         if (releasedCapacity) [self resumeDeferredRife];
         [self trimHeld]; delete job;
         return;
+    }
+#if ODF_AIR_BETA_DIAGNOSTIC
+    if (SPAirBetaEnabled() && error && _rife &&
+        !([error.domain isEqual:@"app.openduckframe.rife"] && error.code == SPRifeBridgeErrorOutputPoolExhausted)) {
+        [self airBetaUsePassthrough:[NSString stringWithFormat:@"Air融合处理失败，现以原帧播放：%@", error.localizedDescription]];
+        [self trimHeld]; delete job; return;
+    }
+#endif
+    if (_airPerformanceEnabled && error && _rife &&
+        !([error.domain isEqual:@"app.openduckframe.rife"] && error.code == SPRifeBridgeErrorOutputPoolExhausted)) {
+        [self airPerformanceUsePassthrough:[NSString stringWithFormat:@"窗口优化处理失败，现以原帧播放：%@", error.localizedDescription]];
+        [self trimHeld]; delete job; return;
     }
     // FRC/RIFE failures can finish before inference (for example pool pressure).
     // They are not samples of the cost of producing a usable output.
@@ -5235,6 +8596,14 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     if (job->clockEpoch != _clockEpoch) {
         _clockRetiredJobs += 1; _clockRetiredModelOutputs += outputs.count;
         if (releasedCapacity) [self resumeDeferredRife];
+        [self trimHeld]; delete job; return;
+    }
+    if(job->pairClock[0].recorded && !sp::sameRifePairClockContext(job->pairClock[0].context,[self rifePairClockContext])) {
+        [self recordR7JobEvent:@"pairAffineContextRetired" detail:@{ @"id":@(job->diagnosticID), @"targets":SPRifeJobPairClockValues(job) }];
+        _pending.erase(std::remove_if(_pending.begin(),_pending.end(),[&](const SPPendingPhase &phase) {
+            return phase.jobID==job->diagnosticID && phase.clockEpoch==job->clockEpoch && phase.measurementEpoch==job->measurementEpoch;
+        }),_pending.end());
+        if(releasedCapacity) [self resumeDeferredRife];
         [self trimHeld]; delete job; return;
     }
     if (_probeWindowOpen && job->count > 0) {
@@ -5257,7 +8626,8 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             sp::SPScheduleOutput event; event.action=sp::SPScheduleAction::Interpolate;
             event.frameA=job->frameA; event.frameB=job->frameB; event.pts=job->pts[0]; event.phase=job->phase[0];
             BOOL deferred=job->count==1 && retry<job->targetHost[0] &&
-                [self deferRifeEvent:event generation:job->generation deadline:job->targetHost[0] retryHost:retry];
+                [self deferRifeEvent:event generation:job->generation deadline:job->targetHost[0] retryHost:retry
+                    frozenPairClock:job->pairClock[0].recorded ? &job->pairClock[0] : nullptr];
             if (deferred) {
                 _rifePoolRetryAdmissions++;
                 int64_t next=_slots.empty()?retry:MIN(retry,_slots.front().targetHost);
@@ -5377,6 +8747,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 // ordered operation. Shared with the deterministic production-path contract.
 - (void)handleAcceptedInput:(uint64_t)identity events:(const std::vector<sp::SPScheduleOutput> &)events generation:(uint64_t)generation {
     [self observeSourceIdentity:identity];
+    if([self usesRifePairAffineClock]) [self freezeRifeSourceClockIdentity:identity generation:generation];
     [self handleEvents:events generation:generation];
 }
 
@@ -5398,8 +8769,10 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         if (event.action != sp::SPScheduleAction::Interpolate) {
             auto found = _held.find(event.sourceIdentity);
             int64_t host = found == _held.end() ? 0 : found->second.host;
+            const BOOL retimed = [self usesFixedSourceReuse] && event.action == sp::SPScheduleAction::PresentSource;
+            if (retimed && found != _held.end() && sp::spCmp(event.pts, found->second.pts) != 0) _fixedSourceReused++;
             [self enqueueSourceIdentity:event.sourceIdentity pts:event.pts host:host generation:generation
-                                   force:_nativeBudgetActive || _rateBudgetPassthrough || event.skipReason != sp::SPScheduleSkipReason::None];
+                                   force:_nativeBudgetActive || _rateBudgetPassthrough || event.skipReason != sp::SPScheduleSkipReason::None retimed:retimed];
             index += 1;
             continue;
         }
@@ -5429,6 +8802,14 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             continue;
         }
         [self noteRateBudgetPlanned:group.size()];
+        if ([self usesFixedSourceReuse]) {
+            const int batchCount = (int)MIN((size_t)3, group.size());
+            if (batchCount > _fixedMaxBatchCount) {
+                _fixedMaxBatchCount = batchCount;
+                [self recomputeInteractiveDelay];
+            }
+            [self enqueueFixedFallbacks:group generation:generation];
+        }
         if (group.size() > 3) _phaseBatchSplits += 1;
         for (size_t batch = 0; batch < group.size(); batch += 3) {
             size_t count = MIN((size_t)3, group.size() - batch);
@@ -5618,7 +8999,38 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
                 _pumpedCaptureMeter.input((int64_t)inputPTS, SPHostToNs(item.host));
             }
         }
-        if (SPBufferIsHDR(item.buffer)) {
+        const SPLiveCaptureSourceKind previousActualKind = _airActualSourceKind;
+        CFTypeRef sourceKind = CVBufferGetAttachment(item.buffer, CFSTR("app.openduckframe.capture.sourceKind"), nullptr);
+        _airActualSourceKind = SPLiveCaptureSourceKindUnknown;
+        if (sourceKind && CFGetTypeID(sourceKind) == CFNumberGetTypeID()) {
+            const NSInteger kind = [(__bridge NSNumber *)sourceKind integerValue];
+            if (kind >= SPLiveCaptureSourceKindWindow && kind <= SPLiveCaptureSourceKindFile)
+                _airActualSourceKind = (SPLiveCaptureSourceKind)kind;
+        }
+        _airPerformanceFormatKnown = YES;
+        _airPerformanceRequested = _airPerformanceCandidate && _airActualSourceKind == SPLiveCaptureSourceKindWindow;
+#if ODF_AIR_BETA_DIAGNOSTIC || ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
+        _airPerformanceFormatReason = _airPerformanceRequested ? SPAirBetaFormatReason(item.buffer) : nil;
+#endif
+        if (_airPerformanceCandidate && previousActualKind != _airActualSourceKind) {
+            ++_prepareToken; _preparing = NO; _asyncPrepareFailed = NO;
+            [self retireEngines]; [self airSetPerformanceMode:NO];
+            _sessionReady = NO; _resolved.interpolationActive = NO;
+            _request = [_airPerformanceRecipe copy];
+            [self clearPendingRife]; [self clearPlaySlots];
+            [self.outputPreview invalidateSharedGeometry];
+            ++_configVersion; _inflightEpoch = _configVersion; _inflight = 0;
+            _airPerformanceEligibilityKnown = NO;
+            [self beginMeasurementEpoch];
+        }
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if (SPAirBetaEnabled()) {
+            _airBetaFormatKnown = YES;
+            _airBetaFormatReason = SPAirBetaFormatReason(item.buffer);
+            _airBetaFormatDescription = _airBetaFormatReason ? SPAirBetaFourCC(CVPixelBufferGetPixelFormatType(item.buffer)) : @"420v · BT.709 · SDR";
+        }
+#endif
+        if (SPBufferIsHDR(item.buffer) && !SPAirBetaEnabled() && !_airPerformanceRequested) {
             CVPixelBufferRelease(item.buffer);
             _resolved.interpolationActive = NO;
             _resolved.scaleActive = NO;
@@ -5632,6 +9044,12 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         int previousSourceWidth = _sourceWidth, previousSourceHeight = _sourceHeight;
         _sourceWidth = (int)CVPixelBufferGetWidth(item.buffer);
         _sourceHeight = (int)CVPixelBufferGetHeight(item.buffer);
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if (SPAirBetaEnabled() || _airPerformanceRequested) {
+            [self.outputPreview setAirBetaCaptureWidth:_sourceWidth height:_sourceHeight];
+            [self.preview setAirBetaCaptureWidth:_sourceWidth height:_sourceHeight];
+        }
+#endif
         if (_request.requiredSourceWidth > 0 && _request.requiredSourceHeight > 0) {
             if (_request.requiredSourceAfterHost && item.host <= (int64_t)_request.requiredSourceAfterHost) {
                 CVPixelBufferRelease(item.buffer); continue;
@@ -5706,6 +9124,9 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             _engine = nil;
             [_lowLatency invalidate];
             _lowLatency = nil;
+#if ODF_AIR_BETA_DIAGNOSTIC
+            if (SPAirBetaEnabled() || _airPerformanceEnabled) [self airRetireResidentKeeperForBridge:_rife reason:@"capture-size-changed"];
+#endif
             [_rife invalidate];
             _rife = nil;
             [_distil invalidate];
@@ -5733,6 +9154,25 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
             _haveAnchor = NO;
             [self resetSchedulerOnQueue];
             [self beginMeasurementEpoch];
+        }
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if (SPAirBetaEnabled() && _airBetaRecipe) {
+            NSString *eligibility = [self airBetaEnvironmentReason];
+            BOOL changedEligibility = !_airBetaEligibilityKnown || !(_airBetaEligibilityReason == eligibility || [_airBetaEligibilityReason isEqual:eligibility]);
+            if (changedEligibility || rawSizeChanged || !hadRawSize) {
+                _airBetaEligibilityKnown = YES; _airBetaEligibilityReason = [eligibility copy];
+                [self startAsyncEngine:_airBetaRecipe];
+            }
+        }
+#endif
+        if (_airPerformanceRecipe) {
+            NSString *eligibility = [self airPerformanceEnvironmentReason];
+            BOOL changedEligibility = !_airPerformanceEligibilityKnown ||
+                !(_airPerformanceEligibilityReason == eligibility || [_airPerformanceEligibilityReason isEqual:eligibility]);
+            if (changedEligibility || rawSizeChanged || !hadRawSize) {
+                _airPerformanceEligibilityKnown = YES; _airPerformanceEligibilityReason = [eligibility copy];
+                [self startAsyncEngine:_airPerformanceRecipe];
+            }
         }
         uint8_t luma[64];
         SPSampleLuma(item.buffer, luma, 64);
@@ -6356,6 +9796,57 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 
 // Deterministic clock inputs, real scheduler and production event handlers;
 // no model is submitted here. The existing output-repair smoke remains real.
++ (NSDictionary<NSString *, id> *)runFixedRateContract {
+    SPLiveProcessor *p=[[SPLiveProcessor alloc] init];
+    CVPixelBufferRef buffer=SPCreateBuffer(32,32,kCVPixelFormatType_32BGRA);
+    __block BOOL originalClock=NO, originalCounted=NO, standby=NO, lateKeepsStandby=NO,
+        replaces=NO, overloadFallback=NO, lateCannotReturn=NO, sourceContinues=NO;
+    if (buffer) dispatch_sync(p->_q, ^{
+        p->_request.interpolationEnabled=YES;p->_request.engineID=@"rife.metal";
+        p->_request.rateKind=SPLiveRateFixedFPS;p->_request.fpsNumerator=60;p->_request.fpsDenominator=1;
+        p->_testCapturePlayout=YES;
+        const int64_t base=SPHostNow()+SPRationalToHost(sp::spMake(2,1));
+        p->_held[11].source=CVPixelBufferRetain(buffer);p->_held[11].pts=sp::spMake(0,1);p->_held[11].host=base;
+        p->_held[12].source=CVPixelBufferRetain(buffer);p->_held[12].pts=sp::spMake(103,3000);
+        p->_held[12].host=base+SPRationalToHost(p->_held[12].pts);
+        [p observeSourceIdentity:11];[p observeSourceIdentity:12];
+        [p enqueueSourceIdentity:12 pts:sp::spMake(1,30) host:p->_held[12].host generation:p->_sourceGeneration force:NO retimed:YES];
+        originalClock=sp::spCmp(p->_previousSourcePts,p->_held[12].pts)==0;
+        originalCounted=p->_slots.size()==1 && !p->_marks[p->_slots[0].frameID].held;
+        [p clearPlaySlots];p->_marks.clear();
+        sp::SPScheduleOutput event;event.action=sp::SPScheduleAction::Interpolate;
+        event.frameA=11;event.frameB=12;event.pts=sp::spMake(1,60);event.phase=sp::spMake(50,103);
+        [p enqueueFixedFallbacks:{event} generation:p->_sourceGeneration];
+        standby=p->_slots.size()==1 && p->_slots[0].fixedFallback && p->_marks[p->_slots[0].frameID].held;
+        [p enqueueReadyEnhanced:CVPixelBufferRetain(buffer) original:nil pts:event.pts synthetic:YES held:NO captureHost:base
+                    generation:p->_sourceGeneration deadlineHost:SPHostNow()-SPRationalToHost(sp::spMake(1,100))];
+        lateKeepsStandby=p->_lateReadyDrops==1 && p->_slots.size()==1 && p->_slots[0].fixedFallback;
+        [p enqueueReadyEnhanced:CVPixelBufferRetain(buffer) original:nil pts:event.pts synthetic:YES held:NO captureHost:base
+                    generation:p->_sourceGeneration deadlineHost:base+SPRationalToHost(sp::spMake(1,10))];
+        replaces=p->_slots.size()==1 && p->_slots[0].synthetic && !p->_slots[0].fixedFallback && p->_fixedFallbackReplaced==1 && p->_marks.size()==1;
+        [p clearPlaySlots];p->_marks.clear();p->_claimedDrops.clear();
+        [p enqueueFixedFallbacks:{event} generation:p->_sourceGeneration];
+        SPPendingPhase pending;pending.pts=event.pts;pending.generation=p->_sourceGeneration;
+        pending.targetHost=SPHostNow()-SPRationalToHost(sp::spMake(1,1000));p->_pending.push_back(pending);
+        p->_slots[0].targetHost=pending.targetHost;
+        [p drainDue];
+        overloadFallback=p->_testPlayout.size()==1 && !p->_testPlayout[0].second &&
+            p->_fixedFallbackPresented==1 && p->_pending.empty() && p->_pendingExpiredDrops==1;
+        [p enqueueReadyEnhanced:CVPixelBufferRetain(buffer) original:nil pts:event.pts synthetic:YES held:NO captureHost:base
+                    generation:p->_sourceGeneration deadlineHost:base];
+        lateCannotReturn=p->_slots.empty() && p->_testPlayout.size()==1;
+        [p enqueueSourceIdentity:12 pts:sp::spMake(1,30) host:p->_held[12].host generation:p->_sourceGeneration force:NO retimed:YES];
+        if (!p->_slots.empty()) { p->_slots[0].targetHost=SPHostNow();[p drainDue]; }
+        sourceContinues=p->_testPlayout.size()==2 && !p->_testPlayout.back().second &&
+            sp::spCmp(p->_testPlayout.back().first,sp::spMake(1,30))==0;
+    });
+    [p stop];if(buffer)CVPixelBufferRelease(buffer);
+    const BOOL ok=originalClock&&originalCounted&&standby&&lateKeepsStandby&&replaces&&overloadFallback&&lateCannotReturn&&sourceContinues;
+    return @{ @"ok":@(ok), @"retimedSourceKeepsCaptureClock":@(originalClock), @"retimedOriginalCountsAsSource":@(originalCounted),
+        @"standbyCountsAsHold":@(standby), @"lateModelKeepsStandby":@(lateKeepsStandby), @"onTimeModelReplacesStandby":@(replaces),
+        @"overloadShowsOriginal":@(overloadFallback), @"lateModelCannotResurrect":@(lateCannotReturn), @"nextSourceContinues":@(sourceContinues) };
+}
+
 + (NSDictionary<NSString *, id> *)runSourceClockSchedulingContract {
     NSMutableArray *rates=[NSMutableArray array]; BOOL allRates=YES;
     for (int multiplier=2; multiplier<=4; ++multiplier) {
@@ -6442,10 +9933,88 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
     [stale adoptSourceGeneration:2];
     dispatch_sync(stale->_q, ^{ sourceReset=stale->_sourceGeneration==2 && !stale->_havePreviousSourcePts && !stale->_haveAnchor; });
     [stale stop]; if(buffer)CVPixelBufferRelease(buffer);
-    BOOL ok=allRates && holdOK && retired && lateRejected && fpsReset && sourceReset;
+    // This uses actual accepted-source/event handling and actual completion to
+    // enqueue. No RIFE object/model is created; inference outputs are simulated.
+    SPLiveProcessor *rifeClock=[[SPLiveProcessor alloc] init];
+    __block NSDictionary *rifeResult=nil; __block BOOL rifeOK=NO;
+    CVPixelBufferRef rifeBuffer=SPCreateBuffer(32,32,kCVPixelFormatType_32BGRA);
+    dispatch_sync(rifeClock->_q, ^{
+        auto p=rifeClock;
+        p->_request.interpolationEnabled=YES; p->_request.engineID=@"rife.metal";
+        p->_request.rateKind=SPLiveRateMultiplier; p->_request.multiplier=2;
+        p->_testCapturePlayout=YES; p->_width=32; p->_height=32; [p resetSchedulerOnQueue];
+        p->_delayHost=SPRationalToHost(sp::spMake(40,1000));
+        int64_t base=SPHostNow()+SPRationalToHost(sp::spMake(2,1));
+        for(uint64_t identity=41;identity<=43;++identity) {
+            p->_held[identity].pts=sp::spMake((int64_t)identity-41,60);
+            p->_held[identity].host=base+SPRationalToHost(p->_held[identity].pts);
+        }
+        if(rifeBuffer) p->_held[42].source=CVPixelBufferRetain(rifeBuffer);
+        auto accept=[&](uint64_t identity) {
+            sp::SPScheduleInput input; input.identity=identity; input.pts=p->_held[identity].pts; input.generation=p->_configVersion;
+            auto result=p->_scheduler.push(input);
+            if(result.reject==sp::SPScheduleReject::None) [p handleAcceptedInput:identity events:result.events generation:p->_sourceGeneration];
+            return result;
+        };
+        auto first=accept(41), second=accept(42);
+        BOOL enabled=[p usesRifePairAffineClock];
+        if(!enabled) {
+            rifeOK=!p->_held[41].pairClockSource.frozen && !p->_held[42].pairClockSource.frozen;
+            rifeResult=@{ @"ok":@(rifeOK),@"enabled":@NO,@"defaultPathLeavesEndpointsUnfrozen":@(rifeOK) }; return;
+        }
+        sp::SPScheduleOutput midpoint;
+        for(auto event:second.events) if(event.action==sp::SPScheduleAction::Interpolate) midpoint=event;
+        auto frozen=[p rifePairClockTargetForEvent:midpoint];
+        const auto b=p->_held[42].pairClockSource;
+        BOOL sourceBUsesCanonical=NO;
+        for(const auto &slot:p->_slots) if(!slot.synthetic && sp::spCmp(slot.pts,p->_held[42].pts)==0)
+            sourceBUsesCanonical=slot.targetHost==b.targetHost;
+        BOOL sourceOrder=first.reject==sp::SPScheduleReject::None && second.reject==sp::SPScheduleReject::None &&
+            p->_held[41].pairClockSource.frozen && b.frozen && frozen.binding==sp::RifePairClockBinding::bound;
+        BOOL frozenBeforePlan=NO; NSUInteger freezeIndex=NSNotFound,planIndex=NSNotFound;
+        for(NSUInteger i=0;i<p->_testTimingTrace.count;++i) {
+            NSDictionary *trace=p->_testTimingTrace[i];
+            if([trace[@"kind"] isEqual:@"pairAffineSourceFrozen"] && [trace[@"sourceIdentity"] unsignedLongLongValue]==42) freezeIndex=i;
+            if([trace[@"kind"] isEqual:@"phasePlan"]) planIndex=i;
+        }
+        frozenBeforePlan=freezeIndex!=NSNotFound && planIndex!=NSNotFound && freezeIndex<planIndex;
+        accept(43);
+        BOOL reusedA=p->_held[42].pairClockSource.targetHost==b.targetHost && p->_held[42].pairClockSource.delayHost==b.delayHost;
+        ++p->_measurementEpoch;
+        auto stale=[p rifePairClockTargetForEvent:midpoint];
+        BOOL staleFallback=stale.binding==sp::RifePairClockBinding::contextMismatch && stale.selectedTargetHost==stale.legacyTargetHost;
+        --p->_measurementEpoch;
+        BOOL deferred=[p deferRifeEvent:midpoint generation:p->_sourceGeneration deadline:frozen.selectedTargetHost
+            retryHost:SPHostNow()+SPRationalToHost(sp::spMake(5,1000)) frozenPairClock:&frozen];
+        p->_delayHost=SPRationalToHost(sp::spMake(84,1000));
+        const auto retry=p->_rifeDeferredPairClock;
+        [p clearDeferredRife];
+        [p submitEventGroup:{midpoint} generation:p->_sourceGeneration frozenDeadline:frozen.selectedTargetHost frozenPairClock:&retry];
+        NSDictionary *retried=[p->_r8OutputTimeline.lastObject[@"targets"] firstObject];
+        BOOL retryStable=deferred && [retried[@"selectedTargetHost"] longLongValue]==frozen.selectedTargetHost &&
+            [retried[@"legacyFrozenDelayHost"] longLongValue]==frozen.legacyDelayHost &&
+            [retried[@"legacyCandidateTargetHost"] longLongValue]==frozen.legacyTargetHost;
+        SPLiveJob *job=new SPLiveJob(); job->count=1; job->frameA=41; job->frameB=42;
+        job->generation=p->_sourceGeneration; job->configVersion=p->_configVersion;
+        job->clockEpoch=p->_clockEpoch; job->measurementEpoch=p->_measurementEpoch; job->inflightEpoch=p->_inflightEpoch;
+        job->pts[0]=midpoint.pts; job->phase[0]=midpoint.phase; job->targetHost[0]=frozen.selectedTargetHost; job->pairClock[0]=frozen;
+        SPOwnedPixelBuffer *box=rifeBuffer ? [[SPOwnedPixelBuffer alloc] initWithBufferNoCopy:CVPixelBufferRetain(rifeBuffer)] : nil;
+        [p finishJob:job token:0 outputs:box ? @[box] : @[] latency:0 error:nil];
+        BOOL completionFrozen=NO;
+        for(const auto &slot:p->_slots) if(slot.synthetic && sp::spCmp(slot.pts,midpoint.pts)==0)
+            completionFrozen=slot.targetHost==frozen.selectedTargetHost;
+        rifeOK=sourceOrder && frozenBeforePlan && sourceBUsesCanonical && reusedA && staleFallback && retryStable && completionFrozen;
+        rifeResult=@{ @"ok":@(rifeOK),@"enabled":@YES,@"acceptedSourcesFrozenBeforePhases":@(sourceOrder&&frozenBeforePlan),
+            @"previousBReusedAsA":@(reusedA),@"staleContextFallsBack":@(staleFallback),@"deferredWholeSnapshotReused":@(retryStable),
+            @"sourceBUsesSameCanonicalTarget":@(sourceBUsesCanonical),
+            @"completionPreservesSelectedTarget":@(completionFrozen),@"target":SPRifePairClockValue(frozen,41,42) };
+    });
+    [rifeClock stop]; if(rifeBuffer)CVPixelBufferRelease(rifeBuffer);
+    BOOL ok=allRates && holdOK && retired && lateRejected && fpsReset && sourceReset && rifeOK;
     return @{ @"ok":@(ok), @"multipliers":rates, @"fixedFPSHoldUsesRealSourceClock":@(holdOK),
         @"oldClockJobRetiredWithoutTouchingNewPending":@(retired), @"lateFrozenDeadlineRejected":@(lateRejected),
         @"recomputedDeadlineWouldBeFuture":@(recomputedWouldBeFuture), @"fpsWindowResetOnReanchor":@(fpsReset), @"sourceGenerationReset":@(sourceReset),
+        @"rifePairAffineClock":rifeResult ?: @{},
         @"scope":@"deterministic source clock and actual scheduler/event handler with simulated completion and synthetic buffer; no real inference, capture, window or physical FPS" };
 }
 
@@ -7359,6 +10928,201 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
         @"budgetClampSourceContinues":@(clampedSourceContinues), @"budgetClampDiagnostics":clampDiagnostics, @"staleGenerationJobRejected":@(staleJobRejected),
         @"frc60to120ProductionSmoke":@(frcSmoke), @"frcInputPacingValid":@(frcInputPacingValid), @"frcSourceOutputs":@(frcSources), @"frcSyntheticOutputs":@(frcSynthetic), @"frcMidpointsOn120Grid":@(frcMidpoints), @"frcDiagnostics":frcDiagnostics, @"frcError":frcError.localizedDescription ?: @"", @"activeTargetExcludesPendingAndCap":@(activeTarget),
         @"scope":@"offscreen GPU command, simulated warmup callback metadata, fast production queue and real slow RIFE/Lanczos scheduling; no window, drawable, physical presentation or GUI" };
+}
+
++ (NSDictionary<NSString *, id> *)runFixedRateModelProbeWithBundle:(NSBundle *)bundle {
+    NSDictionary<NSString *, NSString *> *environment=NSProcessInfo.processInfo.environment;
+    if ([environment[@"ODF_AIR_CADENCE_DIAGNOSTIC"] isEqualToString:@"1"]) {
+        auto option=[&](NSString *key, int fallback, int minimum, int maximum) {
+            NSString *text=environment[key]; long long value=0;
+            NSScanner *scanner=text ? [NSScanner scannerWithString:text] : nil;
+            if (!scanner || ![scanner scanLongLong:&value] || !scanner.isAtEnd) return fallback;
+            return (int)MAX((long long)minimum,MIN((long long)maximum,value));
+        };
+        const int width=option(@"ODF_AIR_CADENCE_WIDTH",2648,128,4096)&~1;
+        const int height=option(@"ODF_AIR_CADENCE_HEIGHT",1668,128,4096)&~1;
+        const int seconds=option(@"ODF_AIR_CADENCE_SECONDS",24,5,60);
+        const int warmup=MIN(seconds-1,option(@"ODF_AIR_CADENCE_WARMUP_SECONDS",3,1,5));
+        const int refresh=option(@"ODF_AIR_CADENCE_DISPLAY_HZ",60,30,240);
+        const int inputRate=30,count=inputRate*seconds;
+        NSString *scope=@"logical offscreen playout; no SCK, drawable, physical display, or quality acceptance";
+        NSMutableArray<SPOwnedPixelBuffer *> *inputs=[NSMutableArray array];
+        const uint8_t levels[]={48,64,80,96,80,64};
+        for (int i=0;i<6;i++) {
+            CVPixelBufferRef frame=SPCreateBuffer(width,height,kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+            if (!frame) return @{ @"ok":@NO,@"executionOK":@NO,@"error":@"input allocation",@"scope":scope };
+            CVPixelBufferLockBaseAddress(frame,0);
+            for (size_t plane=0;plane<CVPixelBufferGetPlaneCount(frame);plane++)
+                memset(CVPixelBufferGetBaseAddressOfPlane(frame,plane),plane?128:levels[i],
+                    CVPixelBufferGetBytesPerRowOfPlane(frame,plane)*CVPixelBufferGetHeightOfPlane(frame,plane));
+            CVPixelBufferUnlockBaseAddress(frame,0);
+            [inputs addObject:[[SPOwnedPixelBuffer alloc] initWithBufferNoCopy:frame]];
+        }
+        SPRifeBridge *rife=[[SPRifeBridge alloc] initWithResourceBundle:bundle]; rife.liveStreamEnabled=YES;
+        NSError *error=nil;
+        if (![rife prepareModelID:@"rife-v4.25" quality:@"fast" width:width height:height error:&error])
+            return @{ @"ok":@NO,@"executionOK":@NO,@"error":error.localizedDescription?:@"RIFE setup",@"scope":scope };
+        NSDictionary *prepared=[rife streamDiagnostics];
+        NSString *experiment=prepared[@"experimentModel"];
+        if ((experiment && ![experiment isEqualToString:@"original"]) ||
+            [prepared[@"experimentIO"] boolValue] || [prepared[@"experimentReplaceMask"] boolValue]) {
+            [rife invalidate];
+            return @{ @"ok":@NO,@"executionOK":@NO,@"error":@"Use an original-model resource bundle without active experiment overrides; preferences were not changed.",
+                @"preparedStreamDiagnostics":prepared,@"scope":scope };
+        }
+        SPLiveProcessor *p=[[SPLiveProcessor alloc] init];
+        dispatch_sync(p->_q, ^{
+            p->_request.interpolationEnabled=YES; p->_request.engineID=@"rife.metal"; p->_request.modelID=@"rife-v4.25"; p->_request.qualityID=@"fast";
+            p->_request.quality=SPFRCQualityNormal; p->_request.scaleEnabled=NO;
+            p->_request.rifeStreamEnabled=YES; p->_request.rateKind=SPLiveRateMultiplier;
+            p->_request.multiplier=2; p->_request.captureCapFPS=0; p->_request.displayRefreshHz=refresh;
+            p->_width=width; p->_height=height; p->_resolved.outputWidth=width; p->_resolved.outputHeight=height;
+            p->_resolved.committed=YES; p->_resolved.interpolationActive=YES; p->_sessionReady=YES; p->_rife=rife; p->_testCapturePlayout=YES;
+            [p resetSchedulerOnQueue]; [p refreshResolvedOnQueue];
+        });
+        const int64_t start=SPHostNow(); int64_t first=0,last=0;
+        NSMutableArray<NSDictionary *> *timeline=[NSMutableArray array];
+        __block int64_t previousHost=start;
+        __block uint64_t previousSource=0,previousSynthetic=0,previousHolds=0,previousEpoch=0,previousConfig=0;
+        __block BOOL haveSnapshot=NO;
+        // These test vectors are lifetime logical counts, independent of the
+        // production measurement epochs. Production stats remain raw snapshots.
+        void (^sample)(NSString *)=^(NSString *kind) {
+            const int64_t host=SPHostNow();
+            uint64_t source=0,synthetic=0,holds=p->_testHoldPlayout.size();
+            for (const auto &entry:p->_testPlayout) { if (entry.second) synthetic++; else source++; }
+            const double elapsed=(double)SPHostToNs(host-start)/1e9;
+            const double previousElapsed=(double)SPHostToNs(previousHost-start)/1e9;
+            const double interval=(double)SPHostToNs(host-previousHost)/1e9;
+            const BOOL reset=source<previousSource || synthetic<previousSynthetic || holds<previousHolds || holds>source;
+            const BOOL valid=haveSnapshot && !reset && interval>0;
+            const uint64_t sourceDelta=reset?0:source-previousSource,syntheticDelta=reset?0:synthetic-previousSynthetic,holdDelta=reset?0:holds-previousHolds;
+            const BOOL validUnique=valid && sourceDelta>=holdDelta;
+            const BOOL completeSecond=[kind isEqualToString:@"second"] && interval>=0.9 && interval<=1.1;
+            NSDictionary *stats=[p currentStats];
+            [timeline addObject:@{ @"kind":kind,@"host":@(host),@"hostElapsedSeconds":@(elapsed),@"intervalStartSeconds":@(previousElapsed),@"intervalSeconds":@(interval),
+                @"completeHostSecond":@(completeSecond),@"measurementWindow":@(completeSecond && previousElapsed>=warmup && elapsed<=seconds),
+                @"logicalSourceSlotsTotal":@(source),@"logicalSyntheticTotal":@(synthetic),@"logicalHoldTotal":@(holds),@"logicalSlotTotal":@(source+synthetic),
+                @"logicalCounterReset":@(reset),@"sourceSlotDelta":valid?@(sourceDelta):(id)NSNull.null,
+                @"syntheticDelta":valid?@(syntheticDelta):(id)NSNull.null,@"holdDelta":valid?@(holdDelta):(id)NSNull.null,
+                @"logicalUniqueFPS":validUnique?@((sourceDelta-holdDelta+syntheticDelta)/interval):(id)NSNull.null,
+                @"logicalSlotFPS":valid?@((sourceDelta+syntheticDelta)/interval):(id)NSNull.null,
+                @"configVersion":@(p->_configVersion),@"measurementEpoch":@(p->_measurementEpoch),
+                @"epochChanged":@(haveSnapshot && previousEpoch!=p->_measurementEpoch),@"configChanged":@(haveSnapshot && previousConfig!=p->_configVersion),
+                @"stats":stats }];
+            previousHost=host; previousSource=source; previousSynthetic=synthetic; previousHolds=holds;
+            previousEpoch=p->_measurementEpoch; previousConfig=p->_configVersion; haveSnapshot=YES;
+        };
+        dispatch_sync(p->_q, ^{ sample(@"initial"); });
+        dispatch_source_t sampler=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,p->_q);
+        dispatch_source_set_timer(sampler,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC),NSEC_PER_SEC,NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(sampler, ^{ sample(@"second"); });
+        dispatch_resume(sampler);
+        for (int i=0;i<count;i++) {
+            const int64_t ptsNs=(int64_t)i*1000000000/inputRate+(i?llround(1800000*sin(i*1.731)):0);
+            SPProbeSpinUntilHost(start+SPRationalToHost(sp::spMake(ptsNs,1000000000)));
+            const int64_t host=SPHostNow(); if (!i) first=host; last=host;
+            [p pushPixelBuffer:inputs[i%6].buffer ptsNum:ptsNs ptsDen:1000000000 host:host generation:1];
+        }
+        SPProbeSpinUntilHost(start+SPRationalToHost(sp::spMake(seconds,1)));
+        dispatch_sync(p->_q, ^{ dispatch_source_cancel(sampler); sample(@"input-end"); });
+        __block BOOL drained=NO;
+        const int64_t drainDeadline=SPHostNow()+SPRationalToHost(sp::spMake(2,1));
+        do {
+            dispatch_sync(p->_q, ^{ drained=p->_inflight==0 && p->_rateBudgetProbeInFlightToken==0 && [p inboundCount]==0; });
+            if (!drained) usleep(10000);
+        } while (!drained && SPHostNow()<drainDeadline);
+        __block NSDictionary *result=nil;
+        dispatch_sync(p->_q, ^{
+            sample(@"final");
+            BOOL ordered=YES;
+            for (size_t i=1;i<p->_testPlayout.size();i++)
+                if (sp::spCmp(p->_testPlayout[i-1].first,p->_testPlayout[i].first)>=0) ordered=NO;
+            double inputFPS=(count-1)*1e9/(double)SPHostToNs(last-first);
+            BOOL executed=drained && ordered && inputFPS>inputRate-1 && inputFPS<inputRate+1 && p->_syntheticFail==0 && p->_testPlayout.size()>p->_testHoldPlayout.size();
+            NSUInteger observed=0,atLeast29=0,atLeast58=0; double measuredSeconds=0;
+            for (NSDictionary *row in timeline) if ([row[@"measurementWindow"] boolValue] && [row[@"logicalUniqueFPS"] isKindOfClass:NSNumber.class]) {
+                observed++; measuredSeconds+=[row[@"intervalSeconds"] doubleValue];
+                if ([row[@"logicalUniqueFPS"] doubleValue]>=29) atLeast29++;
+                if ([row[@"logicalUniqueFPS"] doubleValue]>=58) atLeast58++;
+            }
+            result=@{ @"ok":@(executed),@"executionOK":@(executed),@"scope":scope,
+                @"configuration":@{ @"inputSize":@[@(width),@(height)],@"inputRate":@(inputRate),@"displayRefreshHz":@(refresh),@"durationSeconds":@(seconds),@"warmupSeconds":@(warmup),@"requestedMultiplier":@2,
+                    @"model":@"rife-v4.25",@"quality":@"fast",@"inputFormat":@"NV12 video-range",@"inputContent":@"six immutable uniform luma levels with neutral chroma",@"timestampJitterMs":@1.8 },
+                @"inputFPS":@(inputFPS),@"inputFramesSubmitted":@(count),@"monotonicPTS":@(ordered),@"drained":@(drained),@"drainLimitSeconds":@2,
+                @"preparedStreamDiagnostics":prepared,@"timeline":[timeline copy],@"finalStats":[p currentStats],
+                @"logicalGoalObservations":@{ @"hostSecondWindows":@(observed),@"observedHostSeconds":@(measuredSeconds),@"nominalMeasurementSeconds":@(seconds-warmup),@"windowsAtLeast29":@(atLeast29),@"windowsAtLeast58":@(atLeast58),
+                    @"fractionAtLeast29":observed?@((double)atLeast29/observed):(id)NSNull.null,@"fractionAtLeast58":observed?@((double)atLeast58/observed):(id)NSNull.null },
+                @"resultNote":@"ok/executionOK describe execution only; logical goal observations exclude warmup and incomplete host windows and do not certify display FPS or user-visible quality. Raw production stats may reset at the recorded epoch/config changes; no deltas are inferred from those stats." };
+        });
+        [p stop];
+        return result;
+    }
+    const int requestedInput=[NSProcessInfo.processInfo.environment[@"ODF_FIXED_RATE_PROBE_INPUT_FPS"] intValue];
+    const int inputRate=requestedInput==28?28:30;
+    const int width=2560,height=1410,count=inputRate*5;
+    NSMutableArray<SPOwnedPixelBuffer *> *inputs=[NSMutableArray array];
+    const uint8_t levels[]={48,64,80,96,80,64};
+    for(int i=0;i<6;i++) {
+        CVPixelBufferRef frame=SPCreateBuffer(width,height,kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+        if(!frame)return @{ @"ok":@NO,@"error":@"input allocation" };
+        CVPixelBufferLockBaseAddress(frame,0);
+        for(size_t plane=0;plane<CVPixelBufferGetPlaneCount(frame);plane++)
+            memset(CVPixelBufferGetBaseAddressOfPlane(frame,plane),plane?128:levels[i],
+                CVPixelBufferGetBytesPerRowOfPlane(frame,plane)*CVPixelBufferGetHeightOfPlane(frame,plane));
+        CVPixelBufferUnlockBaseAddress(frame,0);
+        [inputs addObject:[[SPOwnedPixelBuffer alloc] initWithBufferNoCopy:frame]];
+    }
+    NSMutableArray *cases=[NSMutableArray array];__block BOOL allOK=YES;
+    for(int mode=0;mode<3;mode++) {
+        SPRifeBridge *rife=[[SPRifeBridge alloc] initWithResourceBundle:bundle];rife.liveStreamEnabled=YES;
+        NSError *error=nil;
+        if(![rife prepareModelID:@"rife-v4.25" quality:@"fast" width:width height:height error:&error])
+            return @{ @"ok":@NO,@"error":error.localizedDescription?:@"RIFE setup" };
+        SPLiveProcessor *p=[[SPLiveProcessor alloc] init];
+        dispatch_sync(p->_q, ^{
+            p->_request.interpolationEnabled=YES;p->_request.engineID=@"rife.metal";p->_request.modelID=@"rife-v4.25";p->_request.qualityID=@"fast";
+            p->_request.rifeStreamEnabled=YES;p->_request.rateKind=mode==0?SPLiveRateMultiplier:SPLiveRateFixedFPS;
+            p->_request.multiplier=2;p->_request.fpsNumerator=60;p->_request.fpsDenominator=1;p->_request.displayRefreshHz=120;
+            p->_testExactFixedSchedule=mode==1;
+            p->_width=width;p->_height=height;p->_resolved.outputWidth=width;p->_resolved.outputHeight=height;
+            p->_resolved.committed=YES;p->_resolved.interpolationActive=YES;p->_sessionReady=YES;p->_rife=rife;p->_testCapturePlayout=YES;
+            [p resetSchedulerOnQueue];
+        });
+        const int64_t start=SPHostNow();int64_t first=0,last=0;
+        for(int i=0;i<count;i++) {
+            // Identical jittered capture clock and immutable pixel sequence for all three modes.
+            const int64_t ptsNs=(int64_t)i*1000000000/inputRate+(i?llround(1800000*sin(i*1.731)):0);
+            SPProbeSpinUntilHost(start+SPRationalToHost(sp::spMake(ptsNs,1000000000)));
+            const int64_t host=SPHostNow();if(!i)first=host;last=host;
+            [p pushPixelBuffer:inputs[i%6].buffer ptsNum:ptsNs ptsDen:1000000000 host:host generation:1];
+        }
+        usleep(300000);
+        dispatch_sync(p->_q, ^{
+            int source=0,synthetic=0,holds=0;BOOL ordered=YES;
+            auto inWindow=[](sp::SPRational pts){ return sp::spCmp(pts,sp::spMake(1,1))>=0 && sp::spCmp(pts,sp::spMake(4,1))<0; };
+            for(size_t i=0;i<p->_testPlayout.size();i++) {
+                const auto &entry=p->_testPlayout[i];
+                if(i&&sp::spCmp(p->_testPlayout[i-1].first,entry.first)>=0)ordered=NO;
+                if(inWindow(entry.first)){if(entry.second)synthetic++;else source++;}
+            }
+            for(auto pts:p->_testHoldPlayout)if(inWindow(pts))holds++;
+            NSDictionary *stats=[p currentStats],*diag=[rife streamDiagnostics];
+            double inputFPS=(count-1)*1e9/(double)SPHostToNs(last-first);
+            BOOL ok=ordered&&inputFPS>inputRate-1&&inputFPS<inputRate+1&&p->_syntheticFail==0&&source+synthetic>holds;
+            allOK=allOK&&ok;
+            [cases addObject:@{ @"mode":mode==0?@"x2":(mode==1?@"strict-fixed60":@"reuse-fixed60"),@"ok":@(ok),
+                @"inputFPS":@(inputFPS),@"sampleSeconds":@3,@"sourceFrames":@(source-holds),@"syntheticFrames":@(synthetic),@"holdFrames":@(holds),
+                @"uniquePlayoutFPS":@((source-holds+synthetic)/3.0),@"slotPlayoutFPS":@((source+synthetic)/3.0),
+                @"monotonicPTS":@(ordered),@"modelFailures":@(p->_syntheticFail),@"queueDrops":@(p->_queueDrops),@"deadlineDrops":@(p->_deadlineDrops),
+                @"fixedFallbackPresented":@(p->_fixedFallbackPresented),@"fixedFallbackReplaced":@(p->_fixedFallbackReplaced),
+                @"frcP95ms":stats[@"frcP95ms"]?:@0,@"delayMs":stats[@"delayMs"]?:@0,
+                @"cacheHits":diag[@"hits"]?:@0,@"cacheMisses":diag[@"misses"]?:@0 }];
+        });
+        [p stop];
+    }
+    return @{ @"ok":@(allOK),@"cases":cases,@"model":@"rife-v4.25",@"quality":@"fast",@"inputSize":@[@(width),@(height)],
+        @"inputRate":@(inputRate),@"scope":@"real RIFE and production processor playout, identical paced immutable NV12 input with +/-1.8 ms timestamp jitter; 1s warmup, 3s measurement; no ScreenCaptureKit, drawable or physical display" };
 }
 
 + (NSDictionary<NSString *, id> *)runRifePacedWithBundle:(NSBundle *)bundle fullSize:(BOOL)fullSize {
@@ -8332,3 +12096,7 @@ static void SPReleaseSlot(SPPlaySlot &slot) {
 }
 
 @end
+
+#if ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC
+#include "SPAirCapacityExport.inc"
+#endif

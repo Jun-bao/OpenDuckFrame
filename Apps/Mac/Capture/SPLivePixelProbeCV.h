@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import <CoreVideo/CoreVideo.h>
 #import <mach/mach_time.h>
 #include <cmath>
@@ -25,6 +26,50 @@ static NSDictionary *SPPixelFingerprintBuffer(CVPixelBufferRef buffer) {
     size_t height = bgra ? CVPixelBufferGetHeight(buffer) : (yuv ? CVPixelBufferGetHeightOfPlane(buffer, 0) : 0);
     NSMutableDictionary *result = [@{ @"pixelFormat": @(format), @"width": @(width), @"height": @(height),
         @"sampledHost": @(started), @"method": bgra ? @"grid-BGR" : (yuv ? @"grid-Y" : @"unsupported") } mutableCopy];
+    // Read only the supplied buffer's attachments; never infer a color space.
+    NSMutableDictionary *color = [@{ @"primaries": NSNull.null, @"transfer": NSNull.null, @"matrix": NSNull.null,
+        @"cgColorSpaceName": NSNull.null, @"iccProfile": NSNull.null } mutableCopy];
+    NSMutableArray *missing = [NSMutableArray array], *invalidTypes = [NSMutableArray array];
+    CFStringRef colorKeys[] = { kCVImageBufferColorPrimariesKey, kCVImageBufferTransferFunctionKey, kCVImageBufferYCbCrMatrixKey };
+    NSArray<NSString *> *colorFields = @[ @"primaries", @"transfer", @"matrix" ];
+    for (NSUInteger i = 0; i < colorFields.count; ++i) {
+        CFTypeRef value = CVBufferCopyAttachment(buffer, colorKeys[i], NULL);
+        if (!value) [missing addObject:colorFields[i]];
+        else {
+            if (CFGetTypeID(value) == CFStringGetTypeID()) color[colorFields[i]] = (__bridge NSString *)value;
+            else [invalidTypes addObject:colorFields[i]];
+            CFRelease(value);
+        }
+    }
+    CFTypeRef space = CVBufferCopyAttachment(buffer, kCVImageBufferCGColorSpaceKey, NULL);
+    color[@"cgColorSpaceAttachmentPresent"] = @(space != NULL);
+    if (!space) [missing addObject:@"cgColorSpaceName"];
+    else {
+        if (CFGetTypeID(space) == CGColorSpaceGetTypeID()) {
+            CFStringRef name = CGColorSpaceCopyName((CGColorSpaceRef)space);
+            if (name) { color[@"cgColorSpaceName"] = (__bridge NSString *)name; CFRelease(name); }
+            else [missing addObject:@"cgColorSpaceName"];
+        } else [invalidTypes addObject:@"cgColorSpaceName"];
+        CFRelease(space);
+    }
+    CFTypeRef profile = CVBufferCopyAttachment(buffer, kCVImageBufferICCProfileKey, NULL);
+    if (!profile) [missing addObject:@"iccProfile"];
+    else {
+        if (CFGetTypeID(profile) == CFDataGetTypeID()) {
+            CFDataRef data = (CFDataRef)profile;
+            CFIndex length = CFDataGetLength(data);
+            const UInt8 *bytes = CFDataGetBytePtr(data);
+            uint64_t hash = 14695981039346656037ull;
+            // Full ICC bytes, using the existing non-cryptographic FNV-1a scheme.
+            for (CFIndex i = 0; i < length; ++i) { hash ^= bytes[i]; hash *= 1099511628211ull; }
+            color[@"iccProfile"] = @{ @"byteLength": @(length), @"hashMethod": @"fnv1a64",
+                @"hash": [NSString stringWithFormat:@"%016llx", (unsigned long long)hash] };
+        } else [invalidTypes addObject:@"iccProfile"];
+        CFRelease(profile);
+    }
+    color[@"missing"] = missing;
+    if (invalidTypes.count) color[@"invalidTypes"] = invalidTypes;
+    result[@"colorAttachments"] = color;
     if (!bgra && !yuv) {
         result[@"status"] = @"unsupported_pixel_format";
         result[@"costMs"] = @(SPPixelProbeCostMs(started));

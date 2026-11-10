@@ -1,9 +1,7 @@
 name: OpenDuckFrame
 packages:
   RifeMetal:
-    url: https://github.com/cinemore/rife-metal.git
-    # Tag v0.1.8 is commit 06c9fc236c47a51ed08bf534854d4c67ae3eeefc.
-    exactVersion: 0.1.8
+    path: ../../ThirdParty/rife-metal/runtime
 include:
   - path: project.sparkle.yml
     enable: ${ODF_ENABLE_SPARKLE}
@@ -32,8 +30,8 @@ settings:
     SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SP_ENHANCE"
     MACOSX_DEPLOYMENT_TARGET: "14.0"
     ARCHS: arm64
-    MARKETING_VERSION: "0.2.2"
-    CURRENT_PROJECT_VERSION: "8"
+    MARKETING_VERSION: "0.3.1"
+    CURRENT_PROJECT_VERSION: "25"
     ODF_BUNDLE_ID: app.openduckframe.OpenDuckFrame
     ODF_DISPLAY_NAME: OpenDuckFrame
     ODF_CANDIDATE_LABEL: "r6"
@@ -166,6 +164,25 @@ targets:
         embed: true
         codeSign: true
         link: false
+      - sdk: AVFoundation.framework
+    postBuildScripts:
+      - name: Compile Air Resident Library
+        script: |
+          set -euo pipefail
+          AIR="${DERIVED_FILE_DIR}/AirResident.air"
+          OUT="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/gap-fill.metallib"
+          HASH="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/gap-fill.sha256"
+          mkdir -p "$(dirname "${OUT}")"
+          xcrun -sdk macosx metal -c -target "air64-apple-macos${MACOSX_DEPLOYMENT_TARGET}" \
+            "${ODF_REPO_ROOT}/Experiments/AirSustainedCost/native/GapFill.metal" -o "${AIR}"
+          xcrun -sdk macosx metallib "${AIR}" -o "${OUT}"
+          /usr/bin/shasum -a 256 < "${OUT}" | /usr/bin/awk '{print $1}' > "${HASH}"
+        inputFiles:
+          - $(ODF_REPO_ROOT)/Experiments/AirSustainedCost/native/GapFill.metal
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/gap-fill.metallib
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/gap-fill.sha256
+        basedOnDependencyAnalysis: true
     info:
       path: Info.plist
       properties:
@@ -339,6 +356,8 @@ targets:
         PRODUCT_NAME: OpenDuckFrame
         EXECUTABLE_NAME: OpenDuckFrame
         PRODUCT_MODULE_NAME: OpenDuckFrame
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC=1 ODF_AIR_SERVICE_TRACE=1 ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC=1 ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC=1 ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC=1 ODF_AIR_BETA_DIAGNOSTIC=1"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) ODF_AIR_SERVICE_TRACE ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC ODF_AIR_BETA_DIAGNOSTIC"
         COMBINE_HIDPI_IMAGES: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
@@ -366,6 +385,8 @@ targets:
       - path: ../../Modules/MediaCore/Shaders/Video.metal
       - path: ../../ThirdParty/Licenses
         type: folder
+        buildPhase: resources
+      - path: ../../ThirdParty/rife-metal/runtime/source-origin.json
         buildPhase: resources
     preBuildScripts:
       - name: Generate Shader Header

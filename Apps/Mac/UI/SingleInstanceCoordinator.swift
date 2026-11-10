@@ -28,6 +28,7 @@ import Darwin
               let actual = app.executableURL?.resolvingSymlinksInPath().standardizedFileURL,
               declared == actual else { return false }
         if let process = processInfo(app.processIdentifier), process.uid != getuid() { return false }
+        guard SingleInstancePolicy.namespace(bundle: bundle) == SingleInstancePolicy.namespace(bundle: .main) else { return false }
         // NSWorkspace lists applications in the current login session. When
         // sandbox restrictions hide process credentials, retain that boundary.
         return true
@@ -62,7 +63,9 @@ import Darwin
 
     private static func enforceWithLock(_ app: NSApplication, arguments: [String]) {
         let ownPID = ProcessInfo.processInfo.processIdentifier
-        let path = "/private/tmp/odf-chuanflow-\(getuid()).lock"
+        let namespace = SingleInstancePolicy.namespace(bundle: .main)
+        let suffix = namespace.isEmpty ? "" : "-\(namespace)"
+        let path = "/private/tmp/odf-chuanflow-\(getuid())\(suffix).lock"
         guard let lock = SingleInstanceLock(path: path) else {
             fputs("Single-instance guard: could not securely open the product lock.\n", stderr)
             exit(74)

@@ -378,9 +378,35 @@ static void display_preserves_compute_policy() {
            std::string(sp::rateBudgetLimitName(sp::RateBudgetLimit::Display)) == "display" &&
            std::string(sp::rateBudgetLimitName(sp::RateBudgetLimit::Compute)) == "compute", "limit names must match the log contract");
 }
+static void fixed_deadlines() {
+    sp::FixedRateBudget budget;
+    expect(!budget.admit(1,100,99),"fixed expired work must never run, even when idle");
+    expect(budget.admit(1,100,135),"fixed warmup one phase");
+    budget.submitted(1,1,100);
+    expect(!budget.admit(2,105,150),"fixed queued two-phase work would miss its deadline");
+    expect(budget.admit(1,105,160),"fixed queue may accept a feasible second job");
+    budget.submitted(2,1,105);
+    expect(!budget.admit(1,110,300),"fixed model queue stays bounded");
+    budget.completed(1,128,28);
+    expect(!budget.admit(2,130,195),"fixed admission includes the newly active batch");
+    budget.completed(2,156,28);
+    expect(std::abs(budget.taskMs(1)-28)<0.001 && std::abs(budget.taskMs(2)-56)<0.001,"fixed cost bootstraps by phase count");
+    budget.submitted(3,2,160);budget.completed(3,205,45);
+    expect(std::abs(budget.taskMs(2)-45)<0.001 && std::abs(budget.taskMs(1)-28)<0.001,"fixed batch sizes learn separate service costs");
+    budget.submitted(4,1,210);budget.completed(4,211,0);
+    expect(std::abs(budget.taskMs(1)-28)<0.001,"failed early jobs are not fast model samples");
+    budget.reset();budget.completed(3,300,500);
+    expect(budget.admit(1,300,335),"retired callbacks cannot poison a new source budget");
+    budget.submitted(5,1,300);budget.completed(5,400,100);
+    expect(!budget.admit(1,401,440),"fresh expensive samples prevent impossible batches");
+    expect(budget.admit(1,2401,2440),"idle fixed-rate budget retries after temporary overload");
+    budget.submitted(6,1,2401);budget.completed(6,2429,28);
+    expect(std::abs(budget.taskMs(1)-28)<0.001,"recovery replaces stale cold-start costs");
+}
+
 int main(int argc, char **argv) {
     const std::vector<std::pair<std::string, std::function<void()>>> cases = {
-        {"24x3", x3_at_24}, {"60x2", x2_at_60}, {"30x2", x2_at_30},
+        {"24x3", x3_at_24}, {"60x2", x2_at_60}, {"30x2", x2_at_30}, {"fixed_deadlines",fixed_deadlines},
         {"single_spike", single_spike}, {"only_drops", only_drops},
         {"over_budget_without_drops", over_budget_without_drops},
         {"content_60_24", content_60_24}, {"failed_upgrade_cooldown", failed_upgrade_cooldown},
