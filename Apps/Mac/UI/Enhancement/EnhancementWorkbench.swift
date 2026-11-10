@@ -604,6 +604,7 @@ enum LiveEngineSelection {
         profile.interpolationEngineID = "rife.metal"
         profile.modelID = "rife-v4.25"
         profile.interpolationQuality = validQuality(profile.interpolationQuality)
+        profile.rifeStreamEnabled = true
     }
 }
 
@@ -711,7 +712,7 @@ enum EnhancementProfileStore {
 
     static func decode(_ data: Data, fallbackName: String) -> EnhancementProfile? {
         guard var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-        if object["rifeStreamEnabled"] == nil { object["rifeStreamEnabled"] = false }
+        object["rifeStreamEnabled"] = true
         if object["srInputPreset"] == nil { object["srInputPreset"] = 0 }
         if object["sourceWindowPreset"] == nil { object["sourceWindowPreset"] = 0 }
         if object["captureLimit"] == nil { object["captureLimit"] = "auto" }
@@ -1115,7 +1116,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let sourceLabel = NSTextField(labelWithString: "")
     private let fileLimitLabel = NSTextField(wrappingLabelWithString: "")
     private let interpolationSwitch = NSSwitch()
-    private let rifeStreamCheck = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     private let scaleSwitch = NSSwitch()
     private let qualityPopup = NSPopUpButton()
     private let rateMode = NSSegmentedControl(labels: ["FPS", "X"], trackingMode: .selectOne, target: nil, action: nil)
@@ -2131,7 +2131,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let frameQuality = formRow(EnhancementText.t("Quality", "质量"), qualityPopup)
         interpolationQualityRow = frameQuality
         frames.addArrangedSubview(frameQuality)
-        frames.addArrangedSubview(rifeStreamCheck)
         phaseLabel.maximumNumberOfLines = 0
         phaseLabel.textColor = .secondaryLabelColor
         phaseLabel.preferredMaxLayoutWidth = 220
@@ -3074,10 +3073,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         interpolationSwitch.target = self
         interpolationSwitch.action = #selector(controlChanged)
-        rifeStreamCheck.title = EnhancementText.t("RIFE stream cache (experimental)", "RIFE 连续缓存（实验）")
-        rifeStreamCheck.toolTip = EnhancementText.t("Live capture only. Uses the selected model and quality; failures fall back to normal processing.", "仅实时采集。使用当前模型和质量；失败时回退普通处理。")
-        rifeStreamCheck.target = self
-        rifeStreamCheck.action = #selector(controlChanged)
         scaleSwitch.target = self
         scaleSwitch.action = #selector(controlChanged)
         fullscreenCheck.target = self
@@ -4528,7 +4523,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         fullscreenCheck.toolTip = profile.sourceKind == "window" ? EnhancementText.t(
             "Choose follow, viewer, or a fullscreen interaction mode in Window output.",
             "在窗口输出中选择跟随、观看或全屏交互。") : nil
-        rifeStreamCheck.isHidden = profile.sourceKind == "file" || profile.interpolationEngineID != "rife.metal"
         let editable = WorkbenchDimensionPolicy.editable(sizeIndex: sizePopup.indexOfSelectedItem, scaleEnabled: scaleSwitch.state == .on)
         for (field, value) in [(widthField, profile.outputWidth), (heightField, profile.outputHeight)] {
             if field.isEditable != editable { field.isEditable = editable }
@@ -5267,7 +5261,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         applyAirBetaPreset(&profile)
         LiveEngineSelection.normalize(&profile)
         interpolationSwitch.state = profile.interpolationEnabled ? .on : .off
-        rifeStreamCheck.state = profile.rifeStreamEnabled ? .on : .off
         enginePopup.selectItem(at: 0)
         reloadQualityItems()
         sourceKindControl.selectedSegment = ["window": 0, "display": 1, "file": 2][profile.sourceKind] ?? 0
@@ -5364,7 +5357,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private func readControls() {
         profile.interpolationEnabled = interpolationSwitch.state == .on
-        profile.rifeStreamEnabled = rifeStreamCheck.state == .on
         readEngineSelection()
         profile.interpolationQuality = LiveEngineSelection.validQuality(qualityPopup.titleOfSelectedItem ?? "fast")
         profile.sourceKind = ["window", "display", "file"][max(0, sourceKindControl.selectedSegment)]

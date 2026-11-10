@@ -83,8 +83,9 @@ private final class SourceSizeControls {
      var expected = saved
      expected.interpolationEngineID = "rife.metal"; expected.modelID = "rife-v4.25"
      expected.interpolationQuality = ["fast", "balanced", "hq"].contains(quality) ? quality : "fast"
+     expected.rifeStreamEnabled = true
      let restored = EnhancementProfileStore.decode(try JSONEncoder().encode(saved), fallbackName:"legacy")
-     precondition(restored == expected, "Engine migration must preserve every other profile field")
+     precondition(restored == expected, "RIFE migration must enable stream caching and preserve unrelated profile fields")
     }
    }
   }
@@ -150,14 +151,17 @@ private final class SourceSizeControls {
   }
   var userOverride = EnhancementProfile(); userOverride.interpolationEnabled = false; userOverride.rifeStreamEnabled = false
   try EnhancementProfileStore.save(userOverride)
-  precondition(EnhancementProfileStore.load() == userOverride)
+  var expectedOverride = userOverride; expectedOverride.rifeStreamEnabled = true
+  precondition(EnhancementProfileStore.load() == expectedOverride)
   var copiedConfig = EnhancementProfileStore.load(); copiedConfig.configName = "复制设置"; copiedConfig.configID = "custom:复制设置"
   try EnhancementProfileStore.saveNamed(copiedConfig)
-  precondition(EnhancementProfileStore.loadNamed("复制设置") == copiedConfig && !copiedConfig.rifeStreamEnabled)
+  precondition(EnhancementProfileStore.loadNamed("复制设置") == copiedConfig && copiedConfig.rifeStreamEnabled)
   var legacy = try JSONSerialization.jsonObject(with: JSONEncoder().encode(userOverride)) as! [String: Any]
   legacy.removeValue(forKey: "rifeStreamEnabled")
   let decodedLegacy = EnhancementProfileStore.decode(try JSONSerialization.data(withJSONObject: legacy), fallbackName: "legacy")!
-  precondition(!decodedLegacy.rifeStreamEnabled && !decodedLegacy.interpolationEnabled)
+  precondition(decodedLegacy.rifeStreamEnabled && !decodedLegacy.interpolationEnabled)
+  LiveEngineSelection.normalize(&userOverride)
+  precondition(userOverride.rifeStreamEnabled && !userOverride.interpolationEnabled)
   var native=EnhancementProfile(); native.interpolationEngineID="apple.lowlatency"; native.scaleEnabled=true; native.outputWidth=1920; native.outputHeight=1080
   applyNativeQualityPreset(&native)
   precondition(native.interpolationEnabled && native.interpolationEngineID == "rife.metal" && native.modelID == "rife-v4.25" && native.interpolationQuality == "fast" && native.rate == .multiplier(2) && !native.scaleEnabled && native.outputWidth == 0 && native.outputHeight == 0)
