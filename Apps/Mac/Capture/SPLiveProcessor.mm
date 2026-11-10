@@ -12,6 +12,7 @@
 #include "SPAirRobustSourceLead.hpp"
 #include "SPAirWindowOptimization.hpp"
 #include "SPAirMeasurementTrace.hpp"
+#include "SPAirSourceConversion.hpp"
 #import "SPRateSchedule.hpp"
 #import "SPLiveDisplayQueue.h"
 #import "SPRifePairAffineClock.hpp"
@@ -470,46 +471,9 @@ static NSString *SPAirHardwareModel() {
     return model;
 }
 
-static void SPForceSDRAttachments(CVPixelBufferRef buffer) {
-    if (!buffer) return;
-    CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceITUR_709);
-    if (space) {
-        CVBufferSetAttachment(buffer, kCVImageBufferCGColorSpaceKey, space, kCVAttachmentMode_ShouldPropagate);
-        CFRelease(space);
-    }
-    CVBufferSetAttachment(buffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2,
-                          kCVAttachmentMode_ShouldPropagate);
-    CVBufferSetAttachment(buffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2,
-                          kCVAttachmentMode_ShouldPropagate);
-    OSType format = CVPixelBufferGetPixelFormatType(buffer);
-    if (format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
-        format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
-        CVBufferSetAttachment(buffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2,
-                              kCVAttachmentMode_ShouldPropagate);
-    }
-    CVBufferRemoveAttachment(buffer, kCVImageBufferMasteringDisplayColorVolumeKey);
-    CVBufferRemoveAttachment(buffer, kCVImageBufferContentLightLevelInfoKey);
-    CVBufferRemoveAttachment(buffer, kCVImageBufferAmbientViewingEnvironmentKey);
-}
 
-static BOOL SPBufferIsHDR(CVPixelBufferRef buffer) {
-    if (!buffer) return NO;
-    OSType format = CVPixelBufferGetPixelFormatType(buffer);
-    if (format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
-        format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange ||
-        format == kCVPixelFormatType_64RGBAHalf ||
-        format == kCVPixelFormatType_ARGB2101010LEPacked) {
-        return YES;
-    }
-    CFTypeRef transfer = CVBufferGetAttachment(buffer, kCVImageBufferTransferFunctionKey, NULL);
-    if (transfer &&
-        (CFEqual(transfer, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ) ||
-         CFEqual(transfer, kCVImageBufferTransferFunction_ITU_R_2100_HLG))) {
-        return YES;
-    }
-    if (CVBufferGetAttachment(buffer, kCVImageBufferMasteringDisplayColorVolumeKey, NULL)) return YES;
-    return NO;
-}
+
+
 
 #if ODF_AIR_BETA_DIAGNOSTIC || ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
 static NSString *SPAirBetaFourCC(OSType format) {
@@ -535,17 +499,7 @@ static NSString *SPAirBetaFormatReason(CVPixelBufferRef buffer) {
 }
 #endif
 
-static CVPixelBufferRef SPCreateBuffer(int width, int height, OSType format) {
-    NSDictionary *attrs = @{
-        (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
-        (__bridge NSString *)kCVPixelBufferMetalCompatibilityKey: @YES,
-    };
-    CVPixelBufferRef buffer = NULL;
-    CVReturn result = CVPixelBufferCreate(kCFAllocatorDefault, width, height, format,
-                                          (__bridge CFDictionaryRef)attrs, &buffer);
-    if (result != kCVReturnSuccess) return NULL;
-    return buffer;
-}
+
 
 static void SPSampleLuma(CVPixelBufferRef buffer, uint8_t *out, int count) {
     memset(out, 0, (size_t)count);
@@ -3524,6 +3478,10 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     BOOL _testSRBaselineMatches, _testSRIdentityMatches;
     NSString *_testSRError;
     VTPixelTransferSessionRef _transfer;
+    SPAirSourceConversionWorker *_sourceConverter;
+    spAirSourceConversion::State _sourceConversions;
+    std::array<uint64_t, 8> _sourceConversionInvalidated;
+    uint64_t _sourceConversionDelivered, _sourceConversionFrames, _sourceConversionFailures;
     std::vector<SPPlaySlot> _slots;
     std::vector<SPPendingPhase> _pending;
     std::vector<sp::SPScheduleOutput> _rifePending;
@@ -4528,6 +4486,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         @"interactiveTier": _request.quality == SPFRCQualityHigh ? @"quality" : @"normal",
         @"frcP95ms": @(SPStatsPercentileMs(_frcNs)),
         @"scaleP95ms": @(SPStatsPercentileMs(_scaleNs)),
+        @"airSourceConversion": [self airSourceConversionSnapshot],
         @"transferP95ms": @(SPStatsPercentileMs(_transferNs)),
         @"queueP95ms": @(SPStatsPercentileMs(_queueNs)),
         @"playheadP95ms": @(SPStatsPercentileMs(_playheadNs)),
@@ -6235,34 +6194,17 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 }
 
 - (CVPixelBufferRef)transfer:(CVPixelBufferRef)source format:(OSType)format {
-    if (!source || !_transfer) return NULL;
-    if (CVPixelBufferGetPixelFormatType(source) == format && !SPBufferIsHDR(source)) {
-        CVPixelBufferRetain(source);
-        return source;
-    }
-    int width = (int)CVPixelBufferGetWidth(source);
-    int height = (int)CVPixelBufferGetHeight(source);
-    width &= ~1;
-    height &= ~1;
-    if (width < 2 || height < 2) return NULL;
-    CVPixelBufferRef destination = SPCreateBuffer(width, height, format);
-    if (!destination) return NULL;
-    if (!SPAirBetaEnabled() && !_airPerformanceRequested) SPForceSDRAttachments(source);
-    SPForceSDRAttachments(destination);
-    int64_t transferStart = SPHostNow();
-    OSStatus status = VTPixelTransferSessionTransferImage(_transfer, source, destination);
-    SPPushSample(_transferNs, SPHostToNs(SPHostNow() - transferStart));
-    if (status != noErr) {
-        CVPixelBufferRelease(destination);
+    int64_t began = 0, ended = 0;
+    OSStatus status = noErr;
+    CVPixelBufferRef result = SPAirTransferWithSession(_transfer, source, format,
+        SPAirBetaEnabled() || _airPerformanceRequested, began, ended, status);
+    if (began) SPPushSample(_transferNs, SPHostToNs(ended - began));
 #if ODF_AIR_BETA_DIAGNOSTIC
-        if (SPAirBetaEnabled()) {
-            _airBetaOriginalFailure = [NSString stringWithFormat:@"%@；原帧转换失败（%d），来源窗口继续播放", _airBetaFallbackReason ?: @"Air实验档已旁路", (int)status];
-        }
-#endif
-        return NULL;
+    if (!result && began && SPAirBetaEnabled()) {
+        _airBetaOriginalFailure = [NSString stringWithFormat:@"%@；原帧转换失败（%d），来源窗口继续播放", _airBetaFallbackReason ?: @"Air实验档已旁路", (int)status];
     }
-    SPForceSDRAttachments(destination);
-    return destination;
+#endif
+    return result;
 }
 
 - (CVPixelBufferRef)yuvForIdentity:(uint64_t)identity {
@@ -6825,6 +6767,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 }
 
 - (void)clearPlaySlots {
+    [self cancelSourceConversions];
     for (auto &slot : _slots) SPReleaseSlot(slot);
     _slots.clear();
 }
@@ -7001,6 +6944,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 }
 
 - (void)beginMeasurementEpoch {
+    [self cancelSourceConversions];
     _r9FRCBudgetGate.reset();
     _r9RequiredBudgetMs = 0; _r9AllowedBudgetMs = 0;
     _r9OnTimeSynthetic = 0; _r9LatePhysicalSynthetic = 0; _r9TimingUnknownSynthetic = 0;
@@ -7956,6 +7900,141 @@ presentationHost:(int64_t)presentationHost
     [self publishStatus:reason failed:YES];
 }
 
+- (spAirSourceConversion::Context)airSourceConversionContext {
+    return {_sourceGeneration, _configVersion, _measurementEpoch, _clockEpoch, _sourceConversions.cancellation};
+}
+
+- (NSDictionary *)airSourceConversionSnapshot {
+    NSMutableDictionary *invalidated = [NSMutableDictionary dictionary];
+    const char *names[] = {"none", "stopped", "generation", "config", "measurement", "clock", "cancellation", "mode"};
+    for (size_t index = 1; index < _sourceConversionInvalidated.size(); ++index)
+        invalidated[@(names[index])] = @(_sourceConversionInvalidated[index]);
+    return @{ @"enabled": @(_airPerformanceEnabled && _airPerformanceRequested && !_request.scaleEnabled &&
+            _airActualSourceKind == SPLiveCaptureSourceKindWindow && ![self requestUsesLatestPresentation:_request] && _sourcePixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        @"workerCreated": @(_sourceConverter != nil), @"sourcePixelFormat": @(_sourcePixelFormat),
+        @"active": @(_sourceConversions.active != nullptr), @"waiting": @(_sourceConversions.waitingCount),
+        @"outstanding": @(_sourceConversions.outstanding()), @"waitingCapacity": @2,
+        @"reservedBytes": @(_sourceConversions.ownedBytes), @"byteLimit": @(SPQueueByteBudget),
+        @"admitted": @(_sourceConversions.admitted), @"completed": @(_sourceConversions.completed),
+        @"enqueueAttempts": @(_sourceConversionDelivered), @"createdFrames": @(_sourceConversionFrames), @"failures": @(_sourceConversionFailures),
+        @"canceledWaiting": @(_sourceConversions.canceledWaiting), @"invalidated": invalidated,
+        @"capacitySyncFallbacks": @(_sourceConversions.capacitySyncFallbacks),
+        @"cancellation": @(_sourceConversions.cancellation),
+        @"scope": @"One active plus two waiting. Byte reservations conservatively include input plus eight bytes per output pixel. Full capacity restores the old synchronous source path without merging or dropping a source." };
+}
+
+- (void)airRecordSourceConversion:(const spAirSourceConversion::JobPtr &)job kind:(spAirMeasurement::Kind)kind
+    frame:(uint64_t)frameID reason:(spAirSourceConversion::StaleReason)reason {
+    if (!_measurementTrace || !job->traceEnabled) return;
+    auto event = [self airMeasurementEvent:kind];
+    event.frameID = frameID; event.generation = job->context.generation; event.config = job->context.config;
+    event.epoch = job->context.measurement; event.clock = job->context.clock; event.groupID = job->identity;
+    event.relatedID = job->sourceID; event.ptsNum = job->pts.num; event.ptsDen = job->pts.den;
+    event.targetHostTicks = job->targetHost; event.flags = 8u;
+    if (kind == spAirMeasurement::Kind::sourceConvertRequested) {
+        event.beginHostTicks = event.endHostTicks = job->requestedHost;
+        if (job->basisKnown) event.flags |= 16u;
+        event.values[0] = job->delayHost; event.values[1] = job->anchorHost;
+        event.values[2] = job->anchorPTS.num; event.values[3] = job->anchorPTS.den;
+        event.sampleHostTicks = job->sourceIntervalHost;
+        if (!job->identity) event.flags |= 256u;
+    } else if (kind == spAirMeasurement::Kind::sourceConvertFinished) {
+        event.beginHostTicks = job->workerBeginHost; event.endHostTicks = job->workerEndHost;
+        event.sampleHostTicks = job->processorReturnHost;
+        event.values[0] = (uint64_t)(int64_t)job->status; event.values[1] = job->transferBeginHost;
+        event.values[2] = job->transferEndHost; event.values[3] = job->context.cancellation;
+        if (job->output) event.flags |= 16u;
+    } else {
+        event.endHostTicks = SPHostNow();
+        event.beginHostTicks = job->processorReturnHost ?: event.endHostTicks;
+        event.sampleHostTicks = job->processorReturnHost;
+        event.values[0] = (uint64_t)reason; event.values[1] = _sourceConversions.outstanding();
+        event.values[2] = _sourceConversions.ownedBytes; event.values[3] = job->context.cancellation;
+        if (frameID) event.flags |= 16u;
+    }
+    _measurementTrace->append(event);
+}
+
+- (void)cancelSourceConversions {
+    using R = spAirSourceConversion::StaleReason;
+    for (size_t index = 0; index < _sourceConversions.waitingCount; ++index) {
+        const auto &job = _sourceConversions.waiting[index];
+        auto reason = spAirSourceConversion::staleReason(job->context, [self airSourceConversionContext], _stopped);
+        if (reason == R::none) reason = R::cancellation;
+        ++_sourceConversionInvalidated[(size_t)reason];
+        if (reason == R::stopped) ++_stoppedDrops;
+        else if (reason == R::generation) ++_generationDrops;
+        else ++_sourceStaleDrops;
+        [self airRecordSourceConversion:job kind:spAirMeasurement::Kind::sourceConvertDelivered frame:0 reason:reason];
+    }
+    _sourceConversions.cancel();
+}
+
+- (void)drainSourceConversions {
+    auto job = _sourceConversions.active;
+    if (!job || job->started) return;
+    job->started = true;
+    if (!_sourceConverter) _sourceConverter = [SPAirSourceConversionWorker new];
+    [_sourceConverter convert:job completion:^{
+        dispatch_async(self->_q, ^{
+            if (job->traceEnabled) job->processorReturnHost = SPHostNow();
+            using R = spAirSourceConversion::StaleReason;
+            [self airRecordSourceConversion:job kind:spAirMeasurement::Kind::sourceConvertFinished frame:0 reason:R::none];
+            auto reason = spAirSourceConversion::staleReason(job->context, [self airSourceConversionContext], self->_stopped);
+            if (reason == R::none && (!self->_airPerformanceEnabled || self->_request.scaleEnabled ||
+                self->_airActualSourceKind != SPLiveCaptureSourceKindWindow)) reason = R::mode;
+            uint64_t frameID = 0;
+            if (reason != R::none) {
+                ++self->_sourceConversionInvalidated[(size_t)reason];
+                if (reason == R::stopped) ++self->_stoppedDrops;
+                else if (reason == R::generation) ++self->_generationDrops;
+                else ++self->_sourceStaleDrops;
+            } else if (!job->output) {
+                ++self->_sourceConversionFailures; ++self->_sourceConversionDrops;
+            } else {
+                if (job->transferBeginHost) SPPushSample(self->_transferNs, SPHostToNs(job->transferEndHost - job->transferBeginHost));
+                CVPixelBufferRef converted = job->output; job->output = NULL;
+                const uint64_t previousFrameID = self->_nextFrameID;
+                [self enqueueReadyEnhanced:converted original:CVPixelBufferRetain(converted) pts:job->pts synthetic:NO held:job->held
+                    captureHost:job->captureHost generation:job->context.generation deadlineHost:job->targetHost jobID:0 geometryHost:job->geometryHost];
+                if (self->_nextFrameID != previousFrameID) { frameID = self->_nextFrameID; ++self->_sourceConversionFrames; }
+                ++self->_sourceConversionDelivered;
+            }
+            [self airRecordSourceConversion:job kind:spAirMeasurement::Kind::sourceConvertDelivered frame:frameID reason:reason];
+            if (job->output) { CVPixelBufferRelease(job->output); job->output = NULL; }
+            self->_sourceConversions.finish(job);
+            [self drainSourceConversions];
+        });
+    }];
+}
+
+- (BOOL)enqueueSourceConversion:(CVPixelBufferRef)source identity:(uint64_t)identity pts:(sp::SPRational)pts
+    held:(BOOL)held host:(int64_t)host generation:(uint64_t)generation deadline:(int64_t)deadline {
+    if (!_airPerformanceEnabled || !_airPerformanceRequested || _airActualSourceKind != SPLiveCaptureSourceKindWindow ||
+        _request.scaleEnabled || generation != _sourceGeneration || [self requestUsesLatestPresentation:_request] ||
+        CVPixelBufferGetPixelFormatType(source) != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) return NO;
+    auto job = std::make_shared<spAirSourceConversion::Job>(source);
+    job->context = [self airSourceConversionContext]; job->sourceID = identity; job->pts = pts;
+    job->held = held; job->captureHost = host; job->geometryHost = host;
+    job->targetHost = deadline > 0 ? deadline : [self targetHostForPTS:pts];
+    job->delayHost = _delayHost; job->anchorHost = _anchorHost; job->anchorPTS = _anchorPts;
+    sp::SPRational anchorDelta{};
+    job->basisKnown = deadline <= 0 && _haveAnchor && sp::spSub(pts, _anchorPts, anchorDelta);
+    job->sourceIntervalHost = _haveInterval ? _intervalHost : 0;
+    job->bytes = CVPixelBufferGetDataSize(source) + (uint64_t)CVPixelBufferGetWidth(source) * CVPixelBufferGetHeight(source) * 8;
+    job->traceEnabled = _measurementTrace != nullptr;
+    job->requestedHost = job->traceEnabled ? SPHostNow() : 0;
+    const BOOL accepted = _sourceConversions.admit(job, SPQueueByteBudget);
+    [self airRecordSourceConversion:job kind:spAirMeasurement::Kind::sourceConvertRequested frame:0 reason:spAirSourceConversion::StaleReason::none];
+    if (!accepted) return NO;
+#if ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
+    SPRifeBridge *bridge = _rife;
+    if (bridge.rifePrescaleEnabled) job->recordDimensions = ^(int width, int height) { [bridge recordPrescaleOriginalWidth:width height:height]; };
+#endif
+    [self drainSourceConversions];
+    return YES;
+}
+
 - (void)enqueueSourceIdentity:(uint64_t)identity
                           pts:(sp::SPRational)pts
                          host:(int64_t)host
@@ -8006,6 +8085,8 @@ presentationHost:(int64_t)presentationHost
         [self enqueueReadyEnhanced:enhanced original:original pts:pts synthetic:NO held:held captureHost:host generation:generation deadlineHost:0];
         return;
     }
+    if ([self enqueueSourceConversion:found->second.source identity:identity pts:pts held:held
+        host:host generation:generation deadline:pairClockDeadline]) return;
     CVPixelBufferRef bgra = [self bgraFromSource:found->second.source];
     if (!bgra) { _sourceConversionDrops++; return; }
     if ([self requestUsesAsyncScale:_request] && _sessionReady && (_appleSR || _videoSR || _animeSR || _cuganSR)) {

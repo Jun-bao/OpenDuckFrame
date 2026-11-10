@@ -152,6 +152,37 @@ static NSDictionary *SPAirMeasurementRow(const spAirMeasurement::Event &event) {
             row[@"trueSourceIntervalRequested"] = @((event.flags & 128) != 0);
             row[@"basisScope"] = @"D/anchor read at actual affine target construction on the serial processor queue. Frozen/pair-affine/latest/no-anchor targets have unknown basis. Interval is the source estimate observed at this construction, not an invented input to an earlier D recompute.";
             break;
+        case K::sourceConvertRequested:
+            row[@"targetHostTicks"] = @(event.targetHostTicks);
+            row[@"conversionID"] = event.groupID ? @(event.groupID) : (id)NSNull.null;
+            row[@"sourceIdentity"] = @(event.relatedID); row[@"capacitySyncFallback"] = @((event.flags & 256) != 0);
+            row[@"basisKnown"] = @((event.flags & 16) != 0);
+            row[@"delayHostTicksUsed"] = (event.flags & 16) ? @((int64_t)event.values[0]) : (id)NSNull.null;
+            row[@"anchorHostTicks"] = (event.flags & 16) ? @(event.values[1]) : (id)NSNull.null;
+            row[@"anchorPTSNum"] = (event.flags & 16) ? @((int64_t)event.values[2]) : (id)NSNull.null;
+            row[@"anchorPTSDen"] = (event.flags & 16) ? @((int64_t)event.values[3]) : (id)NSNull.null;
+            row[@"sourceIntervalHostTicksAtTargetCreation"] = event.sampleHostTicks ? @(event.sampleHostTicks) : (id)NSNull.null;
+            [row removeObjectForKey:@"sampleHostTicks"];
+            break;
+        case K::sourceConvertFinished:
+            row[@"targetHostTicks"] = @(event.targetHostTicks);
+            row[@"conversionID"] = @(event.groupID); row[@"sourceIdentity"] = @(event.relatedID);
+            row[@"status"] = @((int64_t)event.values[0]); row[@"outputCreated"] = @((event.flags & 16) != 0);
+            row[@"transferBeginHostTicks"] = event.values[1] ? @(event.values[1]) : (id)NSNull.null;
+            row[@"transferEndHostTicks"] = event.values[2] ? @(event.values[2]) : (id)NSNull.null;
+            row[@"cancellationAtRequest"] = @(event.values[3]);
+            row[@"processorQueueEntryHostTicks"] = event.sampleHostTicks ? @(event.sampleHostTicks) : (id)NSNull.null;
+            [row removeObjectForKey:@"sampleHostTicks"];
+            break;
+        case K::sourceConvertDelivered:
+            row[@"targetHostTicks"] = @(event.targetHostTicks);
+            row[@"conversionID"] = @(event.groupID); row[@"sourceIdentity"] = @(event.relatedID);
+            row[@"createdFrame"] = @((event.flags & 16) != 0); row[@"staleReasonCode"] = @(event.values[0]);
+            row[@"outstandingBeforeReturn"] = @(event.values[1]); row[@"reservedBytesBeforeReturn"] = @(event.values[2]);
+            row[@"cancellationAtRequest"] = @(event.values[3]);
+            row[@"processorQueueEntryHostTicks"] = event.sampleHostTicks ? @(event.sampleHostTicks) : (id)NSNull.null;
+            [row removeObjectForKey:@"sampleHostTicks"];
+            break;
         case K::gpuCallback: {
             row[@"commandBufferStatus"] = @(event.values[0]);
             const bool valid = event.values[0] == MTLCommandBufferStatusCompleted && std::isfinite(event.gpuStartSeconds) &&
@@ -709,6 +740,7 @@ static NSDictionary *SPAirCapacityViewSlots(SPAirCapacityViewMark *mark) {
             NSDictionary *preview = [self.preview airTraceDrainState], *output = [self.outputPreview airTraceDrainState];
             const BOOL tracked = self->_r7JobUntracked == self->_airTraceUntrackedJobsAtBegin;
             const BOOL ready = prepareFence && tracked && self->_r7JobHosts.empty() && self->_airTraceDetachPending == 0 &&
+                self->_sourceConversions.outstanding() == 0 &&
                 [preview[@"ready"] boolValue] && [output[@"ready"] boolValue];
             const BOOL timedOut = SPHostNow() >= deadline;
             if ((!ready || !verifiedFence) && !timedOut) {
@@ -719,6 +751,7 @@ static NSDictionary *SPAirCapacityViewSlots(SPAirCapacityViewMark *mark) {
             NSDictionary *payload = [self->_airTracePayloadBudget snapshot];
             const BOOL complete = ready && self->_airTraceDetachDropped == 0 && [payload[@"reservationFailures"] unsignedLongLongValue] == 0;
             NSDictionary *receipt = @{ @"success": @(complete), @"nativeDrainComplete": @(complete), @"timedOut": @(timedOut),
+                @"sourceConversion": [self airSourceConversionSnapshot],
                 @"pendingInferenceJobs": @(self->_r7JobHosts.size()), @"inferenceTrackingComplete": @(tracked),
                 @"viewDrains": @{ @"preview": preview, @"output": output }, @"prepareQueueFenceObserved": @(prepareFence),
                 @"serviceDetachPending": @(self->_airTraceDetachPending), @"serviceDetachDropped": @(self->_airTraceDetachDropped),

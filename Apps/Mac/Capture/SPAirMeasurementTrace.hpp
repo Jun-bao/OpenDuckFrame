@@ -12,7 +12,7 @@ namespace spAirMeasurement {
 enum class Kind : uint32_t {
     slotInsert, timerCreate, timerPark, timerArm, timerCancel, timerFire, drainEntry,
     choiceBegin, choiceCandidate, choiceEnd, leaseRequest, leaseClaim, leaseMap,
-    leaseReady, leaseCancel, leaseCompleteRequest, leaseRelease, inlineMap, gpuCallback, targetCreated
+    leaseReady, leaseCancel, leaseCompleteRequest, leaseRelease, inlineMap, gpuCallback, targetCreated, sourceConvertRequested, sourceConvertFinished, sourceConvertDelivered
 };
 
 inline const char *name(Kind kind) {
@@ -37,6 +37,9 @@ inline const char *name(Kind kind) {
         case Kind::inlineMap: return "inline-map";
         case Kind::gpuCallback: return "gpu-completion-callback";
         case Kind::targetCreated: return "target-created";
+        case Kind::sourceConvertRequested: return "source-convert-requested";
+        case Kind::sourceConvertFinished: return "source-convert-finished";
+        case Kind::sourceConvertDelivered: return "source-convert-delivered";
     }
     return "unknown";
 }
