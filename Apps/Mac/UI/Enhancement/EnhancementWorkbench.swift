@@ -2164,12 +2164,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             button.isHidden = true
             interaction.addArrangedSubview(button)
         }
-        phaseLabel.stringValue = EnhancementText.t(
-            "M3 Air 16GB tested at 2200×1600, 30→60 FPS. Capture limit 2648×1668. Largest stable size remains untested.",
-            "M3 Air 16GB 自测通过 2200×1600、30→60 FPS。当前采集上限 2648×1668，最大稳定尺寸待测。")
-        phaseLabel.toolTip = EnhancementText.t(
-            "Dimensions are window-capture pixels. Above the capture limit, the original frame is retained and the status bar shows the reason.",
-            "这里的尺寸均为窗口采集像素。超过采集上限时保持原帧，并在状态栏显示原因。")
         for column in [scale, frames, interaction] {
             for item in column.arrangedSubviews {
                 item.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
@@ -5317,7 +5311,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         qualityPopup.addItems(withTitles: ["fast", "balanced", "hq"])
         qualityPopup.selectItem(at: ["fast": 0, "balanced": 1, "hq": 2][profile.interpolationQuality] ?? 0)
         qualityPopup.isHidden = false
-        phaseLabel.isHidden = false
+        phaseLabel.isHidden = true
         compatibilityButton.isHidden = true
         interpolationQualityRow?.isHidden = false
     }
