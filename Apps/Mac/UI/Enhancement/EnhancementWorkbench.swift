@@ -716,7 +716,7 @@ enum EnhancementProfileStore {
         if object["srInputPreset"] == nil { object["srInputPreset"] = 0 }
         if object["sourceWindowPreset"] == nil { object["sourceWindowPreset"] = 0 }
         if object["captureLimit"] == nil { object["captureLimit"] = "auto" }
-        if !["follow", "viewer", "absolute", "relative"].contains(object["windowOutputMode"] as? String ?? "") { object["windowOutputMode"] = "follow" }
+        object["windowOutputMode"] = "follow"
         if object["configName"] == nil { object["configName"] = fallbackName }
         if object["scaleQualityID"] == nil { object["scaleQualityID"] = "none" }
         object["interpolationEngineID"] = "rife.metal"
@@ -1154,11 +1154,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private var dimensionEditOriginal: [ObjectIdentifier: String] = [:]
     private let displayPopup = NSPopUpButton()
     private let fullscreenCheck = NSButton(checkboxWithTitle: "", target: nil, action: nil)
-    private let windowOutputPopup = NSPopUpButton()
-    private let interactionStateLabel = NSTextField(wrappingLabelWithString: "")
-    private let inputMonitoringButton = NSButton()
-    private let accessibilityButton = NSButton()
-    private let eventAccessButton = NSButton()
     private var interactionArmed = false
     private var interactionFailure = ""
     private var interactionSourceUnobstructed = false
@@ -2048,8 +2043,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private func inspectorColumn() -> NSView {
         configurePopups()
         if SPRifeExperiments.airBeta {
-            windowOutputPopup.removeAllItems()
-            windowOutputPopup.addItem(withTitle: EnhancementText.t("Follow source", "跟随来源"))
             return airBetaInspector()
         }
         func column() -> NSStackView {
@@ -2144,27 +2137,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         customRateRow = customRate
         frames.addArrangedSubview(customRate)
         frames.addArrangedSubview(multiplierControl)
-        let interaction = column()
-        interaction.addArrangedSubview(heading(EnhancementText.t("Window output", "窗口输出")))
-        windowOutputPopup.addItems(withTitles: [EnhancementText.t("Follow source", "跟随来源"),
-            EnhancementText.t("Fullscreen viewer", "全屏观看"), EnhancementText.t("Fullscreen interaction · pointer", "全屏交互 · 指针"),
-            EnhancementText.t("Fullscreen interaction · relative", "全屏交互 · 相对输入")])
-        windowOutputPopup.target = self
-        windowOutputPopup.action = #selector(interactionModeChanged)
-        interaction.addArrangedSubview(windowOutputPopup)
-        interactionStateLabel.maximumNumberOfLines = 4
-        interactionStateLabel.textColor = .secondaryLabelColor
-        interaction.addArrangedSubview(interactionStateLabel)
-        for (button, title, action) in [
-            (inputMonitoringButton, EnhancementText.t("Input Monitoring…", "输入监听设置…"), #selector(requestInputMonitoring)),
-            (accessibilityButton, EnhancementText.t("Accessibility…", "辅助功能设置…"), #selector(requestAccessibility)),
-            (eventAccessButton, EnhancementText.t("Request event access…", "请求事件访问…"), #selector(requestEventAccess))
-        ] {
-            button.title = title; button.target = self; button.action = action
-            button.isHidden = true
-            interaction.addArrangedSubview(button)
-        }
-        for column in [scale, frames, interaction] {
+        for column in [scale, frames] {
             for item in column.arrangedSubviews {
                 item.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
             }
@@ -2176,14 +2149,11 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         stack.spacing = 12
         let scaleCard = card(scale)
         let framesCard = card(frames)
-        let interactionCard = card(interaction)
         stack.addArrangedSubview(scaleCard)
         stack.addArrangedSubview(framesCard)
-        stack.addArrangedSubview(interactionCard)
         NSLayoutConstraint.activate([
             scaleCard.widthAnchor.constraint(equalTo: stack.widthAnchor),
             framesCard.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            interactionCard.widthAnchor.constraint(equalTo: stack.widthAnchor),
         ])
         return stack
     }
@@ -2446,7 +2416,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         refreshActions()
         persist()
         refreshPlanLabel()
-        refreshInteractionStatus()
     }
 
     private func applyPresetDefaults(_ id: String) {
@@ -4409,7 +4378,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         budgetLabel.stringValue = ""
         refreshActions()
         refreshPlanLabel()
-        refreshInteractionStatus()
     }
 
     @objc private func showLibrary() { showPage(2) }
@@ -4487,7 +4455,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         processor.setViewMode(mode)
         persist()
         refreshPlanLabel()
-        refreshInteractionStatus()
         if capture.running { statusLabel.stringValue = EnhancementText.t("Pending", "待应用") }
     }
 
@@ -4509,14 +4476,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         srInputPopup.toolTip = help
         fullscreenCheck.title = profile.sourceKind == "file"
             ? EnhancementText.t("Fullscreen on output display", "在输出显示器全屏")
-            : (profile.sourceKind == "window"
-               ? EnhancementText.t("Window mode is selected at right", "窗口输出模式在右侧选择")
-               : EnhancementText.t("Fullscreen viewer (Esc to return to interaction)", "全屏预览（Esc 返回交互）"))
+            : EnhancementText.t("Fullscreen viewer (Esc to return to interaction)", "全屏预览（Esc 返回交互）")
+        fullscreenCheck.isHidden = profile.sourceKind == "window"
         fullscreenCheck.isEnabled = profile.sourceKind != "window"
-        fullscreenCheck.state = profile.sourceKind == "window" ? (profile.windowOutputMode == "follow" ? .off : .on) : (profile.outputFullscreen ? .on : .off)
-        fullscreenCheck.toolTip = profile.sourceKind == "window" ? EnhancementText.t(
-            "Choose follow, viewer, or a fullscreen interaction mode in Window output.",
-            "在窗口输出中选择跟随、观看或全屏交互。") : nil
+        fullscreenCheck.state = profile.outputFullscreen ? .on : .off
         let editable = WorkbenchDimensionPolicy.editable(sizeIndex: sizePopup.indexOfSelectedItem, scaleEnabled: scaleSwitch.state == .on)
         for (field, value) in [(widthField, profile.outputWidth), (heightField, profile.outputHeight)] {
             if field.isEditable != editable { field.isEditable = editable }
@@ -4849,7 +4812,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         refreshActions()
         if !lastStats.isEmpty { updateStatsText(lastStats) }
         refreshPlanLabel()
-        refreshInteractionStatus()
         experimentComparisonPanel?.refresh()
     }
 
@@ -5288,7 +5250,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         widthField.stringValue = "\(profile.outputWidth)"
         heightField.stringValue = "\(profile.outputHeight)"
         fullscreenCheck.state = profile.sourceKind == "window" ? .on : (profile.outputFullscreen ? .on : .off)
-        windowOutputPopup.selectItem(at: ["follow":0,"viewer":1,"absolute":2,"relative":3][profile.windowOutputMode] ?? 0)
+        profile.windowOutputMode = "follow"
         viewMode.selectedSegment = ["enhanced": 0, "original": 1, "compare": 2][profile.viewMode] ?? 0
         appearanceControl.selectedSegment = ["system": 0, "light": 1, "dark": 2][profile.appearance] ?? 0
         captureCapPopup.selectItem(at: ["auto": 0, "30": 1, "60": 2][profile.captureLimit] ?? 0)
@@ -5303,7 +5265,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         rebuildConfigRows()
         applyModeVisibility()
         refreshPlanLabel()
-        refreshInteractionStatus()
     }
 
     private func reloadQualityItems() {
@@ -5381,7 +5342,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             profile.outputHeight = WorkbenchDimensionPolicy.value(heightField.stringValue) ?? (profile.outputHeight >= 2 ? profile.outputHeight : 1080)
         }
         if profile.sourceKind != "window" { profile.outputFullscreen = fullscreenCheck.state == .on }
-        profile.windowOutputMode = ["follow", "viewer", "absolute", "relative"][max(0,min(3,windowOutputPopup.indexOfSelectedItem))]
+        profile.windowOutputMode = "follow"
         profile.viewMode = ["enhanced", "original", "compare"][max(0, viewMode.selectedSegment)]
         profile.appearance = ["system", "light", "dark"][max(0, appearanceControl.selectedSegment)]
         profile.captureLimit = ["auto", "30", "60"][max(0, min(2, captureCapPopup.indexOfSelectedItem))]
@@ -5420,79 +5381,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func isInteractiveMode(_ mode: String) -> Bool { mode == "absolute" || mode == "relative" }
-
-    @objc private func interactionModeChanged() {
-        cancelCountdown()
-        inputRouter?.stop(reason: "mode_changed")
-        interactionArmed = false; interactionFailure = ""
-        readControls(); persist(); applyModeVisibility(); refreshPlanLabel(); updateTargetPanels(); refreshInteractionStatus()
-    }
-
-    // Requests happen only in response to these explicit button actions.
-    @objc private func requestInputMonitoring() {
-        if !CGRequestListenEventAccess(), let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") {
-            NSWorkspace.shared.open(url)
-        }
-        refreshInteractionStatus()
-    }
-    @objc private func requestAccessibility() {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        if !AXIsProcessTrustedWithOptions(options), let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-            NSWorkspace.shared.open(url)
-        }
-        refreshInteractionStatus()
-    }
-    @objc private func requestEventAccess() {
-        if !CGRequestPostEventAccess(), let url = URL(string: "x-apple.systempreferences:com.apple.preference.security") {
-            NSWorkspace.shared.open(url)
-        }
-        refreshInteractionStatus()
-    }
-
-    private func refreshInteractionStatus() {
-        let requested = profile.windowOutputMode
-        let permission = LiveInputRouter.Permission.preflight()
-        let showPermissions = profile.sourceKind == "window" && isInteractiveMode(requested)
-        inputMonitoringButton.isHidden = !showPermissions || permission.listen
-        let sourceResizeNeedsAX = profile.sourceWindowResizeActive
-        accessibilityButton.isHidden = !(showPermissions || sourceResizeNeedsAX) || permission.accessibility
-        eventAccessButton.isHidden = !showPermissions || requested != "absolute" || permission.post
-        let releaseWarning = (inputRouter?.cleanupUnconfirmed ?? 0) > 0 ? EnhancementText.t("\nButton release not confirmed; check the source.", "\n按键释放未确认，请检查来源。") : ""
-        guard profile.sourceKind == "window" else {
-            interactionStateLabel.stringValue = EnhancementText.t("Window interaction is available only for window sources.", "全屏交互仅适用于窗口来源。") + releaseWarning
-            return
-        }
-        guard isInteractiveMode(requested) else {
-            interactionStateLabel.stringValue = (requested == "viewer" ? EnhancementText.t("Viewer blocks input.", "观看模式不转发输入。") : EnhancementText.t("Source-aligned output keeps direct input.", "按来源位置增强，可直接操作。")) + releaseWarning
-            return
-        }
-        let requestedText = requested == "relative" ? EnhancementText.t("relative", "相对输入") : EnhancementText.t("pointer", "指针")
-        let activeText = inputRouter?.ready == true ? EnhancementText.t("route active; verify source response", "路由运行中，请检查来源响应") : EnhancementText.t("not active", "未生效")
-        let listen = permission.listen ? EnhancementText.t("granted", "已授权") : EnhancementText.t("missing", "未授权")
-        let post = requested == "relative" ? EnhancementText.t("not needed", "不需要") : (permission.post ? EnhancementText.t("granted", "已授权") : EnhancementText.t("missing", "未授权"))
-        let accessibility = permission.accessibility ? EnhancementText.t("granted", "已授权") : EnhancementText.t("missing", "未授权")
-        let issueText: String
-        switch interactionFailure {
-        case "input_monitoring_missing", "listen_permission_missing": issueText = EnhancementText.t("input monitoring required", "需要输入监听权限")
-        case "event_modification_missing", "post_permission_missing": issueText = EnhancementText.t("event posting required for release", "需要事件发送权限以释放按键")
-        case "accessibility_missing": issueText = EnhancementText.t("accessibility permission required", "需要辅助功能权限")
-        case "comparison_unsupported": issueText = EnhancementText.t("comparison unavailable", "对比画面不支持交互")
-        case "geometry_unavailable": issueText = EnhancementText.t("waiting for verified geometry", "等待有效画面位置")
-        case "target_unavailable", "target_changed": issueText = EnhancementText.t("source is no longer active", "来源窗口已失焦或变化")
-        case "tap_create_failed", "tap_enable_failed", "tap_disabled": issueText = EnhancementText.t("input route unavailable", "输入路由不可用")
-        case "apply_to_start": issueText = EnhancementText.t("apply to start", "应用设置后开始")
-        case "release_mouse_buttons": issueText = EnhancementText.t("release mouse buttons to prepare", "松开鼠标按键以准备交互")
-        case "bootstrap_unavailable": issueText = EnhancementText.t("input preparation unavailable", "输入准备不可用")
-        case "waiting_source_focus": issueText = EnhancementText.t("switch to the source window", "请切回来源窗口")
-        case "source_obstructed_waiting": issueText = EnhancementText.t("waiting for obstruction to clear", "等待遮挡消失")
-        case "source_obstructed": issueText = EnhancementText.t("source is covered or window state unknown", "来源被遮挡或窗口状态未知")
-        case "source_outside_displays": issueText = EnhancementText.t("mapped point is outside active displays", "映射位置不在活动显示器内")
-        case "geometry_invalidated": issueText = EnhancementText.t("source position changed", "来源位置已变化")
-        default: issueText = ""
-        }
-        let issue = issueText.isEmpty ? "" : " · \(issueText)"
-        interactionStateLabel.stringValue = EnhancementText.t("Requested: \(requestedText) · \(activeText)\(issue)\nMonitoring: \(listen) · Posting: \(post) · Accessibility: \(accessibility)\nExit: Ctrl+Option+Esc", "请求：\(requestedText) · \(activeText)\(issue)\n监听：\(listen) · 发送：\(post) · 辅助功能：\(accessibility)\n退出：Control+Option+Esc") + releaseWarning
-    }
 
     private func isVerifiedInputTarget(_ context: LiveInputRouter.Context, requireGeometry: Bool) -> Bool {
         guard capture.running, !capture.paused, capture.currentGeneration == context.generation,
@@ -5580,7 +5468,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             guard let self else { return }
             self.interactionArmed = false; self.interactionFailure = reason
             if reason == "emergency_exit" { self.stop() }
-            else { self.updateTargetPanels(); self.refreshInteractionStatus() }
+            else { self.updateTargetPanels() }
         })
         inputRouter = router
         return router
@@ -5589,13 +5477,13 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private func reconcileInputRouter(target: CaptureTarget, interactive: Bool) {
         guard interactive, interactionArmed, case let .window(id, owner) = target else {
             if inputRouter?.active == true { inputRouter?.stop(reason:"not_interactive") }
-            refreshInteractionStatus(); return
+            return
         }
         let permission = LiveInputRouter.Permission.preflight()
         guard permission.permits(relative: applied.windowOutputMode == "relative") else {
             if inputRouter?.active == true { inputRouter?.stop(reason:"permission_missing") }
             interactionFailure = !permission.listen ? "input_monitoring_missing" : (!permission.accessibility ? "accessibility_missing" : "event_modification_missing")
-            refreshInteractionStatus(); return
+            return
         }
         let geometry = processor.inputGeometrySnapshot()
         guard (geometry["valid"] as? Bool) == true, let version = (geometry["version"] as? NSNumber)?.uint64Value, version > 0,
@@ -5608,7 +5496,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             } else if interactionGeometryWaitAt == 0 { interactionGeometryWaitAt = ProcessInfo.processInfo.systemUptime }
             else if ProcessInfo.processInfo.systemUptime - interactionGeometryWaitAt > 3 { interactionArmed = false }
             if !interactionArmed { inputRouter?.stop(reason:"geometry_unavailable"); outputWindow?.orderOut(nil); viewerControlsPanel?.orderOut(nil); outputPreview.refreshVisibilitySnapshot() }
-            interactionFailure = "geometry_unavailable"; refreshInteractionStatus(); return
+            interactionFailure = "geometry_unavailable"; return
         }
         let context = LiveInputRouter.Context(sourcePID: owner, windowID: id, generation: capture.currentGeneration,
             config: config, epoch: epoch, version: version, relative: applied.windowOutputMode == "relative", exclusions: [], sourceDisplays: interactionDisplayMappings())
@@ -5626,7 +5514,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             router.stop(reason: router.reason)
             outputWindow?.orderOut(nil); viewerControlsPanel?.orderOut(nil); outputPreview.refreshVisibilitySnapshot()
         }
-        refreshInteractionStatus()
     }
 
     private func selectedScreen() -> NSScreen? {
@@ -5928,7 +5815,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             case .wait:
                 outputPreview.observeVerifiedWindowGeometry(nil)
                 outputWindow?.orderOut(nil); viewerControlsPanel?.orderOut(nil); outputPreview.refreshVisibilitySnapshot()
-                interactionFailure = "waiting_source_focus"; outputHiddenReason = "waiting_source_focus"; refreshInteractionStatus(); return
+                interactionFailure = "waiting_source_focus"; outputHiddenReason = "waiting_source_focus"; return
             case .ready: interactionFocusAcquired = true
             case .cancel:
                 inputRouter?.stop(reason:"target_unavailable"); interactionArmed = false; interactionObstructionWait.reset(); interactionFailure = "target_unavailable"
@@ -5966,7 +5853,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             else { interactionFailure = "comparison_unsupported" }
             if interactionArmed { interactionArmed = false }
             outputWindow?.orderOut(nil); viewerControlsPanel?.orderOut(nil); outputPreview.refreshVisibilitySnapshot()
-            outputHiddenReason = "interaction_restricted"; refreshInteractionStatus(); return
+            outputHiddenReason = "interaction_restricted"; return
         }
         if interactionAvailable { setInteractionControlsPassthrough(inputRouter?.ready == true) }
         if interactionAvailable, case let .window(id, owner) = target, let source = state.verifiedScreenRect,
@@ -6014,13 +5901,13 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 outputPreview.invalidateSharedGeometry()
                 outputWindow?.orderOut(nil); viewerControlsPanel?.orderOut(nil); outputPreview.refreshVisibilitySnapshot()
                 investigateSelectedAX(id: id, owner: owner, source: source, targetBounds: state.observedWindowBounds)
-                outputHiddenReason = mayWait ? "source_obstructed_waiting" : "source_obstructed"; refreshInteractionStatus(); return
+                outputHiddenReason = mayWait ? "source_obstructed_waiting" : "source_obstructed"; return
             }
             guard interactionObstructionWait.observe(blocked: false, now: ProcessInfo.processInfo.systemUptime,
                 generation: capture.currentGeneration, config: processor.resolvedPlan.configVersion) else {
                 inputRouter?.stop(reason: "obstruction_timeout"); interactionArmed = false; interactionFailure = "source_obstructed"
                 outputPreview.invalidateSharedGeometry(); outputWindow?.orderOut(nil); viewerControlsPanel?.orderOut(nil)
-                outputPreview.refreshVisibilitySnapshot(); outputHiddenReason = "source_obstructed"; refreshInteractionStatus(); return
+                outputPreview.refreshVisibilitySnapshot(); outputHiddenReason = "source_obstructed"; return
             }
             if interactionFailure == "source_obstructed_waiting" { interactionFailure = "" }
         } else {
@@ -6044,7 +5931,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                     interactionFailure = "release_mouse_buttons"
                 } else { interactionArmed = false; interactionFailure = router.reason }
                 outputWindow?.orderOut(nil); viewerControlsPanel?.orderOut(nil); outputPreview.refreshVisibilitySnapshot()
-                outputHiddenReason = "bootstrap_unavailable"; refreshInteractionStatus(); return
+                outputHiddenReason = "bootstrap_unavailable"; return
             }
         }
         let explicitViewer = TargetOverlayPolicy.activeWindowViewer(windowTarget: windowTarget,

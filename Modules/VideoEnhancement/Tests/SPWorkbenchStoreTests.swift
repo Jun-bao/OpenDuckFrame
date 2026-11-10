@@ -9,7 +9,6 @@ private struct SizePopup {
 private final class SourceSizeControls {
  var scalePopup = SizePopup(indexOfSelectedItem: 1)
  var sourceWindowPopup = SizePopup(indexOfSelectedItem: 2)
- var windowOutputPopup = SizePopup(indexOfSelectedItem: 0)
  var sourceKindControl = (selectedSegment: 0, unused: 0)
  var scaleSwitch = (state: NSControl.StateValue.on, unused: 0)
  var profile = EnhancementProfile()
@@ -23,13 +22,11 @@ private final class SourceSizeControls {
 
 @main struct TestRunner {
  @MainActor static func main() throws {
-  for mode in 0...3 {
+  do {
    let controls = SourceSizeControls()
    controls.profile.sourceWindowPreset = 480
-   controls.windowOutputPopup.selectItem(at: mode)
    controls.changeSourceSize()
-   precondition(controls.windowOutputPopup.indexOfSelectedItem == mode,
-     "Changing source size must preserve the user's output/input mode")
+   precondition(controls.profile.windowOutputMode == "follow")
    precondition(controls.outputSize?.0 == 2560 && controls.outputSize?.1 == 1440)
   }
   for source in 0...2 {
@@ -37,7 +34,7 @@ private final class SourceSizeControls {
    controls.sourceKindControl.selectedSegment = source
    controls.scaleSwitch.state = .off
    controls.changeSourceSize()
-   precondition(controls.windowOutputPopup.indexOfSelectedItem == 0 && controls.outputSize == nil)
+   precondition(controls.profile.windowOutputMode == "follow" && controls.outputSize == nil)
   }
   let p0Args = ["--odf-p0-controls", "--odf-r7-opaque"]
   precondition(P0DiagnosticPolicy.controlsEnabled(args:p0Args,isolated:true))
@@ -110,7 +107,7 @@ private final class SourceSizeControls {
   }
   oldProfile["windowOutputMode"] = "absolute"
   let absoluteData = try JSONSerialization.data(withJSONObject:oldProfile)
-  precondition(EnhancementProfileStore.decode(absoluteData,fallbackName:"legacy")?.windowOutputMode == "absolute")
+  precondition(EnhancementProfileStore.decode(absoluteData,fallbackName:"legacy")?.windowOutputMode == "follow")
   precondition(WorkbenchDimensionPolicy.editable(sizeIndex: 4, scaleEnabled: true))
   for index in [0, 1, 2, 3, 5] { precondition(!WorkbenchDimensionPolicy.editable(sizeIndex: index, scaleEnabled: true)) }
   precondition(!WorkbenchDimensionPolicy.editable(sizeIndex: 4, scaleEnabled: false))
@@ -146,8 +143,9 @@ private final class SourceSizeControls {
    var customViewer = savedDefault
    customViewer.configName = "explicit-viewer"; customViewer.configID = "custom:explicit-viewer"
    try EnhancementProfileStore.saveCurrent(customViewer)
-   precondition(EnhancementProfileStore.load() == customViewer)
-   precondition(EnhancementProfileStore.loadNamed("explicit-viewer") == customViewer)
+   var expectedCustom = customViewer; expectedCustom.windowOutputMode = "follow"
+   precondition(EnhancementProfileStore.load() == expectedCustom)
+   precondition(EnhancementProfileStore.loadNamed("explicit-viewer") == expectedCustom)
   }
   var userOverride = EnhancementProfile(); userOverride.interpolationEnabled = false; userOverride.rifeStreamEnabled = false
   try EnhancementProfileStore.save(userOverride)
