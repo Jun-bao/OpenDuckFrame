@@ -4439,6 +4439,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         srInputPopup.toolTip = help
         fullscreenCheck.title = profile.sourceKind == "file"
             ? EnhancementText.t("Fullscreen on output display", "在输出显示器全屏")
+            : EnhancementText.t("Fullscreen (Esc to return)", "全屏预览（Esc 返回交互）")
+        fullscreenCheck.toolTip = profile.sourceKind == "file" ? nil
             : EnhancementText.t("Fullscreen viewer (Esc to return to interaction)", "全屏预览（Esc 返回交互）")
         fullscreenCheck.isHidden = profile.sourceKind == "window"
         fullscreenCheck.isEnabled = profile.sourceKind != "window"
