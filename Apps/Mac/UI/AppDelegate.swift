@@ -14,6 +14,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var singleInstanceServer: SingleInstanceIPC.Server?
     private var singleInstanceTerminating = false
     private var launchOpensMedia = false
+#if ODF_AIR_BETA_DIAGNOSTIC
+    private var betaTerminationPending = false
+    private var betaTerminationReplied = false
+#endif
+#if ODF_AIR_BETA_DIAGNOSTIC
+    private var airBetaEntryHarness: SPAirBetaEntryHarness?
+#endif
 #if SP_INTERNAL_BUILD && !SP_APP_STORE
     private var reopenTestClickDelay: Double?
     private var reopenTestUseMouse = false
@@ -179,6 +186,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         spLaunchMark("willFinishLaunching 入口")
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if SPAirBetaEntryHarness.isRequested { return }
+#endif
 
         let wc = makeWindowController(deferCore: spCLIFilePath == nil, mediaSize: spCLIFilePath != nil)
         spLaunchMark("窗口已创建（含 loadView/渲染器，未亮相）")
@@ -231,11 +241,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
-        !enhancementSelfTest && !sessionContract && !engineProbe && !srPipelineContract && !videoSRPipelineContract && !anime4KPipelineContract && !cuganPipelineContract && !srInputPipelineContract
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if SPAirBetaEntryHarness.isRequested { return false }
+#endif
+        return !enhancementSelfTest && !sessionContract && !engineProbe && !srPipelineContract && !videoSRPipelineContract && !anime4KPipelineContract && !cuganPipelineContract && !srInputPipelineContract
     }
 
     @MainActor func applicationDidFinishLaunching(_ notification: Notification) {
         spLaunchMark("didFinishLaunching 入口")
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if SPAirBetaEntryHarness.isRequested {
+            guard let harness = SPAirBetaEntryHarness(), harness.start() else { exit(2) }
+            airBetaEntryHarness = harness
+            return
+        }
+#endif
         let args = CommandLine.arguments
         if args.contains(PixelDiagnosticsPolicy.flag) && !PixelDiagnosticsPolicy.enabled(args) {
             fputs("--odf-pixel-diagnostics requires absolute --odf-isolated-profile and --odf-live-log paths\n", stderr)
@@ -346,6 +366,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if let index = args.firstIndex(of: "--odf-live-log"), args.indices.contains(index + 1) {
             EnhancementWorkbenchController.liveLogPath = args[index + 1]
         }
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if EnhancementWorkbenchController.betaSessionRecordingEnabled && EnhancementWorkbenchController.liveLogPath == nil {
+            let directory = EnhancementProfileStore.fileURL().deletingLastPathComponent().appendingPathComponent("logs", isDirectory: true)
+            EnhancementWorkbenchController.liveLogPath = directory.appendingPathComponent("beta-\(UUID().uuidString).jsonl").path
+        }
+#endif
         if engineProbe {
             let output = args.firstIndex(of: "--odf-engine-probe").flatMap { index in
                 args.indices.contains(index + 1) ? args[index + 1] : nil
@@ -489,6 +515,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
 
         if #available(macOS 26.0, *), !CaptionTaskCenter.shared.confirmQuitIfNeeded() { return .terminateCancel }
+
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if EnhancementWorkbenchController.betaSessionRecordingEnabled,
+           let workbench = EnhancementWorkbenchController.betaInstance {
+            if betaTerminationPending { return .terminateLater }
+            betaTerminationPending = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
+                guard let self, !self.betaTerminationReplied else { return }
+                self.betaTerminationReplied = true
+                workbench.forceBetaTerminationIncomplete()
+                sender.reply(toApplicationShouldTerminate: true)
+            }
+            DispatchQueue.main.async { [weak self] in
+                workbench.finishBetaSession(reason: "application_quit") {
+                    guard let self, !self.betaTerminationReplied else { return }
+                    self.betaTerminationReplied = true
+                    sender.reply(toApplicationShouldTerminate: true)
+                }
+            }
+            return .terminateLater
+        }
+#endif
 
         for wc in windowControllers {
             wc.playerViewController.flushResumePositionNow(forceDiskSync: true)

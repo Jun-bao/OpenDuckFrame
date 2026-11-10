@@ -667,6 +667,29 @@ private func applyDefaultPreset(_ profile: inout EnhancementProfile) {
     profile.windowOutputMode = defaults.windowOutputMode
 }
 
+private func applyAirBetaPreset(_ profile: inout EnhancementProfile) {
+    guard Bundle.main.object(forInfoDictionaryKey: "ODFAirBeta") as? Bool == true else { return }
+    profile.configID = "preset:air-beta"
+    profile.configName = "Air 实验档 · 2× 插帧"
+    profile.sourceKind = "window"
+    profile.interpolationEnabled = true
+    profile.interpolationEngineID = "rife.metal"
+    profile.interpolationQuality = "fast"
+    profile.rifeStreamEnabled = true
+    profile.modelID = "rife-v4.25"
+    profile.rate = .multiplier(2)
+    profile.scaleEnabled = false
+    profile.scaleEngineID = "lanczos"
+    profile.srInputPreset = 0
+    profile.sourceWindowPreset = 0
+    profile.outputWidth = 0
+    profile.outputHeight = 0
+    profile.outputFullscreen = false
+    profile.windowOutputMode = "follow"
+    profile.captureLimit = "auto"
+    profile.viewMode = "enhanced"
+}
+
 enum EnhancementProfileStore {
     // Set only by the isolated, single-threaded store contract executable.
     nonisolated(unsafe) static var testDirectory: URL?
@@ -674,8 +697,11 @@ enum EnhancementProfileStore {
         if let testDirectory { return testDirectory.appendingPathComponent("EnhancementProfile.json") }
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        let directory = Bundle.main.object(forInfoDictionaryKey: "ODFExperimentTrial") as? Bool == true
+        let defaultDirectory = Bundle.main.object(forInfoDictionaryKey: "ODFExperimentTrial") as? Bool == true
             ? "OpenDuckFrame/ExperimentComparison" : "OpenDuckFrame"
+        // Bundle overrides are relative to the current user's Application Support.
+        let directory = Bundle.main.object(forInfoDictionaryKey: "ODFEnhancementProfileDirectory") as? String
+            ?? defaultDirectory
         return base.appendingPathComponent(directory, isDirectory: true).appendingPathComponent("EnhancementProfile.json")
     }
 
@@ -726,13 +752,18 @@ enum EnhancementProfileStore {
         fileURL().deletingLastPathComponent().appendingPathComponent("EnhancementConfigs", isDirectory: true)
     }
 
-    static let presets: [(id: String, name: String, english: String, symbol: String)] = [
-        ("preset:default", "默认", "Default", "doc.text"),
-        ("preset:native", "原生画质 X2", "Native quality X2", "viewfinder"),
-        ("preset:game", "游戏", "Game", "gamecontroller"),
-        ("preset:film", "电影", "Film", "film"),
-        ("preset:anime", "动画", "Animation", "photo"),
-    ]
+    static var presets: [(id: String, name: String, english: String, symbol: String)] {
+        if Bundle.main.object(forInfoDictionaryKey: "ODFAirBeta") as? Bool == true {
+            return [("preset:air-beta", "Air 实验档 · 2× 插帧", "Air Beta · 2× Interpolation", "play.rectangle")]
+        }
+        return [
+            ("preset:default", "默认", "Default", "doc.text"),
+            ("preset:native", "原生画质 X2", "Native quality X2", "viewfinder"),
+            ("preset:game", "游戏", "Game", "gamecontroller"),
+            ("preset:film", "电影", "Film", "film"),
+            ("preset:anime", "动画", "Animation", "photo"),
+        ]
+    }
 
     static func resolvedID(_ profile: EnhancementProfile) -> String {
         if let id = profile.configID, !id.isEmpty { return id }
@@ -1009,6 +1040,21 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         init(_ processor: SPLiveProcessor) { self.processor = processor }
     }
     static let shared = EnhancementWorkbenchController()
+#if ODF_AIR_BETA_DIAGNOSTIC
+    private(set) static weak var betaInstance: EnhancementWorkbenchController?
+    static var betaSessionRecordingEnabled: Bool {
+        SPAirBetaSessionRecorder.isEnabled
+    }
+    private var betaRecorder: SPAirBetaSessionRecorder?
+    private var betaLiveLogWriter: SPAirBetaLiveLogWriter?
+    private var betaLogWritesPaused = false
+    private var betaFinishInProgress = false
+    private var betaSessionFinished = false
+    private var betaFinishCompletions: [() -> Void] = []
+    private var betaFinishToken: UUID?
+    private var betaFinishPhase = "export"
+    private var betaFinishDeadline: DispatchWorkItem?
+#endif
 
     private final class WorkbenchWindow: NSWindow {
         var beforeMouseDown: ((NSEvent) -> Void)?
@@ -1059,10 +1105,13 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private var ownCaptureApplications: [SCRunningApplication] = []
 
     private let statusLabel = NSTextField(labelWithString: "")
+    private var lastWindowOptimizationStatus = ""
     private let statsLabel = NSTextField(labelWithString: "")
     private let budgetLabel = NSTextField(labelWithString: "")
     private let planLabel = NSTextField(wrappingLabelWithString: "")
     private let sizeChainLabel = NSTextField(wrappingLabelWithString: "")
+    private let airBetaStatusLabel = NSTextField(wrappingLabelWithString: "")
+    private let airBetaReasonLabel = NSTextField(wrappingLabelWithString: "")
     private let sourceLabel = NSTextField(labelWithString: "")
     private let fileLimitLabel = NSTextField(wrappingLabelWithString: "")
     private let interpolationSwitch = NSSwitch()
@@ -1234,8 +1283,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         window.title = WorkbenchTitle.text(EnhancementText.t("Quality Workbench", "画质工作台"), version: version)
         window.minSize = NSSize(width: 1100, height: 760)
         super.init(window: window)
+#if ODF_AIR_BETA_DIAGNOSTIC
+        Self.betaInstance = self
+#endif
         profile.configID = EnhancementProfileStore.resolvedID(profile)
         if SPRifeExperiments.available { useRifeComparisonProfile() }
+        applyAirBetaPreset(&profile)
         window.delegate = self
         window.contentView = build()
         window.initialFirstResponder = sourceKindControl
@@ -1409,7 +1462,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         window?.center()
         NSApp.activate(ignoringOtherApps: true)
         startLiveLogIfNeeded()
-        if SPRifeExperiments.available, !experimentPanelAutoOpened,
+        if SPRifeExperiments.available, !SPRifeExperiments.airBeta, !experimentPanelAutoOpened,
            CommandLine.arguments.contains("--odf-experiment-comparison") {
             experimentPanelAutoOpened = true
             showExperimentComparison()
@@ -1428,7 +1481,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     @objc private func showExperimentComparison() {
-        guard SPRifeExperiments.available else { return }
+        guard SPRifeExperiments.available, !SPRifeExperiments.airBeta else { return }
         if experimentComparisonPanel == nil {
             experimentComparisonPanel = ExperimentComparisonPanel(selectionChanged: { [weak self] selection in
                 self?.selectExperimentComparison(selection)
@@ -1448,7 +1501,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func selectExperimentComparison(_ selection: SPRifeExperimentSelection) {
-        guard SPRifeExperiments.available else { return }
+        guard SPRifeExperiments.available, !SPRifeExperiments.airBeta else { return }
         readControls()
         stop()
         SPRifeExperiments.selection = selection
@@ -1524,8 +1577,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         sideStack.setCustomSpacing(18, after: brandRow)
         sideStack.addArrangedSubview(navButtons[0])
         sideStack.addArrangedSubview(navButtons[1])
-        sideStack.addArrangedSubview(navButtons[2])
-        sideStack.setCustomSpacing(20, after: navButtons[2])
+        if !SPRifeExperiments.airBeta { sideStack.addArrangedSubview(navButtons[2]) }
+        sideStack.setCustomSpacing(20, after: SPRifeExperiments.airBeta ? navButtons[1] : navButtons[2])
         if p0ControlsEnabled {
             let opaque = NSButton(title: "", target: self, action: #selector(toggleP0OpaqueFromMain))
             let focus = NSButton(title: "", target: self, action: #selector(toggleP0ActivationFromMain))
@@ -1537,7 +1590,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             p0MainOpaqueButton = opaque; p0MainActivateButton = focus; p0MainCaptureButton = cap
             refreshP0ControlTitles()
         }
-        sideStack.addArrangedSubview(heading(EnhancementText.t("Configs", "配置")))
+        sideStack.addArrangedSubview(heading(SPRifeExperiments.airBeta
+            ? EnhancementText.t("Test mode", "测试模式") : EnhancementText.t("Configs", "配置")))
         configRows.orientation = .vertical
         configRows.alignment = .leading
         configRows.spacing = 4
@@ -1573,7 +1627,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         projectLinks.widthAnchor.constraint(equalToConstant: 168).isActive = true
         footer.addArrangedSubview(projectLinks)
         footer.setCustomSpacing(10, after: projectLinks)
-        if SPRifeExperiments.available {
+        if SPRifeExperiments.available && !SPRifeExperiments.airBeta {
             let comparison = NSButton(title: EnhancementText.t("Compare Options", "方案对比"), target: self, action: #selector(showExperimentComparison))
             comparison.identifier = NSUserInterfaceItemIdentifier("experiments.comparison.open")
             comparison.image = NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: nil)
@@ -1605,6 +1659,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         sourceKindControl.setLabel(EnhancementText.t("Window", "窗口"), forSegment: 0)
         sourceKindControl.setLabel(EnhancementText.t("Display", "显示器"), forSegment: 1)
         sourceKindControl.setLabel(EnhancementText.t("Video File", "视频文件"), forSegment: 2)
+        sourceKindControl.isHidden = SPRifeExperiments.airBeta
         sourceKindControl.segmentDistribution = .fillEqually
         sourceKindControl.translatesAutoresizingMaskIntoConstraints = false
         sourceKindControl.widthAnchor.constraint(greaterThanOrEqualToConstant: 360).isActive = true
@@ -1690,8 +1745,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         outputRow.alignment = .centerY
         outputRow.spacing = 8
         outputRow.addArrangedSubview(heading(EnhancementText.t("Output", "输出")))
-        outputRow.addArrangedSubview(displayPopup)
-        outputRow.addArrangedSubview(fullscreenCheck)
+        if !SPRifeExperiments.airBeta {
+            outputRow.addArrangedSubview(displayPopup)
+            outputRow.addArrangedSubview(fullscreenCheck)
+        }
         let fpsRow = NSStackView()
         fpsRow.orientation = .horizontal
         fpsRow.alignment = .centerY
@@ -1706,6 +1763,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         viewMode.translatesAutoresizingMaskIntoConstraints = false
         viewMode.segmentDistribution = .fillEqually
         viewMode.appearance = NSAppearance(named: .darkAqua)
+        viewMode.isHidden = SPRifeExperiments.airBeta
+        viewMode.isEnabled = !SPRifeExperiments.airBeta
         well.addSubview(viewMode)
         NSLayoutConstraint.activate([
             viewMode.widthAnchor.constraint(equalToConstant: 240),
@@ -1927,8 +1986,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let title = NSTextField(labelWithString: EnhancementText.t("Choose Input", "选择输入源"))
         title.font = .systemFont(ofSize: 22, weight: .bold)
         let subtitle = NSTextField(wrappingLabelWithString: EnhancementText.t(
-            "Window, display, or a video file. A capture card is just that app's preview window.",
-            "窗口、显示器或视频文件。采集卡就是那个软件自己的预览窗口。"))
+            SPRifeExperiments.airBeta ? "Choose the window playing your video." : "Window, display, or a video file. A capture card is just that app's preview window.",
+            SPRifeExperiments.airBeta ? "选择正在播放视频的窗口。" : "窗口、显示器或视频文件。采集卡就是那个软件自己的预览窗口。"))
         subtitle.preferredMaxLayoutWidth = 640
         subtitle.textColor = .secondaryLabelColor
         stack.addArrangedSubview(title)
@@ -1938,16 +1997,20 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         cards.alignment = .top
         cards.spacing = 12
         cards.addArrangedSubview(sourceCard(EnhancementText.t("Window", "窗口"), EnhancementText.t("Choose an app window to enhance.", "选择想要增强的应用窗口。"), #selector(chooseWindow)))
-        cards.addArrangedSubview(sourceCard(EnhancementText.t("Display", "显示器"), EnhancementText.t("Capture one display, excluding this app.", "捕获一块显示器，排除本应用。"), #selector(chooseDisplay)))
-        cards.addArrangedSubview(sourceCard(EnhancementText.t("Video File", "视频文件"), EnhancementText.t("Open a video in the player to use supported file enhancement.", "在播放器中打开视频，使用支持的文件增强。"), #selector(chooseFile)))
+        if !SPRifeExperiments.airBeta {
+            cards.addArrangedSubview(sourceCard(EnhancementText.t("Display", "显示器"), EnhancementText.t("Capture one display, excluding this app.", "捕获一块显示器，排除本应用。"), #selector(chooseDisplay)))
+            cards.addArrangedSubview(sourceCard(EnhancementText.t("Video File", "视频文件"), EnhancementText.t("Open a video in the player to use supported file enhancement.", "在播放器中打开视频，使用支持的文件增强。"), #selector(chooseFile)))
+        }
         stack.addArrangedSubview(cards)
         stack.addArrangedSubview(heading(EnhancementText.t("Current source", "当前来源")))
         captureCapPopup.removeAllItems()
         captureCapPopup.addItems(withTitles: [EnhancementText.t("Auto", "自动"), "30", "60"])
         captureCapPopup.target = self
         captureCapPopup.action = #selector(captureCapChanged)
-        stack.addArrangedSubview(heading(EnhancementText.t("Input capture cap (FPS)", "输入采集上限（FPS）")))
-        stack.addArrangedSubview(captureCapPopup)
+        if !SPRifeExperiments.airBeta {
+            stack.addArrangedSubview(heading(EnhancementText.t("Input capture cap (FPS)", "输入采集上限（FPS）")))
+            stack.addArrangedSubview(captureCapPopup)
+        }
         stack.addArrangedSubview(sourceLabel)
         stack.addArrangedSubview(fileLimitLabel)
         stack.addArrangedSubview(heading(EnhancementText.t("Recent", "最近")))
@@ -1960,6 +2023,11 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private func inspectorColumn() -> NSView {
         configurePopups()
+        if SPRifeExperiments.airBeta {
+            windowOutputPopup.removeAllItems()
+            windowOutputPopup.addItem(withTitle: EnhancementText.t("Follow source", "跟随来源"))
+            return airBetaInspector()
+        }
         func column() -> NSStackView {
             let stack = NSStackView()
             stack.orientation = .vertical
@@ -2095,6 +2163,27 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             framesCard.widthAnchor.constraint(equalTo: stack.widthAnchor),
             interactionCard.widthAnchor.constraint(equalTo: stack.widthAnchor),
         ])
+        return stack
+    }
+
+    private func airBetaInspector() -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.addArrangedSubview(heading(EnhancementText.t("Runtime status", "运行状态")))
+        airBetaStatusLabel.font = .systemFont(ofSize: 12)
+        airBetaStatusLabel.maximumNumberOfLines = 10
+        airBetaStatusLabel.stringValue = EnhancementText.t("Choose a window to see runtime details.", "选择窗口后显示运行状态。")
+        airBetaReasonLabel.font = .systemFont(ofSize: 12)
+        airBetaReasonLabel.maximumNumberOfLines = 6
+        airBetaReasonLabel.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(airBetaStatusLabel)
+        stack.addArrangedSubview(airBetaReasonLabel)
+        for label in [airBetaStatusLabel, airBetaReasonLabel] {
+            label.preferredMaxLayoutWidth = 220
+            label.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
         return stack
     }
 
@@ -2313,6 +2402,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func redrawPreview() {
+        applyAirBetaPreset(&profile)
         let mode: SPLiveViewMode
         switch profile.viewMode {
         case "original": mode = .original
@@ -2424,6 +2514,14 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private func rebuildConfigRows() {
         cancelRename()
         for item in configRows.arrangedSubviews { configRows.removeArrangedSubview(item); item.removeFromSuperview() }
+        if SPRifeExperiments.airBeta {
+            let mode = NSTextField(wrappingLabelWithString: EnhancementText.t("Air Beta · 2× Interpolation", "Air 实验档 · 2× 插帧"))
+            mode.font = .systemFont(ofSize: 13, weight: .semibold)
+            mode.maximumNumberOfLines = 2
+            mode.preferredMaxLayoutWidth = 168
+            configRows.addArrangedSubview(mode)
+            return
+        }
         let active = EnhancementProfileStore.resolvedID(profile)
         let metadata = EnhancementProfileStore.metadata()
         func add(_ id: String, _ title: String, _ symbol: String) {
@@ -3223,6 +3321,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func updateAppleSRCapability() {
+        if SPRifeExperiments.airBeta { applyModeVisibility(); return }
         let filePlayer = profile.sourceKind == "file" ? selectedFilePlayer() : nil
         let fileSize = filePlayer?.workbenchSourceSize ?? (0, 0)
         let liveSelected = profile.sourceKind != "file" && capture.running
@@ -3309,6 +3408,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         if capture.running, let incoming = stats["sourceGeneration"] as? UInt64, incoming != capture.currentGeneration { return }
         lastStats = stats
         lastStatsReceipt = ProcessInfo.processInfo.systemUptime
+#if ODF_AIR_BETA_DIAGNOSTIC
+        betaRecorder?.observeReadyStats(stats)
+#endif
         clearObsoleteBudgetWarningIfNeeded()
         if profile.interpolationEngineID == "apple.lowlatency" { phaseLabel.stringValue = lowLatencyPhaseText() }
         updateAppleSRCapability()
@@ -3318,6 +3420,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func updateStatsText(_ stats: [String: Any]) {
+        updateAirBetaStatus(stats)
         let healthNow = ProcessInfo.processInfo.systemUptime
         if healthNow - r7LastHealthAt >= 1 {
             r7LastHealthAt = healthNow
@@ -3328,6 +3431,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             let label = EnhancementText.t("Capture", "采集回调")
             sourceMetaLabel.stringValue = fps > 1 && (r7Diagnostics || p0ControlsEnabled) ? "\(width)×\(height) · \(label) \(String(format: "%.0f", fps)) fps" : "\(width)×\(height)"
         }
+        if SPRifeExperiments.airBeta { return }
         let presented = (stats["epochPhysicalSynthetic"] as? Int) ?? 0
         let scheduled = LiveCoverage.modelScheduled(total: (stats["epochScheduled"] as? Int) ?? 0,
                                                      held: (stats["epochStaticHoldPhases"] as? Int) ?? 0)
@@ -3373,6 +3477,58 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         budgetLabel.textColor = budgetLimited.isEmpty ? .secondaryLabelColor : .systemOrange
     }
 
+    private func updateAirBetaStatus(_ stats: [String: Any]) {
+        guard SPRifeExperiments.airBeta else { return }
+        guard capture.running else {
+            airBetaStatusLabel.stringValue = EnhancementText.t("Choose a window to see runtime details.", "选择窗口后显示运行状态。")
+            airBetaReasonLabel.stringValue = ""
+            statsLabel.stringValue = ""
+            budgetLabel.stringValue = ""
+            return
+        }
+        guard LiveFPSOverlay.fresh(stats: stats, now: ProcessInfo.processInfo.systemUptime, receipt: lastStatsReceipt,
+                generation: capture.currentGeneration, config: processor.resolvedPlan.configVersion,
+                running: capture.running, paused: capture.paused),
+              let runtime = stats["airBeta"] as? [String: Any] else {
+            airBetaStatusLabel.stringValue = EnhancementText.t("Waiting for runtime details…", "正在等待运行数据…")
+            airBetaReasonLabel.stringValue = ""
+            statsLabel.stringValue = EnhancementText.t("Output — FPS", "输出 — FPS")
+            budgetLabel.stringValue = ""
+            return
+        }
+        func pixels(_ key: String) -> String {
+            guard let value = runtime[key] as? [Int], value.count == 2, value[0] > 0, value[1] > 0 else { return "—" }
+            return "\(value[0])×\(value[1])"
+        }
+        let keeper = runtime["keeper"] as? String ?? ""
+        let keeperText: String
+        switch keeper {
+        case "active": keeperText = EnhancementText.t("Active", "运行中")
+        case "stopping": keeperText = EnhancementText.t("Stopping", "停止中")
+        case "inactive": keeperText = EnhancementText.t("Inactive", "未运行")
+        case "failed": keeperText = EnhancementText.t("Failed", "失败")
+        case "preparing": keeperText = EnhancementText.t("Preparing", "准备中")
+        default: keeperText = "—"
+        }
+        let factor = runtime["effectiveFactor"] as? Int
+        let factorText = factor.map { "\($0)×" } ?? "—"
+        let fps = FPSPresentation.rate(runtime["fps"] as? Double ?? stats["overlayPresentedFPS"] as? Double,
+            observing: fpsOutputObservable, now: ProcessInfo.processInfo.systemUptime, receipt: lastStatsReceipt)
+        let fpsText = fps.map { String(format: "%.1f FPS", $0) } ?? "— FPS"
+        statsLabel.stringValue = EnhancementText.t("Output", "输出") + " " + fpsText
+        budgetLabel.stringValue = ""
+        airBetaStatusLabel.stringValue = [
+            EnhancementText.t("Capture", "采集") + "  " + pixels("capturePixels"),
+            EnhancementText.t("Processing", "处理") + "  " + pixels("processingPixels"),
+            EnhancementText.t("Format", "格式") + "  " + (runtime["format"] as? String ?? "—"),
+            EnhancementText.t("GPU keep-alive", "算力维持") + "  " + keeperText,
+            EnhancementText.t("Active factor", "当前倍率") + "  " + factorText,
+            EnhancementText.t("Output", "输出") + "  " + fpsText,
+        ].joined(separator: "\n")
+        airBetaReasonLabel.stringValue = runtime["reason"] as? String ?? ""
+        airBetaReasonLabel.textColor = factor == 1 ? .systemOrange : .secondaryLabelColor
+    }
+
     @objc private func captureCapChanged() {
         cancelCountdown()
         let previous = profile.captureLimit
@@ -3389,14 +3545,134 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private func startLiveLogIfNeeded() {
         guard liveLogTimer == nil, let path = Self.liveLogPath else { return }
         let url = URL(fileURLWithPath: path)
-        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if !FileManager.default.fileExists(atPath: path) {
-            FileManager.default.createFile(atPath: path, contents: nil)
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if Self.betaSessionRecordingEnabled {
+            if betaLiveLogWriter == nil { betaLiveLogWriter = SPAirBetaLiveLogWriter(url: url) }
+            if betaRecorder == nil {
+                let directory = url.deletingLastPathComponent().appendingPathComponent(url.deletingPathExtension().lastPathComponent + "-sessions", isDirectory: true)
+                betaRecorder = SPAirBetaSessionRecorder(processor: processor, source: capture, preview: outputPreview, directory: directory)
+            }
+        } else {
+            prepareLiveLogFile(url)
         }
+#else
+        prepareLiveLogFile(url)
+#endif
         liveLogTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.writeLiveLog(to: path) }
         }
     }
+
+    private func prepareLiveLogFile(_ url: URL) {
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: url.path) { FileManager.default.createFile(atPath: url.path, contents: nil) }
+    }
+
+#if ODF_AIR_BETA_DIAGNOSTIC
+    private func betaAllowsSessionChange() -> Bool {
+        if Self.betaSessionRecordingEnabled {
+            if betaFinishInProgress || betaRecorder?.isFinishing == true {
+                statusLabel.stringValue = EnhancementText.t("Saving session logs…", "正在保存会话日志…")
+                return false
+            }
+            if let recorder = betaRecorder, !recorder.canArm && !recorder.isActive {
+                statusLabel.stringValue = EnhancementText.t("Log export is incomplete. Reopen AirBeta to continue.", "日志导出未完成，请重新打开 AirBeta 后继续。")
+                return false
+            }
+        }
+        return true
+    }
+
+    private func armBetaSessionIfNeeded() {
+        guard Self.betaSessionRecordingEnabled, !betaFinishInProgress,
+              case let .window(id, owner) = capture.target else { return }
+        startLiveLogIfNeeded()
+        guard let recorder = betaRecorder, recorder.canArm || recorder.isActive else { return }
+        betaSessionFinished = false
+        betaLogWritesPaused = false
+        recorder.arm(windowID: id, ownerPID: owner, generation: capture.currentGeneration)
+        recorder.observeReadyStats(lastStats)
+    }
+
+    func finishBetaSession(reason: String, completion: @escaping () -> Void) {
+        guard Self.betaSessionRecordingEnabled else { completion(); return }
+        cancelCountdown()
+        if betaSessionFinished {
+            if capture.running { stopImmediately() }
+            completion()
+            return
+        }
+        betaFinishCompletions.append(completion)
+        guard !betaFinishInProgress else { return }
+        betaFinishInProgress = true
+        let token = UUID()
+        betaFinishToken = token
+        betaFinishPhase = "export"
+        let deadline = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.completeBetaFinish(token: token, incompleteReason: "session_finish_38s_timeout_\(self.betaFinishPhase)")
+        }
+        betaFinishDeadline = deadline
+        DispatchQueue.main.asyncAfter(deadline: .now() + 38, execute: deadline)
+        betaLogWritesPaused = true
+        liveLogTimer?.invalidate(); liveLogTimer = nil
+        guard let recorder = betaRecorder else {
+            stopImmediately()
+            completeBetaFinish(token: token)
+            return
+        }
+        recorder.finish(reason: reason) { [weak self] report in
+            guard let self, self.betaFinishToken == token else { return }
+            self.stopImmediately(stopPipeline: false)
+            if let path = Self.liveLogPath {
+                self.writeLiveLog(to: path, event: "beta_session_export_finished", extra: ["betaSessionExport": report], force: true)
+            }
+            guard let writer = self.betaLiveLogWriter else {
+                self.betaFinishPhase = "final_marker"
+                recorder.recordFinalLiveLogReceipt(["complete": false, "firstError": "live_log_writer_missing"]) { [weak self] in self?.completeBetaFinish(token: token) }
+                return
+            }
+            self.betaFinishPhase = "live_log_flush"
+            writer.flush { [weak self] receipt in
+                DispatchQueue.main.async {
+                    guard let self, self.betaFinishToken == token else { return }
+                    self.betaFinishPhase = "final_marker"
+                    recorder.recordFinalLiveLogReceipt(receipt.jsonObject) { [weak self] in self?.completeBetaFinish(token: token) }
+                }
+            }
+        }
+        outputWindow?.orderOut(nil)
+        targetHUD?.orderOut(nil)
+        targetCountdownHUD?.orderOut(nil)
+        statusLabel.stringValue = EnhancementText.t("Saving session logs…", "正在保存会话日志…")
+    }
+
+    func forceBetaTerminationIncomplete() {
+        betaLogWritesPaused = true
+        liveLogTimer?.invalidate(); liveLogTimer = nil
+        if let token = betaFinishToken {
+            completeBetaFinish(token: token, incompleteReason: "application_termination_60s_timeout")
+        } else {
+            betaRecorder?.forceIncomplete(reason: "application_termination_60s_timeout")
+        }
+    }
+
+    private func completeBetaFinish(token: UUID, incompleteReason: String? = nil) {
+        guard betaFinishInProgress, betaFinishToken == token else { return }
+        betaFinishToken = nil
+        betaFinishDeadline?.cancel(); betaFinishDeadline = nil
+        betaFinishInProgress = false
+        betaSessionFinished = true
+        let completions = betaFinishCompletions
+        betaFinishCompletions.removeAll()
+        if let incompleteReason {
+            betaRecorder?.forceIncomplete(reason: incompleteReason)
+            stopImmediately(stopPipeline: false)
+            statusLabel.stringValue = EnhancementText.t("Log export is incomplete. Reopen AirBeta to continue.", "日志导出未完成，请重新打开 AirBeta 后继续。")
+        }
+        for completion in completions { completion() }
+    }
+#endif
 
     private func observeR7Health() {
         let captureStats = capture.diagnostics()
@@ -3449,7 +3725,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         writeLiveLog(to: path, event: event, extra: extra)
     }
 
-    private func writeLiveLog(to path: String, event: String? = nil, extra: [String: Any] = [:]) {
+    private func writeLiveLog(to path: String, event: String? = nil, extra: [String: Any] = [:], force: Bool = false) {
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if Self.betaSessionRecordingEnabled && betaLogWritesPaused && !force { return }
+#endif
         var line: [String: Any] = [
             "t": Date().timeIntervalSince1970,
             "monotonicSeconds": ProcessInfo.processInfo.systemUptime,
@@ -3550,18 +3829,36 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         line["hudHiddenReason"] = hudHiddenReason
         line["note"] = "counts are capture callbacks and drawable presents; complete is not the output rate"
         guard JSONSerialization.isValidJSONObject(line),
-              var data = try? JSONSerialization.data(withJSONObject: line),
-              let handle = FileHandle(forWritingAtPath: path) else { return }
+              var data = try? JSONSerialization.data(withJSONObject: line) else { return }
         data.append(0x0A)
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if Self.betaSessionRecordingEnabled { betaLiveLogWriter?.append(data); return }
+#endif
+        guard let handle = FileHandle(forWritingAtPath: path) else { return }
         defer { try? handle.close() }
         handle.seekToEndOfFile()
         try? handle.write(contentsOf: data)
     }
 
-    @objc private func chooseWindow() { cancelCountdown(); inputRouter?.stop(reason:"source_changed"); interactionArmed = false; profile.sourceKind = "window"; capture.presentPicker(windows: true); persist() }
-    @objc private func chooseDisplay() { cancelCountdown(); inputRouter?.stop(reason:"source_changed"); interactionArmed = false; profile.sourceKind = "display"; capture.presentPicker(windows: false); persist() }
+    @objc private func chooseWindow() {
+#if ODF_AIR_BETA_DIAGNOSTIC
+        guard betaAllowsSessionChange() else { return }
+#endif
+        cancelCountdown(); inputRouter?.stop(reason:"source_changed"); interactionArmed = false
+        profile.sourceKind = "window"; capture.presentPicker(windows: true); persist()
+    }
+    @objc private func chooseDisplay() {
+#if ODF_AIR_BETA_DIAGNOSTIC
+        guard betaAllowsSessionChange() else { return }
+#endif
+        cancelCountdown(); inputRouter?.stop(reason:"source_changed"); interactionArmed = false
+        profile.sourceKind = "display"; capture.presentPicker(windows: false); persist()
+    }
 
     @objc func chooseFile() {
+#if ODF_AIR_BETA_DIAGNOSTIC
+        guard betaAllowsSessionChange() else { return }
+#endif
         cancelCountdown()
         inputRouter?.stop(reason:"source_changed"); interactionArmed = false
         let panel = NSOpenPanel()
@@ -3570,6 +3867,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         panel.allowsMultipleSelection = false
         panel.begin { [weak self] response in
             guard response == .OK, let url = panel.url, let self else { return }
+#if ODF_AIR_BETA_DIAGNOSTIC
+            guard self.betaAllowsSessionChange() else { return }
+#endif
             self.fileURL = url
             self.fileApplied = nil
             self.profile.sourceKind = "file"
@@ -3626,6 +3926,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     @objc private func pickShareable(_ sender: NSButton) {
+#if ODF_AIR_BETA_DIAGNOSTIC
+        guard betaAllowsSessionChange() else { return }
+#endif
         cancelCountdown()
         if sender.identifier?.rawValue == "display",
            let box = shareableDisplays.first(where: { $0.title == sender.title }),
@@ -3666,6 +3969,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     @objc private func start() {
+#if ODF_AIR_BETA_DIAGNOSTIC
+        guard betaAllowsSessionChange() else { return }
+#endif
         if delayedWindowSelection || startImmediatelyAfterPreparation {
             cancelCountdown()
             statusLabel.stringValue = EnhancementText.t("Cancelled", "已取消")
@@ -4053,6 +4359,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let request = planRequest(snapshot)
         let requestID = liveApply.begin()
         request.requestID = requestID
+#if ODF_AIR_BETA_DIAGNOSTIC
+        armBetaSessionIfNeeded()
+#endif
         recordPlanEvent("submit", extra: ["requestID": requestID, "submittedEngine": request.engineID,
             "submittedModel": request.modelID, "submittedRateKind": request.rateKind == .multiplier ? "multiplier" : "fixedFPS",
             "submittedMultiplier": request.multiplier, "submittedScaleEnabled": request.scaleEnabled,
@@ -4068,6 +4377,13 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     @objc private func apply() { start() }
 
     @objc private func stop() {
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if Self.betaSessionRecordingEnabled { finishBetaSession(reason: "stop") {}; return }
+#endif
+        stopImmediately()
+    }
+
+    private func stopImmediately(stopPipeline: Bool = true) {
         recordPlanEvent("stop")
         inputRouter?.stop(reason:"stopped")
         interactionArmed = false
@@ -4090,7 +4406,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             refreshPlanLabel()
             return
         }
-        capture.stop()
+        if stopPipeline { capture.stop() }
         viewerActive = false; viewerFollowOverride = false; viewerReturnPID = nil
         viewerControlsPanel?.orderOut(nil)
         (outputWindow as? TargetPanel)?.viewerKeyboard = false
@@ -4102,7 +4418,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         targetHUD?.orderOut(nil)
         targetCountdownHUD?.orderOut(nil)
         outputPreview.refreshVisibilitySnapshot()
-        processor.stop()
+        if stopPipeline { processor.stop() }
         lastStats = [:]
         lastStatsReceipt = 0
         updateFPSOverlay()
@@ -4752,8 +5068,18 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func planRequest(_ snapshot: EnhancementProfile? = nil) -> SPLivePlanRequest {
-        let profile = snapshot ?? self.profile
+        var profile = snapshot ?? self.profile
+        applyAirBetaPreset(&profile)
         let request = SPLivePlanRequest()
+        if profile.sourceKind == "file" {
+            request.captureSourceKind = .file
+        } else {
+            switch capture.target {
+            case .window?: request.captureSourceKind = .window
+            case .display?: request.captureSourceKind = .display
+            case nil: request.captureSourceKind = .unknown
+            }
+        }
         let engine = profile.interpolationEngineID
         request.engineID = engine
         request.modelID = profile.modelID
@@ -4837,6 +5163,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func refreshPlanLabel() {
+        updateAirBetaStatus(lastStats)
         let rate: String
         switch profile.rate {
         case let .fixedFPS(numerator, denominator): rate = "\(numerator)/\(denominator) fps"
@@ -4914,7 +5241,35 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         planLabel.stringValue = [live, pending, limited ? EnhancementText.t("Display is \(screenHz) Hz", "显示器 \(screenHz) Hz，不能完整呈现该帧率") : "", profile.sourceKind == "file" ? fileStatus() : ""].filter { !$0.isEmpty }.joined(separator: " · ")
         statusLabel.toolTip = [planLabel.stringValue, sizeChainLabel.stringValue].filter { !$0.isEmpty }.joined(separator: " · ")
         if statusLabel.stringValue.isEmpty { statusLabel.stringValue = live }
+        updateWindowOptimizationStatus(lastStats)
         fileLimitLabel.stringValue = profile.sourceKind == "file" ? fileStatus() : ""
+    }
+
+    private func updateWindowOptimizationStatus(_ stats: [String: Any]) {
+        guard !SPRifeExperiments.airBeta, profile.sourceKind != "file",
+              pendingApply == nil, liveApplyFailure.isEmpty,
+              LiveFPSOverlay.fresh(stats: stats, now: ProcessInfo.processInfo.systemUptime, receipt: lastStatsReceipt,
+                  generation: capture.currentGeneration, config: processor.resolvedPlan.configVersion,
+                  running: capture.running, paused: capture.paused),
+              let runtime = stats["airWindowOptimization"] as? [String: Any],
+              runtime["requestEligible"] as? Bool == true else {
+            if !lastWindowOptimizationStatus.isEmpty, statusLabel.stringValue == lastWindowOptimizationStatus {
+                statusLabel.stringValue = ""
+            }
+            lastWindowOptimizationStatus = ""
+            return
+        }
+        guard processor.resolvedPlan.unavailableReason.isEmpty,
+              statusLabel.textColor != .systemRed, statusLabel.textColor != .systemOrange else { return }
+        let active = runtime["active"] as? Bool == true
+        let reason = EnhancementText.runtime((runtime["reason"] as? String) ?? "")
+        let message = reason.isEmpty
+            ? EnhancementText.t(active ? "RIFE window optimization is active" : "Preparing RIFE window optimization…",
+                                active ? "RIFE窗口优化已生效" : "正在准备RIFE窗口优化…")
+            : reason
+        lastWindowOptimizationStatus = message
+        statusLabel.stringValue = message
+        statusLabel.textColor = active ? .labelColor : .secondaryLabelColor
     }
 
     private static func engineDisplayName(_ engine: String, model: String) -> String {
@@ -4928,6 +5283,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func loadControls() {
+        applyAirBetaPreset(&profile)
         interpolationSwitch.state = profile.interpolationEnabled ? .on : .off
         rifeStreamCheck.state = profile.rifeStreamEnabled ? .on : .off
         switch profile.interpolationEngineID {
@@ -5092,6 +5448,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         profile.soundMode = "sourceApplication"
         let displayIndex = max(0, min(displayIDs.count - 1, displayPopup.indexOfSelectedItem))
         profile.outputDisplayID = displayIDs[displayIndex]
+        applyAirBetaPreset(&profile)
     }
 
     private var displayIDs: [UInt32] = [0]
@@ -5938,5 +6295,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         _ = saveCurrentProfile()
     }
 
-    func windowWillClose(_ notification: Notification) { stop() }
+    func windowWillClose(_ notification: Notification) {
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if Self.betaSessionRecordingEnabled { finishBetaSession(reason: "window_close") {}; return }
+#endif
+        stop()
+    }
 }

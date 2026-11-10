@@ -52,7 +52,7 @@ def main():
             if path.is_file() and not path.is_symlink():
                 check_file(path)
         libraries = sorted({p.name for p in args.app.rglob('*.metallib')})
-        if libraries != ['FrameBudget.metallib', 'default.metallib']:
+        if libraries != ['FrameBudget.metallib', 'default.metallib', 'gap-fill.metallib']:
             raise SystemExit(f'Unexpected bundled shader libraries: {libraries}')
     print(f'Public surface checks passed ({count} runtime files).')
 

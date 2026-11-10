@@ -2,6 +2,19 @@
 
 All notable public releases will be documented here.
 
+## 0.3.1 — 2026-11-10
+
+- Automatically select the optimized live-window pipeline on M3 MacBook Air
+  for RIFE 4.25 / Fast / X2 with stream caching enabled and scaling disabled.
+- Fuse conversion and resize work, reuse prepared GPU textures, and align
+  presentation with actual source intervals. Generated pictures use adaptive
+  lower-resolution inference and reconstruction; originals retain capture size.
+- Restrict this path to SDR BT.709, 60 Hz and captures up to 2648×1668 pixels.
+  Unsupported inputs in the optimized path use original-picture passthrough
+  with an explanation in the existing status area.
+- Preserve the existing workbench controls and use a three-second default
+  delayed-enhancement countdown.
+
 ## 0.3.0 — 2026-11-06
 
 - Add delayed window enhancement: focus a window during the full-screen

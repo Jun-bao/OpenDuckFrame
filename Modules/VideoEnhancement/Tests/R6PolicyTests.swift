@@ -22,6 +22,7 @@ import Foundation
         precondition(SingleInstancePolicy.preferredPeer([later, first], ownPID: first.pid) == nil)
         precondition(SingleInstancePolicy.preferredPeer([first, later], ownPID: later.pid) == first)
         precondition(SingleInstancePolicy.isContract(["OpenDuckFrame", "--odf-session-contract"]))
+        precondition(SingleInstancePolicy.isContract(["OpenDuckFrame", "--odf-air-beta-entry-test", "release"]))
         precondition(!SingleInstancePolicy.isContract(["OpenDuckFrame", "--odf-isolated-profile", "/tmp/example"]))
 
         var saved: [String?] = []

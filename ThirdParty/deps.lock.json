@@ -117,6 +117,14 @@
         {
           "path": "ThirdParty/rife-metal/stream-io.patch",
           "sha256": "266892943b1369b1af95ef2306bee126473a4d5ec35186628e11fb4b12a030b4"
+        },
+        {
+          "path": "ThirdParty/rife-metal/experiment-options.patch",
+          "sha256": "aa6821a05979aef45aee1980809c6304fe48251624b4c740367a6245d457d483"
+        },
+        {
+          "path": "ThirdParty/rife-metal/runtime-support.patch",
+          "sha256": "c5787366442ae31760d06425193ac48dae17d0eedca0e61df03e2536f69d354e"
         }
       ]
     }

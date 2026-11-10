@@ -1,0 +1,719 @@
+--- a/Sources/RifeMetal/RifeInterpolator.swift
++++ b/Sources/RifeMetal/RifeInterpolator.swift
+@@ -1,4 +1,5 @@
+ import Foundation
++import CryptoKit
+ import CoreVideo
+ import RifeMetalCore
+ 
+@@ -6,13 +7,45 @@
+ 
+     private let context: InferenceContext
+     private let weights: WeightStore
++    private let airDiagnosticActualModelURL: URL
++    private let airDiagnosticOverrideApplied: Bool
+     private let qualityTier: RifeQualityTier
+     private let experimentOptions: RifeExperimentOptions
+     internal let queue = DispatchQueue(label: "rife.metal.interpolator", qos: .userInitiated)
+     internal var graph: IFNetGraph?
+     private var graphResolution: (Int, Int)?
+ 
++
++    /// Caller serializes begin/read with makeStream/interpolate/push on its existing executor.
++    public func airServiceTraceBegin(jobID: UInt64, stage: UInt32) {
++        context.airServiceTraceCollector?.begin(jobID: jobID, stage: stage)
++    }
++
++    public var airServiceTraceCount: Int { context.airServiceTraceCollector?.count ?? 0 }
++
++    public func airServiceTraceRecord(at index: Int) -> AirServiceTraceRecord {
++        context.airServiceTraceCollector?.record(at: index) ?? .init()
++    }
++
++    public var airServiceTraceOverflow: UInt64 { context.airServiceTraceCollector?.overflow ?? 0 }
++
++    // AIR_SERVICE_MODEL_IDENTITY_BEGIN
++    public var airDiagnosticModelIdentity: [String: Any] {
++        ["stageCount": weights.header.scaleList.count,
++         "graphID": weights.header.graphID.map { $0 as Any } ?? NSNull(),
++         "model": weights.header.model,
++         "tensorCount": weights.header.tensors.count,
++         "containerVersion": weights.containerVersion,
++         "actualModelPath": airDiagnosticActualModelURL.path,
++         "sha256": weights.airDiagnosticSourceSHA256,
++         "overrideApplied": airDiagnosticOverrideApplied]
++    }
++    // AIR_SERVICE_MODEL_IDENTITY_END
++
+     public init(configuration: RifeConfiguration) throws {
++        let airSelection = try airSelectDiagnosticModel(configuration: configuration)
++        self.airDiagnosticActualModelURL = airSelection.url
++        self.airDiagnosticOverrideApplied = airSelection.overridden
+         do {
+             self.context = try InferenceContext(preferredDevice: configuration.preferredDevice)
+         } catch {
+@@ -20,7 +53,20 @@
+         }
+ 
+         do {
+-            self.weights = try WeightStore(url: configuration.modelURL)
++            let loaded = try WeightStore(url: airSelection.url)
++            if airSelection.overridden {
++                guard loaded.airDiagnosticSourceSHA256 == "729ea555016da98e207bc4570e0be81dddbbd37302f7330c89696da798fba22d",
++                      loaded.containerVersion == 2,
++                      loaded.header.graphID == "odf-ifnet425-fourstage-acc-v1",
++                      loaded.header.model == "odf-ifnet425-fourstage-acc-v1",
++                      loaded.header.maskUpdate == "accumulate",
++                      loaded.header.scaleList == [16, 8, 4, 2],
++                      loaded.header.ifblockChannels == [192, 128, 96, 64],
++                      loaded.header.tensors.count == 128 else {
++                    throw RifeError.modelLoadFailed("four-stage diagnostic actual loaded model identity mismatch")
++                }
++            }
++            self.weights = loaded
+         } catch {
+             throw RifeError.modelLoadFailed(String(describing: error))
+         }
+@@ -330,3 +376,23 @@
+                           queue: queue)
+     }
+ }
++
++// AIR_FOURSTAGE_DIAGNOSTIC_OVERRIDE_BEGIN
++private func airSelectDiagnosticModel(configuration: RifeConfiguration) throws -> (url: URL, overridden: Bool) {
++    guard let raw = ProcessInfo.processInfo.environment["ODF_AIR_FOURSTAGE_MODEL_PATH"] else {
++        return (configuration.modelURL, false)
++    }
++    guard Bundle.main.bundleIdentifier == "app.openduckframe.SelfWindowDiagnostic" else {
++        throw RifeError.modelLoadFailed("four-stage model override requires the self-window diagnostic bundle")
++    }
++    guard raw.hasPrefix("/"), !raw.isEmpty, configuration.modelURL.isFileURL else {
++        throw RifeError.modelLoadFailed("four-stage model override requires an absolute local file path and original local model")
++    }
++    let original = try Data(contentsOf: configuration.modelURL, options: .mappedIfSafe)
++    let digest = SHA256.hash(data: original).map { String(format: "%02x", $0) }.joined()
++    guard digest == "ef29a643a76a9202600458a23dddce16919337ef01743d0fbe817684ec990f74" else {
++        throw RifeError.modelLoadFailed("four-stage diagnostic original source is not the frozen RIFE4.25 control")
++    }
++    return (URL(fileURLWithPath: raw).standardizedFileURL, true)
++}
++// AIR_FOURSTAGE_DIAGNOSTIC_OVERRIDE_END
+--- /dev/null
++++ b/Sources/RifeMetalCore/AirServiceTrace.swift
+@@ -0,0 +1,220 @@
++import Foundation
++import Metal
++import MetalPerformanceShaders
++import Darwin
++
++/// Scalar snapshot. Zero timing fields are unavailable unless their validity bit is set.
++/// validityMask: 1=create observation, 2=commit bracket, 4=wait bracket, 8=status,
++/// 16=GPU interval, 32=kernel interval. coverageFlags: 1=tracked, 2=unobserved root,
++/// 4=incomplete/error, 8=capacity overflow. commitKind: 0=none, 1=explicit, 2=MPS split.
++public struct AirServiceTraceRecord: Sendable {
++    public var jobID: UInt64 = 0
++    public var stage: UInt32 = 0
++    public var rootIndex: UInt32 = 0
++    public var createHostTicks: UInt64 = 0
++    public var commitBeginHostTicks: UInt64 = 0
++    public var commitEndHostTicks: UInt64 = 0
++    public var waitBeginHostTicks: UInt64 = 0
++    public var waitEndHostTicks: UInt64 = 0
++    public var commitKind: UInt32 = 0
++    public var status: UInt32 = 0
++    public var validityMask: UInt32 = 0
++    public var coverageFlags: UInt32 = 0
++    public var gpuStartSeconds: Double = 0
++    public var gpuEndSeconds: Double = 0
++    public var kernelStartSeconds: Double = 0
++    public var kernelEndSeconds: Double = 0
++
++    public init() {}
++}
++
++/// Single-context scratch, serialized by the caller's existing execution path.
++/// No callbacks mutate this storage. Begin/read must not run concurrently with inference.
++/// Stages: 1=stream creation, 2=cache prime, 3=main push, 4=stateless fallback.
++package final class AirServiceTraceCollector {
++    private static let capacity = 128
++    private var rows = [AirServiceTraceRecord](repeating: .init(), count: AirServiceTraceCollector.capacity)
++    private var roots = [MTLCommandBuffer?](repeating: nil, count: AirServiceTraceCollector.capacity)
++    private var jobID: UInt64 = 0
++    private var stage: UInt32 = 0
++    private var nextRootIndex: UInt32 = 0
++    package private(set) var isActive = false
++    package private(set) var count = 0
++    package private(set) var overflow: UInt64 = 0
++
++    package init() {}
++
++    package func begin(jobID: UInt64, stage: UInt32) {
++        // Normally every old reference was released after an existing wait. If inference
++        // threw first, preserve pending roots and their original IDs until a later wait.
++        // Such rows may recur in a later snapshot: last copied (jobID,stage,rootIndex) wins.
++        var kept = 0
++        for index in 0..<count {
++            if let root = roots[index] {
++                rows[kept] = rows[index]
++                roots[kept] = root
++                if kept != index { roots[index] = nil }
++                kept += 1
++            }
++        }
++        for index in kept..<Self.capacity {
++            rows[index] = .init()
++            roots[index] = nil
++        }
++        self.jobID = jobID
++        self.stage = stage
++        nextRootIndex = 0
++        for index in 0..<kept where rows[index].jobID == jobID && rows[index].stage == stage {
++            nextRootIndex = max(nextRootIndex, rows[index].rootIndex &+ 1)
++        }
++        count = kept
++        overflow = 0
++        isActive = true
++    }
++
++    package func record(at index: Int) -> AirServiceTraceRecord {
++        guard index >= 0 && index < count else { return .init() }
++        return rows[index]
++    }
++
++    @discardableResult
++    package func observe(_ root: MTLCommandBuffer, knownNew: Bool) -> Int? {
++        for index in 0..<count {
++            if let candidate = roots[index], candidate === root { return index }
++        }
++        guard count < Self.capacity else {
++            overflow &+= 1
++            for index in 0..<count { rows[index].coverageFlags |= 4 | 8 }
++            return nil
++        }
++        let index = count
++        count += 1
++        var row = AirServiceTraceRecord()
++        row.jobID = jobID
++        row.stage = stage
++        row.rootIndex = nextRootIndex
++        nextRootIndex &+= 1
++        // First-observed tick, not Apple's private allocation instant. In a split the
++        // new root becomes observable only when super.commitAndContinue returns.
++        row.createHostTicks = mach_absolute_time()
++        row.validityMask = 1
++        row.coverageFlags = knownNew ? (1 | 4) : (1 | 2 | 4)
++        rows[index] = row
++        roots[index] = root
++        return index
++    }
++
++    package func beginCommit(_ root: MTLCommandBuffer, kind: UInt32) -> Int? {
++        guard let index = observe(root, knownNew: false) else { return nil }
++        rows[index].commitKind = kind
++        rows[index].commitBeginHostTicks = mach_absolute_time()
++        return index
++    }
++
++    package func endCommit(_ index: Int?) {
++        guard let index else { return }
++        rows[index].commitEndHostTicks = mach_absolute_time()
++        rows[index].validityMask |= 2
++    }
++
++    package func beginWait(_ root: MTLCommandBuffer) -> Int? {
++        guard let index = observe(root, knownNew: false) else { return nil }
++        rows[index].waitBeginHostTicks = mach_absolute_time()
++        return index
++    }
++
++    package func endWait(_ index: Int?) {
++        if let index {
++            rows[index].waitEndHostTicks = mach_absolute_time()
++            rows[index].validityMask |= 4
++        }
++        // Called only after the runtime's original wait. Earlier split roots remain on
++        // the same serial Metal queue. A nonterminal row stays incomplete and retained.
++        for slot in 0..<count {
++            guard let root = roots[slot] else { continue }
++            let status = root.status
++            rows[slot].status = UInt32(status.rawValue)
++            rows[slot].validityMask |= 8
++            if status == .completed {
++                let gpuStart = root.gpuStartTime
++                let gpuEnd = root.gpuEndTime
++                if gpuStart.isFinite && gpuEnd.isFinite && gpuStart > 0 && gpuEnd >= gpuStart {
++                    rows[slot].gpuStartSeconds = gpuStart
++                    rows[slot].gpuEndSeconds = gpuEnd
++                    rows[slot].validityMask |= 16
++                }
++                let kernelStart = root.kernelStartTime
++                let kernelEnd = root.kernelEndTime
++                if kernelStart.isFinite && kernelEnd.isFinite && kernelStart > 0 && kernelEnd >= kernelStart {
++                    rows[slot].kernelStartSeconds = kernelStart
++                    rows[slot].kernelEndSeconds = kernelEnd
++                    rows[slot].validityMask |= 32
++                }
++                if rows[slot].validityMask & (2 | 16) == (2 | 16),
++                   rows[slot].coverageFlags & (2 | 8) == 0 {
++                    rows[slot].coverageFlags &= ~UInt32(4)
++                }
++            }
++            if status == .completed || status == .error ||
++               (status == .notEnqueued && rows[slot].commitKind == 0) {
++                roots[slot] = nil
++            }
++        }
++    }
++}
++
++private final class AirServiceTraceCommandBuffer: MPSCommandBuffer {
++    private let trace: AirServiceTraceCollector
++
++    init(commandBuffer: MTLCommandBuffer, collector: AirServiceTraceCollector) {
++        trace = collector
++        super.init(commandBuffer: commandBuffer)
++        collector.observe(rootCommandBuffer, knownNew: true)
++    }
++
++    override func commitAndContinue() {
++        let oldRoot = rootCommandBuffer
++        let index = trace.beginCommit(oldRoot, kind: 2)
++        // This bracket includes MPS's replacement-root creation. It is not an exact
++        // timestamp of the private underlying MTLCommandBuffer.commit invocation.
++        super.commitAndContinue()
++        trace.endCommit(index)
++        trace.observe(rootCommandBuffer, knownNew: true)
++    }
++}
++
++package func airServiceTraceMakeMPSCommandBuffer(
++    commandBuffer: MTLCommandBuffer, collector: AirServiceTraceCollector?
++) -> MPSCommandBuffer {
++    guard let collector, collector.isActive else {
++        return MPSCommandBuffer(commandBuffer: commandBuffer)
++    }
++    return AirServiceTraceCommandBuffer(commandBuffer: commandBuffer, collector: collector)
++}
++
++/// The before/after-encode sentinel cannot reconstruct a bypassed private split. It
++/// marks an unexpected root as unobserved/incomplete instead of claiming full coverage.
++package func airServiceTraceObserveRoot(
++    _ command: MPSCommandBuffer, collector: AirServiceTraceCollector?
++) {
++    guard let collector, collector.isActive else { return }
++    collector.observe(command.rootCommandBuffer, knownNew: false)
++}
++
++package func airServiceTraceCommit(
++    _ command: MPSCommandBuffer, collector: AirServiceTraceCollector?
++) {
++    guard let collector, collector.isActive else { command.commit(); return }
++    let index = collector.beginCommit(command.rootCommandBuffer, kind: 1)
++    command.commit()
++    collector.endCommit(index)
++}
++
++package func airServiceTraceWaitUntilCompleted(
++    _ command: MPSCommandBuffer, collector: AirServiceTraceCollector?
++) {
++    guard let collector, collector.isActive else { command.waitUntilCompleted(); return }
++    let index = collector.beginWait(command.rootCommandBuffer)
++    command.waitUntilCompleted()
++    collector.endWait(index)
++}
+--- /dev/null
++++ b/Sources/RifeMetalCore/FourStageGraphContract.swift
+@@ -0,0 +1,47 @@
++import Foundation
++
++/// Private four-stage accumulated-mask graph; original RMW1 models are unchanged.
++enum FourStageGraphContract {
++    static func validate(raw: [String: Any], alignment: Data, payloadBytes: Int) throws {
++        let graph = "odf-ifnet425-fourstage-acc-v1"
++        let keys: Set<String> = ["model", "graph_id", "mask_update", "ifblock_channels", "scale_list", "input_layout", "tensors"]
++        guard Set(raw.keys) == keys, raw["graph_id"] as? String == graph,
++              raw["model"] as? String == graph, raw["mask_update"] as? String == "accumulate",
++              raw["ifblock_channels"] as? [Int] == [192, 128, 96, 64],
++              raw["scale_list"] as? [Int] == [16, 8, 4, 2],
++              raw["input_layout"] as? String == "NHWC" else {
++            throw WeightStoreError.headerParseFailed("unknown four-stage graph contract")
++        }
++        var tensors: [[String: Any]] = []
++        var offset = 0
++        func append(_ name: String, _ shape: [Int]) {
++            let size = shape.reduce(2, *)
++            tensors.append(["name": name, "dtype": "f16", "shape": shape, "offset": offset, "size": size])
++            offset += size
++        }
++        for (i, shape) in [[3, 3, 3, 16], [3, 3, 16, 16], [3, 3, 16, 16], [4, 4, 4, 16]].enumerated() {
++            append("encode.cnn\(i).weight", shape)
++            append("encode.cnn\(i).bias", [i == 3 ? 4 : 16])
++        }
++        for (i, c) in [192, 128, 96, 64].enumerated() {
++            let p = "block\(i)."
++            append(p + "conv0.0.0.weight", [3, 3, i == 0 ? 15 : 28, c / 2])
++            append(p + "conv0.0.0.bias", [c / 2])
++            append(p + "conv0.1.0.weight", [3, 3, c / 2, c])
++            append(p + "conv0.1.0.bias", [c])
++            for j in 0..<8 {
++                let r = p + "convblock.\(j)."
++                append(r + "conv.weight", [3, 3, c, c])
++                append(r + "conv.bias", [c])
++                append(r + "beta", [1, 1, 1, c])
++            }
++            append(p + "lastconv.0.weight", [4, 4, 52, c])
++            append(p + "lastconv.0.bias", [52])
++        }
++        guard let entries = raw["tensors"] as? [[String: Any]], entries.count == tensors.count,
++              zip(entries, tensors).allSatisfy({ NSDictionary(dictionary: $0.0).isEqual(to: $0.1) }),
++              alignment.allSatisfy({ $0 == 0 }), payloadBytes == offset else {
++            throw WeightStoreError.headerParseFailed("noncanonical four-stage tensors or payload")
++        }
++    }
++}
+--- a/Sources/RifeMetalCore/IFNetGraph.swift
++++ b/Sources/RifeMetalCore/IFNetGraph.swift
+@@ -199,12 +199,14 @@
+             offset += length
+         }
+         let shape: [NSNumber] = [1, NSNumber(value: height), NSNumber(value: width), NSNumber(value: channels)]
+-        let command = MPSCommandBuffer(commandBuffer: rawCommand)
++        let command = airServiceTraceMakeMPSCommandBuffer(commandBuffer: rawCommand, collector: context.airServiceTraceCollector)
++        airServiceTraceObserveRoot(command, collector: context.airServiceTraceCollector)
+         _ = executable.encode(to: command,
+                               inputs: [MPSGraphTensorData(a, shape: shape, dataType: .float16), MPSGraphTensorData(b, shape: shape, dataType: .float16)],
+                               results: [MPSGraphTensorData(output, shape: shape, dataType: .float16)], executionDescriptor: nil)
+-        command.commit()
+-        command.waitUntilCompleted()
++        airServiceTraceObserveRoot(command, collector: context.airServiceTraceCollector)
++        airServiceTraceCommit(command, collector: context.airServiceTraceCollector)
++        airServiceTraceWaitUntilCompleted(command, collector: context.airServiceTraceCollector)
+         guard command.commandBuffer.status == .completed else { return nil }
+         let values = output.contents().bindMemory(to: UInt16.self, capacity: count)
+         func matches(_ pattern: [UInt16]) -> Bool {
+@@ -470,7 +472,7 @@
+         guard let cb = queue.makeCommandBuffer() else {
+             throw IFNetError.commandBufferFailed("makeCommandBuffer failed")
+         }
+-        var mpsCB = MPSCommandBuffer(commandBuffer: cb)
++        var mpsCB = airServiceTraceMakeMPSCommandBuffer(commandBuffer: cb, collector: context.airServiceTraceCollector)
+ 
+         // Helper: dispatch a compute kernel grid covering the given dims.
+         func dispatch2D(_ enc: MTLComputeCommandEncoder, _ pipeline: MTLComputePipelineState,
+@@ -548,14 +550,18 @@
+ 
+         // 3c. Encoder Head: run img0Int → f0Buf and img1Int → f1Buf.
+         //     Encoder is run twice using the same compiled executable.
++        airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+         encoderExecutable.encode(to: mpsCB,
+                                   inputs: [img0IntTD],
+                                   results: [f0TD],
+                                   executionDescriptor: nil)
++        airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
++        airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+         encoderExecutable.encode(to: mpsCB,
+                                   inputs: [img1IntTD],
+                                   results: [f1TD],
+                                   executionDescriptor: nil)
++        airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+ 
+         // 3d. Expand f0Buf/f1Buf (4-ch fp16 buffers) → f0Tex/f1Tex (RGBA textures) for the
+         //     per-stage feature warps. This runs once; the textures are read-only after this point.
+@@ -648,10 +654,12 @@
+ 
+             if i == 0 {
+                 // Stage 0: write directly into accumulator slot A.
++                airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+                 _ = stage.executable.encode(to: mpsCB,
+                                              inputs: inputs,
+                                              results: [flowAccTD_A, maskAccTD_A, outFeatTD],
+                                              executionDescriptor: nil)
++                airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+                 accFlowTD    = flowAccTD_A
+                 accMaskTD    = maskAccTD_A
+                 accFlowBuf   = p.flowAccBufA
+@@ -661,10 +669,12 @@
+                 featIsInSlotA = true
+             } else {
+                 // Stage 1+: write raw flow/mask into flowRawBuf/maskRawBuf, feat into outFeatTD.
++                airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+                 _ = stage.executable.encode(to: mpsCB,
+                                              inputs: inputs,
+                                              results: [flowRawTD, maskRawTD, outFeatTD],
+                                              executionDescriptor: nil)
++                airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+ 
+                 guard let prevFlowTD = accFlowTD, let prevMaskTD = accMaskTD else {
+                     throw IFNetError.dimensionsMismatch
+@@ -686,15 +696,19 @@
+                     newMaskAccBuf = p.maskAccBufA
+                 }
+ 
++                airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+                 _ = addFlowExecutable.encode(to: mpsCB,
+                                               inputs: [prevFlowTD, flowRawTD],
+                                               results: [newFlowAccTD],
+                                               executionDescriptor: nil)
++                airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+                 if !experimentOptions.replaceMask {
++                    airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+                     _ = addMaskExecutable.encode(to: mpsCB,
+                                                   inputs: [prevMaskTD, maskRawTD],
+                                                   results: [newMaskAccTD],
+                                                   executionDescriptor: nil)
++                    airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+                 }
+ 
+                 if experimentOptions.replaceMask {
+@@ -731,8 +745,8 @@
+                                  to: maskStage, destinationOffset: 0, size: intMaskBytes)
+                     blitEnc.endEncoding()
+                 }
+-                mpsCB.commit()
+-                mpsCB.waitUntilCompleted()
++                airServiceTraceCommit(mpsCB, collector: context.airServiceTraceCollector)
++                airServiceTraceWaitUntilCompleted(mpsCB, collector: context.airServiceTraceCollector)
+                 let flowStageTD = MPSGraphTensorData(flowStage, shape: flowShape, dataType: .float16)
+                 let maskStageTD = MPSGraphTensorData(maskStage, shape: maskShape, dataType: .float16)
+                 Self.dumpStageActivations(stageIndex: i,
+@@ -742,7 +756,7 @@
+                 guard let cb2 = queue.makeCommandBuffer() else {
+                     throw IFNetError.commandBufferFailed("dump: makeCommandBuffer failed")
+                 }
+-                mpsCB = MPSCommandBuffer(commandBuffer: cb2)
++                mpsCB = airServiceTraceMakeMPSCommandBuffer(commandBuffer: cb2, collector: context.airServiceTraceCollector)
+             }
+ 
+             // Per-stage warp at INTERNAL res. Skip on the LAST stage — the final warp happens
+@@ -807,8 +821,8 @@
+             enc.setTexture(outTex, index: 0)
+             dispatch2D(enc, conv.rgbToBGRA, gridW: width, gridH: height)
+             enc.endEncoding()
+-            mpsCB.commit()
+-            mpsCB.waitUntilCompleted()
++            airServiceTraceCommit(mpsCB, collector: context.airServiceTraceCollector)
++            airServiceTraceWaitUntilCompleted(mpsCB, collector: context.airServiceTraceCollector)
+             return
+         }
+ 
+@@ -882,8 +896,8 @@
+             }
+         }
+ 
+-        mpsCB.commit()
+-        mpsCB.waitUntilCompleted()
++        airServiceTraceCommit(mpsCB, collector: context.airServiceTraceCollector)
++        airServiceTraceWaitUntilCompleted(mpsCB, collector: context.airServiceTraceCollector)
+     }
+ 
+     // MARK: - Stream encoding
+@@ -907,7 +921,7 @@
+         guard let cb = queue.makeCommandBuffer() else {
+             throw IFNetError.commandBufferFailed("makeCommandBuffer failed")
+         }
+-        let mpsCB = MPSCommandBuffer(commandBuffer: cb)
++        let mpsCB = airServiceTraceMakeMPSCommandBuffer(commandBuffer: cb, collector: context.airServiceTraceCollector)
+ 
+         // Helper: dispatch a compute kernel grid covering the given dims.
+         func dispatch2D(_ enc: MTLComputeCommandEncoder,
+@@ -962,13 +976,15 @@
+         let intFeat4Shape: [NSNumber] = [1, NSNumber(value: intH), NSNumber(value: intW), 4]
+         let imgIntTD = MPSGraphTensorData(imgIntBufOut, shape: intRGBShape,   dataType: .float16)
+         let featTD   = MPSGraphTensorData(featBufOut,   shape: intFeat4Shape, dataType: .float16)
++        airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+         encoderExecutable.encode(to: mpsCB,
+                                   inputs: [imgIntTD],
+                                   results: [featTD],
+                                   executionDescriptor: nil)
+-
+-        mpsCB.commit()
+-        mpsCB.waitUntilCompleted()
++        airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
++
++        airServiceTraceCommit(mpsCB, collector: context.airServiceTraceCollector)
++        airServiceTraceWaitUntilCompleted(mpsCB, collector: context.airServiceTraceCollector)
+     }
+ 
+     // MARK: - Stream inference
+@@ -1060,7 +1076,7 @@
+         guard let cb = queue.makeCommandBuffer() else {
+             throw IFNetError.commandBufferFailed("makeCommandBuffer failed")
+         }
+-        var mpsCB = MPSCommandBuffer(commandBuffer: cb)
++        var mpsCB = airServiceTraceMakeMPSCommandBuffer(commandBuffer: cb, collector: context.airServiceTraceCollector)
+ 
+         // Helper: dispatch a compute kernel grid covering the given dims.
+         func dispatch2D(_ enc: MTLComputeCommandEncoder, _ pipeline: MTLComputePipelineState,
+@@ -1135,10 +1151,12 @@
+         }
+ 
+         // 3c. Encoder Head on CURR ONLY (prev's feat was computed on a previous call).
++        airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+         encoderExecutable.encode(to: mpsCB,
+                                   inputs: [img1IntTD],
+                                   results: [f1TD],
+                                   executionDescriptor: nil)
++        airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+ 
+         // 3d. Expand prev/curr feat buffers (4-ch fp16) → f0Tex/f1Tex (RGBA textures) for
+         //     per-stage feature warps. Both expansions run each call (pool textures are scratch).
+@@ -1163,8 +1181,8 @@
+         //    fresh cb in iteration 1+ sees populated pool textures.
+         let multiTimestep = timesteps.count > 1
+         if multiTimestep {
+-            mpsCB.commit()
+-            mpsCB.waitUntilCompleted()
++            airServiceTraceCommit(mpsCB, collector: context.airServiceTraceCollector)
++            airServiceTraceWaitUntilCompleted(mpsCB, collector: context.airServiceTraceCollector)
+         }
+ 
+         for (outIdx, t) in timesteps.enumerated() {
+@@ -1173,7 +1191,7 @@
+                 guard let cb2 = queue.makeCommandBuffer() else {
+                     throw IFNetError.commandBufferFailed("per-timestep makeCommandBuffer failed")
+                 }
+-                mpsCB = MPSCommandBuffer(commandBuffer: cb2)
++                mpsCB = airServiceTraceMakeMPSCommandBuffer(commandBuffer: cb2, collector: context.airServiceTraceCollector)
+             }
+ 
+             var accFlowTD: MPSGraphTensorData? = nil
+@@ -1226,10 +1244,12 @@
+                 }
+ 
+                 if i == 0 {
++                    airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+                     _ = stage.executable.encode(to: mpsCB,
+                                                  inputs: inputs,
+                                                  results: [flowAccTD_A, maskAccTD_A, outFeatTD],
+                                                  executionDescriptor: nil)
++                    airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+                     accFlowTD    = flowAccTD_A
+                     accMaskTD    = maskAccTD_A
+                     accFlowBuf   = p.flowAccBufA
+@@ -1238,10 +1258,12 @@
+                     accIsInSlotA = true
+                     featIsInSlotA = true
+                 } else {
++                    airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+                     _ = stage.executable.encode(to: mpsCB,
+                                                  inputs: inputs,
+                                                  results: [flowRawTD, maskRawTD, outFeatTD],
+                                                  executionDescriptor: nil)
++                    airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+ 
+                     guard let prevFlowTD = accFlowTD, let prevMaskTD = accMaskTD else {
+                         throw IFNetError.dimensionsMismatch
+@@ -1280,15 +1302,19 @@
+                         dispatch2D(encoder, conv.accumulateFlowMask, gridW: intW, gridH: intH)
+                         encoder.endEncoding()
+                     } else {
++                        airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+                         _ = addFlowExecutable.encode(to: mpsCB,
+                                                       inputs: [prevFlowTD, flowRawTD],
+                                                       results: [newFlowAccTD],
+                                                       executionDescriptor: nil)
++                        airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+                         if !experimentOptions.replaceMask {
++                            airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+                             _ = addMaskExecutable.encode(to: mpsCB,
+                                                           inputs: [prevMaskTD, maskRawTD],
+                                                           results: [newMaskAccTD],
+                                                           executionDescriptor: nil)
++                            airServiceTraceObserveRoot(mpsCB, collector: context.airServiceTraceCollector)
+                         }
+                     }
+ 
+@@ -1325,8 +1351,8 @@
+                                      to: maskStage, destinationOffset: 0, size: intMaskBytes)
+                         blitEnc.endEncoding()
+                     }
+-                    mpsCB.commit()
+-                    mpsCB.waitUntilCompleted()
++                    airServiceTraceCommit(mpsCB, collector: context.airServiceTraceCollector)
++                    airServiceTraceWaitUntilCompleted(mpsCB, collector: context.airServiceTraceCollector)
+                     let flowStageTD = MPSGraphTensorData(flowStage, shape: flowShape, dataType: .float16)
+                     let maskStageTD = MPSGraphTensorData(maskStage, shape: maskShape, dataType: .float16)
+                     Self.dumpStageActivations(stageIndex: i,
+@@ -1336,7 +1362,7 @@
+                     guard let cb2 = queue.makeCommandBuffer() else {
+                         throw IFNetError.commandBufferFailed("dump: makeCommandBuffer failed")
+                     }
+-                    mpsCB = MPSCommandBuffer(commandBuffer: cb2)
++                    mpsCB = airServiceTraceMakeMPSCommandBuffer(commandBuffer: cb2, collector: context.airServiceTraceCollector)
+                 }
+ 
+                 let isLastStage = (i == scaleList.count - 1)
+@@ -1395,8 +1421,8 @@
+                 enc.setTexture(outTex, index: 0)
+                 dispatch2D(enc, conv.rgbToBGRA, gridW: width, gridH: height)
+                 enc.endEncoding()
+-                mpsCB.commit()
+-                mpsCB.waitUntilCompleted()
++                airServiceTraceCommit(mpsCB, collector: context.airServiceTraceCollector)
++                airServiceTraceWaitUntilCompleted(mpsCB, collector: context.airServiceTraceCollector)
+                 continue
+             }
+ 
+@@ -1473,8 +1499,8 @@
+                 }
+             }
+ 
+-            mpsCB.commit()
+-            mpsCB.waitUntilCompleted()
++            airServiceTraceCommit(mpsCB, collector: context.airServiceTraceCollector)
++            airServiceTraceWaitUntilCompleted(mpsCB, collector: context.airServiceTraceCollector)
+         }  // end per-timestep loop
+     }
+ 
+--- a/Sources/RifeMetalCore/InferenceContext.swift
++++ b/Sources/RifeMetalCore/InferenceContext.swift
+@@ -14,6 +14,12 @@
+     public let warpKernel: BackwardWarpKernel
+     public let conversionKernels: ConversionKernels
+     public let mpsGraphDevice: MPSGraphDevice
++
++    // Generated AirServiceTrace support; default runs retain the original MPS class.
++    package let airServiceTraceCollector: AirServiceTraceCollector? = {
++        guard ProcessInfo.processInfo.environment["ODF_AIR_SERVICE_TRACE"] == "1" else { return nil }
++        return AirServiceTraceCollector()
++    }()
+ 
+     public init(preferredDevice: MTLDevice? = nil) throws {
+         let device: MTLDevice
+--- a/Sources/RifeMetalCore/StudentGraphContract.swift
++++ b/Sources/RifeMetalCore/StudentGraphContract.swift
+@@ -42,6 +42,10 @@
+     }
+ 
+     static func validate(raw: [String: Any], alignment: Data, payloadBytes: Int) throws {
++        if raw["graph_id"] as? String == "odf-ifnet425-fourstage-acc-v1" {
++            try FourStageGraphContract.validate(raw: raw, alignment: alignment, payloadBytes: payloadBytes)
++            return
++        }
+         let keys: Set<String> = ["model", "graph_id", "mask_update", "ifblock_channels", "scale_list", "input_layout", "tensors"]
+         guard Set(raw.keys) == keys, let graph = raw["graph_id"] as? String, let ranks = ranks[graph],
+               raw["model"] as? String == graph, raw["mask_update"] as? String == "accumulate",
+--- a/Sources/RifeMetalCore/WeightStore.swift
++++ b/Sources/RifeMetalCore/WeightStore.swift
+@@ -1,4 +1,5 @@
+ import Foundation
++import CryptoKit
+ import Metal
+ import MetalPerformanceShadersGraph
+ 
+@@ -13,6 +14,7 @@
+ public final class WeightStore {
+     public let header: RifeWeightHeader
+     public let containerVersion: UInt32
++    public let airDiagnosticSourceSHA256: String
+     public var graphID: String { header.graphID ?? header.model }
+     private let mappedData: Data
+     private let blobOffset: Int
+@@ -54,6 +56,7 @@
+         }
+         self.containerVersion = version
+         self.mappedData = data
++        self.airDiagnosticSourceSHA256 = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+     }
+ 
+     /// Returns the raw fp16 bytes for the named tensor.

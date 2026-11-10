@@ -64,7 +64,7 @@ xcrun clang++ -std=c++17 -I "$ROOT/Apps/Mac/Capture" \
   "$ROOT/Modules/VideoEnhancement/Tests/SPLivePixelProbeTests.cpp" -o "$OUT/r6-pixel-probe-tests"
 "$OUT/r6-pixel-probe-tests"
 xcrun clang++ -std=c++17 -fobjc-arc -fblocks -I "$ROOT/Apps/Mac/Capture" \
-  "$ROOT/Modules/VideoEnhancement/Tests/SPLivePixelProbeCVTests.mm" -framework Foundation -framework CoreVideo -o "$OUT/r6-pixel-cv-tests"
+  "$ROOT/Modules/VideoEnhancement/Tests/SPLivePixelProbeCVTests.mm" -framework Foundation -framework CoreVideo -framework CoreGraphics -o "$OUT/r6-pixel-cv-tests"
 "$OUT/r6-pixel-cv-tests"
 python3 - "$ROOT/Apps/Mac/UI/AppDelegate.swift" <<'PY'
 import pathlib, sys

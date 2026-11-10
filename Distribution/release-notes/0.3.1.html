@@ -1,0 +1,12 @@
+<meta charset="utf-8">
+<h2>OpenDuckFrame 0.3.1</h2>
+<ul>
+<li>现有 RIFE 4.25、Fast、2 倍补帧配置接入 M3 MacBook Air 的窗口优化。连续缓存开启、关闭超分时自动匹配，无需新增模式开关。</li>
+<li>融合画面转换和缩放、复用 GPU 纹理，并优化源帧间隔估计与呈现时机。插入帧按自适应较低尺寸计算后放大，原始帧保留采集尺寸。</li>
+<li>已验证普通 SDR BT.709、60 Hz 输出，窗口采集不超过 2648×1668 像素。超出该路径的格式、刷新率或尺寸时显示原因并保留原帧。</li>
+<li>保留窗口、屏幕、本地文件和画质设置入口，延迟增强默认倒计时调整为 3 秒。</li>
+</ul>
+<h3>English</h3>
+<p>The existing RIFE 4.25 / Fast / X2 live-window configuration now selects the optimized pipeline on M3 MacBook Air with stream caching enabled and scaling disabled. Fused conversion, GPU texture reuse and source-aware presentation timing reduce processing cost. Generated pictures use adaptive lower-resolution inference and reconstruction; original pictures retain capture resolution.</p>
+<p>The validated envelope is ordinary SDR BT.709 video, a 60 Hz display and capture buffers up to 2648×1668 pixels. Unsupported inputs in this optimized path pass original pictures through with a visible reason. Window, display, local-file and quality controls remain available. The delayed-enhancement countdown defaults to 3 seconds.</p>
+<p>This community build is ad-hoc signed, supports signed in-app updates, and is not Apple notarized. Requires macOS 14 or later on Apple silicon.</p>

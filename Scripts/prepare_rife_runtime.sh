@@ -11,12 +11,13 @@ PREFIX="$CANONICAL/runtime"
 STAMP="$PREFIX/.build-stamp.json"
 PATCH="$CANONICAL/stream-io.patch"
 EXPERIMENT_PATCH="$CANONICAL/experiment-options.patch"
+RUNTIME_PATCH="$CANONICAL/runtime-support.patch"
 WEIGHT_PATH="Sources/RifeMetal/Resources/rife-v4.25.rmw"
 WEIGHT_SHA="$(sp_lock_get "$NAME" weight_sha256)"
 
 RECIPE_ARGS=(--dependency "$NAME" --input "$SP_ROOT/Scripts/prepare_rife_runtime.sh"
   --input "$SP_ROOT/Scripts/lib/build_common.sh" --input "$SP_ROOT/Scripts/lib/deps_lock.py"
-  --input "$PATCH" --input "$EXPERIMENT_PATCH" --input "$CANONICAL/Package.swift"
+  --input "$PATCH" --input "$EXPERIMENT_PATCH" --input "$RUNTIME_PATCH" --input "$CANONICAL/Package.swift"
   --input "$CANONICAL/PaddedFrameConvert.swift" --input "$CANONICAL/PaddedFrameConvert.metal"
   --input "$CANONICAL/RifeExperimentOptions.swift" --input "$CANONICAL/StudentGraphContract.swift"
   --input "$CANONICAL/LICENSE" --input "$CANONICAL/THIRD-PARTY.md"
@@ -28,6 +29,8 @@ REQUIRED_OUTPUTS=("$PREFIX/Package.swift" "$PREFIX/source-origin.json"
   "$PREFIX/Sources/RifeMetalCore/PaddedFrameConvert.swift"
   "$PREFIX/Sources/RifeMetalCore/RifeExperimentOptions.swift"
   "$PREFIX/Sources/RifeMetalCore/StudentGraphContract.swift"
+  "$PREFIX/Sources/RifeMetalCore/FourStageGraphContract.swift"
+  "$PREFIX/Sources/RifeMetalCore/AirServiceTrace.swift" "$PREFIX/Sources/RifeMetalCore/InferenceContext.swift"
   "$PREFIX/Sources/RifeMetal/RifeConfiguration.swift" "$PREFIX/Sources/RifeMetal/RifeInterpolator.swift"
   "$PREFIX/Sources/RifeMetalCore/WeightStore.swift" "$PREFIX/Sources/RifeMetalCore/WeightHeader.swift"
   "$PREFIX/Sources/RifeMetalCore/IFBlockBuilder.swift"
@@ -46,6 +49,10 @@ ARCHIVE="$SP_ROOT/.build/rife-runtime-source-download/$(sp_lock_get "$NAME" arch
 sp_verified_download "$(sp_lock_get "$NAME" url)" "$(sp_lock_get "$NAME" sha256)" "$ARCHIVE"
 [ "$(sp_sha256 "$PATCH")" = "$(sp_lock_get "$NAME" patches 0 sha256)" ] || \
   sp_die "rife-metal IO patch does not match the dependency lock"
+[ "$(sp_sha256 "$EXPERIMENT_PATCH")" = "$(sp_lock_get "$NAME" patches 1 sha256)" ] || \
+  sp_die "rife-metal experiment patch does not match the dependency lock"
+[ "$(sp_sha256 "$RUNTIME_PATCH")" = "$(sp_lock_get "$NAME" patches 2 sha256)" ] || \
+  sp_die "rife-metal runtime support patch does not match the dependency lock"
 WORK="$(mktemp -d "$CANONICAL/.prepare.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 129' HUP
@@ -68,6 +75,8 @@ cp "$CANONICAL/Package.swift" "$STAGED/Package.swift"
 cp "$CANONICAL/PaddedFrameConvert.swift" "$STAGED/Sources/RifeMetalCore/"
 cp "$CANONICAL/PaddedFrameConvert.metal" "$STAGED/Sources/RifeMetalCore/Shaders/"
 cp "$CANONICAL/RifeExperimentOptions.swift" "$CANONICAL/StudentGraphContract.swift" "$STAGED/Sources/RifeMetalCore/"
+# Apply after the canonical helpers so their locked runtime extensions survive.
+/usr/bin/patch -t -N -p1 -d "$STAGED" < "$RUNTIME_PATCH"
 [ "$(sp_sha256 "$STAGED/$WEIGHT_PATH")" = "$WEIGHT_SHA" ] || \
   sp_die "rife-metal bundled v4.25 weights do not match the pinned original"
 
@@ -96,7 +105,7 @@ origin = {
     },
     "recipe_sha256": sys.argv[4],
     "patches": [{"path": name, "sha256": sha(canonical / name)}
-                for name in ("stream-io.patch", "experiment-options.patch")],
+                for name in ("stream-io.patch", "experiment-options.patch", "runtime-support.patch")],
     "helpers": [artifact("Sources/RifeMetalCore/PaddedFrameConvert.swift"),
                 artifact("Sources/RifeMetalCore/Shaders/PaddedFrameConvert.metal"),
                 artifact("Sources/RifeMetalCore/RifeExperimentOptions.swift"),
@@ -105,6 +114,9 @@ origin = {
                         artifact("Sources/RifeMetal/RifeStream.swift"),
                         artifact("Sources/RifeMetal/RifeConfiguration.swift"),
                         artifact("Sources/RifeMetal/RifeInterpolator.swift"),
+                        artifact("Sources/RifeMetalCore/InferenceContext.swift"),
+                        artifact("Sources/RifeMetalCore/AirServiceTrace.swift"),
+                        artifact("Sources/RifeMetalCore/FourStageGraphContract.swift"),
                         artifact("Sources/RifeMetalCore/IFBlockBuilder.swift"),
                         artifact("Sources/RifeMetalCore/WeightStore.swift"),
                         artifact("Sources/RifeMetalCore/WeightHeader.swift")],

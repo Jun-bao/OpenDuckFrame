@@ -30,6 +30,7 @@ struct DisplaySlotWindow {
     uint64_t token = 0;
     DisplaySlotContext context{};
     int64_t deadlineNs = 0, displayNs = 0;
+    int64_t selectionGuardNs = 0;
 };
 
 // Isolated diagnostic build: measured preparation plus timer overhead needs
@@ -41,6 +42,10 @@ constexpr int64_t displaySelectionGuardNs = 1000000;
 #endif
 enum class DisplaySlotDecision { staleToken, retired, waiting, ready, expired };
 
+inline int64_t displaySlotSelectionGuardNs(DisplaySlotWindow slot) {
+    return slot.selectionGuardNs > 0 ? slot.selectionGuardNs : displaySelectionGuardNs;
+}
+
 inline bool canArmDisplaySlot(DisplaySlotWindow slot, uint64_t token, DisplaySlotContext current) {
     return token && slot.token == token && sameDisplaySlotContext(slot.context, current);
 }
@@ -50,7 +55,7 @@ inline DisplaySlotDecision displaySlotDecision(DisplaySlotWindow slot, uint64_t 
     if (!token || slot.token != token) return DisplaySlotDecision::staleToken;
     if (!sameDisplaySlotContext(slot.context, current)) return DisplaySlotDecision::retired;
     if (nowNs >= slot.deadlineNs) return DisplaySlotDecision::expired;
-    return nowNs < slot.deadlineNs - displaySelectionGuardNs ? DisplaySlotDecision::waiting : DisplaySlotDecision::ready;
+    return nowNs < slot.deadlineNs - displaySlotSelectionGuardNs(slot) ? DisplaySlotDecision::waiting : DisplaySlotDecision::ready;
 }
 
 inline bool canReplaceDisplaySlot(DisplaySlotWindow slot, DisplaySlotContext current, int64_t nowNs) {

@@ -65,6 +65,10 @@ final class SPSelfWindowCaptureBridge: NSObject {
 
     @objc var lastFailurePoolExhausted: Bool { copier.lastFailurePoolExhausted }
 
+#if ODF_AIR_SERVICE_TRACE || ODF_AIR_BETA_DIAGNOSTIC
+    @objc func ownedCopyErrorCounters() -> [String: Any] { copier.diagnosticErrorCounters() }
+#endif
+
     @objc(snapshotAtHostNs:generation:)
     func snapshot(atHostNs hostNs: Int64, generation: UInt64) -> [String: Any] {
         ["contentGate": gate.diagnostics(nowNs: hostNs, expectedGeneration: generation),
@@ -222,6 +226,19 @@ private final class OwnedFrameCopier {
         return destination
     }
 
+#if ODF_AIR_SERVICE_TRACE || ODF_AIR_BETA_DIAGNOSTIC
+    func diagnosticErrorCounters() -> [String: Any] {
+        lock.lock()
+        let counts = (poolDrops: poolDrops, poolExhaustions: poolExhaustions,
+                      copyFailures: copyFailures, allocationFailures: allocationFailures,
+                      prepareFailures: prepareFailures)
+        lock.unlock()
+        return ["poolDrops": counts.poolDrops, "poolExhaustions": counts.poolExhaustions,
+                "copyFailures": counts.copyFailures, "allocationFailures": counts.allocationFailures,
+                "prepareFailures": counts.prepareFailures]
+    }
+#endif
+
     func snapshot() -> [String: Any] {
         lock.lock()
         defer { lock.unlock() }
@@ -331,8 +348,13 @@ private final class OwnedFrameCopier {
             kCVImageBufferTransferFunctionKey,
             kCVImageBufferYCbCrMatrixKey,
             kCVImageBufferCGColorSpaceKey,
+            kCVImageBufferChromaLocationTopFieldKey,
+            kCVImageBufferChromaLocationBottomFieldKey,
+            kCVImageBufferFieldCountKey,
+            kCVImageBufferFieldDetailKey,
         ]
         for key in keys {
+            CVBufferRemoveAttachment(destination, key)
             if let value = CVBufferGetAttachment(source, key, nil)?.takeUnretainedValue() {
                 CVBufferSetAttachment(destination, key, value, .shouldPropagate)
             }
@@ -370,6 +392,180 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     var onDiagnostic: (@Sendable (String) -> Void)?
     var onPoolPressure: (@Sendable (UInt64) -> Void)?
     var excludedWindowIDs: () -> [Int] = { [] }
+#if ODF_AIR_BETA_DIAGNOSTIC
+    var onDiagnosticSample: (@Sendable (CMSampleBuffer, UInt64, UInt64, UInt64) -> Void)?
+    var onDiagnosticGateAdmission: (@Sendable (CMSampleBuffer, UInt64, UInt64, UInt64) -> Void)?
+    var onDiagnosticStreamConstruction: (@Sendable (UInt64, UInt64, UInt64) -> Void)?
+    var onDiagnosticStopCompletion: (@Sendable (String?) -> Void)?
+    var onDiagnosticResizeEvent: (@Sendable ([String: Any]) -> Void)?
+    private let diagnosticRuntimeEnabled = WindowCaptureSource.diagnosticOwnWindowHookEnabled
+    private let airSessionObserverLock = NSLock()
+    private var airSessionObserver: (@Sendable ([String: Any]) -> Void)?
+    private var airSessionStopCompletion: (@Sendable ([String: Any]) -> Void)?
+    private var airSessionLastBuffer: (generation: UInt64, width: Int, height: Int)?
+    private var airSessionStopPending = false
+
+    private func airBetaSessionCanCommitSource() -> Bool {
+        airSessionObserverLock.lock()
+        let allowed = !airSessionStopPending
+        airSessionObserverLock.unlock()
+        return allowed
+    }
+
+    @MainActor func endAirBetaSessionStop(allowRestart: Bool) {
+        airSessionObserverLock.lock()
+        airSessionStopPending = !allowRestart
+        airSessionObserverLock.unlock()
+    }
+
+    func setAirBetaSessionObserver(_ observer: (@Sendable ([String: Any]) -> Void)?) {
+        airSessionObserverLock.lock()
+        airSessionObserver = observer
+        airSessionObserverLock.unlock()
+        if observer != nil { queue.async { self.airSessionLastBuffer = nil } }
+    }
+
+    // The SDK callback stamps this event before any main-thread delivery.
+    private func recordAirBetaCaptureEvent(_ kind: String, error: Error? = nil, details: [String: Any] = [:]) {
+        guard SPAirBetaSessionRecorder.isEnabled else { return }
+        airSessionObserverLock.lock()
+        let observer = airSessionObserver
+        airSessionObserverLock.unlock()
+        guard let observer else { return }
+        var event = details
+        event["kind"] = kind
+        event["hostTicks"] = mach_absolute_time()
+        event["uptimeNs"] = DispatchTime.now().uptimeNanoseconds
+        event["utcEpochSeconds"] = Date().timeIntervalSince1970
+        if let error {
+            let value = error as NSError
+            event["error"] = ["domain": value.domain, "code": value.code,
+                              "message": String(value.localizedDescription.prefix(4096))]
+        }
+        observer(event)
+    }
+
+    // The callback executes on the same serial queue as captureHost sampling
+    // and gate admission. It never synchronously enters Main or the processor.
+    func airBetaCaptureEntryFence(cutoffHostTicks: UInt64, handler: @escaping @Sendable ([String: Any]) -> Void) {
+        queue.async {
+            dispatchPrecondition(condition: .onQueue(self.queue))
+            let fence = mach_absolute_time()
+            self.diagnosticHookLock.lock()
+            let streamGeneration: Any = self.diagnosticHookActive ? self.diagnosticStreamSequence : NSNull()
+            self.diagnosticHookLock.unlock()
+            handler(["schema": "odf-air-capture-entry-fence-v1", "requestedCutoffHostTicks": cutoffHostTicks,
+                "actualFenceHostTicks": fence, "sourceGeneration": streamGeneration,
+                "productSourceGeneration": self.currentGeneration,
+                "lastReceivedHostTicks": self.lastReceivedHost, "receivedSequence": self.receivedSequence,
+                "sourceQueueLabel": self.queue.label, "sourceQueueFenced": true,
+                "captureHostSource": "serial_capture_callback_entry"])
+        }
+    }
+
+    func airBetaSessionSnapshot(completion: @escaping @Sendable ([String: Any]) -> Void) {
+        queue.async {
+            let begin = mach_absolute_time()
+            let value = self.diagnosticsOnQueue()
+            completion(["diagnostics": value, "detailSampleBeginHostTicks": begin,
+                        "detailSampleEndHostTicks": mach_absolute_time()])
+        }
+    }
+
+    // stopCapture completion and the following source-queue fence are separate
+    // observations. The fence does not assert that model/GPU work has drained.
+    @MainActor func stopAirBetaSession(completion: @escaping @Sendable ([String: Any]) -> Void) {
+        airSessionObserverLock.lock(); airSessionStopPending = true; airSessionObserverLock.unlock()
+        airSessionStopCompletion = completion
+        stop()
+    }
+    private let diagnosticHookLock = NSLock()
+    private var diagnosticHookReceipt: [String: Any] = [:]
+    private var diagnosticHookActive = false
+    private var diagnosticStreamSequence: UInt64 = 0
+    private var diagnosticStreamIdentity: ObjectIdentifier?
+
+    static var diagnosticOwnWindowHookEnabled: Bool {
+        let arguments = CommandLine.arguments
+        guard ProcessInfo.processInfo.environment["ODF_AIR_BETA_CAPTURE_DIAGNOSTIC"] == "1",
+              let index = arguments.firstIndex(of: "--odf-air-beta-entry-test"),
+              arguments.indices.contains(index + 1) else { return false }
+        return ["app60", "resize", "release"].contains(arguments[index + 1])
+    }
+
+    // Only the same-binary fixture supplies this explicit, locally owned ID.
+    // Ordinary source selection continues through start(filter:) unchanged.
+    @MainActor func startDiagnosticOwnWindow(windowID: CGWindowID, outputWindowIDs: [CGWindowID]) {
+        guard airBetaSessionCanCommitSource() else { return }
+        guard Self.diagnosticOwnWindowHookEnabled, windowID > 0 else {
+            onStatus?("Air capture diagnostic is disabled or has no explicit source window.", true)
+            return
+        }
+        selectionRevision &+= 1
+        let revision = selectionRevision
+        stopStream()
+        let excluded = Set(outputWindowIDs).union(excludedWindowIDs().compactMap { CGWindowID(exactly: $0) })
+        guard !excluded.contains(windowID),
+              NSApp.windows.contains(where: { $0.windowNumber > 0 && CGWindowID($0.windowNumber) == windowID }) else {
+            onStatus?("Air capture diagnostic source is absent or is an output window.", true)
+            return
+        }
+        guard #available(macOS 15.2, *) else {
+            onStatus?("Air capture diagnostic requires macOS 15.2 window metadata.", true)
+            return
+        }
+        SCShareableContent.getCurrentProcessShareableContent { [weak self] content, error in
+            let result = ShareableResult(content.map { .success($0) } ?? .failure(error ?? NSError(domain: "app.openduckframe.capture", code: 1)))
+            DispatchQueue.main.async {
+                guard let self, self.selectionRevision == revision else { return }
+                guard case let .success(content) = result.value else {
+                    self.onStatus?("Air capture diagnostic could not enumerate its current-process windows.", true)
+                    return
+                }
+                let matches = content.windows.filter { $0.windowID == windowID }
+                guard matches.count == 1, let window = matches.first,
+                      let owner = window.owningApplication, owner.processID == getpid(),
+                      !excluded.contains(window.windowID),
+                      let localWindow = NSApp.windows.first(where: { $0.windowNumber > 0 && CGWindowID($0.windowNumber) == windowID }),
+                      let contentView = localWindow.contentView else {
+                    self.onStatus?("Air capture diagnostic could not verify its current-process source window.", true)
+                    return
+                }
+                let backing = contentView.convertToBacking(contentView.bounds)
+                guard backing.width.isFinite, backing.height.isFinite,
+                      backing.width >= 2, backing.height >= 2,
+                      backing.width < CGFloat(Int.max), backing.height < CGFloat(Int.max) else {
+                    self.onStatus?("Air capture diagnostic has no valid AppKit backing seed.", true)
+                    return
+                }
+                let seed = CaptureResizePolicy.Size(width: Int(backing.width.rounded()) & ~1,
+                                                    height: Int(backing.height.rounded()) & ~1)
+                self.diagnosticHookLock.lock()
+                self.diagnosticHookActive = true
+                self.diagnosticHookReceipt = ["compiled": true, "enabled": true, "windowID": windowID, "selectedWindowID": windowID,
+                    "currentPID": getpid(), "ownerPID": owner.processID, "outputWindowIDs": outputWindowIDs,
+                    "matchCount": matches.count, "accepted": true, "permissionRequested": false, "globalEnumeration": false,
+                    "api": "SCShareableContent.getCurrentProcessShareableContent",
+                    "currentProcessAPI": "SCShareableContent.getCurrentProcessShareableContent", "verified": true,
+                    "seedSource": "AppKit", "seedPixelSize": [seed.width, seed.height],
+                    "seedBackingRectPixels": [backing.minX, backing.minY, backing.width, backing.height]]
+                self.diagnosticHookLock.unlock()
+                self.commit(filter: SCContentFilter(desktopIndependentWindow: window), restartSize: seed)
+            }
+        }
+    }
+
+    private func diagnosticStreamGeneration(_ stream: SCStream) -> UInt64? {
+        diagnosticHookLock.lock()
+        defer { diagnosticHookLock.unlock() }
+        return diagnosticHookActive && diagnosticStreamIdentity == ObjectIdentifier(stream) ? diagnosticStreamSequence : nil
+    }
+
+    func drainDiagnosticCaptureQueue(_ completion: @escaping @Sendable () -> Void) { queue.async(execute: completion) }
+    var diagnosticObservationQueue: DispatchQueue { queue }
+    func diagnosticSnapshotOnCaptureQueue() -> [String: Any] { diagnosticsOnQueue() }
+    func diagnosticOwnedCopyErrorCounters() -> [String: Any] { copier.diagnosticErrorCounters() }
+#endif
     private let pauseLock = NSLock()
     private var pauseValue = false
     var paused: Bool {
@@ -489,6 +685,13 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     }
 
     func start(filter: SCContentFilter) {
+#if ODF_AIR_BETA_DIAGNOSTIC
+        guard airBetaSessionCanCommitSource() else { return }
+        diagnosticHookLock.lock()
+        diagnosticHookActive = false
+        diagnosticStreamIdentity = nil
+        diagnosticHookLock.unlock()
+#endif
         selectionRevision &+= 1
         let revision = selectionRevision
         stopStream()
@@ -526,6 +729,9 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     }
 
     private func commit(filter: SCContentFilter, restartSize: CaptureResizePolicy.Size? = nil) {
+#if ODF_AIR_BETA_DIAGNOSTIC
+        guard airBetaSessionCanCommitSource() else { return }
+#endif
         self.filter = filter
         filterRectAtStart = filter.contentRect
         if #available(macOS 15.2, *) {
@@ -601,14 +807,46 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     private func stopStream() {
         stopResizeMonitoring(note: "stream stopped")
         let current = stream
+#if ODF_AIR_BETA_DIAGNOSTIC
+        let sessionCompletion = airSessionStopCompletion
+        let sessionStopRequested = sessionCompletion != nil ? mach_absolute_time() : 0
+        airSessionStopCompletion = nil
+        if current == nil, let sessionCompletion {
+            queue.async {
+                sessionCompletion(["streamPresentAtRequest": false, "completionObserved": false,
+                    "captureQueueDrained": true, "requestHostTicks": sessionStopRequested,
+                    "completionHostTicks": NSNull(), "queueFenceHostTicks": mach_absolute_time(), "error": NSNull()])
+            }
+        }
+#endif
         streamBinding.retire()
         geometryLock.lock(); frameGeometryReceipt = nil; geometryLock.unlock()
         stream = nil
         running = false
         current?.stopCapture { [weak self] error in
+#if ODF_AIR_BETA_DIAGNOSTIC
+            let completed = sessionCompletion != nil ? mach_absolute_time() : 0
+            self?.recordAirBetaCaptureEvent("source-stop-completed", error: error)
+            if let self, let sessionCompletion {
+                self.queue.async {
+                    sessionCompletion(["streamPresentAtRequest": true, "completionObserved": true,
+                        "captureQueueDrained": true, "requestHostTicks": sessionStopRequested,
+                        "completionHostTicks": completed, "queueFenceHostTicks": mach_absolute_time(),
+                        "error": error?.localizedDescription as Any? ?? NSNull()])
+                }
+            }
+#endif
             if let error {
                 self?.onDiagnostic?("stopCapture error: \(error.localizedDescription)")
             }
+#if ODF_AIR_BETA_DIAGNOSTIC
+            if let self {
+                self.diagnosticHookLock.lock()
+                let active = self.diagnosticHookActive
+                self.diagnosticHookLock.unlock()
+                if active { self.onDiagnosticStopCompletion?(error?.localizedDescription) }
+            }
+#endif
         }
     }
 
@@ -653,6 +891,17 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         let isWindow = filter.style == .window
         let configuration = CaptureStreamConfiguration.make(width: width, height: height, biplanar: biplanar, capFPS: captureCapFPS, window: isWindow)
         let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
+#if ODF_AIR_BETA_DIAGNOSTIC
+        diagnosticHookLock.lock()
+        let diagnosticActive = diagnosticHookActive
+        if diagnosticActive {
+            diagnosticStreamSequence &+= 1
+            diagnosticStreamIdentity = ObjectIdentifier(stream)
+        }
+        let diagnosticGeneration = diagnosticStreamSequence
+        diagnosticHookLock.unlock()
+        if diagnosticActive { onDiagnosticStreamConstruction?(diagnosticGeneration, generation, mach_absolute_time()) }
+#endif
         do {
             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
             self.stream = stream
@@ -660,6 +909,10 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             resizePolicy = CaptureResizePolicy(generation: generation, configured: .init(width: width, height: height))
             streamBinding.activate(stream, generation: generation)
             stream.startCapture { [weak self] error in
+#if ODF_AIR_BETA_DIAGNOSTIC
+                self?.recordAirBetaCaptureEvent("source-start-completed", error: error,
+                    details: ["productSourceGeneration": generation, "requestedPixels": [width, height], "biplanar": biplanar])
+#endif
                 DispatchQueue.main.async {
                     guard let self else { return }
                     // A delayed start callback from a stopped/replaced stream
@@ -683,6 +936,10 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
                 }
             }
         } catch {
+#if ODF_AIR_BETA_DIAGNOSTIC
+            recordAirBetaCaptureEvent("source-output-registration-failed", error: error,
+                details: ["productSourceGeneration": generation, "biplanar": biplanar])
+#endif
             if biplanar {
                 onDiagnostic?("addStreamOutput failed: \(error.localizedDescription); retry BGRA")
                 startStream(filter: filter, width: width, height: height, biplanar: false, generation: generation)
@@ -736,6 +993,9 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
                   self.currentGeneration == generation, self.running else { return }
             self.resizeTimer = nil
             let start = Int64(DispatchTime.now().uptimeNanoseconds)
+#if ODF_AIR_BETA_DIAGNOSTIC
+            let diagnosticCandidateSince = self.resizePolicy?.candidateSince
+#endif
             guard let request = self.resizePolicy?.tick(nowNs: start, running: true) else { return }
             let from = self.resizePolicy!.configured
             self.resizeCounters.requested += 1; self.resizeLastTarget = request.size
@@ -748,13 +1008,42 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
             self.resizeWatch = (generation, request.size, start, false)
             self.resizeObservationLock.unlock()
             let streamBox = ResizeStreamBox(stream)
+#if ODF_AIR_BETA_DIAGNOSTIC
+            self.recordAirBetaCaptureEvent("resize-requested", details: [
+                "productSourceGeneration": generation, "token": request.token,
+                "from": [from.width, from.height], "to": [request.size.width, request.size.height],
+                "policyCandidateSinceUptimeNs": diagnosticCandidateSince as Any? ?? NSNull(),
+                "policyRequestUptimeNs": start, "updateBeginHostTicks": mach_absolute_time()])
+            if self.diagnosticStreamGeneration(stream) != nil {
+                self.onDiagnosticResizeEvent?(["result": "requested", "productSourceGeneration": generation,
+                    "token": request.token, "from": [from.width, from.height], "to": [request.size.width, request.size.height],
+                    "policyCandidateSinceUptimeNs": diagnosticCandidateSince as Any? ?? NSNull(),
+                    "policyRequestUptimeNs": start, "updateBeginHostTicks": mach_absolute_time()])
+            }
+#endif
             stream.updateConfiguration(config) { [weak self, streamBox] error in
+#if ODF_AIR_BETA_DIAGNOSTIC
+                self?.recordAirBetaCaptureEvent("resize-update-completed", error: error,
+                    details: ["productSourceGeneration": generation, "token": request.token,
+                              "to": [request.size.width, request.size.height]])
+                let diagnosticCompletionHost = self?.diagnosticRuntimeEnabled == true ? mach_absolute_time() : 0
+                let diagnosticCompletionUptime = self?.diagnosticRuntimeEnabled == true ? DispatchTime.now().uptimeNanoseconds : 0
+#endif
                 let message = error?.localizedDescription
                 DispatchQueue.main.async {
                     let stream = streamBox.stream
                     guard let self, self.resizeRevision == revision, self.stream === stream,
                           self.currentGeneration == generation, self.resizePolicy?.inFlight == request else { return }
                     let now = Int64(DispatchTime.now().uptimeNanoseconds)
+#if ODF_AIR_BETA_DIAGNOSTIC
+                    if self.diagnosticStreamGeneration(stream) != nil {
+                        self.onDiagnosticResizeEvent?(["result": message == nil ? "completed" : "failed",
+                            "productSourceGeneration": generation, "token": request.token,
+                            "to": [request.size.width, request.size.height], "updateCompletionUptimeNs": diagnosticCompletionUptime,
+                            "updateCompletionHostTicks": diagnosticCompletionHost, "policyCompletionUptimeNs": now,
+                            "policyCompletionHostTicks": mach_absolute_time(), "error": message as Any? ?? NSNull()])
+                    }
+#endif
                     self.resizePolicy?.complete(request, success: message == nil, nowNs: now)
                     if message == nil {
                         self.resizeCounters.completed += 1; self.resizePendingConfirm = (request.size, from, start)
@@ -775,6 +1064,12 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     private func confirmResizeIfObserved() {
         guard let pending = resizePendingConfirm, let frame = resizeLastFrame,
               frame.size == pending.size, frame.host >= pending.start else { return }
+#if ODF_AIR_BETA_DIAGNOSTIC
+        recordAirBetaCaptureEvent("resize-buffer-confirmed", details: [
+            "productSourceGeneration": currentGeneration, "to": [frame.size.width, frame.size.height],
+            "from": [pending.from.width, pending.from.height], "bufferObservedUptimeNs": frame.host,
+            "policyRequestUptimeNs": pending.start])
+#endif
         confirmedResizeSize = pending.size; resizeCounters.confirmed += 1
         resizeObservationLock.lock(); resizeWatch = nil; resizeObservationLock.unlock()
         resizeLastConfirmMs = Double(frame.host - pending.start) / 1e6; resizePendingConfirm = nil
@@ -810,6 +1105,9 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     }
 
     func contentSharingPickerStartDidFailWithError(_ error: Error) {
+#if ODF_AIR_BETA_DIAGNOSTIC
+        recordAirBetaCaptureEvent("source-picker-failed", error: error)
+#endif
         DispatchQueue.main.async { [weak self] in self?.onStatus?("选择器没有打开：\(error.localizedDescription)", true) }
     }
 
@@ -822,6 +1120,10 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
+#if ODF_AIR_BETA_DIAGNOSTIC
+        recordAirBetaCaptureEvent("source-stream-error", error: error,
+            details: ["productSourceGeneration": streamBinding.snapshot(stream) as Any? ?? NSNull()])
+#endif
         if let generation = streamBinding.snapshot(stream) {
             _ = streamBinding.withCurrent(stream, generation: generation) {
                 geometryLock.lock()
@@ -856,6 +1158,11 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         }
         receivedSequence &+= 1
         lastReceivedHost = mach_absolute_time()
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if diagnosticRuntimeEnabled, let streamGeneration = diagnosticStreamGeneration(stream) {
+            onDiagnosticSample?(sampleBuffer, generation, streamGeneration, lastReceivedHost)
+        }
+#endif
         if #available(macOS 13.1, *),
            let items = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
            let dictionary = items.first?[.screenRect] as? NSDictionary,
@@ -919,6 +1226,23 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         }
         let captureHost = lastReceivedHost
         let frameGeometry = geometryMetadata(sampleBuffer, width: CVPixelBufferGetWidth(image), height: CVPixelBufferGetHeight(image), generation: generation)
+#if ODF_AIR_BETA_DIAGNOSTIC
+        airSessionObserverLock.lock()
+        let sessionObserving = airSessionObserver != nil
+        airSessionObserverLock.unlock()
+        if sessionObserving {
+            let width = CVPixelBufferGetWidth(image), height = CVPixelBufferGetHeight(image)
+            if airSessionLastBuffer?.generation != generation || airSessionLastBuffer?.width != width || airSessionLastBuffer?.height != height {
+                airSessionLastBuffer = (generation, width, height)
+                let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+                recordAirBetaCaptureEvent("source-buffer-size-observed", details: [
+                    "productSourceGeneration": generation, "bufferPixels": [width, height],
+                    "pixelFormat": CVPixelBufferGetPixelFormatType(image), "captureHostTicks": captureHost,
+                    "ptsNum": pts.value, "ptsDen": pts.timescale, "ptsFlags": pts.flags.rawValue, "ptsEpoch": pts.epoch,
+                    "geometryAvailable": frameGeometry != nil, "geometry": frameGeometry as Any? ?? NSNull()])
+            }
+        }
+#endif
         guard streamBinding.withCurrent(stream, generation: generation, {
             geometryLock.lock()
             if screenRectGeneration == generation {
@@ -932,6 +1256,13 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         // Geometry remains current even for a duplicate, but duplicate pixels do
         // not become native-cadence evidence or enter the processor queue.
         if contentFrameGate.evaluate(buffer: image, generation: generation, hostNs: contentHostNs(captureHost)) == .duplicate { return }
+#if ODF_AIR_BETA_DIAGNOSTIC
+        if diagnosticRuntimeEnabled, let streamGeneration = diagnosticStreamGeneration(stream) {
+            _ = streamBinding.withCurrent(stream, generation: generation) {
+                onDiagnosticGateAdmission?(sampleBuffer, generation, streamGeneration, captureHost)
+            }
+        }
+#endif
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let ptsNum: Int64
         let ptsDen: Int64
@@ -958,6 +1289,12 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         }
         borrowedPeak = max(borrowedPeak, 1)
         guard let owned = copier.copy(image) else {
+#if ODF_AIR_BETA_DIAGNOSTIC
+            recordAirBetaCaptureEvent("source-owned-copy-failed", details: [
+                "productSourceGeneration": generation, "captureHostTicks": captureHost,
+                "poolExhausted": copier.lastFailurePoolExhausted,
+                "errorCounters": copier.diagnosticErrorCounters()])
+#endif
             if copier.lastFailurePoolExhausted { onPoolPressure?(generation) }
             if completeCount <= 5 || completeCount % 30 == 0 {
                 onDiagnostic?(copier.lastFailurePoolExhausted ? "capture pool full; dropped complete \(completeCount)" : "capture copy failed; dropped complete \(completeCount)")
@@ -975,6 +1312,18 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         let geometryKey = "app.openduckframe.capture.geometry" as CFString
         CVBufferRemoveAttachment(owned, geometryKey)
         if let frameGeometry { CVBufferSetAttachment(owned, geometryKey, frameGeometry as CFDictionary, .shouldNotPropagate) }
+        geometryLock.lock()
+        let sourceTarget = screenRectGeneration == generation ? geometryTarget : nil
+        geometryLock.unlock()
+        let sourceKind: SPLiveCaptureSourceKind
+        switch sourceTarget {
+        case .window?: sourceKind = .window
+        case .display?: sourceKind = .display
+        case nil: sourceKind = .unknown
+        }
+        let sourceKindKey = "app.openduckframe.capture.sourceKind" as CFString
+        CVBufferRemoveAttachment(owned, sourceKindKey)
+        CVBufferSetAttachment(owned, sourceKindKey, NSNumber(value: sourceKind.rawValue), .shouldNotPropagate)
         let admitted = streamBinding.withCurrent(stream, generation: generation) {
             onFrame?(owned, ptsNum, ptsDen, Int64(captureHost), Int64(readyHost), generation)
         }
@@ -1081,6 +1430,15 @@ final class WindowCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, SCC
         report["resize"] = resizeDiagnosticsValue["resize"] ?? [:]
         report["resizeEvents"] = resizeDiagnosticsValue["resizeEvents"] ?? []
         resizeDiagnosticsLock.unlock()
+#if ODF_AIR_BETA_DIAGNOSTIC
+        diagnosticHookLock.lock()
+        if diagnosticHookActive {
+            report["diagnosticHook"] = diagnosticHookReceipt
+            report["productSourceGeneration"] = currentGeneration
+            report["captureStreamGeneration"] = diagnosticStreamSequence
+        }
+        diagnosticHookLock.unlock()
+#endif
         return report
     }
 

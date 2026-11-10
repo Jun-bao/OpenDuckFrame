@@ -18,9 +18,13 @@ struct SPRifeExperimentSelection: Codable, Equatable, Sendable {
 }
 
 enum SPRifeExperiments {
-    private static let suite = "app.openduckframe.ExperimentComparison"
+    private static var suite: String {
+        Bundle.main.object(forInfoDictionaryKey: "ODFExperimentDefaultsSuite") as? String
+            ?? "app.openduckframe.ExperimentComparison"
+    }
     private static let preferenceKey = "RifeExperimentSelection"
 
+    static var airBeta: Bool { Bundle.main.object(forInfoDictionaryKey: "ODFAirBeta") as? Bool == true }
     static var available: Bool { isAvailable(in: .main) }
     static func isAvailable(in bundle: Bundle) -> Bool {
         bundle.object(forInfoDictionaryKey: "ODFExperimentTrial") as? Bool == true
@@ -28,6 +32,7 @@ enum SPRifeExperiments {
 
     static var selection: SPRifeExperimentSelection {
         get {
+            if airBeta { return SPRifeExperimentSelection(ioOptimized: true) }
             guard let data = UserDefaults(suiteName: suite)?.data(forKey: preferenceKey),
                   let value = try? JSONDecoder().decode(SPRifeExperimentSelection.self, from: data) else {
                 return SPRifeExperimentSelection()
@@ -35,7 +40,7 @@ enum SPRifeExperiments {
             return value.normalized
         }
         set {
-            guard available, let data = try? JSONEncoder().encode(newValue.normalized) else { return }
+            guard available, !airBeta, let data = try? JSONEncoder().encode(newValue.normalized) else { return }
             let defaults = UserDefaults(suiteName: suite)
             defaults?.set(data, forKey: preferenceKey)
             // The other build reads the same suite immediately after launch.

@@ -43,7 +43,7 @@ enum SingleInstancePolicy {
     static func isContract(_ arguments: [String]) -> Bool {
         let flags: Set<String> = ["--odf-enhancement-selftest", "--odf-session-contract", "--odf-engine-probe",
             "--odf-sr-pipeline-contract", "--odf-video-sr-pipeline-contract", "--odf-anime4k-pipeline-contract",
-            "--odf-realcugan-pipeline-contract", "--odf-sr-input-contract"]
+            "--odf-realcugan-pipeline-contract", "--odf-sr-input-contract", "--odf-air-beta-entry-test"]
         return arguments.contains { flags.contains($0) }
     }
 }
