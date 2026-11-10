@@ -1297,7 +1297,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                               styleMask: [.titled, .closable, .miniaturizable, .resizable],
                               backing: .buffered, defer: false)
         window.title = "OpenDuckFrame"
-        window.minSize = NSSize(width: 840, height: 620)
         super.init(window: window)
 #if ODF_AIR_BETA_DIAGNOSTIC
         Self.betaInstance = self
@@ -1306,11 +1305,27 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         if SPRifeExperiments.available { useRifeComparisonProfile() }
         applyAirBetaPreset(&profile)
         window.delegate = self
-        window.contentView = build()
+        let content = build()
+        window.contentView = content
         installToolbar(on: window)
         window.openSettings = { [weak self] in self?.showSettings() }
-        if !window.setFrameUsingName("OpenDuckFrame.Workbench") { window.center() }
+        let minimumFrameSize = NSSize(width: 840, height: 620)
+        let minimumContentSize = window.contentRect(forFrameRect: NSRect(origin: .zero, size: minimumFrameSize)).size
+        // Auto Layout derives the window minimum from its content constraints.
+        NSLayoutConstraint.activate([
+            content.widthAnchor.constraint(greaterThanOrEqualToConstant: minimumContentSize.width),
+            content.heightAnchor.constraint(greaterThanOrEqualToConstant: minimumContentSize.height),
+        ])
         window.setFrameAutosaveName("OpenDuckFrame.Workbench")
+        let restored = window.setFrameUsingName("OpenDuckFrame.Workbench")
+        var frame = window.frame
+        let previousHeight = frame.height
+        frame.size = restored
+            ? NSSize(width: max(frame.width, minimumFrameSize.width), height: max(frame.height, minimumFrameSize.height))
+            : NSSize(width: 1180, height: 700)
+        frame.origin.y += previousHeight - frame.height
+        window.setFrame(frame, display: false)
+        if !restored { window.center() }
         window.initialFirstResponder = sourceKindControl
         window.beforeMouseDown = { [weak self] event in self?.endDimensionEditingBeforeClick(event) }
         installCountdownLabels()
