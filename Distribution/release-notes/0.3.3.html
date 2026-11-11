@@ -2,6 +2,7 @@
 <ul>
   <li>Frame generation now uses ODF-VFI, a four-stage model derived from RIFE 4.25, as its default model.</li>
   <li>Reduced model processing overhead while retaining continuous caching and the existing Air window optimizations.</li>
+  <li>Window optimization uses bounded feedback during startup calibration, retaining the same final timing limits when GPU costs shift during warmup.</li>
   <li>Existing enhancement profiles remain compatible. Scaling and super-resolution settings are unchanged.</li>
 </ul>
 <p>ODF-VFI is a structural reduction of the upstream model, not a lossless-quality guarantee. Results depend on the source content.</p>
