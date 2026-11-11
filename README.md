@@ -5,6 +5,8 @@
 <p align="center"><a href="https://openduckframe.cn/en/">Official website</a> · <b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
 <p align="center">Apple silicon · macOS 14+ · <a href="LICENSE">MIT</a></p>
 
+The default frame-generation model is **ODF-VFI**, a four-stage model derived from RIFE 4.25. Existing RIFE 4.25 profiles remain compatible; the app validates the actual four-stage weights when loading. Visual results remain content-dependent.
+
 ## About
 
 OpenDuckFrame is a native Mac app that enhances the picture you are already watching.

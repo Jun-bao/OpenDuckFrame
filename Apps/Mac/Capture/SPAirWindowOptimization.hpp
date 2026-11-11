@@ -16,6 +16,7 @@ struct AirWindowOptimizationInput {
     bool stream = false;
     bool scale = false;
     bool original = false;
+    bool productionFourStage = false;
     bool gpuIO = false;
     bool accumulate = false;
     bool compiled = false;
@@ -34,7 +35,7 @@ inline const char *airWindowOptimizationReason(const AirWindowOptimizationInput 
     if (!input.multiplierRate || input.multiplier != 2) return "requires-x2";
     if (!input.stream) return "requires-stream";
     if (input.scale) return "requires-scale-off";
-    if (!input.original) return "requires-original-model";
+    if (!input.original && !input.productionFourStage) return "requires-supported-model";
     if (!input.gpuIO) return "requires-gpu-io";
     if (!input.accumulate) return "requires-accumulate-mask";
     return nullptr;

@@ -1,0 +1,11 @@
+{
+  "name": "ODF-VFI",
+  "graph_id": "odf-ifnet425-fourstage-acc-v1",
+  "sha256": "729ea555016da98e207bc4570e0be81dddbbd37302f7330c89696da798fba22d",
+  "source_sha256": "ef29a643a76a9202600458a23dddce16919337ef01743d0fbe817684ec990f74",
+  "container_version": 2,
+  "stage_count": 4,
+  "tensor_count": 128,
+  "mask_update": "accumulate",
+  "trained": false
+}

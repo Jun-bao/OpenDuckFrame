@@ -2,6 +2,19 @@ import AppKit
 import CryptoKit
 import Foundation
 
+/// The legacy profile ID and resource name remain compatible with existing settings.
+enum SPRifeProductionModel {
+    static let graphID = "odf-ifnet425-fourstage-acc-v1"
+    static let sha256 = "729ea555016da98e207bc4570e0be81dddbbd37302f7330c89696da798fba22d"
+
+    static func matchesLoadedIdentity(_ identity: [String: Any]) -> Bool {
+        identity["sha256"] as? String == sha256 &&
+        identity["graphID"] as? String == graphID && identity["model"] as? String == graphID &&
+        identity["stageCount"] as? Int == 4 && identity["tensorCount"] as? Int == 128 &&
+        identity["containerVersion"] as? UInt32 == 2 && identity["overrideApplied"] as? Bool == false
+    }
+}
+
 /// Private trial choices are separate from the shipping application's settings.
 struct SPRifeExperimentSelection: Codable, Equatable, Sendable {
     var ioOptimized: Bool = false

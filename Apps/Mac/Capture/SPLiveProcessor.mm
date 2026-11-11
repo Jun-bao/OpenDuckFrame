@@ -5144,6 +5144,9 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     input.stream = request.rifeStreamEnabled;
     input.scale = request.scaleEnabled;
     input.original = [_airPerformanceSelection[@"originalEF29"] boolValue];
+    input.productionFourStage = [_airPerformanceSelection[@"productionFourStage"] boolValue] &&
+        [_airPerformanceSelection[@"expectedGraphID"] isEqual:@"odf-ifnet425-fourstage-acc-v1"] &&
+        [_airPerformanceSelection[@"expectedWeightsSHA256"] isEqual:@"729ea555016da98e207bc4570e0be81dddbbd37302f7330c89696da798fba22d"];
     input.gpuIO = [_airPerformanceSelection[@"gpuIO"] boolValue];
     input.accumulate = [_airPerformanceSelection[@"accumulate"] boolValue];
 #if ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC && ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC && ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC && ODF_AIR_BETA_DIAGNOSTIC

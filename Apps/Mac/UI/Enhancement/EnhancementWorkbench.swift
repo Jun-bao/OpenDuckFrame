@@ -1257,7 +1257,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let enginePopup = AnchoredPopUpButton()
     private let sourceKindControl = NSSegmentedControl(labels: ["窗口", "显示器", "视频文件"], trackingMode: .selectOne, target: nil, action: nil)
     private let phaseLabel = NSTextField(wrappingLabelWithString: "")
-    private let compatibilityButton = NSButton(title: "改用 RIFE 4.25", target: nil, action: nil)
+    private let compatibilityButton = NSButton(title: "改用 ODF-VFI", target: nil, action: nil)
     private let emptyOverlay = NSView()
     private var page = 0
     private var pendingApply: EnhancementProfile?
@@ -1534,8 +1534,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         loadControls()
         persist()
         showWorkbench()
-        showNotice(EnhancementText.t("RIFE 4.25 is selected. Click Start Enhancement to apply it to this video.",
-                                    "已选择 RIFE 4.25。请点击开始增强后应用到此视频。"))
+        showNotice(EnhancementText.t("ODF-VFI is selected. Click Start Enhancement to apply it to this video.",
+                                    "已选择 ODF-VFI。请点击开始增强后应用到此视频。"))
     }
 
     func showPlaybackFailure(_ message: String) {
@@ -1581,8 +1581,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             return
         }
         let message = EnhancementText.t(
-            "Options saved for RIFE 4.25. Enhancement stopped; click Start Enhancement to apply them.",
-            "方案已保存为 RIFE 4.25。增强已停止，请点击开始增强后应用。")
+            "Options saved for ODF-VFI. Enhancement stopped; click Start Enhancement to apply them.",
+            "方案已保存为 ODF-VFI。增强已停止，请点击开始增强后应用。")
         showNotice(message)
         experimentComparisonPanel?.showStatus(message)
     }
@@ -2308,7 +2308,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         stack.addArrangedSubview(intro)
         stack.addArrangedSubview(heading(EnhancementText.t("Frame generation", "帧生成")))
         stack.addArrangedSubview(libraryRow(
-            "RIFE Metal 4.25",
+            "ODF-VFI",
             EnhancementText.t("Available for ordinary 8-bit video. fast is the checked tier. balanced and hq stay experimental.", "可用于普通 8 位画面。fast 是已核对的档位，balanced 和 hq 仍是实验。"),
             "rife.metal|rife-v4.25", enabled: true))
         stack.addArrangedSubview(heading(EnhancementText.t("Scale and super-resolution", "缩放与超分")))
@@ -2858,7 +2858,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         profile.interpolationEnabled = true
         loadControls()
         persist()
-        statusLabel.stringValue = EnhancementText.t("RIFE 4.25 selected. Press Start to apply it.", "已选择 RIFE 4.25。按开始后生效。")
+        statusLabel.stringValue = EnhancementText.t("ODF-VFI selected. Press Start to apply it.", "已选择 ODF-VFI。按开始后生效。")
         statusLabel.textColor = .labelColor
     }
 
@@ -2949,7 +2949,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func configurePopups() {
-        enginePopup.addItems(withTitles: ["RIFE 4.25"])
+        enginePopup.addItems(withTitles: ["ODF-VFI"])
         enginePopup.target = self
         enginePopup.action = #selector(engineChanged)
         qualityPopup.addItems(withTitles: ["fast", "balanced", "hq"])
@@ -4896,7 +4896,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let active = fileApplied ?? profile
         let interpolationActive = player?.workbenchMotionPlusRequested ?? false
         let mode: String
-        let interpolationName = active.interpolationEngineID == "rife.metal" ? "RIFE \(active.modelID) · \(active.interpolationQuality)" : (active.interpolationEngineID == "apple.lowlatency" ? EnhancementText.t("Apple Low Latency", "Apple 低延迟") : (active.interpolationEngineID == "distildrba.coreml" ? "DistilDRBA" : "Apple FRC"))
+        let interpolationName = active.interpolationEngineID == "rife.metal" ? "ODF-VFI · \(active.interpolationQuality)" : (active.interpolationEngineID == "apple.lowlatency" ? EnhancementText.t("Apple Low Latency", "Apple 低延迟") : (active.interpolationEngineID == "distildrba.coreml" ? "DistilDRBA" : "Apple FRC"))
         switch active.rate {
         case .multiplier(let value): mode = interpolationActive ? "\(interpolationName) X\(value) · " + EnhancementText.t("Experimental", "实验") : EnhancementText.t("Motion+ off", "Motion+ 关闭")
         case let .fixedFPS(n, d): mode = interpolationActive ? "\(interpolationName) \(n)/\(d) FPS · " + EnhancementText.t("Experimental", "实验") : EnhancementText.t("Motion+ off", "Motion+ 关闭")
@@ -5051,7 +5051,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             let player = selectedFilePlayer()
             if player?.workbenchMotionPlusActive == true {
                 let selected = fileApplied ?? profile
-                let name = selected.interpolationEngineID == "rife.metal" ? "RIFE \(selected.modelID) · \(selected.interpolationQuality)" : "Apple FRC"
+                let name = selected.interpolationEngineID == "rife.metal" ? "ODF-VFI · \(selected.interpolationQuality)" : "Apple FRC"
                 live = EnhancementText.t("Active", "生效") + " " + name
             } else if player?.workbenchMotionPlusRequested == true {
                 live = EnhancementText.t("Preparing or waiting for compatible frames", "正在准备或等待兼容画面")
@@ -5136,7 +5136,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         switch engine {
         case "apple.lowlatency": return EnhancementText.t("Apple low latency", "Apple 低延迟")
         case "apple.frc": return "Apple FRC"
-        case "rife.metal": return model == "rife-v4.26" ? "RIFE 4.26" : "RIFE 4.25"
+        case "rife.metal": return model == "rife-v4.26" ? "RIFE 4.26" : "ODF-VFI"
         case "distildrba.coreml": return "DistilDRBA"
         default: return engine
         }

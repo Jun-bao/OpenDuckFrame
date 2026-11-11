@@ -5,6 +5,8 @@
 <p align="center"><a href="https://openduckframe.cn/">官网与使用指南</a> · <a href="README.md">English</a> · <b>简体中文</b></p>
 <p align="center">Apple 芯片 · macOS 14+ · <a href="LICENSE">MIT 开源</a></p>
 
+默认补帧模型为 **ODF-VFI 四阶段精简版**，基于 RIFE 4.25 派生。现有 RIFE 4.25 配置保持兼容，加载时会校验实际四阶段权重；画质表现仍取决于素材。
+
 ## 简介
 
 OpenDuckFrame 是一款原生 Mac 画质增强应用。浏览器视频、游戏与串流窗口、整块显示器，或本地视频文件，
