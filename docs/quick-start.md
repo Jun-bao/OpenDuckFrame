@@ -19,20 +19,21 @@ when macOS requests it. Video-file playback does not need capture permission.
 
 ## Start with a simple setup
 
-On a fresh installation, frame generation is enabled with RIFE 4.25, fast
-quality, RIFE stream cache enabled, and X2 rate. Window output follows the
-source, and scaling is off. The stream cache applies to live capture only.
-Existing saved settings are retained; a new named configuration copies the
-current settings.
+On a fresh installation, frame generation is enabled with ODF-VFI, fast
+quality, and X2 rate. Window output follows the source, and scaling is off.
+Continuous caching is always on; there is no separate switch to find or enable.
+Existing saved settings are retained, and profiles saved with RIFE 4.25 use
+ODF-VFI; a new named configuration copies the current settings.
 
-1. Select the source and output display.
+1. Select the source. Display and video-file inputs can also use a selected
+   output display.
 2. Start with one enhancement: frame generation at X2, or Lanczos / MetalFX
    scaling. Higher resolutions and multipliers require more processing time.
-3. For a window, press **Delayed enhancement**, then focus the window you want
+3. For a window, press **Delayed Enhancement**, then focus the window you want
    to enhance before the countdown ends. The focused window is selected and
    enhancement starts automatically. The countdown defaults to 3 seconds and
    can be set from 1 to 20 seconds in **Settings**. Display and video-file inputs
-   keep **Start enhancement**. Compare **Original**, **Enhanced**, and
+   keep **Start Enhancement**. Compare **Original**, **Enhanced**, and
    **Comparison** views; use the FPS overlay to observe actual output.
 4. Save a profile once you have settings that work for your content.
 
@@ -47,7 +48,8 @@ Performance, latency and artifacts vary with motion, resolution and backend.
 - **Output below target:** try X2, a lower resolution, or a lighter quality mode.
   A 60 Hz output display cannot present 120 distinct frames per second.
 - **Softness or motion artifacts:** compare at the same output size, then switch
-  engine or disable one enhancement to identify the stage that changes the picture.
+  the scaling technology or disable one enhancement to identify the stage that
+  changes the picture.
 - **Unavailable engine:** check the [feature requirements](features.md). Some
   backends need newer macOS, a specific input size, or an optional runtime.
 - **Resize / fullscreen problems:** reselect the source and report the source
