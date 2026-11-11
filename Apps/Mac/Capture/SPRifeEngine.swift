@@ -374,7 +374,8 @@ final class SPRifeBridge: NSObject {
         }
 #endif
         let engine = try RifeInterpolator(configuration: configuration)
-        if experiment == nil, !SPRifeProductionModel.matchesLoadedIdentity(engine.airDiagnosticModelIdentity) {
+        if modelID == "rife-v4.25", experiment == nil,
+           !SPRifeProductionModel.matchesLoadedIdentity(engine.airDiagnosticModelIdentity) {
             throw Self.error(25, "Bundled ODF-VFI model identity differs from the released four-stage weights")
         }
         let previousNV = try Self.nv12(width: processingWidth, height: processingHeight, luma: 32)
