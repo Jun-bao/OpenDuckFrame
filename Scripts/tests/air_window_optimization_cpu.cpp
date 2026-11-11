@@ -12,6 +12,14 @@ int main() {
     baseline.multiplier = 2;
     baseline.original = baseline.gpuIO = baseline.accumulate = baseline.compiled = true;
     assert(!sp::airWindowOptimizationReason(baseline));
+    auto production = baseline;
+    production.original = false;
+    production.productionFourStage = true;
+    assert(!sp::airWindowOptimizationReason(production));
+    production.accumulate = false;
+    assert(sp::airWindowOptimizationReason(production));
+    production = baseline; production.original = false;
+    assert(sp::airWindowOptimizationReason(production));
     auto input = baseline;
     input.hardware = "Mac15,13";
     assert(!sp::airWindowOptimizationReason(input));

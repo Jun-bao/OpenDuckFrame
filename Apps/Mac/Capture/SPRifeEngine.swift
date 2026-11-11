@@ -87,13 +87,15 @@ final class SPRifeBridge: NSObject {
     @objc var liveStreamEnabled = false
     /// Set by the live-window eligibility gate before preparing this instance.
     @objc var airPerformanceEnabled = false
-    /// Selection intent only. The loaded EF29 identity is validated in prepare.
+    /// Selection intent only. The loaded production identity is validated in prepare.
     @objc(airPerformanceSelectionStatus)
     static func airPerformanceSelectionStatus() -> [String: Any] {
         guard SPRifeExperiments.isAvailable(in: .main) else {
             let defaults = RifeExperimentOptions()
             return ["eligible": defaults.gpuIO && !defaults.replaceMask,
-                    "reason": "standard defaults", "originalEF29": true,
+                    "reason": "ODF-VFI four-stage default", "originalEF29": false,
+                    "productionFourStage": true, "expectedGraphID": SPRifeProductionModel.graphID,
+                    "expectedWeightsSHA256": SPRifeProductionModel.sha256,
                     "gpuIO": defaults.gpuIO, "accumulate": !defaults.replaceMask,
                     "selectionActive": false]
         }
@@ -372,6 +374,9 @@ final class SPRifeBridge: NSObject {
         }
 #endif
         let engine = try RifeInterpolator(configuration: configuration)
+        if experiment == nil, !SPRifeProductionModel.matchesLoadedIdentity(engine.airDiagnosticModelIdentity) {
+            throw Self.error(25, "Bundled ODF-VFI model identity differs from the released four-stage weights")
+        }
         let previousNV = try Self.nv12(width: processingWidth, height: processingHeight, luma: 32)
         let currentNV = try Self.nv12(width: processingWidth, height: processingHeight, luma: 180)
         let previous = try ownedBGRA(previousNV)
@@ -412,12 +417,10 @@ final class SPRifeBridge: NSObject {
                 let identity = engine.airDiagnosticModelIdentity
                 guard modelID == "rife-v4.25", tier == .fast,
                       adaptiveSizing || (processingWidth == 1814 && processingHeight == 1142),
-                      identity["sha256"] as? String == "ef29a643a76a9202600458a23dddce16919337ef01743d0fbe817684ec990f74",
-                      identity["stageCount"] as? Int == 5, identity["tensorCount"] as? Int == 158,
-                      identity["overrideApplied"] as? Bool == false,
+                      SPRifeProductionModel.matchesLoadedIdentity(identity),
                       !options.replaceMask, options.gpuIO,
                       let library = resourceBundle.url(forResource: "gap-fill", withExtension: "metallib") else {
-                    throw Self.error(21, "App keeper requires the frozen EF29/Fast/1814x1142/GPU-IO configuration and metallib")
+                    throw Self.error(21, "App keeper requires the production ODF-VFI/Fast/GPU-IO configuration and metallib")
                 }
                 let expectedMetallibSHA256 = try airPerformanceEnabled
                     ? SPResidentKeepAliveMetallib.productionSHA256(bundle: resourceBundle) : SPResidentKeepAliveMetallib.diagnosticSHA256
