@@ -2,6 +2,15 @@
 
 All notable public releases will be documented here.
 
+## 0.4.0 — 2026-11-12
+
+- Redesign the compact workbench with grouped settings, aligned control columns,
+  independent scrolling, and fixed source and run-action areas.
+- Add ArtCNN C4F32/C4F16 native 2× SDR super resolution for live and file inputs.
+- Add a skippable, replayable three-step guide for selecting and enhancing a source.
+- Keep signed in-app update delivery. Community builds remain ad-hoc signed and
+  not Apple notarized; macOS may request permissions again after an update.
+
 ## 0.3.1 — 2026-11-10
 
 - Automatically select the optimized live-window pipeline on M3 MacBook Air
