@@ -6,6 +6,7 @@
 #import "SPAppleLowLatencySR.h"
 #import "SPAppleVideoSR.h"
 #import "SPAnime4K.h"
+#import "SPArtCNNSR.h"
 #import "SPRealCUGAN.h"
 #import "SPDistilDRBA.h"
 #import "SPRifeBridge.h"
@@ -61,6 +62,14 @@
 #include <unordered_set>
 #include <vector>
 #include <type_traits>
+
+static BOOL SPLiveIsArtCNNScaleEngine(SPLiveScaleEngine engine) {
+    return engine == SPLiveScaleArtCNN16 || engine == SPLiveScaleArtCNN32;
+}
+
+static BOOL SPLiveIsNative2xScaleEngine(SPLiveScaleEngine engine) {
+    return engine == SPLiveScaleAnime4K || engine == SPLiveScaleRealCUGAN || SPLiveIsArtCNNScaleEngine(engine);
+}
 
 // Private live-budget bridge entry point; the public adapter API is unchanged.
 @interface SPRifeBridge (SPRateBudgetProbe)
@@ -3500,6 +3509,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     SPAppleVideoSR *_videoSR;
     SPAnime4K *_animeSR;
     SPRealCUGAN *_cuganSR;
+    SPArtCNNSR *_artCNNSR;
     std::deque<SPSRJob *> _srPending;
     uint64_t _srSequence;
     uint64_t _srPendingBytes;
@@ -4642,13 +4652,13 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 - (BOOL)validateRequest:(SPLivePlanRequest *)request reason:(NSString **)reason {
     BOOL sourceGuard = request.requiredSourceWidth || request.requiredSourceHeight || request.requiredSourceWindowID || request.requiredSourcePID || request.requiredSourceAfterHost;
     if (sourceGuard && (request.requiredSourceWidth < 2 || request.requiredSourceHeight < 2 || !request.requiredSourceWindowID || request.requiredSourcePID <= 0 || !request.requiredSourceAfterHost || request.srInputPreset != 0 || !request.scaleEnabled ||
-        (request.scaleEngine != SPLiveScaleMetalFX && request.scaleEngine != SPLiveScaleAnime4K && request.scaleEngine != SPLiveScaleRealCUGAN))) {
+        (request.scaleEngine != SPLiveScaleMetalFX && !SPLiveIsNative2xScaleEngine(request.scaleEngine)))) {
         if (reason) *reason = @"来源窗口尺寸计划无效或缺少已确认的窗口身份。";
         return NO;
     }
     if (sourceGuard) {
         BOOL nativeOutput = request.outputWidth == request.requiredSourceWidth*2 && request.outputHeight == request.requiredSourceHeight*2;
-        BOOL autoAnimation = (request.scaleEngine == SPLiveScaleAnime4K || request.scaleEngine == SPLiveScaleRealCUGAN) && request.outputWidth == 0 && request.outputHeight == 0;
+        BOOL autoAnimation = SPLiveIsNative2xScaleEngine(request.scaleEngine) && request.outputWidth == 0 && request.outputHeight == 0;
         if (!nativeOutput && !autoAnimation) { if (reason) *reason = @"来源窗口模式需要匹配的 2× 输出尺寸。"; return NO; }
     }
     if (request.scaleEnabled && request.scaleEngine == SPLiveScaleAppleVideoSR && request.interpolationEnabled) {
@@ -4800,11 +4810,11 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 }
 
 - (BOOL)requestUsesAsyncScale:(SPLivePlanRequest *)request {
-    return request.scaleEnabled && (request.scaleEngine == SPLiveScaleAppleLowLatencySR || request.scaleEngine == SPLiveScaleAppleVideoSR || request.scaleEngine == SPLiveScaleAnime4K || request.scaleEngine == SPLiveScaleRealCUGAN);
+    return request.scaleEnabled && (request.scaleEngine == SPLiveScaleAppleLowLatencySR || request.scaleEngine == SPLiveScaleAppleVideoSR || SPLiveIsNative2xScaleEngine(request.scaleEngine));
 }
 
 - (BOOL)requestUsesLatestScale:(SPLivePlanRequest *)request {
-    return request.scaleEnabled && (request.scaleEngine == SPLiveScaleAnime4K || request.scaleEngine == SPLiveScaleRealCUGAN);
+    return request.scaleEnabled && SPLiveIsNative2xScaleEngine(request.scaleEngine);
 }
 
 - (BOOL)requestUsesLowPrescale:(SPLivePlanRequest *)request width:(int)width height:(int)height {
@@ -4906,7 +4916,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     _videoSRDiscontinuity = YES;
 }
 
-- (void)installRequest:(SPLivePlanRequest *)request lowLatency:(SPLowLatencyEngine *)lowLatency rife:(SPRifeBridge *)rife distil:(SPDistilDRBA *)distil appleSR:(SPAppleLowLatencySR *)appleSR videoSR:(SPAppleVideoSR *)videoSR animeSR:(SPAnime4K *)animeSR cuganSR:(SPRealCUGAN *)cuganSR {
+- (void)installRequest:(SPLivePlanRequest *)request lowLatency:(SPLowLatencyEngine *)lowLatency rife:(SPRifeBridge *)rife distil:(SPDistilDRBA *)distil appleSR:(SPAppleLowLatencySR *)appleSR videoSR:(SPAppleVideoSR *)videoSR animeSR:(SPAnime4K *)animeSR cuganSR:(SPRealCUGAN *)cuganSR artCNNSR:(SPArtCNNSR *)artCNNSR {
     SPFRCEngine *oldEngine = _engine;
     SPLowLatencyEngine *oldLow = _lowLatency;
     SPRifeBridge *oldRife = _rife;
@@ -4915,6 +4925,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     SPAppleVideoSR *oldVideoSR = _videoSR;
     SPAnime4K *oldAnimeSR = _animeSR;
     SPRealCUGAN *oldCuganSR = _cuganSR;
+    SPArtCNNSR *oldArtCNNSR = _artCNNSR;
     SPFrameBudgetMetal *oldMetal = _metal;
     SPSpatialScaler *oldScaler = _scaler;
     SPSpatialScaler *oldBaseline = _baselineScaler;
@@ -4936,6 +4947,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     _videoSR = videoSR;
     _animeSR = animeSR;
     _cuganSR = cuganSR;
+    _artCNNSR = artCNNSR;
     _request = request;
     _sessionReady = NO;
     NSError *error = nil;
@@ -4949,6 +4961,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         [videoSR invalidate];
         [animeSR invalidate];
         [cuganSR invalidate];
+        [artCNNSR invalidate];
         _engine = oldEngine;
         _lowLatency = oldLow;
         _rife = oldRife;
@@ -4957,6 +4970,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         _videoSR = oldVideoSR;
         _animeSR = oldAnimeSR;
         _cuganSR = oldCuganSR;
+        _artCNNSR = oldArtCNNSR;
         _metal = oldMetal;
         _scaler = oldScaler;
         _baselineScaler = oldBaseline;
@@ -4987,6 +5001,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     [oldVideoSR invalidate];
     [oldAnimeSR invalidate];
     [oldCuganSR invalidate];
+    [oldArtCNNSR invalidate];
     [self applyObservedCaptureEnvironment];
     [self resetRateBudgetOnQueue];
     [self clearPendingRife];
@@ -5057,7 +5072,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         _request = original; _sessionReady = YES;
         _resolved.committed = YES; _resolved.interpolationActive = NO; _resolved.scaleActive = NO;
     } else {
-        [self installRequest:original lowLatency:nil rife:nil distil:nil appleSR:nil videoSR:nil animeSR:nil cuganSR:nil];
+        [self installRequest:original lowLatency:nil rife:nil distil:nil appleSR:nil videoSR:nil animeSR:nil cuganSR:nil artCNNSR:nil];
     }
     _resolved.interpolationActive = NO;
     _resolved.unavailableReason = reason;
@@ -5193,7 +5208,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         _request = original; _sessionReady = YES;
         _resolved.committed = YES; _resolved.interpolationActive = NO; _resolved.scaleActive = NO;
     } else {
-        [self installRequest:original lowLatency:nil rife:nil distil:nil appleSR:nil videoSR:nil animeSR:nil cuganSR:nil];
+        [self installRequest:original lowLatency:nil rife:nil distil:nil appleSR:nil videoSR:nil animeSR:nil cuganSR:nil artCNNSR:nil];
     }
     _resolved.interpolationActive = NO; _resolved.unavailableReason = reason;
     [self publishStatus:reason failed:NO];
@@ -5312,6 +5327,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         SPAppleVideoSR *videoSR = nil;
         SPAnime4K *animeSR = nil;
         SPRealCUGAN *cuganSR = nil;
+        SPArtCNNSR *artCNNSR = nil;
         if (copy.interpolationEnabled && [engine isEqualToString:@"apple.lowlatency"]) {
             NSInteger frames = (copy.rateKind == SPLiveRateFixedFPS || copy.multiplier >= 4) ? 2 : 1;
             lowLatency = [[SPLowLatencyEngine alloc] init];
@@ -5339,7 +5355,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         if (!error && [self requestUsesAsyncScale:copy]) {
             NSSize effective = SPLiveSRInputSize(width, height, copy.srInputPreset);
             int width = (int)effective.width, height = (int)effective.height;
-            BOOL autoAnime = (copy.scaleEngine == SPLiveScaleAnime4K || copy.scaleEngine == SPLiveScaleRealCUGAN) && copy.outputWidth == 0 && copy.outputHeight == 0;
+            BOOL autoAnime = SPLiveIsNative2xScaleEngine(copy.scaleEngine) && copy.outputWidth == 0 && copy.outputHeight == 0;
             int targetWidth = autoAnime ? width * 2 : copy.outputWidth;
             int targetHeight = autoAnime ? height * 2 : copy.outputHeight;
             float scale = width > 0 ? (float)targetWidth / (float)width : 0;
@@ -5347,10 +5363,14 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
             if (targetWidth < 2 || targetHeight < 2 || fabsf(scale - scaleH) > 0.0001f) {
                 error = SPLiveError(37, @"低延迟超分需要与来源比例一致的明确输出尺寸。 ");
             } else {
-                if (copy.scaleEngine == SPLiveScaleAnime4K || copy.scaleEngine == SPLiveScaleRealCUGAN) {
+                if (SPLiveIsNative2xScaleEngine(copy.scaleEngine)) {
                     if (fabsf(scale - 2.0f) > 0.0001f) error = SPLiveError(39, @"该动画超分当前使用 2× 来源尺寸。");
                     else if (copy.scaleEngine == SPLiveScaleAnime4K) { animeSR = [[SPAnime4K alloc] init]; if (![animeSR prepareWidth:width height:height error:&error]) animeSR = nil; }
-                    else { cuganSR = [[SPRealCUGAN alloc] init]; if (![cuganSR prepareWidth:width height:height variant:copy.scaleQualityID ?: @"none" error:&error]) cuganSR = nil; }
+                    else if (SPLiveIsArtCNNScaleEngine(copy.scaleEngine)) {
+                        artCNNSR = [[SPArtCNNSR alloc] initWithResourceBundle:NSBundle.mainBundle];
+                        int features = copy.scaleEngine == SPLiveScaleArtCNN32 ? 32 : 16;
+                        if (![artCNNSR prepareWidth:width height:height features:features error:&error]) artCNNSR = nil;
+                    } else { cuganSR = [[SPRealCUGAN alloc] init]; if (![cuganSR prepareWidth:width height:height variant:copy.scaleQualityID ?: @"none" error:&error]) cuganSR = nil; }
                 } else if (copy.scaleEngine == SPLiveScaleAppleVideoSR) {
                     int integerScale = (int)roundf(scale);
                     if (fabsf(scale-integerScale) > 0.0001f) error = SPLiveError(38, @"视频超分需要支持的整数倍率。");
@@ -5372,12 +5392,13 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
                 [videoSR invalidate];
                 [animeSR invalidate];
                 [cuganSR invalidate];
+                [artCNNSR invalidate];
                 return;
             }
             self->_preparing = NO;
-            if (error || (needsAsyncInterpolation && !lowLatency && !rife && !distil) || ([self requestUsesAsyncScale:copy] && !appleSR && !videoSR && !animeSR && !cuganSR)) {
+            if (error || (needsAsyncInterpolation && !lowLatency && !rife && !distil) || ([self requestUsesAsyncScale:copy] && !appleSR && !videoSR && !animeSR && !cuganSR && !artCNNSR)) {
                 [self airDetachSessionServiceTrace:rife reason:@"failed-preparation"];
-                [lowLatency invalidate]; [rife invalidate]; [distil invalidate]; [appleSR invalidate]; [videoSR invalidate]; [animeSR invalidate]; [cuganSR invalidate];
+                [lowLatency invalidate]; [rife invalidate]; [distil invalidate]; [appleSR invalidate]; [videoSR invalidate]; [animeSR invalidate]; [cuganSR invalidate]; [artCNNSR invalidate];
 #if ODF_AIR_BETA_DIAGNOSTIC
                 if (SPAirBetaEnabled()) {
                     [self airBetaUsePassthrough:[NSString stringWithFormat:@"Air初始化失败，现以原帧播放：%@", error.localizedDescription ?: @"融合处理器或保活未准备成功"]];
@@ -5395,7 +5416,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
                 [self publishPlanState:0 reason:reason];
                 return;
             }
-            [self installRequest:copy lowLatency:lowLatency rife:rife distil:distil appleSR:appleSR videoSR:videoSR animeSR:animeSR cuganSR:cuganSR];
+            [self installRequest:copy lowLatency:lowLatency rife:rife distil:distil appleSR:appleSR videoSR:videoSR animeSR:animeSR cuganSR:cuganSR artCNNSR:artCNNSR];
         });
     });
 }
@@ -5493,6 +5514,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         SPAppleVideoSR *oldVideoSR = self->_videoSR;
         SPAnime4K *oldAnimeSR = self->_animeSR;
         SPRealCUGAN *oldCuganSR = self->_cuganSR;
+        SPArtCNNSR *oldArtCNNSR = self->_artCNNSR;
         SPFrameBudgetMetal *oldMetal = self->_metal;
         SPSpatialScaler *oldScaler = self->_scaler;
         SPSpatialScaler *oldBaseline = self->_baselineScaler;
@@ -5533,6 +5555,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         [oldVideoSR invalidate];
         [oldAnimeSR invalidate];
         [oldCuganSR invalidate];
+        [oldArtCNNSR invalidate];
         [self applyObservedCaptureEnvironment];
         [self resetRateBudgetOnQueue];
         // Pending pairs pin source buffers and belong to the old plan.
@@ -5546,6 +5569,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         self->_videoSR = nil;
         self->_animeSR = nil;
         self->_cuganSR = nil;
+        self->_artCNNSR = nil;
         [self resetAsyncScaleOnQueue];
         [self.outputPreview invalidateSharedGeometry];
         self->_configVersion += 1;
@@ -5668,15 +5692,17 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         self->_prepareToken += 1;
         self->_preparing = NO;
         self->_asyncPrepareFailed = NO;
-        if ([self requestUsesAsyncScale:self->_request] && (self->_appleSR || self->_videoSR || self->_animeSR || self->_cuganSR)) {
+        if ([self requestUsesAsyncScale:self->_request] && (self->_appleSR || self->_videoSR || self->_animeSR || self->_cuganSR || self->_artCNNSR)) {
             [self->_appleSR invalidate];
             [self->_videoSR invalidate];
             [self->_animeSR invalidate];
             [self->_cuganSR invalidate];
+            [self->_artCNNSR invalidate];
             self->_appleSR = nil;
             self->_videoSR = nil;
             self->_animeSR = nil;
             self->_cuganSR = nil;
+            self->_artCNNSR = nil;
             self->_sessionReady = NO;
         }
         self->_sourceGeneration = generation;
@@ -5735,10 +5761,18 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     _resolved.engineID = engine;
     if (_request.modelID.length) _resolved.modelID = _request.modelID;
     else if ([engine isEqualToString:@"apple.frc"]) _resolved.modelID = _request.quality == SPFRCQualityHigh ? @"vt.frc.quality" : @"vt.frc.normal";
-    _resolved.scaleEngineID = _request.scaleEngine == SPLiveScaleRealCUGAN ? @"realcugan" : (_request.scaleEngine == SPLiveScaleAnime4K ? @"anime4k" : (_request.scaleEngine == SPLiveScaleAppleVideoSR ? @"apple.video-sr" : (_request.scaleEngine == SPLiveScaleAppleLowLatencySR ? @"apple.low-sr" :
-        (_request.scaleEngine == SPLiveScaleMetalFX ? @"metalfx.spatial" : @"lanczos"))));
+    switch (_request.scaleEngine) {
+        case SPLiveScaleArtCNN16: _resolved.scaleEngineID = @"artcnn.c4f16"; break;
+        case SPLiveScaleArtCNN32: _resolved.scaleEngineID = @"artcnn.c4f32"; break;
+        case SPLiveScaleRealCUGAN: _resolved.scaleEngineID = @"realcugan"; break;
+        case SPLiveScaleAnime4K: _resolved.scaleEngineID = @"anime4k"; break;
+        case SPLiveScaleAppleVideoSR: _resolved.scaleEngineID = @"apple.video-sr"; break;
+        case SPLiveScaleAppleLowLatencySR: _resolved.scaleEngineID = @"apple.low-sr"; break;
+        case SPLiveScaleMetalFX: _resolved.scaleEngineID = @"metalfx.spatial"; break;
+        default: _resolved.scaleEngineID = @"lanczos"; break;
+    }
     _resolved.scaleQualityID = _request.scaleEngine == SPLiveScaleRealCUGAN ? (_request.scaleQualityID ?: @"none") : @"";
-    BOOL autoAnime = _request.scaleEnabled && (_request.scaleEngine == SPLiveScaleAnime4K || _request.scaleEngine == SPLiveScaleRealCUGAN) && _request.outputWidth == 0 && _request.outputHeight == 0;
+    BOOL autoAnime = _request.scaleEnabled && SPLiveIsNative2xScaleEngine(_request.scaleEngine) && _request.outputWidth == 0 && _request.outputHeight == 0;
     NSSize effective = SPLiveSRInputSize(_width, _height, _request.scaleEnabled ? _request.srInputPreset : 0);
     _resolved.outputWidth = autoAnime ? (int)effective.width * 2 : (_request.scaleEnabled ? _request.outputWidth : _width);
     _resolved.outputHeight = autoAnime ? (int)effective.height * 2 : (_request.scaleEnabled ? _request.outputHeight : _height);
@@ -5808,10 +5842,12 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         [self->_videoSR invalidate];
         [self->_animeSR invalidate];
         [self->_cuganSR invalidate];
+        [self->_artCNNSR invalidate];
         self->_appleSR = nil;
         self->_videoSR = nil;
         self->_animeSR = nil;
         self->_cuganSR = nil;
+        self->_artCNNSR = nil;
         self->_scaler = nil;
         self->_baselineScaler = nil;
         self->_srInputScaler = nil;
@@ -7815,7 +7851,7 @@ presentationHost:(int64_t)presentationHost
 }
 
 - (void)enqueueAsyncScale:(CVPixelBufferRef)input original:(CVPixelBufferRef)original pts:(sp::SPRational)pts synthetic:(BOOL)synthetic held:(BOOL)held captureHost:(int64_t)captureHost generation:(uint64_t)generation deadlineHost:(int64_t)deadlineHost geometryHost:(int64_t)geometryHost {
-    if (!input || (!_appleSR && !_videoSR && !_animeSR && !_cuganSR) || _srFailed) {
+    if (!input || (!_appleSR && !_videoSR && !_animeSR && !_cuganSR && !_artCNNSR) || _srFailed) {
         if (input) CVPixelBufferRelease(input); if (original) CVPixelBufferRelease(original);
         if (synthetic) { [self erasePending:pts]; [self noteUniqueSyntheticDrop:pts]; }
         return;
@@ -7868,7 +7904,7 @@ presentationHost:(int64_t)presentationHost
 }
 
 - (void)drainAsyncScaleOnQueue {
-    if (_srBusy || _srFailed || _srPending.empty() || (!_appleSR && !_videoSR && !_animeSR && !_cuganSR)) return;
+    if (_srBusy || _srFailed || _srPending.empty() || (!_appleSR && !_videoSR && !_animeSR && !_cuganSR && !_artCNNSR)) return;
     SPSRJob *job = _srPending.front();
     _srPending.pop_front();
     _srBusy = YES;
@@ -7919,7 +7955,9 @@ presentationHost:(int64_t)presentationHost
                 [strong drainAsyncScaleOnQueue];
             });
         };
-    BOOL accepted = _cuganSR
+    BOOL accepted = _artCNNSR
+        ? [_artCNNSR submitSource:job->input pts:pts token:job->sequence completion:completion]
+        : _cuganSR
         ? [_cuganSR submitSource:job->input pts:pts token:job->sequence completion:completion]
         : _animeSR
         ? [_animeSR submitSource:job->input pts:pts token:job->sequence completion:completion]
@@ -7938,6 +7976,8 @@ presentationHost:(int64_t)presentationHost
 
 - (void)failAsyncScaleOnQueue:(NSString *)reason {
     _srFailed = YES;
+    [_artCNNSR invalidate];
+    _artCNNSR = nil;
     _holdFailureStatus = YES;
     _resolved.scaleActive = NO;
     _resolved.unavailableReason = reason;
@@ -8139,7 +8179,17 @@ presentationHost:(int64_t)presentationHost
         host:host generation:generation deadline:pairClockDeadline]) return;
     CVPixelBufferRef bgra = [self bgraFromSource:found->second.source];
     if (!bgra) { _sourceConversionDrops++; return; }
-    if ([self requestUsesAsyncScale:_request] && _sessionReady && (_appleSR || _videoSR || _animeSR || _cuganSR)) {
+    if (_srFailed && SPLiveIsArtCNNScaleEngine(_request.scaleEngine)) {
+        // Keep failed ArtCNN sessions on source frames. This is baseline display,
+        // not recovered enhancement; retain the error and exclude it from SR timing.
+        CVPixelBufferRef fallback = _baselineScaler ? [_baselineScaler scaleBuffer:bgra error:NULL] : NULL;
+        if (!fallback) fallback = CVPixelBufferRetain(bgra);
+        CVPixelBufferRelease(bgra);
+        [self enqueueReadyEnhanced:fallback original:CVPixelBufferRetain(fallback) pts:pts synthetic:NO held:held
+                       captureHost:host generation:generation deadlineHost:pairClockDeadline];
+        return;
+    }
+    if ([self requestUsesAsyncScale:_request] && _sessionReady && (_appleSR || _videoSR || _animeSR || _cuganSR || _artCNNSR)) {
         CVPixelBufferRef original = _request.viewMode != SPLiveViewEnhanced ? [self scaleBuffer:bgra with:_baselineScaler] : NULL;
         if([self usesRifePairAffineClock] && !held && !retimed)
             [self recordRifeSourceEnqueueClock:identity pts:pts selected:pairClockDeadline stage:@"source-enqueue-before-async-scale"];
@@ -8872,7 +8922,7 @@ presentationHost:(int64_t)presentationHost
         _resolved.unavailableReason = @"";
     }
     if (_request.scaleEnabled) {
-        BOOL autoAnime = (_request.scaleEngine == SPLiveScaleAnime4K || _request.scaleEngine == SPLiveScaleRealCUGAN) && _request.outputWidth == 0 && _request.outputHeight == 0;
+        BOOL autoAnime = SPLiveIsNative2xScaleEngine(_request.scaleEngine) && _request.outputWidth == 0 && _request.outputHeight == 0;
         NSSize effective = SPLiveSRInputSize(_width, _height, _request.srInputPreset);
         int inputW = (int)effective.width, inputH = (int)effective.height;
         int outW = autoAnime ? inputW * 2 : (_request.outputWidth > 0 ? (_request.outputWidth & ~1) : _width);
@@ -8893,7 +8943,8 @@ presentationHost:(int64_t)presentationHost
         if (_request.scaleEngine == SPLiveScaleLanczos && !_srInputScaler) _baselineScaler = _scaler;
         else _baselineScaler = [[SPSpatialScaler alloc] initWithDevice:device inputW:_width inputH:_height outputW:outW outputH:outH
                                                                 engine:SPLiveScaleLanczos error:&local];
-        BOOL scaleEngineReady = _request.scaleEngine == SPLiveScaleAppleLowLatencySR ? _appleSR != nil : (_request.scaleEngine == SPLiveScaleAppleVideoSR ? _videoSR != nil : (_request.scaleEngine == SPLiveScaleAnime4K ? _animeSR != nil : (_request.scaleEngine == SPLiveScaleRealCUGAN ? _cuganSR != nil : _scaler != nil)));
+        BOOL scaleEngineReady = SPLiveIsArtCNNScaleEngine(_request.scaleEngine) ? _artCNNSR != nil :
+            (_request.scaleEngine == SPLiveScaleAppleLowLatencySR ? _appleSR != nil : (_request.scaleEngine == SPLiveScaleAppleVideoSR ? _videoSR != nil : (_request.scaleEngine == SPLiveScaleAnime4K ? _animeSR != nil : (_request.scaleEngine == SPLiveScaleRealCUGAN ? _cuganSR != nil : _scaler != nil))));
         if (!scaleEngineReady || !_baselineScaler) {
             _resolved.scaleActive = NO;
             _resolved.unavailableReason = local.localizedDescription ?: @"缩放创建失败";
@@ -9072,8 +9123,8 @@ presentationHost:(int64_t)presentationHost
                 if (!_sourceSizeConstraintFailed) {
                     _sourceSizeConstraintFailed = YES; ++_configVersion; _resolved.configVersion = _configVersion;
                     ++_prepareToken; _preparing = NO; _sessionReady = NO; [self retireEngines];
-                    [_appleSR invalidate]; [_videoSR invalidate]; [_animeSR invalidate]; [_cuganSR invalidate];
-                    _appleSR=nil; _videoSR=nil; _animeSR=nil; _cuganSR=nil;
+                    [_appleSR invalidate]; [_videoSR invalidate]; [_animeSR invalidate]; [_cuganSR invalidate]; [_artCNNSR invalidate];
+                    _appleSR=nil; _videoSR=nil; _animeSR=nil; _cuganSR=nil; _artCNNSR=nil;
                     _scaler=nil; _baselineScaler=nil; _srInputScaler=nil;
                     [self discardQueuedStateOnQueue]; [self.outputPreview invalidateSharedGeometry];
                     if (_lastEnhanced) { CVPixelBufferRelease(_lastEnhanced); _lastEnhanced=nullptr; }
@@ -9141,10 +9192,12 @@ presentationHost:(int64_t)presentationHost
             [_videoSR invalidate];
             [_animeSR invalidate];
             [_cuganSR invalidate];
+            [_artCNNSR invalidate];
             _appleSR = nil;
             _videoSR = nil;
             _animeSR = nil;
             _cuganSR = nil;
+            _artCNNSR = nil;
             [self resetAsyncScaleOnQueue];
             _scaler = nil;
             _baselineScaler = nil;
@@ -9455,7 +9508,7 @@ presentationHost:(int64_t)presentationHost
     request.scaleEnabled=YES;request.scaleEngine=SPLiveScaleLanczos;request.outputWidth=1920;request.outputHeight=1080;
     dispatch_sync(p->_q, ^{ p->_width=2560;p->_height=1440;p->_held[11].source=CVPixelBufferRetain(a);p->_held[11].pts=sp::spMake(0,1);p->_held[11].host=SPHostNow();
         p->_held[12].source=CVPixelBufferRetain(b);p->_held[12].pts=sp::spMake(1,60);p->_held[12].host=SPHostNow();
-        if(prepared)[p installRequest:request lowLatency:engine rife:nil distil:nil appleSR:nil videoSR:nil animeSR:nil cuganSR:nil];
+        if(prepared)[p installRequest:request lowLatency:engine rife:nil distil:nil appleSR:nil videoSR:nil animeSR:nil cuganSR:nil artCNNSR:nil];
         sp::SPScheduleOutput event;event.action=sp::SPScheduleAction::Interpolate;event.frameA=11;event.frameB=12;event.pts=sp::spMake(1,120);event.phase=sp::spMake(1,2);
         if(p->_sessionReady)[p submitEventGroup:{event} generation:1]; });
     __block BOOL held=NO;
@@ -9759,7 +9812,7 @@ presentationHost:(int64_t)presentationHost
     request.interpolationEnabled=YES; request.engineID=@"apple.lowlatency"; request.rateKind=SPLiveRateMultiplier;
     request.multiplier=2; request.captureCapFPS=60; request.displayRefreshHz=120;
     dispatch_sync(p->_q, ^{ p->_width=640; p->_height=360; p->_testCapturePlayout=YES;
-        [p installRequest:request lowLatency:engine rife:nil distil:nil appleSR:nil videoSR:nil animeSR:nil cuganSR:nil]; });
+        [p installRequest:request lowLatency:engine rife:nil distil:nil appleSR:nil videoSR:nil animeSR:nil cuganSR:nil artCNNSR:nil]; });
     __block BOOL installed=NO; dispatch_sync(p->_q, ^{ installed=p->_sessionReady && p->_resolved.interpolationActive; });
     if (!installed) { [p stop]; return @{ @"ok":@NO, @"prepared":@YES, @"installed":@NO, @"error":p.resolvedPlan.unavailableReason ?: @"install" }; }
     CVPixelBufferRef frames[4]={};
@@ -10262,7 +10315,7 @@ presentationHost:(int64_t)presentationHost
     dispatch_sync(capCheck->_q, ^{});
     [capCheck setRawCadenceRefreshHz:120 captureLimit:0 displayID:1]; [capCheck updateCaptureLimitFPS:0];
     dispatch_sync(capCheck->_q, ^{
-        [capCheck installRequest:staleRequest lowLatency:nil rife:nil distil:nil appleSR:nil videoSR:nil animeSR:nil cuganSR:nil];
+        [capCheck installRequest:staleRequest lowLatency:nil rife:nil distil:nil appleSR:nil videoSR:nil animeSR:nil cuganSR:nil artCNNSR:nil];
         capCheck->_request.interpolationEnabled=YES;
         int64_t now=SPHostToNs(SPHostNow());
         { std::lock_guard<std::mutex> lock(capCheck->_rawCadenceMutex);

@@ -1,0 +1,5 @@
+ArtCNN C4F16/C4F32, MIT, original trained coefficients.
+Upstream: https://github.com/Artoriuz/ArtCNN
+Revision: 0837e5326e710f49e2ab0a8d995da0708047442e
+Core ML FP16 format conversion only; no training or weight updates.
+Normalized SDR luma 2x; chroma uses Lanczos.

@@ -1,0 +1,19 @@
+{
+  "repository": "https://github.com/Artoriuz/ArtCNN",
+  "revision": "0837e5326e710f49e2ab0a8d995da0708047442e",
+  "license": "MIT",
+  "models": {
+    "ArtCNN_C4F16": {
+      "originalONNXSHA256": "7a6436299b8c757dbb7084ac39a25c310db1941133e73d1ee3e74c8b3bddc1ca",
+      "coefficientLicenseEvidence": "https://github.com/Artoriuz/ArtCNN/blob/0837e5326e710f49e2ab0a8d995da0708047442e/GLSL/ArtCNN_C4F16.glsl",
+      "features": 16,
+      "nativeScale": 2
+    },
+    "ArtCNN_C4F32": {
+      "originalONNXSHA256": "b1a1130469a0538d4484fc3d6ca39854ef3906a3a01df8799997b6ed0408f6ea",
+      "coefficientLicenseEvidence": "https://github.com/Artoriuz/ArtCNN/blob/0837e5326e710f49e2ab0a8d995da0708047442e/GLSL/ArtCNN_C4F32.glsl",
+      "features": 32,
+      "nativeScale": 2
+    }
+  }
+}

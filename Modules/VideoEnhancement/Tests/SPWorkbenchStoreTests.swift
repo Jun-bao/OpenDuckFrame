@@ -137,12 +137,15 @@ private final class SourceSizeControls {
   precondition(!followingWindow.hasChanges(relativeTo: EnhancementProfile()),
     "Follow-window mode does not apply separate output-screen or fullscreen settings")
 
-  do {
-   let controls = SourceSizeControls()
-   controls.profile.sourceWindowPreset = 480
-   controls.changeSourceSize()
-   precondition(controls.profile.windowOutputMode == "follow")
-   precondition(controls.outputSize?.0 == 2560 && controls.outputSize?.1 == 1440)
+  for modelIndex in 0...1 {
+   for (index, width, height) in [(1, 854, 480), (2, 1280, 720), (3, 1920, 1080)] {
+    let controls = SourceSizeControls()
+    controls.scalePopup.indexOfSelectedItem = modelIndex
+    controls.sourceWindowPopup.indexOfSelectedItem = index
+    controls.changeSourceSize()
+    precondition(controls.profile.windowOutputMode == "follow")
+    precondition(controls.outputSize?.0 == width * 2 && controls.outputSize?.1 == height * 2)
+   }
   }
   for source in 0...2 {
    let controls = SourceSizeControls()
@@ -196,8 +199,10 @@ private final class SourceSizeControls {
      expected.interpolationEngineID = "rife.metal"; expected.modelID = "rife-v4.25"
      expected.interpolationQuality = ["fast", "balanced", "hq"].contains(quality) ? quality : "fast"
      expected.rifeStreamEnabled = true
+     expected.scaleEngineID = "artcnn.c4f32"; expected.scaleQualityID = "none"
+     expected.outputWidth = 0; expected.outputHeight = 0
      let restored = EnhancementProfileStore.decode(try JSONEncoder().encode(saved), fallbackName:"legacy")
-     precondition(restored == expected, "RIFE migration must enable stream caching and preserve unrelated profile fields")
+     precondition(restored == expected, "Migration must select native ArtCNN32 while preserving source, frame generation, rate and input preset")
     }
    }
   }
@@ -233,6 +238,34 @@ private final class SourceSizeControls {
   try FileManager.default.createDirectory(at:temp,withIntermediateDirectories:true)
   defer { try? FileManager.default.removeItem(at:temp) }
   EnhancementProfileStore.testDirectory=temp
+  precondition(EnhancementProfile().scaleEngineID == "artcnn.c4f32" && EnhancementProfile().srInputPreset == 1080)
+  precondition(ArtCNNSRSelection.fromPopup(0) == "artcnn.c4f32" && ArtCNNSRSelection.fromPopup(1) == "artcnn.c4f16")
+  for legacy in ["lanczos", "metalfx.spatial", "apple.low-sr", "apple.video-sr", "anime4k", "realcugan", "unknown"] {
+   var profile = EnhancementProfile()
+   profile.scaleEngineID = legacy; profile.scaleEnabled = true
+   profile.srInputPreset = 0; profile.sourceWindowPreset = 1080
+   profile.outputWidth = 1920; profile.outputHeight = 1080
+   let migrated = EnhancementProfileStore.decode(try JSONEncoder().encode(profile), fallbackName:"legacy")!
+   precondition(migrated.scaleEngineID == "artcnn.c4f32" && migrated.srInputPreset == 1080 && migrated.outputWidth == 0 && migrated.outputHeight == 0)
+   precondition(migrated.scaleEnabled && migrated.sourceWindowPreset == 1080 && migrated.sourceWindowResizeActive)
+   try EnhancementProfileStore.save(profile)
+   let persisted = try JSONDecoder().decode(EnhancementProfile.self, from: Data(contentsOf: EnhancementProfileStore.fileURL()))
+   precondition(persisted == migrated, "Save must normalize the file itself, not only its next read")
+  }
+  for id in ["artcnn.c4f32", "artcnn.c4f16"] {
+   for preset in [0, 480, 720, 1080] {
+    var profile = EnhancementProfile()
+    profile.scaleEngineID = id; profile.srInputPreset = preset
+    profile.configName = "ArtCNN"; profile.configID = "custom:ArtCNN"
+    try EnhancementProfileStore.saveNamed(profile)
+    precondition(EnhancementProfileStore.loadNamed("ArtCNN") == profile, "Both models and an explicit input-size choice must survive named-profile save/load")
+    try EnhancementProfileStore.savePreset(profile, id:"preset:anime")
+    precondition(EnhancementProfileStore.loadPreset("preset:anime") == profile)
+   }
+  }
+  try FileManager.default.removeItem(at: EnhancementProfileStore.fileURL())
+  try FileManager.default.removeItem(at: EnhancementProfileStore.namedDirectory())
+  try FileManager.default.removeItem(at: EnhancementProfileStore.presetDirectory())
   func hasDefaultEnhancement(_ p: EnhancementProfile) -> Bool {
    p.interpolationEnabled && p.interpolationEngineID == "rife.metal" && p.modelID == "rife-v4.25" &&
     p.interpolationQuality == "fast" && p.rifeStreamEnabled && p.rate == .multiplier(2) &&
@@ -574,7 +607,9 @@ private final class SourceSizeControls {
   precondition(VideoSRAvailability.readyFactors(isFile:true,inputReady:true,factors:[4,2]) == [2,4])
   precondition(VideoSRAvailability.readyFactors(isFile:true,inputReady:false,factors:[4]) == [])
   var videoSR=EnhancementProfile();videoSR.sourceKind="file";videoSR.scaleEnabled=true;videoSR.scaleEngineID="apple.video-sr";videoSR.outputWidth=1920;videoSR.outputHeight=1080;videoSR.interpolationEnabled=true;videoSR.interpolationEngineID="rife.metal";videoSR.modelID="rife-v4.26";videoSR.rate = .multiplier(2)
-  try EnhancementProfileStore.save(videoSR);videoSR.modelID="rife-v4.25";precondition(EnhancementProfileStore.load()==videoSR)
+  try EnhancementProfileStore.save(videoSR);videoSR.modelID="rife-v4.25"
+  videoSR.scaleEngineID="artcnn.c4f32";videoSR.outputWidth=0;videoSR.outputHeight=0
+  precondition(EnhancementProfileStore.load()==videoSR)
   _ = EnhancementText.t("Technology Library","技术库")
   precondition(EnhancementText.translated("技术库",chinese:false)=="Technology Library")
   precondition(EnhancementText.translated("用户来源",chinese:false)=="用户来源")

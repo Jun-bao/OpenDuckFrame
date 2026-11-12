@@ -31,6 +31,8 @@ typedef NS_ENUM(NSInteger, SPLiveScaleEngine) {
     SPLiveScaleAppleVideoSR = 4,
     SPLiveScaleAnime4K = 5,
     SPLiveScaleRealCUGAN = 6,
+    SPLiveScaleArtCNN16 = 7,
+    SPLiveScaleArtCNN32 = 8,
 };
 
 typedef NS_ENUM(NSInteger, SPLiveViewMode) {

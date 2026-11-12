@@ -1,6 +1,7 @@
 #import "SPFileAnimationScaler.h"
 #import "SPFileColorTransfer.h"
 #import "SPAnime4K.h"
+#import "SPArtCNNSR.h"
 #import "SPRealCUGAN.h"
 #import <VideoToolbox/VideoToolbox.h>
 #include <atomic>
@@ -12,6 +13,7 @@ static NSError *SPFileAnimationError(NSInteger code, NSString *message) {
 @implementation SPFileAnimationScaler {
     SPAnime4K *_anime;
     SPRealCUGAN *_cugan;
+    SPArtCNNSR *_artCNN;
     VTPixelTransferSessionRef _toRGB, _toNV12;
     int _width, _height;
     std::atomic<bool> _busy;
@@ -22,20 +24,24 @@ static NSError *SPFileAnimationError(NSInteger code, NSString *message) {
     if (width<2 || height<2 || width>1920 || height>1080 || (width&1) || (height&1)) {
         if(error)*error=SPFileAnimationError(1,@"动画超分需要偶数输入尺寸，2× 输出最高 3840×2160。");return nil;
     }
-    if ([engine isEqualToString:@"anime4k"]) {
+    if ([engine isEqualToString:@"artcnn.c4f16"] || [engine isEqualToString:@"artcnn.c4f32"]) {
+        _artCNN=[[SPArtCNNSR alloc] initWithResourceBundle:bundle];
+        int features=[engine isEqualToString:@"artcnn.c4f32"]?32:16;
+        if(![_artCNN prepareWidth:width height:height features:features error:error]) return nil;
+    } else if ([engine isEqualToString:@"anime4k"]) {
         _anime=[[SPAnime4K alloc] initWithResourceBundle:bundle];
         if(![_anime prepareWidth:width height:height error:error]) return nil;
     } else if ([engine isEqualToString:@"realcugan"]) {
         _cugan=[[SPRealCUGAN alloc] initWithResourceBundle:bundle];
         if(![_cugan prepareWidth:width height:height variant:variant error:error]) return nil;
     } else { if(error)*error=SPFileAnimationError(2,@"这个动画超分引擎尚未接入。");return nil; }
-    if(VTPixelTransferSessionCreate(kCFAllocatorDefault,&_toRGB)!=noErr || !_toRGB ||
-       VTPixelTransferSessionCreate(kCFAllocatorDefault,&_toNV12)!=noErr || !_toNV12) {
+    if(!_artCNN && (VTPixelTransferSessionCreate(kCFAllocatorDefault,&_toRGB)!=noErr || !_toRGB ||
+       VTPixelTransferSessionCreate(kCFAllocatorDefault,&_toNV12)!=noErr || !_toNV12)) {
         if(error)*error=SPFileAnimationError(3,@"无法准备动画超分的画面格式转换。");return nil;
     }
     _width=width;_height=height;return self;
 }
-- (void)dealloc { [_anime invalidate];[_cugan invalidate];if(_toRGB)CFRelease(_toRGB);if(_toNV12)CFRelease(_toNV12); }
+- (void)dealloc { [_anime invalidate];[_cugan invalidate];[_artCNN invalidate];if(_toRGB)CFRelease(_toRGB);if(_toNV12)CFRelease(_toNV12); }
 - (int)outputWidth { return _width*2; }
 - (int)outputHeight { return _height*2; }
 - (BOOL)submit:(CVPixelBufferRef)source completion:(void (^)(CVPixelBufferRef, NSError *))completion {
@@ -54,6 +60,21 @@ static NSError *SPFileAnimationError(NSInteger code, NSString *message) {
         completion(NULL,SPFileAnimationError(4,@"动画超分需要完整的 SDR 8 位 NV12 帧和有效时间戳。"));return YES;
     }
     if(_busy.exchange(true))return NO;
+    if(_artCNN) {
+        // ArtCNN consumes the decoder's NV12 directly, retaining its original PTS
+        // and color metadata; its completion transfers the native 2× NV12 +1.
+        BOOL accepted=[_artCNN submitSource:source pts:CMTimeMake(ptsUs,1000000) token:0
+            completion:^(uint64_t token,CVPixelBufferRef output,double elapsed,NSError *failure){
+                (void)token;(void)elapsed;
+                self->_busy.store(false);
+                if(!output || failure) {
+                    if(output)CVPixelBufferRelease(output);
+                    completion(NULL,failure ?: SPFileAnimationError(7,@"ArtCNN 超分处理失败。"));
+                } else completion(output,nil);
+            }];
+        if(!accepted)_busy.store(false);
+        return accepted;
+    }
     CFTypeRef sourcePrimaries=CVBufferCopyAttachment(source,kCVImageBufferColorPrimariesKey,NULL);
     CFTypeRef sourceTransfer=CVBufferCopyAttachment(source,kCVImageBufferTransferFunctionKey,NULL);
     BOOL knownColor=sourcePrimaries && sourceTransfer && CFGetTypeID(sourcePrimaries)==CFStringGetTypeID() && CFGetTypeID(sourceTransfer)==CFStringGetTypeID();

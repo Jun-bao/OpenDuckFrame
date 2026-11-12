@@ -113,6 +113,8 @@ targets:
           - SPAnime4K.mm
           - SPRealCUGAN.h
           - SPRealCUGAN.mm
+          - SPArtCNNSR.h
+          - SPArtCNNSR.mm
       - path: ../../Modules/VideoEnhancement/Tests/SPRateScheduleTests.cpp
       - path: CaptionsHost
       - path: ../../Modules/Captions
@@ -374,6 +376,8 @@ targets:
       - path: Capture/SPAnime4K.mm
       - path: Capture/SPRealCUGAN.h
       - path: Capture/SPRealCUGAN.mm
+      - path: Capture/SPArtCNNSR.h
+      - path: Capture/SPArtCNNSR.mm
       - path: ../../Modules/MediaCore/Core
       - path: ../../Modules/MediaCore/Bridge
       - path: ../../Modules/VideoEnhancement
@@ -428,6 +432,7 @@ targets:
       - sdk: AudioToolbox.framework
       - sdk: CoreAudio.framework
       - sdk: CoreImage.framework
+      - sdk: CoreML.framework
       - sdk: IOSurface.framework
     settings:
       base:

@@ -611,6 +611,25 @@ enum LiveEngineSelection {
     }
 }
 
+enum ArtCNNSRSelection {
+    static let ids = ["artcnn.c4f32", "artcnn.c4f16"]
+    static func contains(_ id: String) -> Bool { ids.contains(id) }
+    static func fromPopup(_ index: Int) -> String { ids.indices.contains(index) ? ids[index] : ids[0] }
+    static func popupIndex(_ id: String) -> Int { ids.firstIndex(of: id) ?? 0 }
+    static func title(_ id: String) -> String { id == ids[1] ? "ArtCNN C4F16" : "ArtCNN C4F32" }
+
+    static func normalize(_ profile: inout EnhancementProfile) {
+        if !contains(profile.scaleEngineID) {
+            profile.scaleEngineID = ids[0]
+            profile.outputWidth = 0
+            profile.outputHeight = 0
+            if profile.srInputPreset == 0 { profile.srInputPreset = 1080 }
+        }
+        if ![0, 480, 720, 1080].contains(profile.srInputPreset) { profile.srInputPreset = 1080 }
+        profile.scaleQualityID = "none"
+    }
+}
+
 enum LiveCoverage {
     static func modelScheduled(total: Int, held: Int) -> Int { max(0, total - held) }
 }
@@ -638,12 +657,12 @@ struct EnhancementProfile: Codable, Equatable {
     var rifeStreamEnabled = true
     var rate = RateRequest.multiplier(2)
     var scaleEnabled = false
-    var scaleEngineID = "lanczos"
+    var scaleEngineID = "artcnn.c4f32"
     var scaleQualityID = "none"
-    var srInputPreset = 0
+    var srInputPreset = 1080
     var sourceWindowPreset = 0
-    var outputWidth = 1920
-    var outputHeight = 1080
+    var outputWidth = 0
+    var outputHeight = 0
     var outputDisplayID: UInt32 = 0
     var outputFullscreen = false
     // Legacy window output stays source-aligned; saved interaction is never
@@ -687,8 +706,8 @@ private func applyAirBetaPreset(_ profile: inout EnhancementProfile) {
     profile.modelID = "rife-v4.25"
     profile.rate = .multiplier(2)
     profile.scaleEnabled = false
-    profile.scaleEngineID = "lanczos"
-    profile.srInputPreset = 0
+    profile.scaleEngineID = "artcnn.c4f32"
+    profile.srInputPreset = 1080
     profile.sourceWindowPreset = 0
     profile.outputWidth = 0
     profile.outputHeight = 0
@@ -716,7 +735,8 @@ enum EnhancementProfileStore {
     static func decode(_ data: Data, fallbackName: String) -> EnhancementProfile? {
         guard var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         object["rifeStreamEnabled"] = true
-        if object["srInputPreset"] == nil { object["srInputPreset"] = 0 }
+        if object["srInputPreset"] == nil { object["srInputPreset"] = 1080 }
+        if object["scaleEngineID"] == nil { object["scaleEngineID"] = "artcnn.c4f32" }
         if object["sourceWindowPreset"] == nil { object["sourceWindowPreset"] = 0 }
         if object["captureLimit"] == nil { object["captureLimit"] = "auto" }
         object["windowOutputMode"] = "follow"
@@ -726,8 +746,9 @@ enum EnhancementProfileStore {
         object["modelID"] = "rife-v4.25"
         object["interpolationQuality"] = LiveEngineSelection.validQuality(object["interpolationQuality"] as? String ?? "fast")
         guard let normalized = try? JSONSerialization.data(withJSONObject: object),
-              let profile = try? JSONDecoder().decode(EnhancementProfile.self, from: normalized),
+              var profile = try? JSONDecoder().decode(EnhancementProfile.self, from: normalized),
               profile.schemaVersion == 1 else { return nil }
+        ArtCNNSRSelection.normalize(&profile)
         return profile
     }
 
@@ -740,6 +761,8 @@ enum EnhancementProfileStore {
     }
 
     static func save(_ profile: EnhancementProfile) throws {
+        var profile = profile
+        ArtCNNSRSelection.normalize(&profile)
         let url = fileURL()
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let data = try JSONEncoder().encode(profile)
@@ -781,6 +804,8 @@ enum EnhancementProfileStore {
     }
 
     static func savePreset(_ profile: EnhancementProfile, id: String) throws {
+        var profile = profile
+        ArtCNNSRSelection.normalize(&profile)
         guard presets.contains(where: { $0.id == id }) else { throw CocoaError(.fileWriteInvalidFileName) }
         let dir = presetDirectory()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -842,6 +867,7 @@ enum EnhancementProfileStore {
 
     static func saveNamed(_ profile: EnhancementProfile) throws {
         var copy = profile
+        ArtCNNSRSelection.normalize(&copy)
         copy.configName = safeName(profile.configName)
         let url = namedDirectory().appendingPathComponent(copy.configName + ".json")
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -906,7 +932,7 @@ enum EnhancementProfileStore {
         profile.interpolationQuality = "quality"
         profile.rate = .fixedFPS(numerator: 60000, denominator: 1001)
         profile.scaleEnabled = true
-        profile.scaleEngineID = "metalfx.spatial"
+        profile.scaleEngineID = "artcnn.c4f16"
         profile.outputWidth = 1920
         profile.outputHeight = 1080
         profile.viewMode = "compare"
@@ -1085,7 +1111,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private let processor = SPLiveProcessor()
     private let capture = WindowCaptureSource()
-    private let preview = SPLivePreviewView(frame: .zero)
     private let outputPreview = SPLivePreviewView(frame: .zero)
     private var outputWindow: NSWindow?
     private var outputFollowsWindow = false
@@ -1144,16 +1169,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let scalePopup = NSPopUpButton()
     private let scaleQualityPopup = NSPopUpButton()
     private var scaleQualityRow: NSView?
-    private var appleSRLibraryButton: NSButton?
-    private var appleVideoSRLibraryButton: NSButton?
-    private var anime4KLibraryButton: NSButton?
-    private var cuganLibraryButton: NSButton?
-    private var appleSRCapabilityKey = ""
-    private var appleSRCandidate = false
-    private var appleVideoSRCandidate = false
-    private var appleVideoSRFactor = 4
-    private var anime4KCandidate = false
-    private var cuganCandidate = false
+    private var artCNNLibraryButtons: [String: NSButton] = [:]
     private let sizePopup = AnchoredPopUpButton()
     private let srInputPopup = NSPopUpButton()
     private let srInputHelp = NSButton(title: "", target: nil, action: nil)
@@ -1187,7 +1203,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private var interactionGeometryWaitAt: TimeInterval = 0
     private var inputRouter: LiveInputRouter?
     private let fpsSwitch = NSSwitch()
-    private let previewFPS = NSTextField(labelWithString: "")
     private let outputFPS = NSTextField(labelWithString: "")
     private var lastStatsReceipt: TimeInterval = 0
     private var fpsCanObserve = false
@@ -1210,7 +1225,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let configActions = NSPopUpButton(frame: .zero, pullsDown: true)
     private var scaleBody: NSView?
     private var framesBody: NSView?
-    private var previewAspect: NSLayoutConstraint?
     private var formLabels: [(NSTextField, NSView, NSLayoutConstraint)] = []
     private var hasPendingFormChanges = false
     private let captureCapPopup = NSPopUpButton()
@@ -1258,7 +1272,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let sourceKindControl = NSSegmentedControl(labels: ["窗口", "显示器", "视频文件"], trackingMode: .selectOne, target: nil, action: nil)
     private let phaseLabel = NSTextField(wrappingLabelWithString: "")
     private let compatibilityButton = NSButton(title: "改用 ODF-VFI", target: nil, action: nil)
-    private let emptyOverlay = NSView()
     private var page = 0
     private var pendingApply: EnhancementProfile?
     private var liveApply = LiveApplyTracker()
@@ -1319,7 +1332,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         ])
         installToolbar(on: window)
         window.openSettings = { [weak self] in self?.showSettings() }
-        let minimumFrameSize = NSSize(width: 840, height: 620)
+        let minimumFrameSize = NSSize(width: 540, height: 620)
         let minimumContentSize = window.contentRect(forFrameRect: NSRect(origin: .zero, size: minimumFrameSize)).size
         // Auto Layout derives the window minimum from its content constraints.
         NSLayoutConstraint.activate([
@@ -1330,9 +1343,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let restored = window.setFrameUsingName("OpenDuckFrame.Workbench")
         var frame = window.frame
         let previousHeight = frame.height
-        frame.size = restored
-            ? NSSize(width: max(frame.width, minimumFrameSize.width), height: max(frame.height, minimumFrameSize.height))
-            : NSSize(width: 1180, height: 700)
+        frame.size = NSSize(width: 560, height: max(restored ? frame.height : 700, minimumFrameSize.height))
         frame.origin.y += previousHeight - frame.height
         window.setFrame(frame, display: false)
         if !restored { window.center() }
@@ -1350,7 +1361,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     required init?(coder: NSCoder) { nil }
 
     private func installCountdownLabels() {
-        for (host, label) in [(preview, previewCountdown), (outputPreview, outputCountdown)] {
+        for (host, label) in [(outputPreview, outputCountdown)] {
             label.font = .monospacedDigitSystemFont(ofSize: 40, weight: .semibold)
             label.textColor = .white
             label.alignment = .center
@@ -1370,7 +1381,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func installFPSLabels() {
-        for (host, label) in [(preview, previewFPS), (outputPreview, outputFPS)] {
+        for (host, label) in [(outputPreview, outputFPS)] {
             let plate = NSView()
             plate.wantsLayer = true
             plate.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.62).cgColor
@@ -1400,9 +1411,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let enabled = fpsSwitch.state == .on
         let isFile = profile.sourceKind == "file"
         let now = ProcessInfo.processInfo.systemUptime
-        let endpointVisible = outputPreview.windowVisibleSnapshot
-            ? (outputPreview.drawableVisibleSnapshot && outputPreview.exposedSnapshot)
-            : (preview.drawableVisibleSnapshot && preview.exposedSnapshot)
+        let endpointVisible = outputPreview.drawableVisibleSnapshot && outputPreview.exposedSnapshot
         let canObserve = !isFile && capture.running && !capture.paused && (endpointVisible || targetFrontmost)
         fpsOutputObservable = !isFile && capture.running && !capture.paused && endpointVisible
         if canObserve != fpsCanObserve {
@@ -1432,13 +1441,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 interpolation: processor.resolvedPlan.interpolationActive, canObserve: canObserve,
                 outputObservable: fpsOutputObservable, chinese: EnhancementText.chinese)
         }
-        for label in [previewFPS, targetFPS] {
+        for label in [targetFPS] {
             label.stringValue = text
         }
         if !isFile && outputWarmupWarningShown && outputWindow?.isVisible == true && (outputWindow?.alphaValue ?? 1) < 1 {
             targetFPS.stringValue += EnhancementText.t(" · Not ready", " · 未就绪")
         }
-        previewFPS.superview?.isHidden = !enabled || isFile
         outputFPS.superview?.isHidden = true
         targetFPS.superview?.isHidden = !enabled
         for player in players {
@@ -1601,8 +1609,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let root = NSView()
         root.wantsLayer = true
         let inspector = glass()
-        let well = NSView()
-        for view in [inspector, well, stageHost, sourceHost, libraryHost, preview] as [NSView] {
+        for view in [inspector, stageHost, sourceHost, libraryHost] as [NSView] {
             view.translatesAutoresizingMaskIntoConstraints = false
         }
         for view in [stageHost, sourceHost, libraryHost] { root.addSubview(view) }
@@ -1612,40 +1619,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         languageControl.action = #selector(languageChanged)
         languageControl.selectedSegment = EnhancementText.chinese ? 0 : 1
 
-        well.wantsLayer = true
-        well.layer?.backgroundColor = NSColor.black.cgColor
-        well.layer?.cornerRadius = WorkbenchStyle.panelRadius
-        well.layer?.masksToBounds = true
-        well.addSubview(preview)
-        emptyOverlay.translatesAutoresizingMaskIntoConstraints = false
-        emptyOverlay.wantsLayer = true
-        emptyOverlay.layer?.backgroundColor = NSColor.black.cgColor
-        let emptyTitle = NSTextField(labelWithString: EnhancementText.t("Choose a source to preview", "选择来源后在这里预览"))
-        emptyTitle.font = .systemFont(ofSize: 18, weight: .semibold)
-        emptyTitle.textColor = .white
-        emptyTitle.alignment = .center
-        let emptyButton = button(EnhancementText.t("Choose Window", "选择窗口"), #selector(chooseCurrentKind), primary: true)
-        emptySourceButton = emptyButton
-        let emptyStack = NSStackView(views: [emptyTitle, emptyButton])
-        emptyStack.orientation = .vertical
-        emptyStack.alignment = .centerX
-        emptyStack.spacing = 12
-        emptyStack.translatesAutoresizingMaskIntoConstraints = false
-        emptyOverlay.addSubview(emptyStack)
-        well.addSubview(emptyOverlay)
-        let aspect = preview.widthAnchor.constraint(equalTo: preview.heightAnchor, multiplier: 16.0 / 9.0)
-        let fillWidth = preview.widthAnchor.constraint(equalTo: well.widthAnchor)
-        let fillHeight = preview.heightAnchor.constraint(equalTo: well.heightAnchor)
-        fillWidth.priority = .defaultLow
-        fillHeight.priority = .defaultLow
-        previewAspect = aspect
         viewMode.translatesAutoresizingMaskIntoConstraints = false
         viewMode.segmentDistribution = .fillEqually
-        viewMode.appearance = NSAppearance(named: .darkAqua)
         viewMode.isEnabled = !SPRifeExperiments.airBeta
-        well.addSubview(viewMode)
-
-        let source = sourceBlock()
+        let source = column([sourceBlock(), viewMode])
         let sourceDivider = divider()
         let inspectorScroll = scrolled(inspectorColumn(), inset: 16)
         let runDivider = divider()
@@ -1655,7 +1632,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             view.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(view)
         }
-        stageHost.addSubview(well)
         stageHost.addSubview(inspector)
         let sourceScroll = scrolled(readableColumn(sourceColumn(), maxWidth: 900))
         let libraryScroll = scrolled(readableColumn(libraryColumn(), maxWidth: 760))
@@ -1685,26 +1661,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             inspector.topAnchor.constraint(equalTo: stageHost.topAnchor),
             inspector.bottomAnchor.constraint(equalTo: stageHost.bottomAnchor),
             inspector.trailingAnchor.constraint(equalTo: stageHost.trailingAnchor),
-            inspector.widthAnchor.constraint(equalToConstant: WorkbenchStyle.inspectorWidth),
-            well.topAnchor.constraint(equalTo: stageHost.topAnchor),
-            well.bottomAnchor.constraint(equalTo: stageHost.bottomAnchor),
-            well.leadingAnchor.constraint(equalTo: stageHost.leadingAnchor),
-            well.trailingAnchor.constraint(equalTo: inspector.leadingAnchor, constant: -WorkbenchStyle.gap),
-            preview.centerXAnchor.constraint(equalTo: well.centerXAnchor),
-            preview.centerYAnchor.constraint(equalTo: well.centerYAnchor),
-            preview.widthAnchor.constraint(lessThanOrEqualTo: well.widthAnchor),
-            preview.heightAnchor.constraint(lessThanOrEqualTo: well.heightAnchor),
-            aspect, fillWidth, fillHeight,
-            emptyStack.centerXAnchor.constraint(equalTo: emptyOverlay.centerXAnchor),
-            emptyStack.centerYAnchor.constraint(equalTo: emptyOverlay.centerYAnchor),
-            emptyStack.widthAnchor.constraint(lessThanOrEqualTo: emptyOverlay.widthAnchor, constant: -32),
-            emptyOverlay.leadingAnchor.constraint(equalTo: well.leadingAnchor),
-            emptyOverlay.trailingAnchor.constraint(equalTo: well.trailingAnchor),
-            emptyOverlay.topAnchor.constraint(equalTo: well.topAnchor),
-            emptyOverlay.bottomAnchor.constraint(equalTo: well.bottomAnchor),
-            viewMode.widthAnchor.constraint(equalToConstant: 240),
-            viewMode.centerXAnchor.constraint(equalTo: well.centerXAnchor),
-            viewMode.bottomAnchor.constraint(equalTo: well.bottomAnchor, constant: -12),
+            inspector.leadingAnchor.constraint(equalTo: stageHost.leadingAnchor),
             source.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
             source.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
             source.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
@@ -1733,22 +1690,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func updateSourceChrome(hasSource: Bool) {
-        emptyOverlay.isHidden = hasSource
-        sourceActionButton?.isHidden = !hasSource
+        sourceActionButton?.isHidden = false
         sourceMetaLabel.isHidden = !hasSource || sourceMetaLabel.stringValue.isEmpty
         viewMode.isHidden = !hasSource || SPRifeExperiments.airBeta
         refreshActions()
     }
 
-    private func setPreviewAspect(_ size: CGSize) {
-        guard size.width > 0, size.height > 0 else { return }
-        let ratio = size.width / size.height
-        guard previewAspect?.multiplier != ratio else { return }
-        previewAspect?.isActive = false
-        let next = preview.widthAnchor.constraint(equalTo: preview.heightAnchor, multiplier: ratio)
-        next.isActive = true
-        previewAspect = next
-    }
 
     private func refreshFormLabels() {
         for (label, view, width) in formLabels {
@@ -2312,15 +2259,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             EnhancementText.t("Available for ordinary 8-bit video. fast is the checked tier. balanced and hq stay experimental.", "可用于普通 8 位画面。fast 是已核对的档位，balanced 和 hq 仍是实验。"),
             "rife.metal|rife-v4.25", enabled: true))
         stack.addArrangedSubview(heading(EnhancementText.t("Scale and super-resolution", "缩放与超分")))
-        stack.addArrangedSubview(libraryRow("Lanczos", EnhancementText.t("High-quality spatial scaling with low overhead.", "高质量空间缩放，资源开销较低。"), "scale|lanczos", enabled: true))
-        stack.addArrangedSubview(libraryRow("MetalFX Spatial", EnhancementText.t("Spatial scaling on supported Macs.", "在支持的 Mac 上使用空间缩放。"), "scale|metalfx.spatial", enabled: true))
-        stack.addArrangedSubview(libraryRow(EnhancementText.t("Apple low-latency super-resolution", "Apple 低延迟超分"), EnhancementText.t("Experimental · 720p to 1080p on supported sources.", "实验 · 支持的 720p 来源可提升至 1080p。"), "scale|apple.low-sr", enabled: true))
-        stack.addArrangedSubview(libraryRow(
-            EnhancementText.t("Apple video super-resolution", "Apple 视频超分"),
-            EnhancementText.t("Experimental · 480×270 to 1080p, with frame generation off.", "实验 · 480×270 升至 1080p，暂需关闭帧生成。"),
-            "scale|apple.video-sr", enabled: true))
-        stack.addArrangedSubview(libraryRow("Real-CUGAN", EnhancementText.t("Experimental · 2× anime detail enhancement with optional denoising.", "实验 · 2× 动画细节增强，可选降噪。"), "scale|realcugan", enabled: true))
-        stack.addArrangedSubview(libraryRow("Anime4K", EnhancementText.t("Experimental · Anime-oriented 2× enhancement. This build requires macOS 27.", "实验 · 面向动画的 2× 增强，此版本运行库需要 macOS 27。"), "scale|anime4k", enabled: true))
+        stack.addArrangedSubview(libraryRow("ArtCNN C4F32", EnhancementText.t("2× enhancement with more detail.", "2× 增强，画质优先。"), "scale|artcnn.c4f32", enabled: true))
+        stack.addArrangedSubview(libraryRow("ArtCNN C4F16", EnhancementText.t("Lightweight 2× enhancement.", "2× 增强，速度优先。"), "scale|artcnn.c4f16", enabled: true))
         return stack
     }
 
@@ -2356,10 +2296,11 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         if enabled {
             let use = button(EnhancementText.t("Use", "使用"), #selector(useLibrary(_:)), primary: true)
             use.identifier = NSUserInterfaceItemIdentifier(identifier)
-            if identifier == "scale|apple.low-sr" { appleSRLibraryButton = use; use.isEnabled = false }
-            if identifier == "scale|apple.video-sr" { appleVideoSRLibraryButton = use; use.isEnabled = false }
-            if identifier == "scale|anime4k" { anime4KLibraryButton = use; use.isEnabled = false }
-            if identifier == "scale|realcugan" { cuganLibraryButton = use; use.isEnabled = false }
+            if identifier.hasPrefix("scale|artcnn.") {
+                let id = String(identifier.dropFirst(6))
+                artCNNLibraryButtons[id] = use
+                use.isEnabled = SPArtCNNSR.isPackagedForThisSystem()
+            }
             line.addArrangedSubview(use)
         } else {
             let unavailable = NSTextField(labelWithString: unavailableStatus ?? EnhancementText.t("Unavailable", "暂不可用"))
@@ -2386,13 +2327,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         stageHost.isHidden = next != 0
         sourceHost.isHidden = next != 1
         libraryHost.isHidden = next != 2
-        preview.isHidden = next != 0
-        preview.refreshVisibilitySnapshot()
         pageControl.selectedSegment = next
         if next == 0 { redrawPreview() }
     }
 
     private func redrawPreview() {
+        if profile.sourceKind == "file" { selectedFilePlayer()?.workbenchSetFileViewMode(profile.viewMode); return }
         applyAirBetaPreset(&profile)
         let mode: SPLiveViewMode
         switch profile.viewMode {
@@ -2419,7 +2359,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         cancelCountdown()
         inputRouter?.stop(reason:"source_changed"); interactionArmed = false
         readControls()
-        updateAppleSRCapability()
+        updateSRCapability()
         refreshSourceBar()
         refreshActions()
         persist()
@@ -2436,9 +2376,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             profile.modelID = "rife-v4.25"
             profile.rate = .multiplier(2)
             profile.scaleEnabled = true
-            profile.scaleEngineID = "lanczos"
-            profile.outputWidth = 1920
-            profile.outputHeight = 1080
+            profile.scaleEngineID = "artcnn.c4f32"
+            profile.outputWidth = 0
+            profile.outputHeight = 0
         case "preset:film":
             profile.interpolationEnabled = true
             profile.interpolationEngineID = "rife.metal"
@@ -2446,9 +2386,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             profile.modelID = "rife-v4.25"
             profile.rate = .multiplier(2)
             profile.scaleEnabled = true
-            profile.scaleEngineID = "lanczos"
-            profile.outputWidth = 1920
-            profile.outputHeight = 1080
+            profile.scaleEngineID = "artcnn.c4f32"
+            profile.outputWidth = 0
+            profile.outputHeight = 0
         case "preset:anime":
             profile.interpolationEnabled = true
             profile.interpolationEngineID = "rife.metal"
@@ -2456,9 +2396,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             profile.interpolationQuality = "fast"
             profile.rate = .multiplier(2)
             profile.scaleEnabled = true
-            profile.scaleEngineID = "lanczos"
-            profile.outputWidth = 1920
-            profile.outputHeight = 1080
+            profile.scaleEngineID = "artcnn.c4f32"
+            profile.outputWidth = 0
+            profile.outputHeight = 0
         default:
             applyDefaultPreset(&profile)
         }
@@ -2815,25 +2755,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let parts = (sender.identifier?.rawValue ?? "").split(separator: "|").map(String.init)
         guard let id = parts.first, !id.isEmpty else { return }
         if id == "scale", parts.count > 1 {
-            if parts[1] == "apple.low-sr" {
-                guard appleSRCandidate else { return }
-                if let size = appleSRNativeOutput(engine: parts[1], preset: profile.srInputPreset) { profile.outputWidth = size.0; profile.outputHeight = size.1 }
-            }
-            if parts[1] == "apple.video-sr" {
-                guard appleVideoSRCandidate else { return }
-                if profile.sourceKind == "file", let player = selectedFilePlayer() {
-                    let size = player.workbenchSourceSize
-                    profile.outputWidth = size.0 * appleVideoSRFactor; profile.outputHeight = size.1 * appleVideoSRFactor
-                } else if let size = appleSRNativeOutput(engine: parts[1], preset: profile.srInputPreset) { profile.outputWidth = size.0; profile.outputHeight = size.1 }
-            }
-            if parts[1] == "anime4k" {
-                guard anime4KCandidate else { return }
-                profile.outputWidth = 0; profile.outputHeight = 0
-            }
-            if parts[1] == "realcugan" {
-                guard cuganCandidate else { return }
-                profile.outputWidth = 0; profile.outputHeight = 0
-            }
+            guard ArtCNNSRSelection.contains(parts[1]), SPArtCNNSR.isPackagedForThisSystem() else { return }
+            profile.outputWidth = 0; profile.outputHeight = 0
             profile.scaleEnabled = true
             profile.scaleEngineID = parts[1]
             loadControls()
@@ -2895,9 +2818,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         case 2: choose = EnhancementText.t("Choose File", "选择文件")
         default: choose = EnhancementText.t("Choose Window", "选择窗口")
         }
-        sourceActionButton?.title = [EnhancementText.t("Change Window", "更换窗口"),
+        sourceActionButton?.title = hasSelectedSource ? [EnhancementText.t("Change Window", "更换窗口"),
                                       EnhancementText.t("Change Display", "更换显示器"),
-                                      EnhancementText.t("Change File", "更换文件")][max(0, sourceKindControl.selectedSegment)]
+                                      EnhancementText.t("Change File", "更换文件")][max(0, sourceKindControl.selectedSegment)] : choose
         emptySourceButton?.title = choose
         updateSourceChrome(hasSource: hasSelectedSource)
     }
@@ -2954,18 +2877,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         enginePopup.action = #selector(engineChanged)
         qualityPopup.addItems(withTitles: ["fast", "balanced", "hq"])
         fpsPopup.addItems(withTitles: ["24", "25", "30", "50", "60", "90", "120", EnhancementText.t("Custom", "自定义")])
-        scalePopup.addItems(withTitles: [
-            EnhancementText.t("Lanczos scale", "Lanczos 高质量缩放"),
-            "MetalFX Spatial",
-            EnhancementText.t("Apple low-latency super-resolution · Experimental", "Apple 低延迟超分 · 实验"),
-            EnhancementText.t("Apple video super-resolution · Experimental", "Apple 视频超分 · 实验"),
-            EnhancementText.t("Anime4K · 2× · Experimental", "Anime4K · 2× · 实验"),
-            EnhancementText.t("Real-CUGAN · 2× · Experimental", "Real-CUGAN · 2× · 实验"),
-        ])
-        scalePopup.item(at: 2)?.isEnabled = false
-        scalePopup.item(at: 3)?.isEnabled = false
-        scalePopup.item(at: 4)?.isEnabled = false
-        scalePopup.item(at: 5)?.isEnabled = false
+        scalePopup.addItems(withTitles: ArtCNNSRSelection.ids.map(ArtCNNSRSelection.title))
         scaleQualityPopup.addItems(withTitles: [EnhancementText.t("Off", "不降噪"), EnhancementText.t("Low", "轻度"), EnhancementText.t("Medium", "中等"), EnhancementText.t("Strong", "强")])
         srInputPopup.addItems(withTitles: [EnhancementText.t("Source size", "保持采集尺寸"), "480p (≤854×480)", "720p (≤1280×720)", "1080p (≤1920×1080)"])
         sourceWindowPopup.addItems(withTitles: [EnhancementText.t("Keep current size", "保持当前尺寸"), "480p (854×480)", "720p (1280×720)", "1080p (1920×1080)"])
@@ -3017,13 +2929,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func wire() {
-        processor.preview = preview
+        processor.preview = nil
         processor.outputPreview = outputPreview
         processor.installPresentationHooks()
         if PixelDiagnosticsPolicy.enabled(CommandLine.arguments) { processor.enablePixelDiagnostics() }
         visibilityTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.preview.refreshVisibilitySnapshot()
                 self?.outputPreview.refreshVisibilitySnapshot()
                 self?.updateTargetPanels()
                 self?.updateFPSOverlay()
@@ -3031,7 +2942,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 let now = ProcessInfo.processInfo.systemUptime
                 guard now - self.lastFileStatsUpdate >= 1 else { return }
                 self.lastFileStatsUpdate = now
-                self.updateAppleSRCapability()
+                self.updateSRCapability()
                 if let player = self.selectedFilePlayer() {
                     player.workbenchSetFileViewMode(self.profile.viewMode)
                     let fps = player.workbenchPresentedFPS
@@ -3176,7 +3087,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 self.generation = generation
                 self.syncRawCadenceEnvironment()
                 self.processor.adoptSourceGeneration(generation)
-                self.preview.setGeneration(generation)
                 self.outputPreview.setGeneration(generation)
                 let active = self.processor.resolvedPlan.interpolationActive || self.processor.resolvedPlan.scaleActive
                 self.statusLabel.stringValue = active
@@ -3238,63 +3148,14 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         updateFPSOverlay()
     }
 
-    private func updateAppleSRCapability() {
+    private func updateSRCapability() {
         if SPRifeExperiments.airBeta { applyModeVisibility(); return }
-        let filePlayer = profile.sourceKind == "file" ? selectedFilePlayer() : nil
-        let fileSize = filePlayer?.workbenchSourceSize ?? (0, 0)
-        let liveSelected = profile.sourceKind != "file" && capture.running
-        let rawWidth = profile.sourceKind == "file" ? fileSize.0 : (liveSelected ? (lastStats["sourceWidth"] as? Int ?? 0) : 0)
-        let rawHeight = profile.sourceKind == "file" ? fileSize.1 : (liveSelected ? (lastStats["sourceHeight"] as? Int ?? 0) : 0)
-        let effective = SPLiveSRInputSize(Int32(rawWidth), Int32(rawHeight), Int32(profile.sourceKind == "window" || profile.sourceKind == "file" ? 0 : profile.srInputPreset))
-        let width = Int(effective.width), height = Int(effective.height)
-        let key = "\(profile.srInputPreset)-\(profile.sourceKind)-\(capture.running)-\(filePlayer?.openMediaPath ?? "")-\(width)-\(height)-\(interpolationSwitch.state.rawValue)"
-        guard key != appleSRCapabilityKey else { return }
-        appleSRCapabilityKey = key
-        let hasSource = filePlayer != nil || liveSelected
-        let actualLowFactors = hasSource ? SPAppleLowLatencySR.supportedFactors(forWidth: Int32(width), height: Int32(height)) : []
-        let lowActual = (profile.sourceKind != "file" || (width == 1280 && height == 720)) && actualLowFactors.contains { abs($0.doubleValue - 1.5) < 0.0001 } && width * 3 <= 7680 && height * 3 <= 4320
-        // Permit choosing a supported engine before setting its input size. The
-        // actual source and output are still checked when the plan is applied.
-        let lowDevice = profile.sourceKind != "file" && hasSource && SPAppleLowLatencySR.supportedFactors(forWidth: 1280, height: 720).contains { abs($0.doubleValue - 1.5) < 0.0001 }
-        appleSRCandidate = lowActual || lowDevice
-        scalePopup.item(at: 2)?.isEnabled = appleSRCandidate
-        appleSRLibraryButton?.isEnabled = appleSRCandidate
-        let videoSRInputReady = profile.sourceKind == "file" ? filePlayer != nil : (capture.running && interpolationSwitch.state == .off)
-        let availableFactors = videoSRInputReady && width > 0 && height > 0
-            ? SPAppleVideoSR.readyScales(forWidth: Int32(width), height: Int32(height)).map(\.intValue) : []
-        let videoScales = VideoSRAvailability.readyFactors(isFile: profile.sourceKind == "file", inputReady: videoSRInputReady, factors: availableFactors)
-        let videoDeviceReady = profile.sourceKind != "file" && videoSRInputReady && SPAppleVideoSR.readyScales(forWidth: 480, height: 270).contains { $0.intValue == 4 }
-        appleVideoSRCandidate = !videoScales.isEmpty || videoDeviceReady
-        scalePopup.item(at: 2)?.toolTip = lowActual ? nil : EnhancementText.t("Choose a supported SR input and matching output before applying.", "请先选择支持的超分输入和匹配的输出尺寸，再应用。")
-        scalePopup.item(at: 3)?.toolTip = !videoScales.isEmpty ? nil : EnhancementText.t("Choose a supported SR input and matching output before applying.", "请先选择支持的超分输入和匹配的输出尺寸，再应用。")
-        if let first = videoScales.first { appleVideoSRFactor = first }
-        scalePopup.item(at: 3)?.isEnabled = appleVideoSRCandidate
-        appleVideoSRLibraryButton?.isEnabled = appleVideoSRCandidate
-        applyModeVisibility()
-        let sizeOK = width == 0 || height == 0 || (width <= 1920 && height <= 1080)
-        anime4KCandidate = SPAnime4K.isPackagedForThisSystem() && sizeOK
-        scalePopup.item(at: 4)?.isEnabled = anime4KCandidate
-        anime4KLibraryButton?.isEnabled = anime4KCandidate
-        cuganCandidate = SPRealCUGAN.isPackagedForThisSystem() && sizeOK
-        scalePopup.item(at: 5)?.isEnabled = cuganCandidate
-        cuganLibraryButton?.isEnabled = cuganCandidate
-    }
-
-    private func appleSRNativeOutput(engine: String, preset: Int) -> (Int, Int)? {
-        let raw: (Int, Int)
-        if profile.sourceKind == "file" { raw = selectedFilePlayer()?.workbenchSourceSize ?? (0, 0) }
-        else { raw = (lastStats["sourceWidth"] as? Int ?? 0, lastStats["sourceHeight"] as? Int ?? 0) }
-        let size = SPLiveSRInputSize(Int32(raw.0), Int32(raw.1), Int32(profile.sourceKind == "file" ? 0 : preset))
-        let w = Int(size.width), h = Int(size.height)
-        guard w >= 2 && h >= 2 else { return nil }
-        if engine == "apple.low-sr" {
-            guard (profile.sourceKind != "file" || (w == 1280 && h == 720)), w % 2 == 0, h % 2 == 0, w * 3 <= 7680, h * 3 <= 4320,
-                  SPAppleLowLatencySR.supportedFactors(forWidth: Int32(w), height: Int32(h)).contains(where: { abs($0.doubleValue - 1.5) < 0.0001 }) else { return nil }
-            return (w * 3 / 2, h * 3 / 2)
+        let packaged = SPArtCNNSR.isPackagedForThisSystem()
+        for (index, id) in ArtCNNSRSelection.ids.enumerated() {
+            scalePopup.item(at: index)?.isEnabled = packaged
+            artCNNLibraryButtons[id]?.isEnabled = packaged
         }
-        if engine == "apple.video-sr", w * 4 <= 3840, h * 4 <= 2160,
-           SPAppleVideoSR.readyScales(forWidth: Int32(w), height: Int32(h)).contains(where: { $0.intValue == 4 }) { return (w * 4, h * 4) }
-        return nil
+        applyModeVisibility()
     }
 
     private func selectOutputSize(_ w: Int, _ h: Int) {
@@ -3331,7 +3192,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 #endif
         clearObsoleteBudgetWarningIfNeeded()
         if profile.interpolationEngineID == "apple.lowlatency" { phaseLabel.stringValue = lowLatencyPhaseText() }
-        updateAppleSRCapability()
+        updateSRCapability()
         refreshActions()
         updateFPSOverlay()
         refreshPlanLabel()
@@ -3347,7 +3208,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         if let width = stats["sourceWidth"] as? Int, let height = stats["sourceHeight"] as? Int, width > 0 {
             let fps = stats["callbackFPS"] as? Double ?? 0
             let label = EnhancementText.t("Capture", "采集回调")
-            setPreviewAspect(CGSize(width: width, height: height))
             sourceMetaLabel.stringValue = fps > 1 && (r7Diagnostics || p0ControlsEnabled) ? "\(width)×\(height) · \(label) \(String(format: "%.0f", fps)) fps" : "\(width)×\(height)"
             sourceMetaLabel.isHidden = !hasSelectedSource
         }
@@ -4061,20 +3921,16 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 statusLabel.stringValue = EnhancementText.t("The source window size is invalid.", "来源窗口尺寸无效。")
                 statusLabel.textColor = .systemRed; return
             }
-            guard ["metalfx.spatial", "anime4k", "realcugan"].contains(snapshot.scaleEngineID) else {
+            guard ArtCNNSRSelection.contains(snapshot.scaleEngineID) else {
                 statusLabel.stringValue = EnhancementText.t("Choose a supported 2× scaling engine.", "请选择支持 2× 的缩放引擎。")
                 statusLabel.textColor = .systemRed; return
             }
-            if snapshot.scaleEngineID == "anime4k" && !SPAnime4K.isPackagedForThisSystem() || snapshot.scaleEngineID == "realcugan" && !SPRealCUGAN.isPackagedForThisSystem() {
+            if !SPArtCNNSR.isPackagedForThisSystem() {
                 statusLabel.stringValue = EnhancementText.t("The selected 2× engine is unavailable in this build.", "当前安装包没有所选 2× 引擎。")
                 statusLabel.textColor = .systemRed; return
             }
             let width = snapshot.sourceWindowPreset == 480 ? 854 : (snapshot.sourceWindowPreset == 720 ? 1280 : 1920)
-            if snapshot.scaleEngineID == "metalfx.spatial" && !SPLiveCanPrepareMetalFX(Int32(width), Int32(snapshot.sourceWindowPreset)) {
-                statusLabel.stringValue = EnhancementText.t("MetalFX Spatial is unavailable on this device.", "这台设备不支持 MetalFX Spatial。")
-                statusLabel.textColor = .systemRed; return
-            }
-            if (snapshot.outputWidth != width*2 || snapshot.outputHeight != snapshot.sourceWindowPreset*2) && !(snapshot.scaleEngineID != "metalfx.spatial" && snapshot.outputWidth == 0 && snapshot.outputHeight == 0) {
+            if (snapshot.outputWidth != width*2 || snapshot.outputHeight != snapshot.sourceWindowPreset*2) && !(snapshot.outputWidth == 0 && snapshot.outputHeight == 0) {
                 statusLabel.stringValue = EnhancementText.t("Choose the matching 2× output size.", "请选择与来源窗口匹配的 2× 输出尺寸。")
                 statusLabel.textColor = .systemRed; return
             }
@@ -4400,25 +4256,19 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let chosenWindowPreset = [0,480,720,1080][max(0,min(3,sourceWindowPopup.indexOfSelectedItem))]
         let windowPresetChanged = sourceKindControl.selectedSegment == 0 && chosenWindowPreset != profile.sourceWindowPreset
         let windowResizeSelected = sourceKindControl.selectedSegment == 0 && scaleSwitch.state == .on && chosenWindowPreset > 0
-        if windowResizeSelected && (windowPresetChanged || (selectedEngine == 1 && profile.scaleEngineID != "metalfx.spatial")) && selectedEngine == 1 {
+        if windowResizeSelected && windowPresetChanged && ArtCNNSRSelection.ids.indices.contains(selectedEngine) {
             let w = chosenWindowPreset == 480 ? 854 : (chosenWindowPreset == 720 ? 1280 : 1920)
             selectOutputSize(w*2, chosenWindowPreset*2)
         }
-        let wasLanczos = profile.scaleEngineID == "lanczos"
-        if wasLanczos && selectedEngine != 0 { srInputPopup.selectItem(at: [0,480,720,1080].firstIndex(of: profile.srInputPreset) ?? 0) }
-        let chosenPreset = [0,480,720,1080][max(0,min(3,srInputPopup.indexOfSelectedItem))]
-        let engineID = selectedEngine == 2 ? "apple.low-sr" : (selectedEngine == 3 ? "apple.video-sr" : "")
-        let inputChanged = selectedEngine != 0 && chosenPreset != profile.srInputPreset
-        if !engineID.isEmpty && (engineID != profile.scaleEngineID || inputChanged),
-           let size = appleSRNativeOutput(engine: engineID, preset: chosenPreset) { selectOutputSize(size.0, size.1) }
-        let animationSelected = scalePopup.indexOfSelectedItem == 4 || scalePopup.indexOfSelectedItem == 5
-        sizePopup.item(at: 5)?.isEnabled = animationSelected
-        sizePopup.item(at: 0)?.isEnabled = !animationSelected
-        if (scalePopup.indexOfSelectedItem == 4 && profile.scaleEngineID != "anime4k" && anime4KCandidate) ||
-            (scalePopup.indexOfSelectedItem == 5 && profile.scaleEngineID != "realcugan" && cuganCandidate) { sizePopup.selectItem(at: 5) }
-        if !animationSelected && sizePopup.indexOfSelectedItem == 5 { sizePopup.selectItem(at: 0) }
+        let wasLanczos = !ArtCNNSRSelection.contains(profile.scaleEngineID)
+        if wasLanczos { srInputPopup.selectItem(at: [0,480,720,1080].firstIndex(of: profile.srInputPreset == 0 ? 1080 : profile.srInputPreset) ?? 3) }
+        let engineID = ArtCNNSRSelection.fromPopup(selectedEngine)
+        let scaleJustEnabled = scaleSwitch.state == .on && !profile.scaleEnabled
+        sizePopup.item(at: 5)?.isEnabled = true
+        sizePopup.item(at: 0)?.isEnabled = false
+        if engineID != profile.scaleEngineID || scaleJustEnabled { sizePopup.selectItem(at: 5) }
         readControls()
-        updateAppleSRCapability()
+        updateSRCapability()
         applyModeVisibility()
         let mode: SPLiveViewMode
         switch profile.viewMode {
@@ -4433,7 +4283,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func applyModeVisibility() {
-        let isLanczos = profile.scaleEngineID == "lanczos"
         srInputRow?.isHidden = profile.sourceKind == "window"
         sourceWindowRow?.isHidden = profile.sourceKind != "window"
         sourceWindowPopup.isEnabled = profile.sourceKind == "window" && profile.scaleEnabled
@@ -4441,11 +4290,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         sourceWindowHint.stringValue = profile.scaleEnabled
             ? EnhancementText.t("Use a dedicated or picture-in-picture video window; the video must fill the captured window.", "请使用独立或画中画视频窗口；视频须铺满采集画面。")
             : EnhancementText.t("Scaling is off; the saved window size is not applied.", "缩放已关闭；已保存的窗口尺寸不会应用。")
-        srInputPopup.isEnabled = profile.sourceKind != "file" && !isLanczos
-        if isLanczos { srInputPopup.selectItem(at: 0) }
-        let help = profile.sourceKind == "file" ? EnhancementText.t("Video files use decoded pixels; this control applies to live capture.", "视频文件使用解码后的原始像素；此选项适用于实时采集。") : (isLanczos
-            ? EnhancementText.t("Lanczos is ordinary scaling. Reducing the input first discards detail, so it keeps the capture size. Your SR input choice is retained for other engines.", "Lanczos 是普通缩放。先缩小会丢失细节，因此保持采集尺寸；已保存的超分输入选择会留给其他引擎。")
-            : EnhancementText.t("This reduces the captured image before scaling; it does not identify the source video resolution. Lower input may trade quality for speed and does not guarantee a sharper image.", "此选项会先缩小采集画面，再进行缩放；它不代表自动识别到了片源分辨率。较低输入尺寸可能以画质换速度，不保证画面更清晰。"))
+        srInputPopup.isEnabled = profile.sourceKind != "file"
+        let help = profile.sourceKind == "file"
+            ? EnhancementText.t("Video files use decoded pixels; this control applies to live capture.", "视频文件使用解码后的原始像素；此选项适用于实时采集。")
+            : EnhancementText.t("This reduces the captured image before scaling; it does not identify the source video resolution. Lower input may trade quality for speed and does not guarantee a sharper image.", "此选项会先缩小采集画面，再进行缩放；它不代表自动识别到了片源分辨率。较低输入尺寸可能以画质换速度，不保证画面更清晰。")
         srInputHelp.toolTip = help
         srInputPopup.toolTip = help
         fullscreenCheck.title = profile.sourceKind == "file"
@@ -4462,16 +4310,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             if field.isSelectable != editable { field.isSelectable = editable }
             if field.currentEditor() == nil { field.stringValue = WorkbenchDimensionPolicy.text(value) }
         }
-        let native2x = profile.scaleEngineID == "anime4k" || profile.scaleEngineID == "realcugan"
-        if profile.sourceKind == "file" && profile.scaleEngineID == "apple.video-sr" {
-            sizePopup.item(at: 0)?.title = appleVideoSRCandidate
-                ? EnhancementText.t("\(appleVideoSRFactor)× source (model native)", "\(appleVideoSRFactor)×来源（模型原生）")
-                : EnhancementText.t("Source × model factor", "来源 × 模型倍率")
-        } else {
-            sizePopup.item(at: 0)?.title = native2x ? EnhancementText.t("2× source (model native)", "2×来源（模型原生）") : EnhancementText.t("Source size", "与来源相同")
-        }
+        sizePopup.item(at: 0)?.title = EnhancementText.t("2× source (model native)", "2×来源（模型原生）")
         sizePopup.item(at: 5)?.title = EnhancementText.t("2× source (model native)", "2×来源（模型原生）")
-        scaleQualityRow?.isHidden = profile.scaleEngineID != "realcugan"
+        scaleQualityRow?.isHidden = true
         let targetRate = rateMode.selectedSegment == 0
         fpsPopup.isHidden = !targetRate
         customRateRow?.isHidden = !targetRate || fpsPopup.indexOfSelectedItem != 7
@@ -4775,7 +4616,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             fileApplyError = EnhancementText.t("The selected display is unavailable.", "所选显示器不可用。")
             statusLabel.stringValue = fileApplyError; statusLabel.textColor = .systemRed; return
         }
-        guard !profile.scaleEnabled || ["lanczos", "metalfx.spatial", "apple.low-sr", "apple.video-sr", "anime4k", "realcugan"].contains(profile.scaleEngineID) else {
+        guard !profile.scaleEnabled || ArtCNNSRSelection.contains(profile.scaleEngineID) else {
             fileApplyError = EnhancementText.t("This scaler is not connected to file playback yet.", "这个缩放引擎尚未接入文件播放。")
             statusLabel.stringValue = fileApplyError; statusLabel.textColor = .systemRed; return
         }
@@ -4887,7 +4728,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private func fileStatus() -> String {
         if !fileApplyError.isEmpty { return fileApplyError }
-        if profile.scaleEnabled && !["lanczos", "metalfx.spatial", "apple.low-sr", "apple.video-sr", "anime4k", "realcugan"].contains(profile.scaleEngineID) { return EnhancementText.t("This scaler is not connected to file playback yet.", "这个缩放引擎尚未接入文件播放。") }
+        if profile.scaleEnabled && !ArtCNNSRSelection.contains(profile.scaleEngineID) { return EnhancementText.t("This scaler is not connected to file playback yet.", "这个缩放引擎尚未接入文件播放。") }
         if profile.interpolationEnabled && !["apple.frc", "rife.metal", "apple.lowlatency", "distildrba.coreml"].contains(profile.interpolationEngineID) {
             return EnhancementText.t("This interpolation engine is not connected to file playback yet; current playback is unchanged.", "这个插帧引擎尚未接入文件播放，当前播放保持不变。")
         }
@@ -4903,15 +4744,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         let fps = player?.workbenchPresentedFPS ?? 0
         let size = player?.workbenchFileLanczosSize ?? (0, 0)
-        let scalerName: String
-        switch active.scaleEngineID {
-        case "metalfx.spatial": scalerName = "MetalFX Spatial"
-        case "apple.low-sr": scalerName = EnhancementText.t("Apple Low-Latency SR", "Apple 低延迟超分")
-        case "apple.video-sr": scalerName = EnhancementText.t("Apple Video SR · per-frame experiment (Random)", "Apple 视频超分 · 逐帧实验（Random）")
-        case "anime4k": scalerName = "Anime4K · " + EnhancementText.t("Experimental", "实验")
-        case "realcugan": scalerName = "Real-CUGAN · " + EnhancementText.t("Experimental", "实验")
-        default: scalerName = "Lanczos"
-        }
+        let scalerName = ArtCNNSRSelection.title(active.scaleEngineID)
         let scaler = (player?.workbenchFileLanczosActive ?? false) ? "\(scalerName) \(size.0)×\(size.1) · " : ""
         return scaler + mode + (fps > 0 ? String(format: " · %.1f FPS", fps) : "")
     }
@@ -4928,6 +4761,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         var profile = snapshot ?? self.profile
         applyAirBetaPreset(&profile)
         LiveEngineSelection.normalize(&profile)
+        ArtCNNSRSelection.normalize(&profile)
         let request = SPLivePlanRequest()
         if profile.sourceKind == "file" {
             request.captureSourceKind = .file
@@ -4963,15 +4797,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         request.scaleEnabled = profile.scaleEnabled
         request.scaleQualityID = profile.scaleQualityID
-        switch profile.scaleEngineID {
-        case "metalfx.spatial": request.scaleEngine = .metalFX
-        case "apple.low-sr": request.scaleEngine = .appleLowLatencySR
-        case "apple.video-sr": request.scaleEngine = .appleVideoSR
-        case "anime4k": request.scaleEngine = .anime4K
-        case "realcugan": request.scaleEngine = .realCUGAN
-        default: request.scaleEngine = .lanczos
-        }
-        request.srInputPreset = Int32(profile.sourceKind == "window" || profile.sourceKind == "file" || profile.scaleEngineID == "lanczos" ? 0 : profile.srInputPreset)
+        request.scaleEngine = profile.scaleEngineID == "artcnn.c4f16" ? .artCNN16 : .artCNN32
+        request.srInputPreset = Int32(profile.sourceKind == "window" || profile.sourceKind == "file" ? 0 : profile.srInputPreset)
         if profile.sourceWindowResizeActive, case let .window(id, owner) = capture.target {
             request.requiredSourceWidth = Int32(profile.sourceWindowPreset == 480 ? 854 : (profile.sourceWindowPreset == 720 ? 1280 : 1920))
             request.requiredSourceHeight = Int32(profile.sourceWindowPreset)
@@ -5044,8 +4871,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let liveEngine = processor.resolvedPlan.engineID ?? ""
         let liveModel = processor.resolvedPlan.modelID ?? ""
         let scaleEngine = processor.resolvedPlan.scaleEngineID ?? ""
-        let scaleVariant = processor.resolvedPlan.scaleQualityID ?? ""
-        let parts = [processor.resolvedPlan.interpolationActive ? "\(liveEngine) \(liveModel)" : "", processor.resolvedPlan.scaleActive ? "\(scaleEngine)\(scaleEngine == "realcugan" ? " · \(scaleVariant)" : "")" : ""].filter { !$0.isEmpty }.joined(separator: " + ")
+        let scaleName = ArtCNNSRSelection.contains(scaleEngine) ? ArtCNNSRSelection.title(scaleEngine) : scaleEngine
+        let parts = [processor.resolvedPlan.interpolationActive ? "\(liveEngine) \(liveModel)" : "", processor.resolvedPlan.scaleActive ? scaleName : ""].filter { !$0.isEmpty }.joined(separator: " + ")
         let live: String
         if profile.sourceKind == "file" {
             let player = selectedFilePlayer()
@@ -5084,7 +4911,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             || (profile.interpolationEngineID == "rife.metal" && profile.rifeStreamEnabled != baseline.rifeStreamEnabled)
             || profile.scaleEnabled != baseline.scaleEnabled
             || profile.scaleEngineID != baseline.scaleEngineID
-            || (profile.scaleEngineID == "realcugan" && profile.scaleQualityID != baseline.scaleQualityID)
+            || profile.scaleQualityID != baseline.scaleQualityID
             || profile.srInputPreset != baseline.srInputPreset
             || profile.sourceWindowPreset != baseline.sourceWindowPreset
             || profile.outputWidth != baseline.outputWidth
@@ -5145,6 +4972,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private func loadControls() {
         applyAirBetaPreset(&profile)
         LiveEngineSelection.normalize(&profile)
+        ArtCNNSRSelection.normalize(&profile)
         interpolationSwitch.state = profile.interpolationEnabled ? .on : .off
         enginePopup.selectItem(at: 0)
         reloadQualityItems()
@@ -5162,15 +4990,14 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         scaleSwitch.state = profile.scaleEnabled ? .on : .off
         sourceWindowPopup.selectItem(at: [0,480,720,1080].firstIndex(of: profile.sourceWindowPreset) ?? 0)
-        srInputPopup.selectItem(at: profile.scaleEngineID == "lanczos" ? 0 : ([0, 480, 720, 1080].firstIndex(of: profile.srInputPreset) ?? 0))
+        srInputPopup.selectItem(at: [0, 480, 720, 1080].firstIndex(of: profile.srInputPreset) ?? 3)
         scaleQualityPopup.selectItem(at: ["none", "light", "medium", "strong"].firstIndex(of: profile.scaleQualityID) ?? 0)
-        updateAppleSRCapability()
-        let animationSelected = profile.scaleEngineID == "anime4k" || profile.scaleEngineID == "realcugan"
-        scalePopup.selectItem(at: profile.scaleEngineID == "metalfx.spatial" ? 1 : (profile.scaleEngineID == "apple.low-sr" ? 2 : (profile.scaleEngineID == "apple.video-sr" ? 3 : (profile.scaleEngineID == "anime4k" ? 4 : (profile.scaleEngineID == "realcugan" ? 5 : 0)))))
-        sizePopup.item(at: 5)?.isEnabled = animationSelected
-        sizePopup.item(at: 0)?.isEnabled = !animationSelected
+        updateSRCapability()
+        scalePopup.selectItem(at: ArtCNNSRSelection.popupIndex(profile.scaleEngineID))
+        sizePopup.item(at: 5)?.isEnabled = true
+        sizePopup.item(at: 0)?.isEnabled = false
         switch (profile.outputWidth, profile.outputHeight) {
-        case (0, 0): sizePopup.selectItem(at: animationSelected ? 5 : 0)
+        case (0, 0): sizePopup.selectItem(at: 5)
         case (1280, 720): sizePopup.selectItem(at: 1)
         case (1920, 1080): sizePopup.selectItem(at: 2)
         case (2560, 1440): sizePopup.selectItem(at: 3)
@@ -5257,9 +5084,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         profile.scaleEnabled = scaleSwitch.state == .on
         if profile.sourceKind == "window" { profile.sourceWindowPreset = [0,480,720,1080][max(0,min(3,sourceWindowPopup.indexOfSelectedItem))] }
-        if profile.sourceKind != "window" && scalePopup.indexOfSelectedItem != 0 { profile.srInputPreset = [0, 480, 720, 1080][max(0, min(3, srInputPopup.indexOfSelectedItem))] }
-        profile.scaleEngineID = scalePopup.indexOfSelectedItem == 1 ? "metalfx.spatial" : (scalePopup.indexOfSelectedItem == 2 ? "apple.low-sr" : (scalePopup.indexOfSelectedItem == 3 ? "apple.video-sr" : (scalePopup.indexOfSelectedItem == 4 ? "anime4k" : (scalePopup.indexOfSelectedItem == 5 ? "realcugan" : "lanczos"))))
-        if profile.scaleEngineID == "realcugan" { profile.scaleQualityID = ["none", "light", "medium", "strong"][max(0, min(3, scaleQualityPopup.indexOfSelectedItem))] }
+        if profile.sourceKind != "window" && profile.sourceKind != "file" { profile.srInputPreset = [0, 480, 720, 1080][max(0, min(3, srInputPopup.indexOfSelectedItem))] }
+        profile.scaleEngineID = ArtCNNSRSelection.fromPopup(scalePopup.indexOfSelectedItem)
+        profile.scaleQualityID = "none"
         switch sizePopup.indexOfSelectedItem {
         case 0: profile.outputWidth = 0; profile.outputHeight = 0
         case 1: profile.outputWidth = 1280; profile.outputHeight = 720
