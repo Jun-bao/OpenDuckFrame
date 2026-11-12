@@ -2,6 +2,12 @@
 
 All notable public releases will be documented here.
 
+## 0.4.1 — 2026-11-12
+
+- Remove the fullscreen preview option for display sources; display output
+  follows the source, including when an older profile had fullscreen enabled.
+- Keep the fullscreen output option for video files.
+
 ## 0.4.0 — 2026-11-12
 
 - Redesign the compact workbench with grouped settings, aligned control columns,

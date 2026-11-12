@@ -21,8 +21,8 @@ your Mac, without an account or uploading your picture.
   enhancement. Scaling and frame generation can be
   configured separately.
 - **A workbench for everyday use.** Save profiles for games, films and animation;
-  compare original and enhanced output. Window output follows the source window;
-  display and video-file output can go fullscreen on a selected display.
+  compare original and enhanced output. Window and display output follow the
+  source; video-file output can go fullscreen on a selected display.
 - **A local video player, too.** Open formats including MKV, MP4, MOV and WebM,
   with subtitles, HDR playback on compatible displays, playback resume, speed
   control, and Finder Quick Look previews.
