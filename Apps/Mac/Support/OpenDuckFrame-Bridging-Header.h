@@ -10,6 +10,7 @@
 #import "SPAppleVideoSR.h"
 #import "SPAnime4K.h"
 #import "SPRealCUGAN.h"
+#import "SPArtCNNSR.h"
 #import "SPDistilDRBA.h"
 #import "SPFileRifeEngine.h"
 #import "SPFileLowLatencyEngine.h"

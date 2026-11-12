@@ -3488,7 +3488,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         guard hasVideoSession, let core else { completion(false, "请先打开视频。"); return }
         let sourceWidth = Int(core.videoInfo.width), sourceHeight = Int(core.videoInfo.height)
         let factor: Int
-        if ["anime4k", "realcugan"].contains(engine) { factor = 2 }
+        if ["anime4k", "realcugan", "artcnn.c4f16", "artcnn.c4f32"].contains(engine) { factor = 2 }
         else if engine == "apple.video-sr" && (width == 0 || height == 0) {
             guard let first = SPAppleVideoSR.readyScales(forWidth: Int32(sourceWidth), height: Int32(sourceHeight)).first else {
                 completion(false, "设备或当前输入不支持 Apple 视频超分。 "); return

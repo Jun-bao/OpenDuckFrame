@@ -11,6 +11,7 @@ whose MIT copyright notice is preserved in [LICENSE](LICENSE) and the bundled
 | RIFE Metal | 0.1.8, `cinemore/rife-metal` | Apache-2.0 |
 | Practical-RIFE weights | 4.25 (package resource), 4.26 (app resource) | MIT, hzwer |
 | Anime4K shader | 4.0.1, `bloc97/Anime4K` | MIT |
+| ArtCNN C4F16 / C4F32 | Original coefficients, `Artoriuz/ArtCNN` at `0837e5326e710f49e2ab0a8d995da0708047442e`; Core ML format conversion | MIT |
 | Real-CUGAN weights | Bundled 2× models, bilibili | MIT |
 | Real-CUGAN ncnn adapter | `nihui/realcugan-ncnn-vulkan` | MIT |
 | ncnn | Pinned by the optional runtime recipe | BSD-3-Clause |

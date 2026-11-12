@@ -25,6 +25,7 @@ REQUIRED_METALLIBS = (
 # Verbatim upstream notices retain their component directories in the shared
 # framework. Every required file is also part of the embedded artifact hashes.
 THIRD_PARTY_LICENSES = (
+    "ArtCNN-MIT.txt",
     "THIRD_PARTY_NOTICES.txt",
     "FFmpeg/LICENSE.md",
     "FFmpeg/COPYING.LGPLv2.1",
@@ -50,6 +51,10 @@ THIRD_PARTY_LICENSES = (
 REQUIRED_ARTIFACTS = REQUIRED_METALLIBS + (
     Path("Contents/Frameworks/libass.9.dylib"),
     Path("Contents/Frameworks/OpenDuckFrameCaptionsUI.framework/Versions/A/OpenDuckFrameCaptionsUI"),
+) + tuple(
+    Path("Contents/Resources") / ("ArtCNN_C4F" + str(features) + ".mlmodelc") / name
+    for features in (16, 32)
+    for name in ("model.mil", "coremldata.bin", "weights/weight.bin")
 ) + tuple(_MEDIACORE_RESOURCES / "Licenses" / name for name in THIRD_PARTY_LICENSES)
 
 

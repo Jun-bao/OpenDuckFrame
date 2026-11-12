@@ -4050,7 +4050,7 @@ static BOOL spThumbsEnabled(void) {
 // Injectable resource bundle keeps headless checks on the exact app resources;
 // the product entry point above always uses its own main bundle.
 - (void)prepareFileScalerWidth:(int)width height:(int)height engine:(NSString *)engine variant:(NSString *)variant resourceBundle:(NSBundle *)bundle completion:(void (^)(BOOL, NSString *))completion {
-    if (![engine isEqualToString:@"lanczos"] && ![engine isEqualToString:@"apple.low-sr"] && ![engine isEqualToString:@"apple.video-sr"] && ![engine isEqualToString:@"metalfx.spatial"] && ![engine isEqualToString:@"anime4k"] && ![engine isEqualToString:@"realcugan"]) {
+    if (![engine isEqualToString:@"lanczos"] && ![engine isEqualToString:@"apple.low-sr"] && ![engine isEqualToString:@"apple.video-sr"] && ![engine isEqualToString:@"metalfx.spatial"] && ![engine isEqualToString:@"anime4k"] && ![engine isEqualToString:@"realcugan"] && ![engine isEqualToString:@"artcnn.c4f16"] && ![engine isEqualToString:@"artcnn.c4f32"]) {
         completion(NO, @"所选文件缩放引擎尚未接入。"); return;
     }
     const uint64_t revision = _fileScalePrepareRevision.fetch_add(1) + 1;
@@ -4083,7 +4083,7 @@ static BOOL spThumbsEnabled(void) {
             candidate=[[SPFileAppleVideoSRScaler alloc] initWithSourceWidth:(int)CVPixelBufferGetWidth(sample) sourceHeight:(int)CVPixelBufferGetHeight(sample) outputWidth:width outputHeight:height error:&error];
         } else if ([engine isEqualToString:@"metalfx.spatial"]) {
             candidate=[[SPFileMetalFXScaler alloc] initWithDevice:device sourceWidth:(int)CVPixelBufferGetWidth(sample) sourceHeight:(int)CVPixelBufferGetHeight(sample) outputWidth:width outputHeight:height error:&error];
-        } else if ([engine isEqualToString:@"anime4k"] || [engine isEqualToString:@"realcugan"]) {
+        } else if ([engine isEqualToString:@"anime4k"] || [engine isEqualToString:@"realcugan"] || [engine isEqualToString:@"artcnn.c4f16"] || [engine isEqualToString:@"artcnn.c4f32"]) {
             int sourceWidth=(int)CVPixelBufferGetWidth(sample), sourceHeight=(int)CVPixelBufferGetHeight(sample);
             if (width!=sourceWidth*2 || height!=sourceHeight*2) error=[NSError errorWithDomain:@"OpenDuckFrame.FileAnimation" code:10 userInfo:@{NSLocalizedDescriptionKey:@"动画超分使用来源尺寸的 2× 输出。"}];
             else candidate=[[SPFileAnimationScaler alloc] initWithSourceWidth:sourceWidth sourceHeight:sourceHeight engine:engine variant:variant resourceBundle:bundle error:&error];
