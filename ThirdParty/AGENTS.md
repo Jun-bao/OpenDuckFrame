@@ -20,6 +20,6 @@ Removing a patch requires equivalent behavior from the newly locked dependency a
 It can fetch sources and replace generated runtime output; preparation itself does not compile or run GPU work.
 The generated `runtime/source-origin.json` records source and helper hashes.
 Edit repository-owned inputs instead of the generated runtime copy.
-The normal app's frame-generation choice stays RIFE 4.25 with continuous caching enabled by default.
+The normal app uses ODF-VFI with continuous caching enabled by default. Its four-stage graph and weight provenance are pinned in [production-model.json](rife-metal/production-model.json); the `rife-v4.25` resource and profile IDs remain for compatibility.
 Experimental graph/IO helpers require a separately scoped experiment and matching provenance.
 When packaging models or runtimes, retain their required notices and validate the actual loaded identity.

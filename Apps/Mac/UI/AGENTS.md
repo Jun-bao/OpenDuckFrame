@@ -9,7 +9,7 @@ Own native windows, menus, player interaction and enhancement configuration here
 
 [Enhancement/EnhancementWorkbench.swift](Enhancement/EnhancementWorkbench.swift) owns profiles, migration, configuration actions, source/output controls and the workbench window.
 [Enhancement/LiveFPSOverlay.swift](Enhancement/LiveFPSOverlay.swift) formats live FPS observations.
-The visible interpolation engine is RIFE 4.25, with fast/balanced/hq tiers.
+The visible interpolation model is ODF-VFI, with fast/balanced/hq tiers; persisted `rife-v4.25` identifiers remain for compatibility.
 Keep continuous stream caching enabled by default and window output fixed to follow with mouse passthrough.
 The normal countdown defaults to 3 seconds; keep saved countdown and custom settings working.
 Hardware/configuration auto-detection is deferred. Keep its suggestions and scoring out of ordinary controls.

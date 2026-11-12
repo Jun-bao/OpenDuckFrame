@@ -12,7 +12,7 @@ Keep rational source PTS, original frame pairs, source generations and configura
 Cancellation, seek and mode changes must reject stale work and retain valid source fallback behavior.
 Track actual generated and presented frames separately from scheduled holds and skipped work.
 A fixed FPS request or multiplier defines a target; achieved presentation also depends on display and processing limits.
-Keep the normal visible engine RIFE 4.25; private comparison backends do not automatically become public choices.
+Keep ODF-VFI as the normal visible frame-generation model; the internal `rife-v4.25` identifier remains for compatibility. Private comparison backends do not automatically become public choices.
 Preserve model identity, quality tier, dimensions, padding, color metadata and cache semantics in comparisons.
 
 ## Verification entry points

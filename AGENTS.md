@@ -32,7 +32,7 @@ Contribution and release requirements live in [CONTRIBUTING.md](CONTRIBUTING.md)
 ## Product boundaries
 
 Processing is local. Preserve user media, source permissions, profiles and playback state.
-The visible frame-generation choice is RIFE 4.25. Existing backend and experiment code has a wider scope.
+The visible frame-generation choice is ODF-VFI, the four-stage structural reduction of RIFE 4.25 using upstream weights without retraining. The internal `rife-v4.25` profile and resource identifiers remain for compatibility. Existing backend and experiment code has a wider scope.
 Automatic hardware/configuration detection is deferred. Keep new recommendations or automatic tuning within an explicit task.
 Preserve internal SP symbols and existing interfaces unless the task calls for their migration.
 
