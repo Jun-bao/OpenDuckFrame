@@ -5,6 +5,8 @@
 <p align="center"><a href="https://openduckframe.cn/en/">Official website</a> · <b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
 <p align="center">Apple silicon · macOS 14+ · <a href="LICENSE">MIT</a></p>
 
+Frame generation uses **ODF-VFI**, a four-stage structural reduction of RIFE 4.25. It keeps the upstream weights without retraining and reduces model processing overhead. Existing RIFE 4.25 profiles remain compatible and run ODF-VFI; the app validates the actual four-stage weights when loading. Visual results remain content-dependent.
+
 ## About
 
 OpenDuckFrame is a native Mac app that enhances the picture you are already watching.
@@ -12,15 +14,15 @@ Select a browser window, game or stream, a display, or a local video file, then
 control frame generation and upscaling from one workbench. Processing happens on
 your Mac, without an account or uploading your picture.
 
-- **Frame generation.** Choose Apple interpolation or RIFE 4.25 / 4.26, select a
+- **Frame generation.** ODF-VFI is the workbench's frame-generation model. Select a
   target frame rate or X2 / X3 / X4, and watch the actual output rate.
-  Availability and achieved performance depend on the engine, source and Mac.
+  Achieved performance depends on the source, settings and Mac.
 - **Upscaling, independently.** Use Lanczos or MetalFX, or try the supported
   Apple and animation-oriented backends. Scaling and frame generation can be
   configured separately.
 - **A workbench for everyday use.** Save profiles for games, films and animation;
-  compare original and enhanced output; follow the source window or use a
-  fullscreen output display.
+  compare original and enhanced output. Window output follows the source window;
+  display and video-file output can go fullscreen on a selected display.
 - **A local video player, too.** Open formats including MKV, MP4, MOV and WebM,
   with subtitles, HDR playback on compatible displays, playback resume, speed
   control, and Finder Quick Look previews.
@@ -32,6 +34,7 @@ The player has 17 interface languages; the enhancement workbench supports Chines
 and English. Experimental backends and constraints are described in [the feature guide](docs/features.md).
 
 <p align="center"><img src="Website/assets/openduckframe-library-v2.webp" alt="The OpenDuckFrame v0.1.0 technology library on macOS" width="900"></p>
+<p align="center"><sub>Earlier v0.1.0 interface. The current technology library lists ODF-VFI as its only frame-generation model.</sub></p>
 
 ## Get started
 
@@ -46,9 +49,13 @@ You can also use **OpenDuckFrame → Check for Updates**, or disable automatic
 checks from the same menu. Updating never uploads your media.
 
 1. Open **File → Quality Workbench** (⇧⌘E).
-2. Choose a window, display, or video file. macOS asks for Screen Recording
+2. Choose a window, display, or video file input. macOS asks for Screen Recording
    permission when you capture a window or display.
-3. Choose frame generation, upscaling, or both, and press **Start enhancement**.
+3. Choose frame generation, upscaling, or both. For a window, press **Delayed Enhancement**
+   and switch to the window you want before the countdown ends; that window is
+   selected and enhanced automatically. The countdown defaults to 3 seconds and can
+   be set from 1 to 20 seconds in the workbench **Settings**. For a display or
+   video file, press **Start Enhancement**.
 4. Use the original / enhanced / comparison controls and FPS display to check the result.
 
 See [Quick start](docs/quick-start.md) for permissions and troubleshooting.
@@ -59,13 +66,17 @@ See [Quick start](docs/quick-start.md) for permissions and troubleshooting.
 |---|---|
 | App and local playback | Apple silicon Mac, macOS 14 or later |
 | Window / display capture | Screen Recording permission; protected content may not be capturable |
-| Apple frame generation and Apple super resolution | macOS 26+, supported hardware and input formats |
-| RIFE frame generation | Apple silicon; throughput depends on resolution, quality and display rate |
+| Apple super resolution | macOS 26+, supported hardware and input formats |
+| ODF-VFI frame generation | Apple silicon; throughput depends on resolution, quality and display rate |
 | Subtitle generation and translation | macOS 26+ and an available system language model |
 | Experimental animation backends | Additional models / runtimes; see [features](docs/features.md) |
 
 Intel Macs, Windows, iPhone and iPad are not currently supported. A multiplier is
 a requested processing mode, not a guarantee of a particular displayed frame rate.
+
+When local-video frame generation cannot keep up, the original picture is kept and
+late generated frames are discarded instead of delaying playback. This does not
+mean the selected multiplier is reached on a slower Mac.
 
 ## Build from source
 
@@ -108,7 +119,7 @@ Platform/macOS/    Mac rendering and audio implementations
 Scripts/           Build, verification, localization and release tools
 ThirdParty/        Dependency lock, selected source and license notices
 Design/            App icon source and deterministic exports
-Website/           Static website source
+Website/           Earlier static page and README images; openduckframe.cn is maintained separately
 docs/              Getting started, features and project documentation
 ```
 

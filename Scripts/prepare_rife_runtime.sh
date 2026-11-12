@@ -13,7 +13,8 @@ PATCH="$CANONICAL/stream-io.patch"
 EXPERIMENT_PATCH="$CANONICAL/experiment-options.patch"
 RUNTIME_PATCH="$CANONICAL/runtime-support.patch"
 WEIGHT_PATH="Sources/RifeMetal/Resources/rife-v4.25.rmw"
-WEIGHT_SHA="$(sp_lock_get "$NAME" weight_sha256)"
+ORIGINAL_WEIGHT_SHA="$(sp_lock_get "$NAME" weight_sha256)"
+WEIGHT_SHA="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha256"])' "$CANONICAL/production-model.json")"
 
 RECIPE_ARGS=(--dependency "$NAME" --input "$SP_ROOT/Scripts/prepare_rife_runtime.sh"
   --input "$SP_ROOT/Scripts/lib/build_common.sh" --input "$SP_ROOT/Scripts/lib/deps_lock.py"
@@ -21,6 +22,7 @@ RECIPE_ARGS=(--dependency "$NAME" --input "$SP_ROOT/Scripts/prepare_rife_runtime
   --input "$CANONICAL/PaddedFrameConvert.swift" --input "$CANONICAL/PaddedFrameConvert.metal"
   --input "$CANONICAL/RifeExperimentOptions.swift" --input "$CANONICAL/StudentGraphContract.swift"
   --input "$CANONICAL/LICENSE" --input "$CANONICAL/THIRD-PARTY.md"
+  --input "$CANONICAL/production-model.json" --input "$SP_ROOT/Scripts/derive_fourstage_model.py"
   --tool python3 --tool "patch=/usr/bin/patch" --tool tar --parameter "mode=source-only-library")
 RECIPE_HASH="$(sp_recipe_hash "${RECIPE_ARGS[@]}")"
 REQUIRED_OUTPUTS=("$PREFIX/Package.swift" "$PREFIX/source-origin.json"
@@ -77,8 +79,9 @@ cp "$CANONICAL/PaddedFrameConvert.metal" "$STAGED/Sources/RifeMetalCore/Shaders/
 cp "$CANONICAL/RifeExperimentOptions.swift" "$CANONICAL/StudentGraphContract.swift" "$STAGED/Sources/RifeMetalCore/"
 # Apply after the canonical helpers so their locked runtime extensions survive.
 /usr/bin/patch -t -N -p1 -d "$STAGED" < "$RUNTIME_PATCH"
-[ "$(sp_sha256 "$STAGED/$WEIGHT_PATH")" = "$WEIGHT_SHA" ] || \
+[ "$(sp_sha256 "$STAGED/$WEIGHT_PATH")" = "$ORIGINAL_WEIGHT_SHA" ] || \
   sp_die "rife-metal bundled v4.25 weights do not match the pinned original"
+python3 "$SP_ROOT/Scripts/derive_fourstage_model.py" --source "$STAGED/$WEIGHT_PATH" --output "$STAGED/$WEIGHT_PATH"
 
 python3 - "$SP_DEPS_LOCK" "$CANONICAL" "$STAGED" "$RECIPE_HASH" <<'PY'
 import hashlib
@@ -125,6 +128,8 @@ origin = {
                            "student_graphs": ["odf-ifnet425-acc-b3r32-b4r16-v1"]},
     "package_manifest": artifact("Package.swift"),
     "weights": artifact("Sources/RifeMetal/Resources/rife-v4.25.rmw"),
+    "production_model": json.loads((canonical / "production-model.json").read_text()),
+    "model_derivation": {"path": "Scripts/derive_fourstage_model.py", "sha256": sha(canonical.parents[1] / "Scripts/derive_fourstage_model.py")},
     "licenses": [artifact("LICENSE"), artifact("THIRD-PARTY.md")],
 }
 (staged / "source-origin.json").write_text(json.dumps(origin, indent=2, sort_keys=True) + "\n")

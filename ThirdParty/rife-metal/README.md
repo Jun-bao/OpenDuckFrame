@@ -12,7 +12,7 @@ The upstream baseline is `cinemore/rife-metal` 0.1.8 at
 `CompileMetalShaders` plugin are retained. The upstream CLI, tests, and
 `swift-argument-parser` dependency are excluded from the generated package.
 
-The production patch changes stream IO only:
+The stream patch changes IO:
 
 - IOSurface-backed BGRA inputs use GPU edge replication on the original
   padded grid. RGBA and other input buffers retain the CPU padding path.
@@ -23,7 +23,19 @@ The production patch changes stream IO only:
 `PaddedFrameConvert.swift` and `PaddedFrameConvert.metal` are the canonical
 helper sources, also used by the experiment harness. The internal padded
 dimensions, downsample sampler, IFNet, accumulated mask, original weights,
-cache rotation, timesteps, and fallback behavior are retained.
+cache rotation, timesteps, and fallback behavior are retained by this patch.
+
+The shipping default is **ODF-VFI**, the four-stage accumulated-mask graph
+`odf-ifnet425-fourstage-acc-v1`, derived from Practical-RIFE 4.25. Preparation
+verifies the pinned original weights, then `Scripts/derive_fourstage_model.py`
+removes block4 and writes the canonical RMW2 header. The encoder and retained
+four blocks are byte-identical to the original; no additional training is
+applied. `production-model.json` pins both source and evaluated output hashes.
+The output must reproduce SHA-256
+`729ea555016da98e207bc4570e0be81dddbbd37302f7330c89696da798fba22d`.
+The resource filename and profile ID remain `rife-v4.25` for compatibility;
+the loaded model metadata identifies the four-stage graph. This structural
+reduction does not imply lossless quality for every scene.
 
 `experiment-options.patch` and the repository-owned option/graph-contract
 helpers add immutable per-interpolator trial options. The default keeps GPU
@@ -36,7 +48,7 @@ Experimental warp fusion, tail trimming and training are not enabled here.
 
 `runtime/source-origin.json` records the upstream commit/version and hashes
 of the patch, helpers, patched Swift files, package manifest, original model,
-and license notices, including the repository-owned experiment patch and
+and license notices, including the production model derivation and the experiment patch and
 helpers. All are included in the preparation recipe hash. It contains no
 local machine paths. The upstream
 [Apache-2.0 license](LICENSE) and [Practical-RIFE MIT notice](THIRD-PARTY.md)

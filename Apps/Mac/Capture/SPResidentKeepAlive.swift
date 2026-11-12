@@ -283,16 +283,18 @@ final class SPResidentKeepAliveAccounting {
 
 struct SPResidentKeepAliveCalibration: Encodable {
     let initialPilotIterations: UInt32 = 65_536
-    let targetMilliseconds: Double = 1
+    let targetMilliseconds = SPResidentCalibrationPolicy.targetMs
     let pilotCount = 5, validationCount = 5
-    let minimumValidationMs: Double = 0.5, maximumValidationMs: Double = 2
-    let iterationConversion = "initialPilotIterations * targetMilliseconds / pilotMedianMs; nearest, tiesAwayFromZero; out-of-UInt32 or <1 fails; one conversion, no retry"
+    let minimumValidationMs = SPResidentCalibrationPolicy.minimumMs, maximumValidationMs = SPResidentCalibrationPolicy.maximumMs
+    let maximumValidationRounds = SPResidentCalibrationPolicy.maximumValidationRounds
+    let iterationConversion = "Measured feedback: round(currentIterations * targetMilliseconds / medianMs); midpoint for a valid monotone low/high bracket; UInt32 bounds; at most three validation rounds; unchanged final [0.5,2]ms gate"
     var status = "not_started"
     var pilotMedianMs: Double?
     var scaledIterations: UInt32?
     var validationMedianMs: Double?
     var passed = false
     var firstFailure: String?
+    var validationRounds: [[String: Double]] = []
     var records: [SPResidentKeepAliveRecord] = []
 }
 
@@ -398,6 +400,7 @@ func spKeeperCalibrationDictionary(_ value: SPResidentKeepAliveCalibration) -> [
         "initialPilotIterations": value.initialPilotIterations, "targetMilliseconds": value.targetMilliseconds,
         "pilotCount": value.pilotCount, "validationCount": value.validationCount,
         "minimumValidationMs": value.minimumValidationMs, "maximumValidationMs": value.maximumValidationMs,
+        "maximumValidationRounds": value.maximumValidationRounds, "validationRounds": value.validationRounds,
         "iterationConversion": value.iterationConversion, "status": value.status,
         "passed": value.passed, "records": value.records.map(\.dictionary)
     ]
@@ -1015,6 +1018,7 @@ final class SPResidentKeepAlive {
                     try checkCancel()
                     guard try submit(phase: phase) else { throw SPResidentKeepAliveError.cancelled }
                     collectOldest()
+                    try checkCancel()
                     if let failure = report.firstFailure { throw SPResidentKeepAliveError.calibration(failure) }
                 }
             }
@@ -1028,24 +1032,44 @@ final class SPResidentKeepAlive {
             lock.lock(); report.calibration.status = "pilot"; lock.unlock()
             let pilot = try five("calibration_pilot")
             lock.lock(); report.calibration.pilotMedianMs = pilot; lock.unlock()
-            let scaled = (Double(report.calibration.initialPilotIterations) * report.calibration.targetMilliseconds / pilot).rounded()
-            guard scaled.isFinite, scaled >= 1, scaled <= Double(UInt32.max) else {
-                throw SPResidentKeepAliveError.calibration("keeper one-shot iteration conversion out of range")
+            guard let scaled = SPResidentCalibrationPolicy.nextIterations(
+                current: report.calibration.initialPilotIterations, observedMs: pilot) else {
+                throw SPResidentKeepAliveError.calibration("keeper pilot iteration conversion out of range")
             }
-            iterations = UInt32(scaled)
+            iterations = scaled
             lock.lock()
             report.calibration.scaledIterations = iterations
             report.calibration.status = "validation"
             lock.unlock()
-            let validation = try five("calibration_validation")
-            lock.lock(); report.calibration.validationMedianMs = validation; lock.unlock()
-            guard validation >= 0.5, validation <= 2 else {
-                throw SPResidentKeepAliveError.calibration("keeper validation outside [0.5,2]ms; no retry")
+            var lower: UInt32?, upper: UInt32?
+            for round in 1...SPResidentCalibrationPolicy.maximumValidationRounds {
+                let phase = round == 1 ? "calibration_validation" : "calibration_validation_\(round)"
+                let validation = try five(phase)
+                try checkCancel()
+                lock.lock()
+                report.calibration.validationMedianMs = validation
+                report.calibration.validationRounds.append([
+                    "round": Double(round), "iterations": Double(iterations), "medianMs": validation])
+                lock.unlock()
+                if SPResidentCalibrationPolicy.accepts(validation) {
+                    lock.lock(); report.calibration.passed = true; report.calibration.status = "passed"; lock.unlock()
+                    return
+                }
+                if validation < SPResidentCalibrationPolicy.minimumMs { lower = iterations }
+                else { upper = iterations }
+                guard round < SPResidentCalibrationPolicy.maximumValidationRounds,
+                      let next = SPResidentCalibrationPolicy.nextIterations(
+                        current: iterations, observedMs: validation, lower: lower, upper: upper),
+                      next != iterations else {
+                    let attempts = report.calibration.validationRounds.map {
+                        "round \(Int($0["round"]!)): \(Int($0["iterations"]!)) iterations, \($0["medianMs"]!)ms"
+                    }.joined(separator: "; ")
+                    throw SPResidentKeepAliveError.calibration(
+                        "keeper validation outside [0.5,2]ms after \(round) rounds; pilot \(pilot)ms; \(attempts)")
+                }
+                iterations = next
+                lock.lock(); report.calibration.scaledIterations = iterations; lock.unlock()
             }
-            lock.lock()
-            report.calibration.passed = true
-            report.calibration.status = "passed"
-            lock.unlock()
         } catch {
             lock.lock()
             report.calibration.status = "failed"
