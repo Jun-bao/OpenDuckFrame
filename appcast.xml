@@ -6,6 +6,27 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>OpenDuckFrame</title>
         <item>
+            <title>0.4.1</title>
+            <pubDate>Thu, 12 Nov 2026 20:24:13 +0800</pubDate>
+            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
+            <sparkle:version>36</sparkle:version>
+            <sparkle:shortVersionString>0.4.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>OpenDuckFrame 0.4.1</h2>
+<ul>
+  <li>移除显示器来源的全屏预览选项，增强画面跟随来源；旧配置不会重新开启该预览。</li>
+  <li>视频文件的全屏输出选项继续保留。</li>
+</ul>
+<ul>
+  <li>Removes the fullscreen preview option for display sources; output follows the source even when an older profile enabled that preview.</li>
+  <li>Keeps the fullscreen output option for video files.</li>
+</ul>
+<p>This community build is ad-hoc signed and supports signed in-app updates. It is not Apple notarized. macOS may ask for Screen Recording or Accessibility permission again after an upgrade. 此社区版未经过 Apple 公证，升级后可能需要重新授权。</p>
+]]></description>
+            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.4.1/OpenDuckFrame-0.4.1.zip" length="43104537" type="application/octet-stream" sparkle:edSignature="9cdjt/+Kw17OvIJY62BiYFSjX95UqP0i2uatC3Am7KNFBueLuwXbFQ+/wMTG8+LuLgiIiiszCEOlbsOmQwQaCA=="/>
+        </item>
+        <item>
             <title>0.4.0</title>
             <pubDate>Thu, 12 Nov 2026 18:12:04 +0800</pubDate>
             <link>https://github.com/Jun-bao/OpenDuckFrame</link>
@@ -49,29 +70,9 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
 ]]></description>
             <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.3.3/OpenDuckFrame-0.3.3.zip" length="42968206" type="application/octet-stream" sparkle:edSignature="v6RdPgQ1qLo5iAMeJp3q4hl/QodmtbBe2lMBxmykw1xaqF/qeyEPpIg7Z8GPXg/HMQtqMRv9Pgb5bRwDKL0MAw=="/>
         </item>
-        <item>
-            <title>0.3.2</title>
-            <pubDate>Wed, 11 Nov 2026 11:10:36 +0800</pubDate>
-            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
-            <sparkle:version>27</sparkle:version>
-            <sparkle:shortVersionString>0.3.2</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<!doctype html><html lang="zh-CN"><meta charset="utf-8"><h2>OpenDuckFrame 0.3.2</h2>
-<ul>
-<li>重新设计画质工作台，采用顶部导航、大预览区和右侧紧凑控制栏，关闭功能后自动收起参数。</li>
-<li>帧生成统一使用 RIFE 4.25，连续缓存默认开启，窗口增强自动跟随来源。</li>
-<li>完善配置管理与中英文、深浅色显示，修复倒计时取消、显示器输出修改和窗口放大、全屏布局。</li>
-<li>视频文件的帧生成设置统一进入画质工作台。</li>
-</ul>
-<p>本轮验证覆盖界面与交互、配置与按钮状态回归、Release 构建及应用包验证。</p>
-<h3>English</h3><p>A compact workbench with toolbar navigation, a larger preview and a right-hand control panel. Disabled features collapse their settings. Frame generation uses RIFE 4.25 with stream caching enabled by default. Window enhancement follows its source. This release improves configuration management, countdown cancellation, output-setting changes, localization, appearance and window/full-screen layout. File frame-generation settings open in the workbench.</p>
-<p>Requires Apple silicon and macOS 14 or later. This ad-hoc signed community build supports signed in-app updates and is not Apple notarized.</p></html>]]></description>
-            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.3.2/OpenDuckFrame-0.3.2.zip" length="43170785" type="application/octet-stream" sparkle:edSignature="psSGdTIwidYZkH9MS8ZwflX50bBBc4E0Q6yWT/GGLMs3U5v8lILk7Ajv0vrM8+ScxOevFx4M6QvFDEEGfX/uDA=="/>
-        </item>
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: C4bD9KkyUKhk3RQapq68wV4eMYQpkhRpSR8pxmaiROA0v59VLqzIgRAYydZS+Y1J/DImWU+Cj/7YJa8O71ETAg==
-length: 6032
+edSignature: wcmwQ56icarFHA8ksL9np+UcbRQaduRcRzDB4ELGG7ZmHMrL45gmR0lkevPCZkfOWbtrxGnPowedAsL5DcZmBw==
+length: 5459
 -->
