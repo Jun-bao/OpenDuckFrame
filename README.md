@@ -17,8 +17,8 @@ your Mac, without an account or uploading your picture.
 - **Frame generation.** ODF-VFI is the workbench's frame-generation model. Select a
   target frame rate or X2 / X3 / X4, and watch the actual output rate.
   Achieved performance depends on the source, settings and Mac.
-- **Upscaling, independently.** Use Lanczos or MetalFX, or try the supported
-  Apple and animation-oriented backends. Scaling and frame generation can be
+- **Upscaling, independently.** Choose ArtCNN C4F32 or the lighter C4F16 model for native 2× SDR
+  enhancement. Scaling and frame generation can be
   configured separately.
 - **A workbench for everyday use.** Save profiles for games, films and animation;
   compare original and enhanced output. Window output follows the source window;
@@ -42,7 +42,8 @@ Download the [Mac app](https://github.com/Jun-bao/OpenDuckFrame/releases/latest/
 or [browse releases](https://github.com/Jun-bao/OpenDuckFrame/releases).
 The community download is ad-hoc signed and **not Apple notarized**, so macOS may
 block its first launch. Only allow it in System Settings → Privacy & Security if
-you trust the source. Apple silicon and macOS 14+ are required.
+you trust the source. Updates may require granting Screen Recording or
+Accessibility access again because this community lane uses ad-hoc signing. Apple silicon and macOS 14+ are required.
 
 The app checks for signed updates and lets you choose when to install them.
 You can also use **OpenDuckFrame → Check for Updates**, or disable automatic
@@ -66,7 +67,7 @@ See [Quick start](docs/quick-start.md) for permissions and troubleshooting.
 |---|---|
 | App and local playback | Apple silicon Mac, macOS 14 or later |
 | Window / display capture | Screen Recording permission; protected content may not be capturable |
-| Apple super resolution | macOS 26+, supported hardware and input formats |
+| ArtCNN super resolution | SDR input up to 1920×1080; native 2× output up to 3840×2160 |
 | ODF-VFI frame generation | Apple silicon; throughput depends on resolution, quality and display rate |
 | Subtitle generation and translation | macOS 26+ and an available system language model |
 | Experimental animation backends | Additional models / runtimes; see [features](docs/features.md) |

@@ -16,6 +16,8 @@ For window and display capture, grant Screen Recording access in **System
 Settings → Privacy & Security** when macOS prompts. The precise setting name
 varies by macOS version. If access is denied, change it there and reopen the app
 when macOS requests it. Video-file playback does not need capture permission.
+Community updates are ad-hoc signed, so macOS may ask for capture or
+Accessibility permission again after an upgrade.
 
 ## Start with a simple setup
 
@@ -27,14 +29,14 @@ ODF-VFI; a new named configuration copies the current settings.
 
 1. Select the source. Display and video-file inputs can also use a selected
    output display.
-2. Start with one enhancement: frame generation at X2, or Lanczos / MetalFX
+2. Start with one enhancement: frame generation at X2, or ArtCNN C4F32 / C4F16
    scaling. Higher resolutions and multipliers require more processing time.
 3. For a window, press **Delayed Enhancement**, then focus the window you want
    to enhance before the countdown ends. The focused window is selected and
    enhancement starts automatically. The countdown defaults to 3 seconds and
    can be set from 1 to 20 seconds in **Settings**. Display and video-file inputs
    keep **Start Enhancement**. Compare **Original**, **Enhanced**, and
-   **Comparison** views; use the FPS overlay to observe actual output.
+   **Comparison** views in the output settings; use the FPS overlay to observe actual output.
 4. Save a profile once you have settings that work for your content.
 
 Frame generation creates intermediate pictures; it does not change the source

@@ -63,18 +63,20 @@ the requested multiplier on a slower device.
 
 ## Scaling and super resolution
 
-| Backend | Availability and scope |
-|---|---|
-| Lanczos | Spatial scaling without a learned model |
-| MetalFX | System spatial scaling, subject to the Mac's Metal capability |
-| Apple low-latency super resolution | macOS 26+; the workbench gates 720p input and supported 1.5× scaling |
-| Apple video super resolution | Experimental; supported scale factors and source conditions are checked at runtime |
-| Anime4K | Experimental animation-oriented 2× enhancement; optional runtime currently requires macOS 27 |
-| Real-CUGAN | Experimental animation enhancement; optional model / runtime and input-size limits apply |
+The normal workbench exposes ArtCNN C4F32 and the lighter C4F16 model.
+Both use the original upstream weights and produce native 2× luma; chroma is
+scaled separately. They support SDR input up to 1920×1080 and output up to
+3840×2160. HDR, cropped input and odd dimensions are rejected. Compare at the
+same output size; neither model guarantees recovery of real missing detail.
 
-Animation runtime selection currently limits input dimensions to 1920×1080.
-Apple video super resolution has a restricted live-input path; read the UI's
-availability state rather than assuming arbitrary source sizes work.
+Window inputs can optionally resize the selected source window before capture;
+that requires Accessibility permission and a resizable window. The source video
+must fill the captured window. Display inputs can reduce capture dimensions
+before processing. Local files use decoded source pixels directly.
+
+The repository retains Lanczos/MetalFX and experimental Apple, Anime4K and
+Real-CUGAN implementations. These are not selectable in the current normal
+workbench; their existence in source does not establish packaged availability.
 
 ## Local playback and subtitles
 
