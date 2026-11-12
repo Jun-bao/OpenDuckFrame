@@ -14,13 +14,18 @@ extension Notification.Name {
 private enum WorkbenchStyle {
     static let edge: CGFloat = 16
     static let gap: CGFloat = 12
-    static let inspectorWidth: CGFloat = 300
-    static let panelRadius: CGFloat = 12
     static let groupRadius: CGFloat = 10
+    // Grouped workbench form: a centered band of rounded groups with inset rows.
+    static let stageMargin: CGFloat = 20
+    static let stageMaxWidth: CGFloat = 640
+    static let groupSpacing: CGFloat = 14
+    static let rowInset: CGFloat = 12
+    static let rowPadding: CGFloat = 6
+    static let rowHeight: CGFloat = 36
+    static let controlWidth: CGFloat = 220
     static var titleFont: NSFont { .systemFont(ofSize: 20, weight: .semibold) }
     static var brandFont: NSFont { .systemFont(ofSize: 13, weight: .semibold) }
     static var captionFont: NSFont { .systemFont(ofSize: 11) }
-    @MainActor static var labelWidth: CGFloat { EnhancementText.chinese ? 84 : 104 }
 }
 
 @MainActor enum EnhancementText {
@@ -1069,6 +1074,16 @@ private final class CollapsingLabel: NSTextField {
     }
 }
 
+/// Wraps at the width layout assigns, so text reflows when the window resizes.
+private final class FittingLabel: NSTextField {
+    override func layout() {
+        super.layout()
+        guard abs(preferredMaxLayoutWidth - bounds.width) > 0.5 else { return }
+        preferredMaxLayoutWidth = bounds.width
+        invalidateIntrinsicContentSize()
+    }
+}
+
 final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate, NSTextFieldDelegate, NSToolbarDelegate {
     /// Capture callbacks call only the processor's queueing entry points.
     private final class CaptureProcessorSink: @unchecked Sendable {
@@ -1148,14 +1163,14 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private var shareableDisplays: [SCDisplayBox] = []
     private var ownCaptureApplications: [SCRunningApplication] = []
 
-    private let statusLabel = NSTextField(labelWithString: "")
+    private let statusLabel = FittingLabel(labelWithString: "")
     private var lastWindowOptimizationStatus = ""
     private let statsLabel = CollapsingLabel(labelWithString: "")
     private let budgetLabel = CollapsingLabel(labelWithString: "")
     private let planLabel = NSTextField(wrappingLabelWithString: "")
     private let sizeChainLabel = NSTextField(wrappingLabelWithString: "")
-    private let airBetaStatusLabel = NSTextField(wrappingLabelWithString: "")
-    private let airBetaReasonLabel = NSTextField(wrappingLabelWithString: "")
+    private let airBetaStatusLabel = FittingLabel(wrappingLabelWithString: "")
+    private let airBetaReasonLabel = FittingLabel(wrappingLabelWithString: "")
     private let sourceLabel = NSTextField(labelWithString: "")
     private let fileLimitLabel = NSTextField(wrappingLabelWithString: "")
     private let interpolationSwitch = NSSwitch()
@@ -1177,7 +1192,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let sourceWindowHelp = NSButton(title: "", target: nil, action: nil)
     private var srInputRow: NSView?
     private var sourceWindowRow: NSView?
-    private let sourceWindowHint = NSTextField(wrappingLabelWithString: "")
+    private let sourceWindowHint = FittingLabel(wrappingLabelWithString: "")
     private var sourceWindowPreparing = false
     private var sourceWindowConfirmedAfter: UInt64 = 0
     private var sourceWindowConfirmedStarted: TimeInterval = 0
@@ -1225,7 +1240,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let configActions = NSPopUpButton(frame: .zero, pullsDown: true)
     private var scaleBody: NSView?
     private var framesBody: NSView?
-    private var formLabels: [(NSTextField, NSView, NSLayoutConstraint)] = []
+    private var targetRateRow: NSView?
+    private var multiplierRow: NSView?
+    private var dimensionRow: NSView?
+    private var fullscreenRow: NSView?
+    private var viewModeRow: NSView?
+    private var formLabels: [(NSTextField, NSView)] = []
     private var hasPendingFormChanges = false
     private let captureCapPopup = NSPopUpButton()
     private let recentStack = NSStackView()
@@ -1273,7 +1293,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let libraryHost = NSView()
     private let enginePopup = AnchoredPopUpButton()
     private let sourceKindControl = NSSegmentedControl(labels: ["窗口", "显示器", "视频文件"], trackingMode: .selectOne, target: nil, action: nil)
-    private let phaseLabel = NSTextField(wrappingLabelWithString: "")
+    private let phaseLabel = FittingLabel(wrappingLabelWithString: "")
     private let compatibilityButton = NSButton(title: "改用 ODF-VFI", target: nil, action: nil)
     private var page = 0
     private var pendingApply: EnhancementProfile?
@@ -1612,48 +1632,46 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private func build() -> NSView {
         let root = NSView()
         root.wantsLayer = true
-        let inspector = glass()
-        for view in [inspector, stageHost, sourceHost, libraryHost] as [NSView] {
+        for view in [stageHost, sourceHost, libraryHost] {
             view.translatesAutoresizingMaskIntoConstraints = false
+            root.addSubview(view)
         }
-        for view in [stageHost, sourceHost, libraryHost] { root.addSubview(view) }
         appearanceControl.target = self
         appearanceControl.action = #selector(appearanceChanged)
         languageControl.target = self
         languageControl.action = #selector(languageChanged)
         languageControl.selectedSegment = EnhancementText.chinese ? 0 : 1
 
-        viewMode.translatesAutoresizingMaskIntoConstraints = false
         viewMode.segmentDistribution = .fillEqually
         viewMode.isEnabled = !SPRifeExperiments.airBeta
-        let source = column([sourceBlock(), viewMode])
+        // Source stays pinned above the settings; status and actions stay pinned
+        // below them. Only the settings scroll, so the footer never covers a row.
+        let source = stageBand(sourceBlock(), top: 12, bottom: 12)
         let sourceDivider = divider()
-        let inspectorScroll = scrolled(inspectorColumn(), inset: 16)
+        let inspectorScroll = scrolled(stageBand(inspectorColumn(), top: 16, bottom: 20), inset: 0)
         let runDivider = divider()
-        let run = runPanel()
-        let content = inspector.content
+        let run = stageBand(runPanel(), top: 12, bottom: 16)
         for view in [source, sourceDivider, inspectorScroll, runDivider, run] {
             view.translatesAutoresizingMaskIntoConstraints = false
-            content.addSubview(view)
+            stageHost.addSubview(view)
         }
-        stageHost.addSubview(inspector)
         let sourceScroll = scrolled(readableColumn(sourceColumn(), maxWidth: 900))
         let libraryScroll = scrolled(readableColumn(libraryColumn(), maxWidth: 760))
         sourceHost.addSubview(sourceScroll)
         libraryHost.addSubview(libraryScroll)
         NSLayoutConstraint.activate([
-            stageHost.topAnchor.constraint(equalTo: root.safeAreaLayoutGuide.topAnchor, constant: 10),
-            stageHost.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: WorkbenchStyle.edge),
-            stageHost.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -WorkbenchStyle.edge),
-            stageHost.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -WorkbenchStyle.edge),
-            sourceHost.leadingAnchor.constraint(equalTo: stageHost.leadingAnchor),
-            sourceHost.trailingAnchor.constraint(equalTo: stageHost.trailingAnchor),
-            sourceHost.topAnchor.constraint(equalTo: stageHost.topAnchor),
-            sourceHost.bottomAnchor.constraint(equalTo: stageHost.bottomAnchor),
-            libraryHost.leadingAnchor.constraint(equalTo: stageHost.leadingAnchor),
-            libraryHost.trailingAnchor.constraint(equalTo: stageHost.trailingAnchor),
-            libraryHost.topAnchor.constraint(equalTo: stageHost.topAnchor),
-            libraryHost.bottomAnchor.constraint(equalTo: stageHost.bottomAnchor),
+            stageHost.topAnchor.constraint(equalTo: root.safeAreaLayoutGuide.topAnchor),
+            stageHost.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            stageHost.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            stageHost.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            sourceHost.topAnchor.constraint(equalTo: root.safeAreaLayoutGuide.topAnchor, constant: 10),
+            sourceHost.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: WorkbenchStyle.edge),
+            sourceHost.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -WorkbenchStyle.edge),
+            sourceHost.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -WorkbenchStyle.edge),
+            libraryHost.leadingAnchor.constraint(equalTo: sourceHost.leadingAnchor),
+            libraryHost.trailingAnchor.constraint(equalTo: sourceHost.trailingAnchor),
+            libraryHost.topAnchor.constraint(equalTo: sourceHost.topAnchor),
+            libraryHost.bottomAnchor.constraint(equalTo: sourceHost.bottomAnchor),
             sourceScroll.leadingAnchor.constraint(equalTo: sourceHost.leadingAnchor),
             sourceScroll.trailingAnchor.constraint(equalTo: sourceHost.trailingAnchor),
             sourceScroll.topAnchor.constraint(equalTo: sourceHost.topAnchor),
@@ -1662,26 +1680,22 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             libraryScroll.trailingAnchor.constraint(equalTo: libraryHost.trailingAnchor),
             libraryScroll.topAnchor.constraint(equalTo: libraryHost.topAnchor),
             libraryScroll.bottomAnchor.constraint(equalTo: libraryHost.bottomAnchor),
-            inspector.topAnchor.constraint(equalTo: stageHost.topAnchor),
-            inspector.bottomAnchor.constraint(equalTo: stageHost.bottomAnchor),
-            inspector.trailingAnchor.constraint(equalTo: stageHost.trailingAnchor),
-            inspector.leadingAnchor.constraint(equalTo: stageHost.leadingAnchor),
-            source.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
-            source.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            source.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
-            sourceDivider.topAnchor.constraint(equalTo: source.bottomAnchor, constant: 12),
-            sourceDivider.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            sourceDivider.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            source.topAnchor.constraint(equalTo: stageHost.topAnchor),
+            source.leadingAnchor.constraint(equalTo: stageHost.leadingAnchor),
+            source.trailingAnchor.constraint(equalTo: stageHost.trailingAnchor),
+            sourceDivider.topAnchor.constraint(equalTo: source.bottomAnchor),
+            sourceDivider.leadingAnchor.constraint(equalTo: stageHost.leadingAnchor),
+            sourceDivider.trailingAnchor.constraint(equalTo: stageHost.trailingAnchor),
             inspectorScroll.topAnchor.constraint(equalTo: sourceDivider.bottomAnchor),
-            inspectorScroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            inspectorScroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            inspectorScroll.leadingAnchor.constraint(equalTo: stageHost.leadingAnchor),
+            inspectorScroll.trailingAnchor.constraint(equalTo: stageHost.trailingAnchor),
             inspectorScroll.bottomAnchor.constraint(equalTo: runDivider.topAnchor),
-            runDivider.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            runDivider.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            run.topAnchor.constraint(equalTo: runDivider.bottomAnchor, constant: 12),
-            run.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            run.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
-            run.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
+            runDivider.leadingAnchor.constraint(equalTo: stageHost.leadingAnchor),
+            runDivider.trailingAnchor.constraint(equalTo: stageHost.trailingAnchor),
+            run.topAnchor.constraint(equalTo: runDivider.bottomAnchor),
+            run.leadingAnchor.constraint(equalTo: stageHost.leadingAnchor),
+            run.trailingAnchor.constraint(equalTo: stageHost.trailingAnchor),
+            run.bottomAnchor.constraint(equalTo: stageHost.bottomAnchor),
         ])
         showPage(0)
         rebuildConfigRows()
@@ -1696,14 +1710,13 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private func updateSourceChrome(hasSource: Bool) {
         sourceActionButton?.isHidden = false
         sourceMetaLabel.isHidden = !hasSource || sourceMetaLabel.stringValue.isEmpty
-        viewMode.isHidden = !hasSource || SPRifeExperiments.airBeta
+        (viewModeRow ?? viewMode).isHidden = !hasSource || SPRifeExperiments.airBeta
         refreshActions()
     }
 
 
     private func refreshFormLabels() {
-        for (label, view, width) in formLabels {
-            width.constant = WorkbenchStyle.labelWidth
+        for (label, view) in formLabels {
             let control = (view as? NSControl) ?? view.subviews.compactMap { $0 as? NSControl }.first
             label.textColor = control?.isEnabled == false ? .tertiaryLabelColor : .labelColor
         }
@@ -1923,16 +1936,22 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let sourceText = NSStackView(views: [sourceStripLabel, sourceMetaLabel])
         sourceText.orientation = .vertical
         sourceText.alignment = .leading
-        sourceText.spacing = 1
+        sourceText.spacing = 2
         sourceText.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let changeSource = button(EnhancementText.t("Change Window", "更换窗口"), #selector(changeWindow))
         changeSource.setContentCompressionResistancePriority(.required, for: .horizontal)
         sourceActionButton = changeSource
-        let current = NSStackView(views: [sourceText, changeSource])
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+        let current = NSStackView(views: [sourceText, spacer, changeSource])
         current.orientation = .horizontal
         current.alignment = .centerY
-        current.spacing = 8
-        return column([sourceKindControl, current])
+        current.distribution = .fill
+        current.spacing = 12
+        let currentRow = FormRow(current, padding: 8)
+        // Keep room for the size line so choosing a source does not shift the settings below.
+        currentRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 50).isActive = true
+        return column([sourceKindControl, formGroup([currentRow])], spacing: 10)
     }
 
     private func column(_ views: [NSView], spacing: CGFloat = 8) -> NSStackView {
@@ -1951,13 +1970,50 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         return line
     }
 
+    /// The first row of a switchable group: its title and the switch that enables it.
     private func sectionHeader(_ title: String, _ toggle: NSView) -> NSView {
         let spacer = NSView()
-        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        spacer.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
         let header = NSStackView(views: [heading(title), spacer, toggle])
         header.orientation = .horizontal
         header.alignment = .centerY
-        return header
+        header.distribution = .fill
+        return FormRow(header)
+    }
+
+    /// A rounded settings group whose rows are separated by inset hairlines.
+    private func formGroup(_ rows: [NSView]) -> NSView {
+        (rows.first as? FormRow)?.separated = false
+        let group = FormGroup()
+        let stack = column(rows, spacing: 0)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        group.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: group.leadingAnchor, constant: WorkbenchStyle.rowInset),
+            stack.trailingAnchor.constraint(equalTo: group.trailingAnchor, constant: -WorkbenchStyle.rowInset),
+            stack.topAnchor.constraint(equalTo: group.topAnchor, constant: 2),
+            stack.bottomAnchor.constraint(equalTo: group.bottomAnchor, constant: -2),
+        ])
+        return group
+    }
+
+    /// A full-width band whose content keeps the stage margins and a readable maximum width.
+    private func stageBand(_ content: NSView, top: CGFloat, bottom: CGFloat) -> NSView {
+        let host = NSView()
+        content.translatesAutoresizingMaskIntoConstraints = false
+        host.addSubview(content)
+        let fill = content.widthAnchor.constraint(equalTo: host.widthAnchor, constant: -2 * WorkbenchStyle.stageMargin)
+        // Preferred fill must yield to window resizing, whose priority is 500.
+        fill.priority = .dragThatCannotResizeWindow
+        NSLayoutConstraint.activate([
+            fill,
+            content.widthAnchor.constraint(lessThanOrEqualToConstant: WorkbenchStyle.stageMaxWidth),
+            content.leadingAnchor.constraint(greaterThanOrEqualTo: host.leadingAnchor, constant: WorkbenchStyle.stageMargin),
+            content.centerXAnchor.constraint(equalTo: host.centerXAnchor),
+            content.topAnchor.constraint(equalTo: host.topAnchor, constant: top),
+            content.bottomAnchor.constraint(equalTo: host.bottomAnchor, constant: -bottom),
+        ])
+        return host
     }
 
     private func readableColumn(_ content: NSView, maxWidth: CGFloat) -> NSView {
@@ -2004,73 +2060,61 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
     }
 
-    private final class GlassBox: NSView {
-        let content = NSView()
+    /// Grouped-form surface: a faint fill and hairline edge that follow light and dark appearance.
+    private final class FormGroup: NSView {
+        override var wantsUpdateLayer: Bool { true }
         override init(frame: NSRect) {
             super.init(frame: frame)
             wantsLayer = true
-            layer?.cornerRadius = WorkbenchStyle.panelRadius
-            content.translatesAutoresizingMaskIntoConstraints = false
-            content.wantsLayer = true
-            content.layer?.cornerRadius = WorkbenchStyle.panelRadius
-            if #available(macOS 26.0, *) {
-                let glass = NSGlassEffectView()
-                glass.translatesAutoresizingMaskIntoConstraints = false
-                glass.cornerRadius = WorkbenchStyle.panelRadius
-                glass.contentView = content
-                addSubview(glass)
-                pin(glass, to: self)
-            } else {
-                let visual = NSVisualEffectView()
-                visual.material = .underWindowBackground
-                visual.blendingMode = .withinWindow
-                visual.state = .followsWindowActiveState
-                visual.translatesAutoresizingMaskIntoConstraints = false
-                addSubview(visual)
-                pin(visual, to: self)
-                visual.addSubview(content)
-            }
-            pin(content, to: self)
-            refreshPlate()
+            layer?.cornerRadius = WorkbenchStyle.groupRadius
+            layer?.cornerCurve = .continuous
         }
         required init?(coder: NSCoder) { nil }
         override func viewDidChangeEffectiveAppearance() {
             super.viewDidChangeEffectiveAppearance()
-            refreshPlate()
+            needsDisplay = true
         }
-        override func layout() {
-            super.layout()
-            refreshPlate()
+        override func viewDidChangeBackingProperties() {
+            super.viewDidChangeBackingProperties()
+            needsDisplay = true
         }
-        func refreshPlate() {
-            let appearance = window?.effectiveAppearance ?? effectiveAppearance
-            var glassAvailable = false
-            if #available(macOS 26.0, *) { glassAvailable = true }
-            appearance.performAsCurrentDrawingAppearance {
-                // Liquid Glass draws its own fill and depth; older systems get a
-                // translucent plate over the window material instead of opaque white.
-                content.layer?.backgroundColor = glassAvailable ? NSColor.clear.cgColor
-                    : NSColor.controlBackgroundColor.withAlphaComponent(0.55).cgColor
-                content.layer?.borderWidth = 0.5
-                content.layer?.borderColor = NSColor.separatorColor.cgColor
-                layer?.shadowColor = NSColor.black.cgColor
+        override func updateLayer() {
+            effectiveAppearance.performAsCurrentDrawingAppearance {
+                layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.045).cgColor
+                layer?.borderColor = NSColor.separatorColor.cgColor
             }
-            layer?.shadowOpacity = glassAvailable ? 0 : 0.06
-            layer?.shadowRadius = 4
-            layer?.shadowOffset = CGSize(width: 0, height: 1)
-            layer?.masksToBounds = false
-        }
-        private func pin(_ child: NSView, to parent: NSView) {
-            NSLayoutConstraint.activate([
-                child.leadingAnchor.constraint(equalTo: parent.leadingAnchor),
-                child.trailingAnchor.constraint(equalTo: parent.trailingAnchor),
-                child.topAnchor.constraint(equalTo: parent.topAnchor),
-                child.bottomAnchor.constraint(equalTo: parent.bottomAnchor),
-            ])
+            layer?.borderWidth = 1 / max(1, window?.backingScaleFactor ?? 2)
         }
     }
 
-    private func glass() -> GlassBox { GlassBox() }
+    /// One form row. Rows after the first in a group draw a separator above themselves,
+    /// so hiding a row also hides its separator.
+    private final class FormRow: NSView {
+        private let line = NSBox()
+        var separated = true { didSet { line.isHidden = !separated } }
+        init(_ content: NSView, padding: CGFloat = WorkbenchStyle.rowPadding) {
+            super.init(frame: .zero)
+            line.boxType = .separator
+            for view in [line, content] {
+                view.translatesAutoresizingMaskIntoConstraints = false
+                addSubview(view)
+            }
+            let compact = heightAnchor.constraint(equalToConstant: WorkbenchStyle.rowHeight)
+            compact.priority = .defaultLow
+            NSLayoutConstraint.activate([
+                line.topAnchor.constraint(equalTo: topAnchor),
+                line.leadingAnchor.constraint(equalTo: leadingAnchor),
+                line.trailingAnchor.constraint(equalTo: trailingAnchor),
+                content.leadingAnchor.constraint(equalTo: leadingAnchor),
+                content.trailingAnchor.constraint(equalTo: trailingAnchor),
+                content.centerYAnchor.constraint(equalTo: centerYAnchor),
+                content.topAnchor.constraint(greaterThanOrEqualTo: topAnchor, constant: padding),
+                heightAnchor.constraint(greaterThanOrEqualToConstant: WorkbenchStyle.rowHeight),
+                compact,
+            ])
+        }
+        required init?(coder: NSCoder) { nil }
+    }
 
     private func fill(_ box: NSView, with stack: NSView) {
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -2164,66 +2208,87 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         configurePopups()
         var items: [NSView] = []
         if SPRifeExperiments.airBeta {
-            items.append(airBetaInspector())
+            items.append(formGroup([FormRow(airBetaInspector(), padding: 10)]))
         } else {
             configPopup.target = self
             configPopup.action = #selector(configPopupChanged(_:))
-            configPopup.setContentHuggingPriority(.defaultLow, for: .horizontal)
             (configActions.cell as? NSPopUpButtonCell)?.arrowPosition = .noArrow
             configActions.setAccessibilityLabel(EnhancementText.t("Manage configs", "管理配置"))
-            let configControls = NSStackView(views: [configPopup, configActions])
-            configControls.spacing = 4
-            items.append(row(EnhancementText.t("Config", "配置"), configControls))
+            items.append(formGroup([row(EnhancementText.t("Config", "配置"), configPopup, help: configActions)]))
 
+            for control in [interpolationSwitch, scaleSwitch] { control.controlSize = .small }
+            for control in [rateMode, multiplierControl] { control.segmentDistribution = .fillEqually }
             let frameQuality = row(EnhancementText.t("Quality", "质量"), qualityPopup)
             interpolationQualityRow = frameQuality
-            let customRate = row("n/d", pair(fpsNum, fpsDen))
+            let fixedRate = row(EnhancementText.t("Target FPS", "目标帧率"), fpsPopup)
+            targetRateRow = fixedRate
+            let customRate = row("n/d", pair(fpsNum, fpsDen, joinedBy: "/"))
             customRateRow = customRate
+            let multiplier = row(EnhancementText.t("Multiplier", "倍率"), multiplierControl)
+            multiplierRow = multiplier
             phaseLabel.maximumNumberOfLines = 0
+            phaseLabel.font = WorkbenchStyle.captionFont
             phaseLabel.textColor = .secondaryLabelColor
-            phaseLabel.preferredMaxLayoutWidth = WorkbenchStyle.inspectorWidth - 32
             compatibilityButton.target = self
             compatibilityButton.action = #selector(useFrameRateConversion)
             let frames = column([row(EnhancementText.t("Engine", "引擎"), enginePopup), frameQuality,
-                                 phaseLabel, compatibilityButton, rateMode, fpsPopup, customRate, multiplierControl])
+                                 phaseLabel, compatibilityButton,
+                                 row(EnhancementText.t("Frame rate", "帧率"), rateMode),
+                                 fixedRate, customRate, multiplier], spacing: 0)
+            frames.setCustomSpacing(8, after: phaseLabel)
+            frames.setCustomSpacing(8, after: compatibilityButton)
             framesBody = frames
             let qualityRow = row(EnhancementText.t("Denoising", "降噪"), scaleQualityPopup)
             scaleQualityRow = qualityRow
             srInputHelp.bezelStyle = .helpButton
             srInputHelp.setAccessibilityLabel(EnhancementText.t("SR input size help", "超分输入尺寸帮助"))
-            let srInputControls = NSStackView(views: [srInputPopup, srInputHelp])
-            srInputControls.orientation = .horizontal
-            srInputControls.alignment = .centerY
-            srInputControls.spacing = 4
-            srInputControls.distribution = .fill
-            srInputHelp.setContentHuggingPriority(.required, for: .horizontal)
-            let srRow = row(EnhancementText.t("SR input size", "超分输入尺寸"), srInputControls)
+            let srRow = row(EnhancementText.t("SR input size", "超分输入尺寸"), srInputPopup, help: srInputHelp)
             srInputRow = srRow
             sourceWindowHelp.bezelStyle = .helpButton
             sourceWindowHelp.setAccessibilityLabel(EnhancementText.t("Source window size help", "来源窗口尺寸帮助"))
             sourceWindowHelp.toolTip = EnhancementText.t("The selected window is resized before capture. The video must fill that window for the video itself to be 720p; browser toolbars and borders are not video. Requires Accessibility permission and a resizable window. Try 720p first; final clarity depends on the source and engine.", "开始时会调整所选来源窗口，再采集画面。视频须铺满该窗口，视频本身才可能是720p；浏览器工具栏和边框不是视频。需要辅助功能权限且窗口可调整大小。建议先从720p试起，最终清晰度取决于片源与引擎。")
-            let sourceControls = NSStackView(views: [sourceWindowPopup, sourceWindowHelp])
-            sourceControls.orientation = .horizontal
-            sourceControls.alignment = .centerY
-            sourceControls.spacing = 4
-            sourceControls.distribution = .fill
-            sourceWindowHelp.setContentHuggingPriority(.required, for: .horizontal)
-            let windowRow = row(EnhancementText.t("Source window", "来源窗口尺寸"), sourceControls)
+            let windowRow = row(EnhancementText.t("Source window", "来源窗口尺寸"), sourceWindowPopup, help: sourceWindowHelp)
             sourceWindowRow = windowRow
             sourceWindowHint.stringValue = EnhancementText.t("Use a dedicated or picture-in-picture video window; the video must fill the captured window.", "请使用独立或画中画视频窗口；视频须铺满采集画面。")
+            sourceWindowHint.font = WorkbenchStyle.captionFont
             sourceWindowHint.textColor = .secondaryLabelColor
             sourceWindowHint.maximumNumberOfLines = 0
-            sourceWindowHint.preferredMaxLayoutWidth = WorkbenchStyle.inspectorWidth - 32
+            let dimensions = row("W×H", pair(widthField, heightField, joinedBy: "×"))
+            dimensionRow = dimensions
             let scale = column([row(EnhancementText.t("Technology", "技术"), scalePopup), qualityRow,
                                 srRow, windowRow, sourceWindowHint,
                                 row(EnhancementText.t("Output size", "输出尺寸"), sizePopup),
-                                row("W×H", pair(widthField, heightField))])
+                                dimensions], spacing: 0)
+            scale.setCustomSpacing(8, after: sourceWindowHint)
             scaleBody = scale
-            items += [divider(), sectionHeader(EnhancementText.t("Frame generation", "帧生成"), interpolationSwitch), frames,
-                      divider(), sectionHeader(EnhancementText.t("Scale", "缩放 / 超分"), scaleSwitch), scale]
+            items += [formGroup([sectionHeader(EnhancementText.t("Frame generation", "帧生成"), interpolationSwitch), frames]),
+                      formGroup([sectionHeader(EnhancementText.t("Scale", "缩放 / 超分"), scaleSwitch), scale])]
         }
-        if p0ControlsEnabled { items += [divider(), p0Controls()] }
-        return column(items, spacing: 12)
+        items.append(outputGroup())
+        if p0ControlsEnabled { items.append(p0Controls()) }
+        return column(items, spacing: WorkbenchStyle.groupSpacing)
+    }
+
+    /// Where and how the result is shown: display, fullscreen, view mode and the FPS overlay.
+    private func outputGroup() -> NSView {
+        fpsSwitch.state = FPSPreference.enabled(in: .standard) ? .on : .off
+        fpsSwitch.target = self
+        fpsSwitch.action = #selector(fpsVisibilityChanged)
+        fpsSwitch.controlSize = .small
+        var rows: [NSView] = []
+        if !SPRifeExperiments.airBeta {
+            let spacer = NSView()
+            spacer.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+            let check = NSStackView(views: [fullscreenCheck, spacer])
+            check.distribution = .fill
+            let fullscreen = FormRow(check)
+            fullscreenRow = fullscreen
+            let viewRow = row(EnhancementText.t("View", "画面"), viewMode)
+            viewModeRow = viewRow
+            rows += [row(EnhancementText.t("Output to", "输出到"), displayPopup), fullscreen, viewRow]
+        }
+        rows.append(row(EnhancementText.t("Show FPS", "显示帧率"), fpsSwitch))
+        return formGroup(rows)
     }
 
     private func p0Controls() -> NSView {
@@ -2256,7 +2321,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         stack.addArrangedSubview(airBetaStatusLabel)
         stack.addArrangedSubview(airBetaReasonLabel)
         for label in [airBetaStatusLabel, airBetaReasonLabel] {
-            label.preferredMaxLayoutWidth = 220
             label.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
         return stack
@@ -2264,19 +2328,15 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private func runPanel() -> NSView {
         let start = button(EnhancementText.t("Delayed Enhancement", "延迟增强"), #selector(start), primary: true)
-        let stop = button(EnhancementText.t("Stop", "停止"), #selector(stop), primary: true)
+        let stop = button(EnhancementText.t("Stop", "停止"), #selector(stop))
+        stop.controlSize = .large
         startButton = start
         stopButton = stop
         stop.isHidden = true
-        fpsSwitch.state = FPSPreference.enabled(in: .standard) ? .on : .off
-        fpsSwitch.target = self
-        fpsSwitch.action = #selector(fpsVisibilityChanged)
-        let fpsRow = sectionHeader(EnhancementText.t("Show FPS", "显示帧率"), fpsSwitch)
         statusLabel.font = .systemFont(ofSize: 13, weight: .medium)
         statusLabel.lineBreakMode = .byWordWrapping
         statusLabel.maximumNumberOfLines = 2
         statusLabel.cell?.truncatesLastVisibleLine = true
-        statusLabel.preferredMaxLayoutWidth = WorkbenchStyle.inspectorWidth - 32
         for label in [statsLabel, budgetLabel] {
             label.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
             label.textColor = .secondaryLabelColor
@@ -2285,15 +2345,13 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             label.isHidden = label.stringValue.isEmpty
         }
         let statusColumn = column([statusLabel, statsLabel, budgetLabel], spacing: 2)
-        var views: [NSView] = []
-        if !SPRifeExperiments.airBeta {
-            views += [row(EnhancementText.t("Output to", "输出到"), displayPopup), fullscreenCheck]
-        }
-        views += [fpsRow, statusColumn, start, stop]
-        let stack = column(views)
-        stack.setCustomSpacing(12, after: fpsRow)
-        stack.setCustomSpacing(10, after: statusColumn)
-        return stack
+        // Stop sits before the default action; whichever is visible alone takes the full width.
+        let actions = NSStackView(views: [stop, start])
+        actions.orientation = .horizontal
+        actions.distribution = .fillEqually
+        actions.spacing = 10
+        actions.detachesHiddenViews = true
+        return column([statusColumn, actions], spacing: 10)
     }
 
     private final class TopDownDocument: NSView {
@@ -2937,29 +2995,47 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         stopButton?.isHidden = !enhancing && !filePreparing
     }
 
-    private func row(_ title: String, _ control: NSView) -> NSView {
-        let stack = NSStackView()
+    /// Form controls share one trailing column; switches keep their native size.
+    private func row(_ title: String, _ control: NSView, help: NSButton? = nil) -> NSView {
+        let label = NSTextField(labelWithString: title)
+        label.lineBreakMode = .byTruncatingTail
+        label.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        label.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(751), for: .horizontal)
+        formLabels.append((label, control))
+        help?.setContentHuggingPriority(.required, for: .horizontal)
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+        control.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        if !(control is NSSwitch) {
+            let width = control.widthAnchor.constraint(equalToConstant: WorkbenchStyle.controlWidth)
+            width.priority = .defaultHigh
+            width.isActive = true
+        }
+        // Long names truncate inside their pop-up buttons before the row label does.
+        for popup in ([control] + control.subviews).compactMap({ $0 as? NSPopUpButton }) where !popup.pullsDown {
+            popup.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        }
+        var views: [NSView] = [label]
+        if let help { views.append(help) }
+        views += [spacer, control]
+        let stack = NSStackView(views: views)
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.distribution = .fill
+        stack.spacing = 8
+        if help != nil { stack.setCustomSpacing(4, after: label) }
+        return FormRow(stack)
+    }
+
+    private func pair(_ a: NSTextField, _ b: NSTextField, joinedBy symbol: String) -> NSView {
+        let join = NSTextField(labelWithString: symbol)
+        join.textColor = .secondaryLabelColor
+        let stack = NSStackView(views: [a, join, b])
         stack.orientation = .horizontal
         stack.alignment = .centerY
         stack.spacing = 6
-        let label = NSTextField(labelWithString: title)
-        let width = label.widthAnchor.constraint(equalToConstant: WorkbenchStyle.labelWidth)
-        width.isActive = true
-        formLabels.append((label, control, width))
-        stack.addArrangedSubview(label)
-        control.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        control.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        stack.addArrangedSubview(control)
-        return stack
-    }
-
-    private func pair(_ a: NSTextField, _ b: NSTextField) -> NSView {
-        let stack = NSStackView()
-        stack.orientation = .horizontal
-        stack.spacing = 6
-        stack.distribution = .fillEqually
-        stack.addArrangedSubview(a)
-        stack.addArrangedSubview(b)
+        join.setContentHuggingPriority(.required, for: .horizontal)
+        a.widthAnchor.constraint(equalTo: b.widthAnchor).isActive = true
         return stack
     }
 
@@ -4393,7 +4469,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             : EnhancementText.t("Fullscreen (Esc to return)", "全屏预览（Esc 返回交互）")
         fullscreenCheck.toolTip = profile.sourceKind == "file" ? nil
             : EnhancementText.t("Fullscreen viewer (Esc to return to interaction)", "全屏预览（Esc 返回交互）")
-        fullscreenCheck.isHidden = profile.sourceKind == "window"
+        fullscreenRow?.isHidden = profile.sourceKind == "window"
         fullscreenCheck.isEnabled = profile.sourceKind != "window"
         fullscreenCheck.state = profile.outputFullscreen ? .on : .off
         let editable = WorkbenchDimensionPolicy.editable(sizeIndex: sizePopup.indexOfSelectedItem, scaleEnabled: scaleSwitch.state == .on)
@@ -4402,13 +4478,15 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             if field.isSelectable != editable { field.isSelectable = editable }
             if field.currentEditor() == nil { field.stringValue = WorkbenchDimensionPolicy.text(value) }
         }
+        // Width and height are only entered for a custom output size; presets name their size.
+        dimensionRow?.isHidden = !editable
         sizePopup.item(at: 0)?.title = EnhancementText.t("2× source (model native)", "2×来源（模型原生）")
         sizePopup.item(at: 5)?.title = EnhancementText.t("2× source (model native)", "2×来源（模型原生）")
         scaleQualityRow?.isHidden = true
         let targetRate = rateMode.selectedSegment == 0
-        fpsPopup.isHidden = !targetRate
+        targetRateRow?.isHidden = !targetRate
         customRateRow?.isHidden = !targetRate || fpsPopup.indexOfSelectedItem != 7
-        multiplierControl.isHidden = targetRate
+        multiplierRow?.isHidden = targetRate
         if profile.interpolationEngineID == "apple.lowlatency" {
             phaseLabel.stringValue = lowLatencyPhaseText()
         }
