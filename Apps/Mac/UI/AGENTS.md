@@ -16,7 +16,7 @@ Hardware/configuration auto-detection is deferred. Keep its suggestions and scor
 Preserve configuration add/rename/delete, preset metadata and saved-profile migration.
 The three-step first-use coach marks are implemented in [WorkbenchOnboarding.swift](Enhancement/WorkbenchOnboarding.swift); keep them skippable, source-specific and replayable from Help.
 Preserve the no-source delayed window-selection path, countdown cancellation, restart after Stop and pending Apply Changes actions.
-Display and file output retain their fullscreen controls; window follow uses its existing source-aligned behavior.
+File output retains its fullscreen control; display and window output follow their source without a fullscreen preview option.
 The workbench is a compact controls-only window. Keep its preview endpoint disconnected; file video stays in the player and live enhancement uses its actual output view.
 
 ## UI validation

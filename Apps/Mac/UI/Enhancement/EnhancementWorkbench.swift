@@ -571,16 +571,12 @@ enum TargetOverlayPolicy {
     static func outputFrame(target: NSRect, fullscreen: Bool, display: NSRect?) -> NSRect? {
         fullscreen ? display : target
     }
-    static func followsTarget(fullscreen: Bool, viewerFollowOverride: Bool) -> Bool {
-        !fullscreen || viewerFollowOverride
-    }
     static func activeWindowViewer(windowTarget: Bool, viewerSelected: Bool, viewerFollowOverride: Bool) -> Bool {
         windowTarget && viewerSelected && !viewerFollowOverride
     }
     static func usesFullscreen(windowTarget: Bool, explicitViewer: Bool, interactiveAvailable: Bool,
-                               diagnosticFullscreen: Bool, legacyFullscreen: Bool, viewerFollowOverride: Bool) -> Bool {
-        diagnosticFullscreen || (windowTarget && ((explicitViewer && !viewerFollowOverride) || interactiveAvailable)) ||
-            (!windowTarget && !followsTarget(fullscreen: legacyFullscreen, viewerFollowOverride: viewerFollowOverride))
+                               diagnosticFullscreen: Bool, viewerFollowOverride: Bool) -> Bool {
+        diagnosticFullscreen || (windowTarget && ((explicitViewer && !viewerFollowOverride) || interactiveAvailable))
     }
     static func screenIndex(target: NSRect, screens: [NSRect]) -> Int? {
         guard !target.isEmpty else { return nil }
@@ -3729,7 +3725,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             "outputPanelIsOpaque": outputWindow?.isOpaque ?? false,
             "outputLayerIsOpaque": outputPreview.layer?.isOpaque ?? false,
             "outputFollowsWindow": outputFollowsWindow,
-            "outputFullscreenApplied": applied.outputFullscreen,
+            "outputFullscreenApplied": applied.sourceKind == "display" ? false : applied.outputFullscreen,
             "requestedWindowOutputMode": profile.windowOutputMode,
             "appliedWindowOutputMode": applied.windowOutputMode,
             "inputRoute": inputRouter?.diagnostics() ?? ["active": false, "reason": "not_started"],
@@ -4464,13 +4460,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             : EnhancementText.t("This reduces the captured image before scaling; it does not identify the source video resolution. Lower input may trade quality for speed and does not guarantee a sharper image.", "此选项会先缩小采集画面，再进行缩放；它不代表自动识别到了片源分辨率。较低输入尺寸可能以画质换速度，不保证画面更清晰。")
         srInputHelp.toolTip = help
         srInputPopup.toolTip = help
-        fullscreenCheck.title = profile.sourceKind == "file"
-            ? EnhancementText.t("Fullscreen on output display", "在输出显示器全屏")
-            : EnhancementText.t("Fullscreen (Esc to return)", "全屏预览（Esc 返回交互）")
-        fullscreenCheck.toolTip = profile.sourceKind == "file" ? nil
-            : EnhancementText.t("Fullscreen viewer (Esc to return to interaction)", "全屏预览（Esc 返回交互）")
-        fullscreenRow?.isHidden = profile.sourceKind == "window"
-        fullscreenCheck.isEnabled = profile.sourceKind != "window"
+        fullscreenRow?.isHidden = profile.sourceKind != "file"
+        fullscreenCheck.isEnabled = profile.sourceKind == "file"
         fullscreenCheck.state = profile.outputFullscreen ? .on : .off
         let editable = WorkbenchDimensionPolicy.editable(sizeIndex: sizePopup.indexOfSelectedItem, scaleEnabled: scaleSwitch.state == .on)
         for (field, value) in [(widthField, profile.outputWidth), (heightField, profile.outputHeight)] {
@@ -4988,9 +4979,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func cadenceScreen(for output: EnhancementProfile) -> NSScreen? {
-        let windowTarget: Bool
-        if case .window = capture.target { windowTarget = true } else { windowTarget = false }
-        if (windowTarget || TargetOverlayPolicy.followsTarget(fullscreen: output.outputFullscreen, viewerFollowOverride: viewerFollowOverride)) && capture.target != nil && !targetFrame.isEmpty {
+        if capture.target != nil && !targetFrame.isEmpty {
             let screens = NSScreen.screens
             if let index = TargetOverlayPolicy.screenIndex(target: targetFrame, screens: screens.map(\.frame)) { return screens[index] }
         }
@@ -5086,7 +5075,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             || profile.sourceWindowPreset != baseline.sourceWindowPreset
             || profile.outputWidth != baseline.outputWidth
             || profile.outputHeight != baseline.outputHeight
-            || (profile.sourceKind != "window" && (profile.outputDisplayID != baseline.outputDisplayID || profile.outputFullscreen != baseline.outputFullscreen))
+            || (profile.sourceKind != "window" && profile.outputDisplayID != baseline.outputDisplayID)
+            || (profile.sourceKind == "file" && profile.outputFullscreen != baseline.outputFullscreen)
         hasPendingFormChanges = formDiffers
         refreshActions()
         let pending = formDiffers ? EnhancementText.t("Pending", "待应用") + " \(Self.engineDisplayName(profile.interpolationEngineID, model: profile.modelID)) \(rate)" : ""
@@ -5175,7 +5165,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         widthField.stringValue = "\(profile.outputWidth)"
         heightField.stringValue = "\(profile.outputHeight)"
-        fullscreenCheck.state = profile.sourceKind == "window" ? .on : (profile.outputFullscreen ? .on : .off)
+        fullscreenCheck.state = profile.outputFullscreen ? .on : .off
         profile.windowOutputMode = "follow"
         viewMode.selectedSegment = ["enhanced": 0, "original": 1, "compare": 2][profile.viewMode] ?? 0
         appearanceControl.selectedSegment = ["system": 0, "light": 1, "dark": 2][profile.appearance] ?? 0
@@ -5267,7 +5257,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             profile.outputWidth = WorkbenchDimensionPolicy.value(widthField.stringValue) ?? (profile.outputWidth >= 2 ? profile.outputWidth : 1920)
             profile.outputHeight = WorkbenchDimensionPolicy.value(heightField.stringValue) ?? (profile.outputHeight >= 2 ? profile.outputHeight : 1080)
         }
-        if profile.sourceKind != "window" { profile.outputFullscreen = fullscreenCheck.state == .on }
+        if profile.sourceKind == "file" { profile.outputFullscreen = fullscreenCheck.state == .on }
         profile.windowOutputMode = "follow"
         profile.viewMode = ["enhanced", "original", "compare"][max(0, viewMode.selectedSegment)]
         profile.appearance = ["system", "light", "dark"][max(0, appearanceControl.selectedSegment)]
@@ -5864,7 +5854,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             viewerSelected: applied.windowOutputMode == "viewer", viewerFollowOverride: viewerFollowOverride)
         let fullscreen = TargetOverlayPolicy.usesFullscreen(windowTarget: windowTarget, explicitViewer: explicitViewer,
             interactiveAvailable: interactionAvailable, diagnosticFullscreen: diagnosticFullscreen,
-            legacyFullscreen: applied.outputFullscreen, viewerFollowOverride: viewerFollowOverride)
+            viewerFollowOverride: viewerFollowOverride)
         let screenFrame = fullscreen ? outputScreen(for: applied.outputDisplayID)?.frame : nil
         let outputFrame = TargetOverlayPolicy.outputFrame(target: state.frame, fullscreen: fullscreen, display: screenFrame)
         let alignedInput = !windowTarget || diagnosticFullscreen || explicitViewer || TargetOverlayPolicy.windowInputAligned(viewMode: profile.viewMode)

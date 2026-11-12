@@ -129,7 +129,8 @@ private final class SourceSizeControls {
    precondition(outputChanges.hasChanges(relativeTo: baseline), "Output display changes must expose Apply")
    outputChanges.profile = baseline
    outputChanges.profile.outputFullscreen = true
-   precondition(outputChanges.hasChanges(relativeTo: baseline), "Fullscreen changes must expose Apply")
+   precondition(outputChanges.hasChanges(relativeTo: baseline) == (sourceKind == "file"),
+     "Fullscreen changes only apply to video files")
   }
   let followingWindow = WorkbenchActionControls()
   followingWindow.profile.outputDisplayID = 9
@@ -175,10 +176,11 @@ private final class SourceSizeControls {
   oldProfile["sourceKind"] = "display"; oldProfile["outputFullscreen"] = true
   let displayOld = EnhancementProfileStore.decode(try JSONSerialization.data(withJSONObject:oldProfile),fallbackName:"legacy")!
   precondition(displayOld.windowOutputMode == "follow" && displayOld.outputFullscreen &&
-    TargetOverlayPolicy.usesFullscreen(windowTarget:false,explicitViewer:false,interactiveAvailable:false,diagnosticFullscreen:false,legacyFullscreen:displayOld.outputFullscreen,viewerFollowOverride:false))
+    !TargetOverlayPolicy.usesFullscreen(windowTarget:false,explicitViewer:false,interactiveAvailable:false,diagnosticFullscreen:false,viewerFollowOverride:false),
+    "A saved fullscreen setting must not enable the removed display preview")
   oldProfile["sourceKind"] = "window"
   let windowOld = EnhancementProfileStore.decode(try JSONSerialization.data(withJSONObject:oldProfile),fallbackName:"legacy")!
-  precondition(windowOld.windowOutputMode == "follow" && !TargetOverlayPolicy.usesFullscreen(windowTarget:true,explicitViewer:false,interactiveAvailable:false,diagnosticFullscreen:false,legacyFullscreen:windowOld.outputFullscreen,viewerFollowOverride:false))
+  precondition(windowOld.windowOutputMode == "follow" && !TargetOverlayPolicy.usesFullscreen(windowTarget:true,explicitViewer:false,interactiveAvailable:false,diagnosticFullscreen:false,viewerFollowOverride:false))
   oldProfile["sourceKind"] = "file"
   let fileOld = EnhancementProfileStore.decode(try JSONSerialization.data(withJSONObject:oldProfile),fallbackName:"legacy")!
   precondition(fileOld.sourceKind == "file" && fileOld.outputFullscreen)
@@ -575,18 +577,15 @@ private final class SourceSizeControls {
   precondition(TargetOverlayPolicy.outputFrame(target:targetFrame,fullscreen:false,display:primary)==targetFrame)
   precondition(TargetOverlayPolicy.outputFrame(target:targetFrame,fullscreen:true,display:primary)==primary)
   precondition(TargetOverlayPolicy.outputFrame(target:targetFrame,fullscreen:true,display:nil)==nil)
-  precondition(TargetOverlayPolicy.followsTarget(fullscreen:false,viewerFollowOverride:false))
-  precondition(!TargetOverlayPolicy.followsTarget(fullscreen:true,viewerFollowOverride:false))
-  precondition(TargetOverlayPolicy.followsTarget(fullscreen:true,viewerFollowOverride:true))
   let savedViewer = "viewer"
   var followOverride = true // Esc changes only session state, not the saved preference.
   precondition(!TargetOverlayPolicy.activeWindowViewer(windowTarget:true,viewerSelected:savedViewer == "viewer",viewerFollowOverride:followOverride))
-  precondition(!TargetOverlayPolicy.usesFullscreen(windowTarget:true,explicitViewer:true,interactiveAvailable:false,diagnosticFullscreen:false,legacyFullscreen:false,viewerFollowOverride:followOverride))
+  precondition(!TargetOverlayPolicy.usesFullscreen(windowTarget:true,explicitViewer:true,interactiveAvailable:false,diagnosticFullscreen:false,viewerFollowOverride:followOverride))
   followOverride = false // A successful new apply clears the override.
   precondition(savedViewer == "viewer" && TargetOverlayPolicy.activeWindowViewer(windowTarget:true,viewerSelected:savedViewer == "viewer",viewerFollowOverride:followOverride))
-  precondition(TargetOverlayPolicy.usesFullscreen(windowTarget:true,explicitViewer:true,interactiveAvailable:false,diagnosticFullscreen:false,legacyFullscreen:false,viewerFollowOverride:followOverride))
-  precondition(TargetOverlayPolicy.usesFullscreen(windowTarget:true,explicitViewer:false,interactiveAvailable:true,diagnosticFullscreen:false,legacyFullscreen:false,viewerFollowOverride:true))
-  precondition(TargetOverlayPolicy.usesFullscreen(windowTarget:true,explicitViewer:true,interactiveAvailable:false,diagnosticFullscreen:true,legacyFullscreen:false,viewerFollowOverride:true))
+  precondition(TargetOverlayPolicy.usesFullscreen(windowTarget:true,explicitViewer:true,interactiveAvailable:false,diagnosticFullscreen:false,viewerFollowOverride:followOverride))
+  precondition(TargetOverlayPolicy.usesFullscreen(windowTarget:true,explicitViewer:false,interactiveAvailable:true,diagnosticFullscreen:false,viewerFollowOverride:true))
+  precondition(TargetOverlayPolicy.usesFullscreen(windowTarget:true,explicitViewer:true,interactiveAvailable:false,diagnosticFullscreen:true,viewerFollowOverride:true))
   let cadenceScreens = [NSRect(x:0,y:0,width:1000,height:800), NSRect(x:1000,y:0,width:1000,height:800)]
   precondition(TargetOverlayPolicy.screenIndex(target:NSRect(x:700,y:50,width:400,height:300),screens:cadenceScreens)==0)
   precondition(TargetOverlayPolicy.screenIndex(target:NSRect(x:900,y:50,width:400,height:300),screens:cadenceScreens)==1)
