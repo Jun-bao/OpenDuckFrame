@@ -14,7 +14,7 @@ the FPS overlay reports observed output.
 
 ## Frame generation
 
-The workbench's frame-generation engine is **ODF-VFI**, run with Metal on
+The workbench's default frame-generation engine is **ODF-VFI**, run with Metal on
 Apple silicon; resolution and quality affect throughput. ODF-VFI is a
 four-stage structural reduction of Practical-RIFE 4.25: the retained stages
 keep the upstream weights, no additional training is applied, and model
@@ -27,15 +27,24 @@ The workbench offers target-FPS and multiplier modes. X2 / X3 / X4 are requests;
 frame budget, source cadence and display refresh rate determine actual
 presentation. Continuous caching is always on; there is no separate switch.
 
-The source tree also contains other interpolation backends. They are not
-selectable in the current workbench:
+The engine selector also offers Apple's system processors. Low latency targets
+real-time enhancement; FRC is designed for quality-oriented video processing.
+FRC can be used during playback here, but its throughput and added delay depend
+on the device, dimensions and content. Neither choice guarantees the target FPS.
+These options process playback/capture; they do not export an interpolated file.
 
-| Backend | Status in the current app |
+| Engine | Workbench support |
 |---|---|
-| Apple FRC / Motion+ | Not a workbench engine. The player's own motion-smoothing menu (off / double rate) uses it on macOS 26+ with supported hardware; runtime capability checks apply |
-| Apple low-latency interpolation | Code retained; not selectable in the workbench |
-| RIFE 4.26 | Weights and loader retained; not selectable in the workbench |
-| DistilDRBA | Experimental code retained; optional model, fixed 1280×720 input and X2 midpoint |
+| ODF-VFI | Default; target FPS or X2 / X3 / X4; fast / balanced / hq |
+| Apple low latency | macOS 26+ and runtime support; live window/display X2 or X4; local file X2 only. Fixed FPS and X3 are disabled |
+| Apple FRC | macOS 15.4+ and runtime support; live target FPS or X2 / X3 / X4, standard / quality; local files standard only, fixed FPS up to 3× source rate |
+
+Saved and named profiles retain the selected engine. Changing to low latency
+selects X2 when the previous rate is unsupported. Changing to file input restricts
+low latency to X2 and FRC to standard. Unsupported hardware or input is reported
+when preparing the engine; the previous committed plan is retained on failure.
+The player's Motion+ menu remains a separate off/double-rate FRC control.
+RIFE 4.26 and DistilDRBA remain hidden experimental backends.
 
 On M3 MacBook Air (Mac15,12 and Mac15,13), live **window** capture with
 ODF-VFI, Fast, X2 and scaling disabled automatically selects the optimized
