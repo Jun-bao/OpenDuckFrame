@@ -1865,8 +1865,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let edge: NSRectEdge
         switch step {
         case .source:
-            target = emptyOverlay.isHidden ? sourceKindControl : (emptySourceButton ?? sourceKindControl)
-            edge = emptyOverlay.isHidden ? .minX : .minY
+            target = sourceKindControl
+            edge = .minY
         case .frameGeneration:
             target = interpolationSwitch
             edge = .minX
