@@ -14,6 +14,7 @@ Keep continuous stream caching enabled by default and window output fixed to fol
 The normal countdown defaults to 3 seconds; keep saved countdown and custom settings working.
 Hardware/configuration auto-detection is deferred. Keep its suggestions and scoring out of ordinary controls.
 Preserve configuration add/rename/delete, preset metadata and saved-profile migration.
+The three-step first-use coach marks are implemented in [WorkbenchOnboarding.swift](Enhancement/WorkbenchOnboarding.swift); keep them skippable, source-specific and replayable from Help.
 Preserve the no-source delayed window-selection path, countdown cancellation, restart after Stop and pending Apply Changes actions.
 Display and file output retain their fullscreen controls; window follow uses its existing source-aligned behavior.
 The workbench is a compact controls-only window. Keep its preview endpoint disconnected; file video stays in the player and live enhancement uses its actual output view.
@@ -21,6 +22,7 @@ The workbench is a compact controls-only window. Keep its preview endpoint disco
 ## UI validation
 
 Run `./Scripts/test_workbench_store.sh` for profile, countdown or workbench action changes.
+Run `./Scripts/test_workbench_guide.sh` for coach-mark preferences, navigation and source-specific guidance.
 Use the existing localization catalog and EnhancementText flow according to the current surface.
 Verify actual English/Chinese, light/dark, source types, long names and keyboard actions when affected.
 Check default 560×700, minimum 540×620, native fullscreen and ordinary window resizing for layout changes.

@@ -1262,6 +1262,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private var stopButton: NSButton?
     private var sourceActionButton: NSButton?
     private var emptySourceButton: NSButton?
+    private var guideStep: WorkbenchGuideStep?
+    private var guidePopover: NSPopover?
+    private var guideStartScheduled = false
     private var activeSourceTitle = ""
     private var activeSourceKind = ""
     private var activeSourceBundle = ""
@@ -1515,6 +1518,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         installWorkbenchMenuEntries()
         NSApp.activate(ignoringOtherApps: true)
         startLiveLogIfNeeded()
+        scheduleGuideIfNeeded()
         if SPRifeExperiments.available, !SPRifeExperiments.airBeta, !experimentPanelAutoOpened,
            CommandLine.arguments.contains("--odf-experiment-comparison") {
             experimentPanelAutoOpened = true
@@ -1802,6 +1806,13 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         guard let help = NSApp.mainMenu?.items.compactMap(\.submenu).first(where: {
             $0.identifier?.rawValue == "sp.helpMenu"
         }) else { return }
+        let guideID = NSUserInterfaceItemIdentifier("workbench.guide.replay")
+        let guideItem = help.items.first { $0.identifier == guideID } ?? NSMenuItem()
+        if guideItem.menu == nil { help.insertItem(guideItem, at: 0) }
+        guideItem.title = EnhancementText.t("Getting Started", "新手引导")
+        guideItem.identifier = guideID
+        guideItem.target = self
+        guideItem.action = #selector(replayWorkbenchGuide)
         for (title, key) in [(EnhancementText.t("Website", "官网"), "ODFWebsiteURL"),
                              ("GitHub", "ODFRepositoryURL"),
                              (EnhancementText.t("Feedback", "反馈"), "ODFFeedbackURL")] {
@@ -1818,6 +1829,79 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     func windowDidBecomeKey(_ notification: Notification) {
         installWorkbenchMenuEntries()
+        if guideStep != nil, page == 0, guidePopover?.isShown != true {
+            DispatchQueue.main.async { [weak self] in self?.showGuideStep() }
+        }
+    }
+
+    private func scheduleGuideIfNeeded() {
+        guard !SPRifeExperiments.airBeta, guideStep == nil, !guideStartScheduled,
+              WorkbenchGuidePreference.shouldShow(in: .standard) else { return }
+        guideStartScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.guideStartScheduled = false
+            guard self.window?.isVisible == true, self.guideStep == nil,
+                  WorkbenchGuidePreference.shouldShow(in: .standard) else { return }
+            self.beginWorkbenchGuide()
+        }
+    }
+
+    @objc private func replayWorkbenchGuide() {
+        showWorkbench()
+        beginWorkbenchGuide()
+    }
+
+    private func beginWorkbenchGuide() {
+        guideStep = .source
+        if page != 0 { showPage(0) }
+        showGuideStep()
+    }
+
+    private func showGuideStep() {
+        guard let step = guideStep, page == 0, let window, window.isVisible else { return }
+        let isRunning = startButton?.isHidden == true && stopButton?.isHidden == false
+        let target: NSView?
+        let edge: NSRectEdge
+        switch step {
+        case .source:
+            target = emptyOverlay.isHidden ? sourceKindControl : (emptySourceButton ?? sourceKindControl)
+            edge = emptyOverlay.isHidden ? .minX : .minY
+        case .frameGeneration:
+            target = interpolationSwitch
+            edge = .minX
+        case .start:
+            target = isRunning ? stopButton : startButton
+            edge = .minX
+        }
+        guard let target, target.window === window, !target.isHiddenOrHasHiddenAncestor else { return }
+        target.scrollToVisible(target.bounds)
+        window.contentView?.layoutSubtreeIfNeeded()
+        let content = WorkbenchGuideContent(step: step, sourceKind: profile.sourceKind, alreadyRunning: isRunning,
+            skip: { [weak self] in self?.finishWorkbenchGuide() },
+            advance: { [weak self] in self?.advanceWorkbenchGuide() })
+        let popover = NSPopover()
+        popover.behavior = .applicationDefined
+        popover.animates = true
+        popover.contentViewController = content
+        popover.contentSize = NSSize(width: 328, height: 180)
+        guidePopover?.close()
+        guidePopover = popover
+        popover.show(relativeTo: target.bounds, of: target, preferredEdge: edge)
+    }
+
+    private func advanceWorkbenchGuide() {
+        guard let step = guideStep else { return }
+        guard let next = step.next else { finishWorkbenchGuide(); return }
+        guideStep = next
+        showGuideStep()
+    }
+
+    private func finishWorkbenchGuide() {
+        WorkbenchGuidePreference.complete(in: .standard)
+        guideStep = nil
+        guidePopover?.close()
+        guidePopover = nil
     }
 
     private func sourceBlock() -> NSView {
@@ -2328,7 +2412,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         sourceHost.isHidden = next != 1
         libraryHost.isHidden = next != 2
         pageControl.selectedSegment = next
-        if next == 0 { redrawPreview() }
+        if next == 0 {
+            redrawPreview()
+            if guideStep != nil { DispatchQueue.main.async { [weak self] in self?.showGuideStep() } }
+        } else {
+            guidePopover?.close()
+        }
     }
 
     private func redrawPreview() {
@@ -2823,6 +2912,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                                       EnhancementText.t("Change File", "更换文件")][max(0, sourceKindControl.selectedSegment)] : choose
         emptySourceButton?.title = choose
         updateSourceChrome(hasSource: hasSelectedSource)
+        if guideStep == .source && page == 0 {
+            DispatchQueue.main.async { [weak self] in self?.showGuideStep() }
+        }
     }
 
     private func refreshActions() {
@@ -5879,6 +5971,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     func windowWillClose(_ notification: Notification) {
+        guidePopover?.close()
+        guideStep = nil
+        guideStartScheduled = false
 #if ODF_AIR_BETA_DIAGNOSTIC
         if Self.betaSessionRecordingEnabled { finishBetaSession(reason: "window_close") {}; return }
 #endif
