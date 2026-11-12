@@ -6,6 +6,30 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>OpenDuckFrame</title>
         <item>
+            <title>0.4.0</title>
+            <pubDate>Thu, 12 Nov 2026 18:12:04 +0800</pubDate>
+            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
+            <sparkle:version>35</sparkle:version>
+            <sparkle:shortVersionString>0.4.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>OpenDuckFrame 0.4.0</h2>
+<ul>
+  <li>重新设计紧凑工作台：分组设置、对齐的控件列、独立滚动区域，以及固定的来源与开始／停止操作区。</li>
+  <li>新增 ArtCNN C4F32 / C4F16 原生 2× SDR 超分，可与 ODF-VFI 补帧分别配置。</li>
+  <li>新增可跳过、可从帮助菜单重看的三步新手引导。</li>
+</ul>
+<ul>
+  <li>A redesigned compact workbench with grouped settings, aligned controls and fixed source/action areas.</li>
+  <li>ArtCNN C4F32 / C4F16 native 2× SDR super resolution, independently configurable from ODF-VFI frame generation.</li>
+  <li>A skippable three-step guide that can be replayed from Help.</li>
+</ul>
+<p>ArtCNN 输入不超过 1920×1080，原生 2× 输出不超过 3840×2160。实际画质和帧率取决于输入、设置与设备。</p>
+<p>This community build is ad-hoc signed and supports signed in-app updates. It is not Apple notarized. macOS may ask for Screen Recording or Accessibility permission again after an upgrade. 此社区版未经过 Apple 公证，升级后可能需要重新授权。</p>
+]]></description>
+            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.4.0/OpenDuckFrame-0.4.0.zip" length="43104771" type="application/octet-stream" sparkle:edSignature="CkQs3Og6Ti76VHeaxuapLr+rDWrKYnndbRRkdfsbckAXYX6VGCtdOXbjaPhDuzSq9XUP7oqaTfwNvg+nDiTaDw=="/>
+        </item>
+        <item>
             <title>0.3.3</title>
             <pubDate>Wed, 11 Nov 2026 21:08:23 +0800</pubDate>
             <link>https://github.com/Jun-bao/OpenDuckFrame</link>
@@ -45,34 +69,9 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
 <p>Requires Apple silicon and macOS 14 or later. This ad-hoc signed community build supports signed in-app updates and is not Apple notarized.</p></html>]]></description>
             <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.3.2/OpenDuckFrame-0.3.2.zip" length="43170785" type="application/octet-stream" sparkle:edSignature="psSGdTIwidYZkH9MS8ZwflX50bBBc4E0Q6yWT/GGLMs3U5v8lILk7Ajv0vrM8+ScxOevFx4M6QvFDEEGfX/uDA=="/>
         </item>
-        <item>
-            <title>0.3.1</title>
-            <pubDate>Tue, 10 Nov 2026 18:20:03 +0800</pubDate>
-            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
-            <sparkle:version>25</sparkle:version>
-            <sparkle:shortVersionString>0.3.1</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<meta charset="utf-8">
-<h2>OpenDuckFrame 0.3.1</h2>
-<ul>
-<li>现有 RIFE 4.25、Fast、2 倍补帧配置接入 M3 MacBook Air 的窗口优化。连续缓存开启、关闭超分时自动匹配，无需新增模式开关。</li>
-<li>融合画面转换和缩放、复用 GPU 纹理，并优化源帧间隔估计与呈现时机。插入帧按自适应较低尺寸计算后放大，原始帧保留采集尺寸。</li>
-<li>调整帧的交付提前量和保序显示规则，减少刷新时机抖动造成的丢帧。正常补帧时，部分画面会顺延一个刷新周期，60 Hz 下约为 16.7 毫秒。</li>
-<li>已验证普通 SDR BT.709、60 Hz 输出，窗口采集不超过 2648×1668 像素。超出该路径的格式、刷新率或尺寸时显示原因并保留原帧。</li>
-<li>保留窗口、屏幕、本地文件和画质设置入口，延迟增强默认倒计时调整为 3 秒。</li>
-</ul>
-<h3>English</h3>
-<p>The existing RIFE 4.25 / Fast / X2 live-window configuration now selects the optimized pipeline on M3 MacBook Air with stream caching enabled and scaling disabled. Fused conversion, GPU texture reuse and source-aware presentation timing reduce processing cost. Generated pictures use adaptive lower-resolution inference and reconstruction; original pictures retain capture resolution.</p>
-<p>Earlier frame handoff and bounded, PTS-ordered selection reduce losses caused by presentation phase jitter. During normal interpolation, some pictures can be displayed one refresh later, approximately 16.7 milliseconds at 60 Hz.</p>
-<p>The validated envelope is ordinary SDR BT.709 video, a 60 Hz display and capture buffers up to 2648×1668 pixels. Unsupported inputs in this optimized path pass original pictures through with a visible reason. Window, display, local-file and quality controls remain available. The delayed-enhancement countdown defaults to 3 seconds.</p>
-<p>This community build is ad-hoc signed, supports signed in-app updates, and is not Apple notarized. Requires macOS 14 or later on Apple silicon.</p>
-]]></description>
-            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.3.1/OpenDuckFrame-0.3.1.zip" length="43180426" type="application/octet-stream" sparkle:edSignature="wl+MHkCU4rzLY2JQiLwmQRzhlY1POIdzzyFU7ST5L19Vb74oOaMQ/oAlykue11gR9FEsd9KMF+5UvgrSlRHGAg=="/>
-        </item>
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: cNoDazqWdOSZuWMuIcI0Vqi9svyR93fin1INpi25hGbDmWw1t81NFYv6OgZ/3huVLWNNgwBf1Yoz/ba9G1UfCA==
-length: 6974
+edSignature: C4bD9KkyUKhk3RQapq68wV4eMYQpkhRpSR8pxmaiROA0v59VLqzIgRAYydZS+Y1J/DImWU+Cj/7YJa8O71ETAg==
+length: 6032
 -->
