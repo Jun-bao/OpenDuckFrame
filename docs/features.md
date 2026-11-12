@@ -7,8 +7,8 @@ supports that backend.
 ## Input and output
 
 Window and display inputs use ScreenCaptureKit. Local files use the player's
-decoding path. Window output follows the source window; display and video-file
-output can use a selected display, including fullscreen output. Scaling and
+decoding path. Window and display output follow their source; video-file output
+can use a selected display, including fullscreen output. Scaling and
 interpolation have separate controls. Profiles preserve common settings, and
 the FPS overlay reports observed output.
 
