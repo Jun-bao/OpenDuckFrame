@@ -1872,7 +1872,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             edge = .minX
         case .start:
             target = isRunning ? stopButton : startButton
-            edge = .minX
+            edge = .minY
         }
         guard let target, target.window === window, !target.isHiddenOrHasHiddenAncestor else { return }
         target.scrollToVisible(target.bounds)
@@ -1884,7 +1884,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         popover.behavior = .applicationDefined
         popover.animates = true
         popover.contentViewController = content
-        popover.contentSize = NSSize(width: 328, height: 180)
+        popover.contentSize = NSSize(width: 328, height: 164)
         guidePopover?.close()
         guidePopover = popover
         popover.show(relativeTo: target.bounds, of: target, preferredEdge: edge)

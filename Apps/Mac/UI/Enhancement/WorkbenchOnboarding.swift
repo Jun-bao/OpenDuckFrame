@@ -20,6 +20,15 @@ enum WorkbenchGuidePreference {
 }
 
 @MainActor final class WorkbenchGuideContent: NSViewController {
+    private final class Surface: NSView {
+        override var wantsUpdateLayer: Bool { true }
+        override func updateLayer() {
+            effectiveAppearance.performAsCurrentDrawingAppearance {
+                layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+            }
+        }
+    }
+
     private let step: WorkbenchGuideStep
     private let sourceKind: String
     private let alreadyRunning: Bool
@@ -39,7 +48,8 @@ enum WorkbenchGuidePreference {
     required init?(coder: NSCoder) { nil }
 
     override func loadView() {
-        let root = NSView(frame: NSRect(x: 0, y: 0, width: 328, height: 180))
+        let root = Surface(frame: NSRect(x: 0, y: 0, width: 328, height: 164))
+        root.wantsLayer = true
         let icon = NSImageView(image: NSApp.applicationIconImage)
         icon.imageScaling = .scaleProportionallyUpOrDown
         icon.setAccessibilityElement(false)

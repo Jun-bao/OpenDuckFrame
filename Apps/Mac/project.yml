@@ -103,8 +103,11 @@ targets:
         basedOnDependencyAnalysis: false
     sources:
       - path: UI
+        excludes:
+          - AGENTS.md
       - path: Capture
         excludes:
+          - AGENTS.md
           - SPAppleLowLatencySR.h
           - SPAppleLowLatencySR.mm
           - SPAppleVideoSR.h
@@ -382,10 +385,13 @@ targets:
       - path: ../../Modules/MediaCore/Bridge
       - path: ../../Modules/VideoEnhancement
         excludes:
+          - AGENTS.md
           - Shaders
           - Tests
       - path: Support/OpenDuckFrame-Bridging-Header.h
       - path: ../../Platform/macOS
+        excludes:
+          - AGENTS.md
       - path: ../../Modules/MediaCore/Shaders/Video.metal
       - path: ../../ThirdParty/Licenses
         type: folder
