@@ -67,6 +67,11 @@ static void SPSREndProcessor(id processor) {
 
 - (void)dealloc { if (_transfer) CFRelease(_transfer); }
 
++ (BOOL)isSupported {
+    if (@available(macOS 26.0, *)) return VTLowLatencySuperResolutionScalerConfiguration.isSupported;
+    return NO;
+}
+
 + (NSArray<NSNumber *> *)supportedFactorsForWidth:(int)width height:(int)height {
     if (width < 2 || height < 2) return @[];
     if (@available(macOS 26.0, *)) {
@@ -74,6 +79,28 @@ static void SPSREndProcessor(id processor) {
         return [VTLowLatencySuperResolutionScalerConfiguration supportedScaleFactorsForFrameWidth:width frameHeight:height] ?: @[];
     }
     return @[];
+}
+
++ (NSSize)inputSizeForWidth:(int)width height:(int)height preset:(int)preset {
+    if (width < 4 || height < 4) return NSZeroSize;
+    double ratio = 1.0;
+    if (preset == 480 || preset == 720 || preset == 1080) {
+        int maxWidth = preset == 480 ? 854 : (preset == 720 ? 1280 : 1920);
+        ratio = MIN(1.0, MIN((double)maxWidth / width, (double)preset / height));
+    }
+    return NSMakeSize(MAX(4, ((int)(width * ratio)) & ~3), MAX(4, ((int)(height * ratio)) & ~3));
+}
+
++ (NSSize)automaticOutputForWidth:(int)width height:(int)height {
+    NSArray<NSNumber *> *factors = [[self supportedFactorsForWidth:width height:height]
+        sortedArrayUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) { return [b compare:a]; }];
+    for (NSNumber *number in factors) {
+        double factor = number.doubleValue, w = width * factor, h = height * factor;
+        int outW = (int)llround(w), outH = (int)llround(h);
+        if (factor > 1 && fabs(w - outW) < 0.0001 && fabs(h - outH) < 0.0001 &&
+            outW <= 3840 && outH <= 2160 && !(outW & 1) && !(outH & 1)) return NSMakeSize(outW, outH);
+    }
+    return NSZeroSize;
 }
 
 - (BOOL)prepareWidth:(int)width height:(int)height scale:(float)scale error:(NSError **)error {
@@ -133,7 +160,8 @@ static void SPSREndProcessor(id processor) {
     __block id processor = nil;
     __block uint64_t seen = 0;
     @synchronized (self) {
-        if (!_processor || _inflight || CVPixelBufferGetWidth(source) != (size_t)_width || CVPixelBufferGetHeight(source) != (size_t)_height) return NO;
+        if (!_processor || _inflight || (!self.allowsInputResize &&
+            (CVPixelBufferGetWidth(source) != (size_t)_width || CVPixelBufferGetHeight(source) != (size_t)_height))) return NO;
         _inflight = YES; processor = _processor; seen = _epoch;
     }
     CVPixelBufferRetain(source);
@@ -161,6 +189,11 @@ static void SPSREndProcessor(id processor) {
             finish(NULL, SPSRError(10, @"低延迟超分输入格式转换失败。 ")); return;
         }
         CVBufferPropagateAttachments(source, adapted);
+        if (self.allowsInputResize) {
+            CVBufferRemoveAttachment(adapted, kCVImageBufferCleanApertureKey);
+            CVBufferRemoveAttachment(adapted, kCVImageBufferPreferredCleanApertureKey);
+            CVBufferRemoveAttachment(adapted, kCVImageBufferDisplayDimensionsKey);
+        }
         CVPixelBufferRef output = SPSRCreate(self->_outWidth, self->_outHeight, self->_destinationFormat, self->_destinationAttributes);
         if (!output) { CVPixelBufferRelease(adapted); finish(NULL, SPSRError(11, @"无法分配超分输出缓冲。 ")); return; }
         CVBufferPropagateAttachments(source, output);

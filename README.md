@@ -18,9 +18,7 @@ your Mac, without an account or uploading your picture.
   Available frame-rate and quality settings follow the selected engine and source;
   Apple options require runtime hardware/system support. Watch the actual output rate.
   Achieved performance depends on the source, settings and Mac.
-- **Upscaling, independently.** Choose ArtCNN C4F32 or the lighter C4F16 model for native 2× SDR
-  enhancement. Scaling and frame generation can be
-  configured separately.
+- **Upscaling.** Choose Apple real-time or Apple video super resolution on supported macOS 26+ systems. Larger inputs may be reduced before processing. Live Apple video SR currently requires frame generation to be off.
 - **A workbench for everyday use.** Save profiles for games, films and animation;
   compare original and enhanced output. Window and display output follow the
   source; video-file output can go fullscreen on a selected display.
@@ -70,7 +68,7 @@ See [Quick start](docs/quick-start.md) for permissions and troubleshooting.
 | Window / display capture | Screen Recording permission; protected content may not be capturable |
 | Apple low-latency interpolation | macOS 26+ and runtime support; live X2/X4, file X2 |
 | Apple FRC | macOS 15.4+ and runtime support; quality-oriented, added delay and speed vary |
-| ArtCNN super resolution | SDR input up to 1920×1080; native 2× output up to 3840×2160 |
+| Apple super resolution | macOS 26+ and a supported Mac; sizes and factors depend on the processor; video SR may download an Apple model |
 | ODF-VFI frame generation | Apple silicon; throughput depends on resolution, quality and display rate |
 | Subtitle generation and translation | macOS 26+ and an available system language model |
 | Experimental animation backends | Additional models / runtimes; see [features](docs/features.md) |

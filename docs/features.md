@@ -72,20 +72,26 @@ the requested multiplier on a slower device.
 
 ## Scaling and super resolution
 
-The normal workbench exposes ArtCNN C4F32 and the lighter C4F16 model.
-Both use the original upstream weights and produce native 2× luma; chroma is
-scaled separately. They support SDR input up to 1920×1080 and output up to
-3840×2160. HDR, cropped input and odd dimensions are rejected. Compare at the
-same output size; neither model guarantees recovery of real missing detail.
+The workbench offers Apple low-latency and Apple video super resolution on
+supported macOS 26+ devices. Scaling is off by default. Apple video SR may need
+the system model to be downloaded and live capture currently requires frame
+generation to be off. File playback uses the existing independent-frame video SR
+path; it is not a claim of temporal video history in file playback.
+
+Automatic output chooses a supported factor within the current 3840×2160 output
+budget. Live input defaults to a 720p maximum box; video SR may reduce it further
+to fit the supported factor and a 3200×1800 live output box. File input is similarly
+reduced when needed. Reducing an input can lose detail; actual quality and speed
+must be assessed on the source and device. Unsupported sizes or factors are
+reported rather than silently switching to another engine. SDR 8-bit is required.
+For file playback, Apple video SR currently requires a complete, uncropped NV12
+frame with supported 601 or 709 color metadata.
 
 Window inputs can optionally resize the selected source window before capture;
 that requires Accessibility permission and a resizable window. The source video
-must fill the captured window. Display inputs can reduce capture dimensions
-before processing. Local files use decoded source pixels directly.
-
-The repository retains Lanczos/MetalFX and experimental Apple, Anime4K and
-Real-CUGAN implementations. These are not selectable in the current normal
-workbench; their existence in source does not establish packaged availability.
+must fill the captured window. The repository retains ArtCNN, Lanczos/MetalFX,
+Anime4K and Real-CUGAN implementations but they are not selectable in the normal
+workbench.
 
 ## Local playback and subtitles
 
