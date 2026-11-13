@@ -117,7 +117,7 @@ enum WorkbenchGuidePreference {
             return EnhancementText.t("Turn on frame generation to make motion smoother.", "确认帧生成已开启，让画面更流畅。")
         case .start:
             if alreadyRunning {
-                return EnhancementText.t("Use Stop when you want to end enhancement.", "需要结束增强时，可以点击停止。")
+                return EnhancementText.t("Select Stop Enhancement when you want to end enhancement.", "需要结束增强时，可以点击关闭增强。")
             }
             if sourceKind == "window" {
                 return EnhancementText.t("Select a window and choose Enhance Selected Window, or choose Delayed Enhancement and switch windows.", "选好窗口后点指定窗口增强；或点延迟增强，再切换窗口。")
