@@ -29,14 +29,17 @@ ODF-VFI; a new named configuration copies the current settings.
 
 1. Select the source. Display and video-file inputs can also use a selected
    output display.
-2. Start with one enhancement: frame generation at X2, or ArtCNN C4F32 / C4F16
-   scaling. Higher resolutions and multipliers require more processing time.
+2. Choose ODF-VFI, Apple low latency, or Apple FRC in the engine selector.
+   Apple options require system/hardware support; low latency offers live X2/X4
+   and file X2, while FRC can add processing delay. Start with one enhancement:
+   frame generation at X2, or Apple real-time super resolution. Apple video SR
+   is also available on supported devices; live video SR requires frame generation
+   to be off. Higher resolutions and multipliers require more processing time.
 3. For a window, press **Delayed Enhancement**, then focus the window you want
    to enhance before the countdown ends. The focused window is selected and
    enhancement starts automatically. The countdown defaults to 3 seconds and
    can be set from 1 to 20 seconds in **Settings**. Display and video-file inputs
-   keep **Start Enhancement**. Compare **Original**, **Enhanced**, and
-   **Comparison** views in the output settings; use the FPS overlay to observe actual output.
+   keep **Start Enhancement**. Use the FPS overlay to observe actual output.
 4. Save a profile once you have settings that work for your content.
 
 Frame generation creates intermediate pictures; it does not change the source

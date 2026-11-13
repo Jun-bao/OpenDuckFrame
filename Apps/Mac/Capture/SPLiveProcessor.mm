@@ -16,6 +16,7 @@
 #include "SPAirSourceConversion.hpp"
 #include "SPAirDisplayPolicyB.hpp"
 #import "SPRateSchedule.hpp"
+#include "SPVideoCadence.hpp"
 #import "SPLiveDisplayQueue.h"
 #import "SPRifePairAffineClock.hpp"
 #import "SPFPSMeter.hpp"
@@ -669,6 +670,26 @@ NSSize SPLiveSRInputSize(int width, int height, int preset) {
     return NSMakeSize(MAX(2, ((int)(width * factor)) & ~1), MAX(2, ((int)(height * factor)) & ~1));
 }
 
+static NSSize SPLiveSRInputSizeForRequest(int width, int height, SPLivePlanRequest *request) {
+    int preset = request.scaleEnabled ? request.srInputPreset : 0;
+    if (request.scaleEnabled && request.scaleEngine == SPLiveScaleAppleLowLatencySR)
+        return [SPAppleLowLatencySR inputSizeForWidth:width height:height preset:preset];
+    NSSize input = SPLiveSRInputSize(width, height, preset);
+    if (request.scaleEnabled && request.scaleEngine == SPLiveScaleAppleVideoSR && request.outputWidth == 0 && request.outputHeight == 0) {
+        NSSize effective = [SPAppleVideoSR automaticInputForWidth:(int)input.width height:(int)input.height];
+        NSSize output = [SPAppleVideoSR automaticOutputForWidth:(int)effective.width height:(int)effective.height];
+        // Leave room for the source, compare frame, and temporal output buffers
+        // within the live queue's 160 MiB budget.
+        if (output.width > 3200 || output.height > 1800) {
+            double ratio = MIN(3200.0 / output.width, 1800.0 / output.height);
+            effective = [SPAppleVideoSR automaticInputForWidth:MAX(4, ((int)(effective.width * ratio)) & ~3)
+                                                         height:MAX(4, ((int)(effective.height * ratio)) & ~3)];
+        }
+        return effective;
+    }
+    return input;
+}
+
 @implementation SPLivePlanRequest
 - (id)copyWithZone:(NSZone *)zone {
     (void)zone;
@@ -696,6 +717,7 @@ NSSize SPLiveSRInputSize(int width, int height, int preset) {
     copy.modelID = self.modelID ?: @"";
     copy.qualityID = self.qualityID ?: @"";
     copy.rifeStreamEnabled = self.rifeStreamEnabled;
+    copy.automaticVideoCadence = self.automaticVideoCadence;
     copy.captureSourceKind = self.captureSourceKind;
     return copy;
 }
@@ -1527,6 +1549,8 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
     consumes:(std::vector<SPAirSlotConsumeEvent> *)consumes consumeTotal:(uint64_t *)consumeTotal snapshot:(SPAirSlotSnapshot *)snapshot;
 - (BOOL)copyAirSlotCallbacks:(std::vector<SPAirSlotCallbackEvent> *)events total:(uint64_t *)total
     mainCallerSynchronouslyOnProcessorQueue:(BOOL)safe unsupported:(uint64_t *)unsupported;
+- (void)setLowLatencyPresentationEnabled:(BOOL)enabled;
+- (BOOL)boundedPresentationEnabled;
 @end
 
 @implementation SPLivePreviewView {
@@ -1587,6 +1611,7 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
     BOOL _airPreparedTextureDiagnostic;
     spAirMeasurement::TracePtr _measurementTrace;
     std::atomic<bool> _airPerformanceEnabled;
+    std::atomic<bool> _lowLatencyPresentationEnabled;
     std::atomic<int64_t> _selectionGuardNs;
     int64_t _diagnosticSelectionGuardNs;
     std::unique_ptr<SPAirFrameRing> _airCadenceFrames;
@@ -1616,6 +1641,7 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
     if (SPAirFullMeasurementTraceRequested())
         _measurementTrace = std::make_shared<spAirMeasurement::Trace>(spAirMeasurement::viewCapacity);
     _airPerformanceEnabled.store(false);
+    _lowLatencyPresentationEnabled.store(false);
     const BOOL legacyAirRecipe = SPAirBetaEnabled() ||
         (strcmp(getenv("ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC") ?: "", "1") == 0 &&
          strcmp(getenv("ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC") ?: "", "1") == 0 &&
@@ -1750,6 +1776,15 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
 }
 
 - (BOOL)airPerformanceEnabled { return _airPerformanceEnabled.load(std::memory_order_acquire); }
+- (BOOL)boundedPresentationEnabled {
+    return [self airPerformanceEnabled] || _lowLatencyPresentationEnabled.load();
+}
+- (void)setLowLatencyPresentationEnabled:(BOOL)enabled {
+    if (_lowLatencyPresentationEnabled.exchange(enabled) != enabled) {
+        std::lock_guard<std::mutex> lock(_presentationMutex);
+        [self resetAirDisplayPolicyLocked];
+    }
+}
 - (int64_t)selectionGuardNs { return _selectionGuardNs.load(); }
 
 - (void)setPresentedVideoReadbackEnabled:(BOOL)enabled {
@@ -2545,7 +2580,7 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
         std::lock_guard<std::mutex> lock(_presentationMutex);
         history = _displayTimerTrace; total = _displayTimerTraceCount;
         pendingFrames = _pendingPresentations.count; pendingSlot = _prospectiveSlot != nil;
-        ruleBEnabled = _airPerformanceEnabled.load(); ruleBDecision = _airRuleBLastDecision;
+        ruleBEnabled = [self boundedPresentationEnabled]; ruleBDecision = _airRuleBLastDecision;
         ruleBDecisionCount = _airRuleBDecisionCount; ruleBHistoryCount = _airRuleBLastHistoryCount;
     }
     // Build diagnostic objects outside the deadline-sensitive publication lock.
@@ -2647,7 +2682,7 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
                 }
             }
             slot->timing = {++_nextDisplaySlotToken, context, (int64_t)(deadline * 1e9), (int64_t)(displayTime * 1e9), [self selectionGuardNs]};
-            slot->ruleBEnabled = [self airPerformanceEnabled];
+            slot->ruleBEnabled = [self boundedPresentationEnabled];
             if (slot->ruleBEnabled) {
                 _airDisplayRefreshHistory.observe(slot->timing.displayNs);
                 slot->ruleBHistory = _airDisplayRefreshHistory;
@@ -2723,7 +2758,7 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
             std::vector<sp::DisplayQueueFrame> timings;
             for (SPDisplayFrameRequest *pending in _pendingPresentations) timings.push_back(SPDisplayFrameTiming(pending));
             const uint64_t measurementChoiceBegin = _measurementTrace ? SPHostNow() : 0;
-            const bool ruleBEnabled = slot->ruleBEnabled && [self airPerformanceEnabled];
+            const bool ruleBEnabled = slot->ruleBEnabled && [self boundedPresentationEnabled];
             const auto ruleB = spAirDisplayPolicyB::decide(timings, slot->timing.displayNs,
                 slot->ruleBHistory.intervals, slot->ruleBHistory.count, ruleBEnabled);
             const auto selected = ruleB.selected;
@@ -3281,7 +3316,31 @@ struct SPLiveInbound {
     int64_t host = 0;
     int64_t readyHost = 0;
     uint64_t generation = 0;
+    uint64_t videoRevision = 0, videoContext = 0;
+    int videoFPS = 0;
+    int64_t videoPhaseNs = 0;
+    bool videoRetimed = false, videoDiscontinuity = false;
 };
+
+static bool SPVideoSamples(CVPixelBufferRef buffer, sp::VideoLumaSamples &samples) {
+    const OSType format = CVPixelBufferGetPixelFormatType(buffer);
+    const bool planar = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+    if (!planar && format != kCVPixelFormatType_32BGRA) return false;
+    if (CVPixelBufferLockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return false;
+    const auto *base = (const uint8_t *)(planar ? CVPixelBufferGetBaseAddressOfPlane(buffer, 0) : CVPixelBufferGetBaseAddress(buffer));
+    const size_t stride = planar ? CVPixelBufferGetBytesPerRowOfPlane(buffer, 0) : CVPixelBufferGetBytesPerRow(buffer);
+    const size_t width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer);
+    if (base && width && height) for (size_t zone = 0; zone < samples.size(); ++zone) {
+        for (size_t y = 0; y < 9; ++y) for (size_t x = 0; x < 16; ++x) {
+            const size_t px = std::min(width-1, size_t(width*(0.08 + (zone%3 + (x+0.5)/16.0)*0.84/3)));
+            const size_t py = std::min(height-1, size_t(height*(0.12 + (zone/3 + (y+0.5)/9.0)*0.76/2)));
+            const uint8_t *p = base + py*stride + px*(planar ? 1 : 4);
+            samples[zone][y*16+x] = planar ? p[0] : uint8_t((29*p[0] + 150*p[1] + 77*p[2]) >> 8);
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
+    return base && width && height;
+}
 
 struct SPLiveJob {
     uint64_t diagnosticID = 0;
@@ -3633,6 +3692,19 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     sp::SPRateScheduler _scheduler;
     std::mutex _inMx;
     std::deque<SPLiveInbound> _inbound;
+    // Sampling/detection runs before the bounded inference input queue. Its
+    // state is protected by _inMx, independently of model processing speed.
+    std::atomic<bool> _videoSamplingEnabled;
+    sp::VideoCadenceDetector _videoDetector;
+    uint64_t _videoIngressRevision, _videoIngressContext, _videoIngressGeneration;
+    int _videoIngressWidth, _videoIngressHeight;
+    // Retiming and pending-frame ownership belong exclusively to _q.
+    uint64_t _videoConfiguration, _videoRequestRevision, _videoContext, _videoPendingToken;
+    int _videoDetectedFPS;
+    sp::VideoCadenceClock _videoClock;
+    SPLiveInbound _videoPending;
+    int64_t _videoPendingIndex, _videoLastEmittedIndex;
+    uint64_t _videoRetimedFrames, _videoCoalescedInputs;
     sp::FPSMeter _copiedMeter; // protected by _inMx, before inbound eviction
     uint64_t _copiedGeneration, _copiedFrames;
     BOOL _pumpQueued;
@@ -3776,6 +3848,9 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 - (instancetype)init {
     if (!(self = [super init])) return nil;
     _airOutputSubmitDeadlineFailures.store(0, std::memory_order_relaxed);
+    _videoSamplingEnabled.store(false);
+    _videoLastEmittedIndex = INT64_MIN;
+    _videoConfiguration = UINT64_MAX;
     if (SPAirFullMeasurementTraceRequested())
         _measurementTrace = std::make_shared<spAirMeasurement::Trace>(spAirMeasurement::processorCapacity);
     _airRobustSourceLeadRequested = SPAirRobustSourceLeadRequested();
@@ -3933,6 +4008,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 
 - (BOOL)nativeBudgetForSnapshot:(const sp::NativeCadenceSnapshot &)snapshot {
     return !_stopped && _request.interpolationEnabled && _request.rateKind == SPLiveRateMultiplier &&
+        ![self automaticVideoCadenceActive] &&
         snapshot.active && snapshot.generation == _sourceGeneration &&
         snapshot.width == _sourceWidth && snapshot.height == _sourceHeight &&
         snapshot.captureLimit == _request.captureCapFPS && snapshot.refreshHz == _request.displayRefreshHz;
@@ -4371,7 +4447,15 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         requestedFPS = (double)_request.fpsNumerator / (double)_request.fpsDenominator;
     else if (_resolved.committed && _resolved.interpolationActive && _request.interpolationEnabled && _request.rateKind == SPLiveRateMultiplier && inputFPS > 0)
         requestedFPS = inputFPS * _request.multiplier;
+    if ([self automaticVideoCadenceActive]) requestedFPS = _resolved.committed && _resolved.interpolationActive && _videoDetectedFPS > 0
+        ? _videoDetectedFPS * _request.multiplier : -1;
     NSDictionary *result = @{
+        @"automaticVideoCadence": @([self automaticVideoCadenceActive]),
+        @"detectedVideoFPS": @(_videoDetectedFPS),
+        @"videoRetimedFrames": @(_videoRetimedFrames),
+        @"videoCoalescedInputs": @(_videoCoalescedInputs),
+        @"videoPendingInput": @(_videoPending.buffer != nullptr),
+        @"videoCadenceNote": @"Visible-content estimate, not decoder metadata. Coalesced captures are window updates, not a count of missing video frames.",
         @"airWindowOptimization": windowOptimization,
         @"pumpedInputSequence": @(_processedSequence),
         @"capturePressureEvents": @(_capturePressureEvents),
@@ -4605,14 +4689,15 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         @"r8ReportedSlotBytesScope": @"deduplicated CVPixelBufferGetDataSize for queued slot buffers, not resident or total GPU/VT process memory",
         @"sourceWidth": @(_width),
         @"sourceHeight": @(_height),
-        @"srInputWidth": @((int)SPLiveSRInputSize(_width, _height, _request.scaleEnabled ? _request.srInputPreset : 0).width),
-        @"srInputHeight": @((int)SPLiveSRInputSize(_width, _height, _request.scaleEnabled ? _request.srInputPreset : 0).height),
+        @"srInputWidth": @((int)SPLiveSRInputSizeForRequest(_width, _height, _request).width),
+        @"srInputHeight": @((int)SPLiveSRInputSizeForRequest(_width, _height, _request).height),
         @"lowLatencyPreScale": @([self requestUsesLowPrescale:_request width:_width height:_height]),
         @"lowLatencyPrescaledInputs": @(_lowPrescaleInputs), @"lowLatencySyntheticNoRescale": @(_lowSyntheticNoRescale),
         @"processingWidth": @(processingWidth),
         @"processingHeight": @(processingHeight),
         @"lowLatencyProcessingWidth": @(_lowLatency ? _lowLatency.width : 0),
         @"lowLatencyProcessingHeight": @(_lowLatency ? _lowLatency.height : 0),
+        @"lowLatencyPreparationFallbackReason": _lowLatency.preparationFallbackReason ?: @"",
         @"lowLatencyProcessingOrder": [self requestUsesLowPrescale:_request width:_width height:_height] ? @"lanczos-before-low-latency" : @"interpolation-before-scale",
         @"estimatedContentFPS": @((double)_windowChanged / seconds),
         @"r7ContentChange": @{ @"host": @(_r7ContentChangedHost),
@@ -4665,18 +4750,24 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 
 - (BOOL)validateRequest:(SPLivePlanRequest *)request reason:(NSString **)reason {
     BOOL sourceGuard = request.requiredSourceWidth || request.requiredSourceHeight || request.requiredSourceWindowID || request.requiredSourcePID || request.requiredSourceAfterHost;
-    if (sourceGuard && (request.requiredSourceWidth < 2 || request.requiredSourceHeight < 2 || !request.requiredSourceWindowID || request.requiredSourcePID <= 0 || !request.requiredSourceAfterHost || request.srInputPreset != 0 || !request.scaleEnabled ||
-        (request.scaleEngine != SPLiveScaleMetalFX && !SPLiveIsNative2xScaleEngine(request.scaleEngine)))) {
+    BOOL appleLowSR = request.scaleEngine == SPLiveScaleAppleLowLatencySR || request.scaleEngine == SPLiveScaleAppleVideoSR;
+    if (sourceGuard && (request.requiredSourceWidth < 2 || request.requiredSourceHeight < 2 || !request.requiredSourceWindowID || request.requiredSourcePID <= 0 || !request.requiredSourceAfterHost || (!appleLowSR && request.srInputPreset != 0) || !request.scaleEnabled ||
+        (!appleLowSR && request.scaleEngine != SPLiveScaleMetalFX && !SPLiveIsNative2xScaleEngine(request.scaleEngine)))) {
         if (reason) *reason = @"来源窗口尺寸计划无效或缺少已确认的窗口身份。";
         return NO;
     }
-    if (sourceGuard) {
+    if (sourceGuard && !appleLowSR) {
         BOOL nativeOutput = request.outputWidth == request.requiredSourceWidth*2 && request.outputHeight == request.requiredSourceHeight*2;
         BOOL autoAnimation = SPLiveIsNative2xScaleEngine(request.scaleEngine) && request.outputWidth == 0 && request.outputHeight == 0;
         if (!nativeOutput && !autoAnimation) { if (reason) *reason = @"来源窗口模式需要匹配的 2× 输出尺寸。"; return NO; }
     }
     if (request.scaleEnabled && request.scaleEngine == SPLiveScaleAppleVideoSR && request.interpolationEnabled) {
         if (reason) *reason = @"Apple 视频超分暂不支持同时插帧，请先关闭帧生成。";
+        return NO;
+    }
+    if (request.scaleEnabled && request.scaleEngine == SPLiveScaleAppleVideoSR &&
+        (int64_t)request.outputWidth * request.outputHeight > 3200LL * 1800) {
+        if (reason) *reason = @"苹果视频超分的实时输出尺寸过大，请选择自动输出或更小尺寸。";
         return NO;
     }
     if (request.interpolationEnabled && request.rateKind == SPLiveRateMultiplier &&
@@ -5331,6 +5422,28 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     [self publishStatus:@"正在准备引擎" failed:NO];
     [self publishPlanState:1 reason:@"正在准备引擎，当前画面仍用上一份已生效的计划"];
     dispatch_async(_prepareQ, ^{
+        if (copy.scaleEnabled && copy.scaleEngine == SPLiveScaleAppleVideoSR) {
+            NSSize input = SPLiveSRInputSizeForRequest(width, height, copy);
+            BOOL automatic = copy.outputWidth == 0 && copy.outputHeight == 0;
+            NSSize output = automatic ? [SPAppleVideoSR automaticOutputForWidth:(int)input.width height:(int)input.height] : NSMakeSize(copy.outputWidth, copy.outputHeight);
+            int factor = input.width > 0 ? (int)llround(output.width / input.width) : 0;
+            if (factor >= 2 && ![SPAppleVideoSR isReadyForWidth:(int)input.width height:(int)input.height scale:factor]) {
+                dispatch_async(self->_q, ^{ if (token == self->_prepareToken) [self publishStatus:@"正在准备苹果视频超分模型，可能需要下载" failed:NO]; });
+                [SPAppleVideoSR ensureModelForWidth:(int)input.width height:(int)input.height scale:factor completion:^(NSError *modelError) {
+                    dispatch_async(self->_q, ^{
+                        if (token != self->_prepareToken) return;
+                        self->_preparing = NO;
+                        if (modelError) {
+                            self->_asyncPrepareFailed = YES;
+                            self->_resolved.unavailableReason = modelError.localizedDescription;
+                            [self publishStatus:modelError.localizedDescription failed:YES];
+                            [self publishPlanState:0 reason:modelError.localizedDescription];
+                        } else [self updateRequest:copy];
+                    });
+                }];
+                return;
+            }
+        }
         NSError *error = nil;
         BOOL sessionPreparationTraceLost = NO;
         SPLowLatencyEngine *lowLatency = nil;
@@ -5345,7 +5458,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
             NSInteger frames = (copy.rateKind == SPLiveRateFixedFPS || copy.multiplier >= 4) ? 2 : 1;
             lowLatency = [[SPLowLatencyEngine alloc] init];
             BOOL pre=[self requestUsesLowPrescale:copy width:width height:height];
-            if (![lowLatency prepareWidth:pre ? copy.outputWidth : width height:pre ? copy.outputHeight : height frames:frames error:&error]) lowLatency = nil;
+            if (![lowLatency prepareLiveWidth:pre ? copy.outputWidth : width height:pre ? copy.outputHeight : height frames:frames error:&error]) lowLatency = nil;
             else copy.modelID = lowLatency.modelID;
         } else if (copy.interpolationEnabled && [engine isEqualToString:@"rife.metal"]) {
             if (!copy.modelID.length) copy.modelID = @"rife-v4.25";
@@ -5368,15 +5481,19 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         }
         BOOL needsAsyncInterpolation = [self requestUsesAsyncEngine:copy];
         if (!error && [self requestUsesAsyncScale:copy]) {
-            NSSize effective = SPLiveSRInputSize(width, height, copy.srInputPreset);
+            NSSize effective = SPLiveSRInputSizeForRequest(width, height, copy);
             int width = (int)effective.width, height = (int)effective.height;
-            BOOL autoAnime = SPLiveIsNative2xScaleEngine(copy.scaleEngine) && copy.outputWidth == 0 && copy.outputHeight == 0;
-            int targetWidth = autoAnime ? width * 2 : copy.outputWidth;
-            int targetHeight = autoAnime ? height * 2 : copy.outputHeight;
+            BOOL automatic = copy.outputWidth == 0 && copy.outputHeight == 0;
+            BOOL autoAnime = SPLiveIsNative2xScaleEngine(copy.scaleEngine) && automatic;
+            BOOL autoApple = automatic && (copy.scaleEngine == SPLiveScaleAppleLowLatencySR || copy.scaleEngine == SPLiveScaleAppleVideoSR);
+            NSSize appleOutput = !autoApple ? NSZeroSize : (copy.scaleEngine == SPLiveScaleAppleVideoSR ?
+                [SPAppleVideoSR automaticOutputForWidth:width height:height] : [SPAppleLowLatencySR automaticOutputForWidth:width height:height]);
+            int targetWidth = autoAnime ? width * 2 : (autoApple ? (int)appleOutput.width : copy.outputWidth);
+            int targetHeight = autoAnime ? height * 2 : (autoApple ? (int)appleOutput.height : copy.outputHeight);
             float scale = width > 0 ? (float)targetWidth / (float)width : 0;
             float scaleH = height > 0 ? (float)targetHeight / (float)height : 0;
             if (targetWidth < 2 || targetHeight < 2 || fabsf(scale - scaleH) > 0.0001f) {
-                error = SPLiveError(37, @"低延迟超分需要与来源比例一致的明确输出尺寸。 ");
+                error = SPLiveError(37, @"苹果超分不支持当前输入尺寸或输出倍率，请缩小超分输入尺寸并选择自动输出。 ");
             } else {
                 if (SPLiveIsNative2xScaleEngine(copy.scaleEngine)) {
                     if (fabsf(scale - 2.0f) > 0.0001f) error = SPLiveError(39, @"该动画超分当前使用 2× 来源尺寸。");
@@ -5630,6 +5747,9 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 }
 
 - (void)discardQueuedStateOnQueue {
+    [self cancelVideoPendingInput];
+    _videoClock.reset(); _videoDetectedFPS = 0; _videoContext = 0;
+    _videoLastEmittedIndex = INT64_MIN; _videoConfiguration = UINT64_MAX;
     [self resetRateBudgetOnQueue];
     _fpsMeter.reset();
     _pumpedCaptureMeter.reset();
@@ -5795,10 +5915,14 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         default: _resolved.scaleEngineID = @"lanczos"; break;
     }
     _resolved.scaleQualityID = _request.scaleEngine == SPLiveScaleRealCUGAN ? (_request.scaleQualityID ?: @"none") : @"";
-    BOOL autoAnime = _request.scaleEnabled && SPLiveIsNative2xScaleEngine(_request.scaleEngine) && _request.outputWidth == 0 && _request.outputHeight == 0;
-    NSSize effective = SPLiveSRInputSize(_width, _height, _request.scaleEnabled ? _request.srInputPreset : 0);
-    _resolved.outputWidth = autoAnime ? (int)effective.width * 2 : (_request.scaleEnabled ? _request.outputWidth : _width);
-    _resolved.outputHeight = autoAnime ? (int)effective.height * 2 : (_request.scaleEnabled ? _request.outputHeight : _height);
+    BOOL automatic = _request.scaleEnabled && _request.outputWidth == 0 && _request.outputHeight == 0;
+    BOOL autoAnime = automatic && SPLiveIsNative2xScaleEngine(_request.scaleEngine);
+    NSSize effective = SPLiveSRInputSizeForRequest(_width, _height, _request);
+    BOOL autoApple = automatic && (_request.scaleEngine == SPLiveScaleAppleLowLatencySR || _request.scaleEngine == SPLiveScaleAppleVideoSR);
+    NSSize appleOutput = !autoApple ? NSZeroSize : (_request.scaleEngine == SPLiveScaleAppleVideoSR ?
+        [SPAppleVideoSR automaticOutputForWidth:(int)effective.width height:(int)effective.height] : [SPAppleLowLatencySR automaticOutputForWidth:(int)effective.width height:(int)effective.height]);
+    _resolved.outputWidth = autoAnime ? (int)effective.width * 2 : (autoApple ? (int)appleOutput.width : (_request.scaleEnabled ? _request.outputWidth : _width));
+    _resolved.outputHeight = autoAnime ? (int)effective.height * 2 : (autoApple ? (int)appleOutput.height : (_request.scaleEnabled ? _request.outputHeight : _height));
     double target = 0;
     if (_request.interpolationEnabled && _request.rateKind == SPLiveRateFixedFPS && _request.fpsDenominator > 0) {
         target = (double)_request.fpsNumerator / (double)_request.fpsDenominator;
@@ -6271,6 +6395,8 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
               readyHost:(int64_t)readyHost
              generation:(uint64_t)generation {
     if (!buffer || ptsDen == 0) return;
+    sp::VideoLumaSamples videoSamples{};
+    const bool sampledVideo = _videoSamplingEnabled.load() && SPVideoSamples(buffer, videoSamples);
     CVPixelBufferRetain(buffer);
     std::lock_guard<std::mutex> lock(_inMx);
     if (generation >= _copiedGeneration) {
@@ -6294,6 +6420,17 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     item.host = host;
     item.readyHost = readyHost > 0 ? readyHost : host;
     item.generation = generation;
+    if (sampledVideo && _videoSamplingEnabled.load() && generation >= _videoIngressGeneration && ptsDen > 0) {
+        const int width = (int)CVPixelBufferGetWidth(buffer), height = (int)CVPixelBufferGetHeight(buffer);
+        if (generation != _videoIngressGeneration || width != _videoIngressWidth || height != _videoIngressHeight) {
+            _videoDetector.reset(); ++_videoIngressContext;
+            _videoIngressGeneration = generation; _videoIngressWidth = width; _videoIngressHeight = height;
+        }
+        const __int128 ns = (__int128)ptsNum * 1000000000 / ptsDen;
+        if (ns >= INT64_MIN && ns <= INT64_MAX) _videoDetector.observe(videoSamples, (int64_t)ns);
+        item.videoRevision = _videoIngressRevision; item.videoContext = _videoIngressContext;
+        item.videoFPS = _videoDetector.fps(); item.videoPhaseNs = _videoDetector.phaseNs();
+    }
     _inbound.push_back(item);
     if (!_pumpQueued) {
         _pumpQueued = YES;
@@ -6509,7 +6646,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     if (!sample.valid || !_resolved.committed || _resolved.configVersion != _configVersion) return @{};
     return @{ @"endpoint": _scoreOutput ? @"output" : @"preview", @"sourceWidth": @(sample.sourceWidth), @"sourceHeight": @(sample.sourceHeight),
         @"processingWidth": @(sample.processingWidth), @"processingHeight": @(sample.processingHeight),
-        @"srInputWidth": @((int)SPLiveSRInputSize(_width, _height, _request.scaleEnabled ? _request.srInputPreset : 0).width), @"srInputHeight": @((int)SPLiveSRInputSize(_width, _height, _request.scaleEnabled ? _request.srInputPreset : 0).height),
+        @"srInputWidth": @((int)SPLiveSRInputSizeForRequest(_width, _height, _request).width), @"srInputHeight": @((int)SPLiveSRInputSizeForRequest(_width, _height, _request).height),
         @"bufferWidth": @(sample.bufferWidth), @"bufferHeight": @(sample.bufferHeight), @"drawableWidth": @(sample.drawableWidth), @"drawableHeight": @(sample.drawableHeight),
         @"presentedTimeNs": @(sample.presentedTimeNs), @"sourceGeneration": @(_sourceGeneration), @"configVersion": @(_configVersion), @"measurementEpoch": @(_measurementEpoch),
         @"engineID": _resolved.engineID ?: @"", @"modelID": _resolved.modelID ?: @"", @"downsampled": @([self requestUsesLowPrescale:_request width:_width height:_height]) };
@@ -7170,6 +7307,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 
 - (void)recomputeInteractiveDelay {
     double cap = _request.quality == SPFRCQualityHigh ? SPQualityCapSec : SPInteractiveCapSec;
+    if ([self automaticVideoCadenceActive]) cap = 0.160;
 #if defined(ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC) && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC == 1
     if (_airInteractiveCap125msRequested && _request.quality != SPFRCQualityHigh) cap = 0.125;
 #endif
@@ -7254,6 +7392,10 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         renderMargin = (double)_airDelayAlignmentMarginNs / 1e9;
     }
     double wanted = lead + process + renderMargin;
+    // Window capture carries uneven video/UI timestamps. Reserve time for the
+    // following source, conversion and a display slot before releasing X2/X4
+    // output; the existing time/byte caps below still bound retained work.
+    if (_lowLatency && !_nativeBudgetActive) wanted = MAX(wanted, [self automaticVideoCadenceActive] ? 0.140 : 0.080);
     if (_lowLatency && [self requestUsesLowPrescale:_request width:_width height:_height] && _captureToOutputReadyNs.size() >= 8) {
         // Include actual capture-to-ready time, which also covers pre-scaling,
         // conversion, asynchronous delivery and comparison baseline work.
@@ -7545,6 +7687,9 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
          frameID:(uint64_t)frameID
 presentationHost:(int64_t)presentationHost
           redraw:(BOOL)redraw {
+    const BOOL lowLatencyPresentation = _lowLatency && _resolved.interpolationActive && !_nativeBudgetActive && _request.viewMode == SPLiveViewEnhanced;
+    [self.preview setLowLatencyPresentationEnabled:lowLatencyPresentation];
+    [self.outputPreview setLowLatencyPresentationEnabled:lowLatencyPresentation];
     [self.preview setDiagnosticsConfig:_configVersion epoch:_measurementEpoch];
     [self.outputPreview setDiagnosticsConfig:_configVersion epoch:_measurementEpoch];
     [self.preview setPresentationClockEpoch:_clockEpoch];
@@ -8945,11 +9090,15 @@ presentationHost:(int64_t)presentationHost
         _resolved.unavailableReason = @"";
     }
     if (_request.scaleEnabled) {
-        BOOL autoAnime = SPLiveIsNative2xScaleEngine(_request.scaleEngine) && _request.outputWidth == 0 && _request.outputHeight == 0;
-        NSSize effective = SPLiveSRInputSize(_width, _height, _request.srInputPreset);
+        BOOL automatic = _request.outputWidth == 0 && _request.outputHeight == 0;
+        BOOL autoAnime = SPLiveIsNative2xScaleEngine(_request.scaleEngine) && automatic;
+        NSSize effective = SPLiveSRInputSizeForRequest(_width, _height, _request);
         int inputW = (int)effective.width, inputH = (int)effective.height;
-        int outW = autoAnime ? inputW * 2 : (_request.outputWidth > 0 ? (_request.outputWidth & ~1) : _width);
-        int outH = autoAnime ? inputH * 2 : (_request.outputHeight > 0 ? (_request.outputHeight & ~1) : _height);
+        BOOL autoApple = automatic && (_request.scaleEngine == SPLiveScaleAppleLowLatencySR || _request.scaleEngine == SPLiveScaleAppleVideoSR);
+        NSSize appleOutput = !autoApple ? NSZeroSize : (_request.scaleEngine == SPLiveScaleAppleVideoSR ?
+            [SPAppleVideoSR automaticOutputForWidth:inputW height:inputH] : [SPAppleLowLatencySR automaticOutputForWidth:inputW height:inputH]);
+        int outW = autoAnime ? inputW * 2 : (autoApple ? (int)appleOutput.width : (_request.outputWidth > 0 ? (_request.outputWidth & ~1) : _width));
+        int outH = autoAnime ? inputH * 2 : (autoApple ? (int)appleOutput.height : (_request.outputHeight > 0 ? (_request.outputHeight & ~1) : _height));
         if (outW < 2 || outH < 2) {
             if (error) *error = SPLiveError(33, @"输出尺寸无效");
             return NO;
@@ -9027,6 +9176,107 @@ presentationHost:(int64_t)presentationHost
     if (!ok) [self publishStatus:error.localizedDescription ?: @"准备失败" failed:YES];
 }
 
+- (BOOL)automaticVideoCadenceActive {
+    return !_stopped && _request.automaticVideoCadence && _request.interpolationEnabled &&
+        [_request.engineID isEqualToString:@"apple.lowlatency"] && _request.captureSourceKind != SPLiveCaptureSourceKindFile;
+}
+
+- (void)cancelVideoPendingInput {
+    ++_videoPendingToken;
+    if (_videoPending.buffer) CVPixelBufferRelease(_videoPending.buffer);
+    _videoPending = {};
+}
+
+- (void)resetVideoOutputTimeline {
+    [self cancelVideoPendingInput];
+    _videoClock.reset(); _videoLastEmittedIndex = INT64_MIN;
+    [self retireClockTimeline];
+    _haveAnchor = NO; _haveLastPts = NO; _havePreviousSourcePts = NO; _haveInterval = NO;
+    _havePair = NO; _previousSourceIdentity = 0;
+    [self resetSchedulerOnQueue];
+}
+
+- (void)syncVideoCadenceMode {
+    const bool enabled = [self automaticVideoCadenceActive];
+    const bool wasEnabled = _videoSamplingEnabled.load();
+    if (_videoConfiguration == _configVersion && enabled == wasEnabled) return;
+    _videoConfiguration = _configVersion;
+    if (!enabled && !wasEnabled) return;
+    {
+        std::lock_guard<std::mutex> lock(_inMx);
+        _videoSamplingEnabled.store(enabled);
+        _videoDetector.reset(); ++_videoIngressContext;
+        _videoRequestRevision = ++_videoIngressRevision;
+    }
+    _videoDetectedFPS = 0; _videoContext = 0;
+    [self resetVideoOutputTimeline];
+}
+
+- (SPLiveInbound)takeRetimedVideoInput {
+    SPLiveInbound item = _videoPending; _videoPending = {};
+    const auto pts = _videoClock.pts(_videoPendingIndex);
+    item.ptsNum = pts.num; item.ptsDen = pts.den; item.videoRetimed = true;
+    item.videoDiscontinuity = _videoLastEmittedIndex != INT64_MIN && _videoPendingIndex - _videoLastEmittedIndex > 1;
+    _videoLastEmittedIndex = _videoPendingIndex; ++_videoRetimedFrames;
+    return item;
+}
+
+- (void)retimeVideoBatch:(std::deque<SPLiveInbound> &)batch {
+    [self syncVideoCadenceMode];
+    if (![self automaticVideoCadenceActive]) {
+        for (auto i = batch.begin(); i != batch.end();) {
+            if (i->videoRetimed) { CVPixelBufferRelease(i->buffer); i = batch.erase(i); }
+            else ++i;
+        }
+        return;
+    }
+    std::deque<SPLiveInbound> ready;
+    for (auto item : batch) {
+        if (item.generation != _sourceGeneration || _stopped) { CVPixelBufferRelease(item.buffer); continue; }
+        if (item.videoRetimed) {
+            if (item.videoRevision == _videoRequestRevision && item.videoContext == _videoContext) ready.push_back(item);
+            else CVPixelBufferRelease(item.buffer);
+            continue;
+        }
+        const int fps = item.videoRevision == _videoRequestRevision ? item.videoFPS : 0;
+        if (fps != _videoDetectedFPS || item.videoContext != _videoContext) {
+            [self resetVideoOutputTimeline];
+            for (auto old : ready) CVPixelBufferRelease(old.buffer);
+            ready.clear(); _videoDetectedFPS = fps; _videoContext = item.videoContext;
+            if (fps) _videoClock.start(fps, (int64_t)((__int128)item.ptsNum * 1000000000 / item.ptsDen), item.videoPhaseNs);
+        }
+        if (!fps) { ready.push_back(item); continue; }
+        const int64_t captureNs = (int64_t)((__int128)item.ptsNum * 1000000000 / item.ptsDen);
+        const int64_t index = _videoClock.index(captureNs);
+        if (index <= _videoLastEmittedIndex || (_videoPending.buffer && index < _videoPendingIndex)) {
+            ++_videoCoalescedInputs; CVPixelBufferRelease(item.buffer); continue;
+        }
+        if (_videoPending.buffer && index > _videoPendingIndex) ready.push_back([self takeRetimedVideoInput]);
+        if (_videoPending.buffer) {
+            ++_videoCoalescedInputs; CVPixelBufferRelease(_videoPending.buffer);
+            _videoPending = item;
+            continue;
+        }
+        _videoPending = item; _videoPendingIndex = index;
+        const uint64_t token = ++_videoPendingToken;
+        const int64_t remainingNs = std::max(int64_t{0}, _videoClock.closesNs(index) - captureNs);
+        // Close from the capture host, not from a delayed inference queue entry.
+        const int64_t elapsedNs = SPHostToNs(SPHostNow() - item.host);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, std::max(int64_t{0}, remainingNs - elapsedNs)), _q, ^{
+            if (token != self->_videoPendingToken || !self->_videoPending.buffer) return;
+            if (self->_stopped) { [self cancelVideoPendingInput]; return; }
+            const auto closed = [self takeRetimedVideoInput];
+            std::lock_guard<std::mutex> lock(self->_inMx);
+            self->_inbound.push_front(closed);
+            if (!self->_pumpQueued) {
+                self->_pumpQueued = YES;
+                dispatch_async(self->_q, ^{ [self pump]; });
+            }
+        });
+    }
+    batch.swap(ready);
+}
+
 - (void)pump {
     std::deque<SPLiveInbound> batch;
     {
@@ -9034,6 +9284,7 @@ presentationHost:(int64_t)presentationHost
         batch.swap(_inbound);
         _pumpQueued = NO;
     }
+    [self retimeVideoBatch:batch];
     if (SPR7Passthrough() || !_request.interpolationEnabled) {
         // Coalesce only already-buffered frames of the current source. Pick
         // the greatest valid PTS rather than blindly trusting callback order.
@@ -9177,8 +9428,8 @@ presentationHost:(int64_t)presentationHost
         }
         if (width != _width || height != _height || rawSizeChanged) {
             if (_sessionReady && _resolved.scaleActive && _request.scaleEnabled && (_request.scaleEngine == SPLiveScaleAppleLowLatencySR || _request.scaleEngine == SPLiveScaleAppleVideoSR)) {
-                NSSize previous = SPLiveSRInputSize(_width, _height, _request.srInputPreset);
-                NSSize next = SPLiveSRInputSize(width, height, _request.srInputPreset);
+                NSSize previous = SPLiveSRInputSizeForRequest(_width, _height, _request);
+                NSSize next = SPLiveSRInputSizeForRequest(width, height, _request);
                 int outW=0, outH=0;
                 if (sp::resizedNativeSROutput((int)previous.width, (int)previous.height, _request.outputWidth, _request.outputHeight,
                                                (int)next.width, (int)next.height, outW, outH)) {
@@ -9255,12 +9506,12 @@ presentationHost:(int64_t)presentationHost
         }
         uint8_t luma[64];
         SPSampleLuma(item.buffer, luma, 64);
-        BOOL cut = NO;
+        BOOL cut = item.videoDiscontinuity;
         BOOL changed = YES;
         BOOL comparableLuma = _haveLuma && _r7LumaGeneration == _sourceGeneration &&
             _r7LumaConfig == _configVersion && _r7LumaEpoch == _measurementEpoch;
         if (_haveLuma) {
-            cut = sp::spDetectSceneCut(_previousLuma, luma, 64);
+            cut = cut || sp::spDetectSceneCut(_previousLuma, luma, 64);
             int64_t mad = 0;
             for (int i = 0; i < 64; ++i) {
                 int delta = (int)luma[i] - (int)_previousLuma[i];
@@ -9328,7 +9579,8 @@ presentationHost:(int64_t)presentationHost
         }
         [self updateRateBudgetOnQueue];
         BOOL engineReady = _engine != nil || _lowLatency != nil || _rife != nil || _distil != nil;
-        if (_request.interpolationEnabled && _sessionReady && engineReady) {
+        if (_request.interpolationEnabled && _sessionReady && engineReady &&
+            (![self automaticVideoCadenceActive] || item.videoRetimed)) {
             sp::SPScheduleInput input;
             input.pts = sp::spMake(item.ptsNum, item.ptsDen);
             input.identity = identity;
@@ -11414,52 +11666,64 @@ presentationHost:(int64_t)presentationHost
 
 + (NSDictionary<NSString *, id> *)runVideoSRPipelineContract {
     SPLiveProcessor *p = [[SPLiveProcessor alloc] init];
-    CVPixelBufferRef input = SPCreateBuffer(480, 270, kCVPixelFormatType_32BGRA);
+    CVPixelBufferRef input = SPCreateBuffer(1920, 1080, kCVPixelFormatType_32BGRA);
     if (!input) return @{ @"ok": @NO, @"reason": @"source allocation" };
     CVPixelBufferLockBaseAddress(input, 0);
     memset(CVPixelBufferGetBaseAddress(input), 80, CVPixelBufferGetBytesPerRow(input) * CVPixelBufferGetHeight(input));
     CVPixelBufferUnlockBaseAddress(input, 0);
     [p adoptSourceGeneration:1];
-    dispatch_sync(p->_q, ^{ p->_width=480; p->_height=270; });
+    dispatch_sync(p->_q, ^{ p->_width=1920; p->_height=1080; p->_testRecordSRInput=YES; });
     SPLivePlanRequest *request=[[SPLivePlanRequest alloc] init];
     request.scaleEnabled=YES; request.scaleEngine=SPLiveScaleAppleVideoSR;
-    request.outputWidth=1920; request.outputHeight=1080; request.viewMode=SPLiveViewCompare;
+    request.outputWidth=0; request.outputHeight=0; request.viewMode=SPLiveViewCompare;
+    NSSize effective=SPLiveSRInputSizeForRequest(1920,1080,request);
+    NSSize expected=[SPAppleVideoSR automaticOutputForWidth:(int)effective.width height:(int)effective.height];
     [p updateRequest:request];
     __block BOOL ready=NO;
     for (int i=0;i<400&&!ready;i++) { usleep(50000); dispatch_sync(p->_q, ^{ready=p->_sessionReady && p->_videoSR && p->_resolved.scaleActive;}); }
     if (!ready) { CVPixelBufferRelease(input); [p stop]; return @{ @"ok":@NO, @"reason":@"video SR prepare", @"stats":[p stats] }; }
     __block uint64_t config=0; dispatch_sync(p->_q, ^{config=p->_configVersion;});
+    SPLivePlanRequest *large=[request copy]; large.outputWidth=3840; large.outputHeight=2160;
+    __block BOOL oversizedRejected=NO;
+    dispatch_sync(p->_q, ^{oversizedRejected=![p validateRequest:large reason:nil];});
     SPLivePlanRequest *bad=[request copy]; bad.interpolationEnabled=YES; bad.engineID=@"apple.frc"; bad.multiplier=2;
     [p updateRequest:bad];
     __block BOOL rejectedWithoutReplacing=NO;
     dispatch_sync(p->_q, ^{rejectedWithoutReplacing=p->_configVersion==config && p->_videoSR && p->_sessionReady && !p->_request.interpolationEnabled;});
-    int64_t future=SPHostNow()+SPRationalToHost(sp::spMake(20,1));
-    dispatch_sync(p->_q, ^{
-        for (int i=0;i<3;i++) {
+    int64_t future=SPHostNow()+SPRationalToHost(sp::spMake(120,1));
+    __block int observed=0; __block BOOL sizes=YES, comparison=YES, failed=NO;
+    for (int frame=0;frame<3;frame++) {
+        dispatch_sync(p->_q, ^{
+            int i=frame;
             uint64_t id=11+i;
             p->_held[id].source=CVPixelBufferRetain(input);p->_held[id].host=future+SPRationalToHost(sp::spMake(i,30));p->_held[id].pts=sp::spMake(i,30);
             [p enqueueSourceIdentity:id pts:sp::spMake(i,30) host:p->_held[id].host generation:1 force:NO];
-        }
-    });
-    __block int observed=0; __block BOOL sizes=YES, comparison=YES;
-    for (int i=0;i<400&&observed<3;i++) {usleep(50000);dispatch_sync(p->_q, ^{
-        observed=0;for(const SPPlaySlot &slot:p->_slots){
-            if(slot.sourceGeneration!=1 || slot.synthetic)continue;
-            if(sp::spCmp(slot.pts,sp::spMake(0,1))>=0 && sp::spCmp(slot.pts,sp::spMake(2,30))<=0)observed++;
-            sizes=sizes && CVPixelBufferGetWidth(slot.enhanced)==1920 && CVPixelBufferGetHeight(slot.enhanced)==1080 && CVPixelBufferGetPixelFormatType(slot.enhanced)==kCVPixelFormatType_32BGRA;
-            comparison=comparison && slot.original && CVPixelBufferGetWidth(slot.original)==1920;
-        }
-    });}
+        });
+        for (int i=0;i<400&&observed<frame+1&&!failed;i++) {usleep(50000);dispatch_sync(p->_q, ^{
+            failed=p->_srFailed;
+            if (p->_lastEnhanced && sp::spCmp(p->_lastRedrawPts,sp::spMake(frame,30))==0) {
+                observed=frame+1;
+                sizes=sizes && CVPixelBufferGetWidth(p->_lastEnhanced)==(size_t)expected.width && CVPixelBufferGetHeight(p->_lastEnhanced)==(size_t)expected.height && CVPixelBufferGetPixelFormatType(p->_lastEnhanced)==kCVPixelFormatType_32BGRA;
+                comparison=comparison && p->_lastOriginal && CVPixelBufferGetWidth(p->_lastOriginal)==(size_t)expected.width;
+            }
+        });}
+        if (failed || observed<frame+1) break;
+    }
+    __block NSString *firstError=nil; dispatch_sync(p->_q, ^{firstError=p->_testSRError;});
     [p adoptSourceGeneration:2];dispatch_sync(p->_q,^{});
     [p pushPixelBuffer:input ptsNum:1 ptsDen:1 host:future generation:2];
     __block BOOL secondReady=NO;
     for(int i=0;i<400&&!secondReady;i++){usleep(50000);dispatch_sync(p->_q,^{secondReady=p->_sourceGeneration==2 && p->_sessionReady && p->_videoSR && p->_resolved.scaleActive;});}
     [p pushPixelBuffer:input ptsNum:31 ptsDen:30 host:future+SPRationalToHost(sp::spMake(1,30)) generation:2];
     __block BOOL newOutput=NO,oldOutput=NO;
-    for(int i=0;i<400&&!newOutput;i++){usleep(50000);dispatch_sync(p->_q,^{for(const SPPlaySlot &slot:p->_slots){if(slot.sourceGeneration!=2)oldOutput=YES;if(slot.sourceGeneration==2&&sp::spCmp(slot.pts,sp::spMake(31,30))==0&&CVPixelBufferGetWidth(slot.enhanced)==1920)newOutput=YES;}});}
+    for(int i=0;i<400&&!newOutput;i++){usleep(50000);dispatch_sync(p->_q,^{
+        newOutput=p->_sourceGeneration==2 && p->_lastEnhanced && sp::spCmp(p->_lastRedrawPts,sp::spMake(31,30))==0 && CVPixelBufferGetWidth(p->_lastEnhanced)==(size_t)expected.width;
+        for(const SPPlaySlot &slot:p->_slots) if(slot.sourceGeneration!=2) oldOutput=YES;
+    });}
+    __block NSString *lastError=nil; dispatch_sync(p->_q, ^{lastError=p->_testSRError;});
     CVPixelBufferRelease(input);[p stop];
-    BOOL ok=ready&&rejectedWithoutReplacing&&observed==3&&sizes&&comparison&&secondReady&&newOutput&&!oldOutput;
-    return @{ @"ok":@(ok), @"prepared":@(ready), @"outputFramesWithOriginalPTS":@(observed), @"outputBGRAAndSize":@(sizes), @"compareBaseline":@(comparison), @"unverifiedCombinationRejectedAndOldPlanKept":@(rejectedWithoutReplacing), @"newGenerationSession":@(secondReady), @"newGenerationOutput":@(newOutput), @"oldGenerationOutput":@(oldOutput), @"note":@"Synthetic sources only; real capture, visual quality, UI persistence and performance remain unverified." };
+    BOOL ok=ready&&rejectedWithoutReplacing&&oversizedRejected&&observed==3&&sizes&&comparison&&secondReady&&newOutput&&!oldOutput;
+    return @{ @"ok":@(ok), @"prepared":@(ready), @"outputFramesWithOriginalPTS":@(observed), @"outputBGRAAndSize":@(sizes), @"compareBaseline":@(comparison), @"unverifiedCombinationRejectedAndOldPlanKept":@(rejectedWithoutReplacing), @"oversizedLiveOutputRejected":@(oversizedRejected), @"newGenerationSession":@(secondReady), @"newGenerationOutput":@(newOutput), @"oldGenerationOutput":@(oldOutput), @"firstError":firstError ?: @"", @"lastError":lastError ?: @"", @"automaticOutput":@[@((int)expected.width),@((int)expected.height)], @"note":@"Synthetic sources only; real capture, visual quality, UI persistence and performance remain unverified." };
 }
 
 + (NSDictionary<NSString *, id> *)runSRPipelineContractWithPreset:(int)preset {
@@ -11480,7 +11744,7 @@ presentationHost:(int64_t)presentationHost
     dispatch_sync(p->_q, ^{ p->_width = width; p->_height = height; p->_testRecordSRInput = YES; });
     SPLivePlanRequest *request = [[SPLivePlanRequest alloc] init];
     request.scaleEnabled = YES; request.scaleEngine = SPLiveScaleAppleLowLatencySR; request.srInputPreset = preset;
-    request.outputWidth = 1920; request.outputHeight = 1080; request.viewMode = SPLiveViewCompare;
+    request.outputWidth = preset ? 0 : 1920; request.outputHeight = preset ? 0 : 1080; request.viewMode = SPLiveViewCompare;
     [p updateRequest:request];
     __block BOOL ready = NO;
     for (int i = 0; i < 400 && !ready; ++i) {

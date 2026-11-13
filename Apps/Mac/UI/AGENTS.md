@@ -9,15 +9,18 @@ Own native windows, menus, player interaction and enhancement configuration here
 
 [Enhancement/EnhancementWorkbench.swift](Enhancement/EnhancementWorkbench.swift) owns profiles, migration, configuration actions, source/output controls and the workbench window.
 [Enhancement/LiveFPSOverlay.swift](Enhancement/LiveFPSOverlay.swift) formats live FPS observations.
-The visible interpolation model is ODF-VFI, with fast/balanced/hq tiers; persisted `rife-v4.25` identifiers remain for compatibility.
+The engine selector offers ODF-VFI (default), Apple low latency and Apple FRC. Preserve each engine when loading and saving profiles. ODF-VFI has fast/balanced/hq tiers; persisted `rife-v4.25` identifiers remain for compatibility. Apple low latency uses X2/X4 for live capture and X2 for files, without fixed FPS or X3. FRC has standard/quality tiers for live capture and standard for files. Keep rate controls and quality choices consistent with the selected source and engine.
+The workbench offers Apple low-latency and Apple video super resolution; preserve the disabled-by-default scale switch and migrate legacy scaler profiles without altering frame-generation settings.
+The workbench always shows enhanced output; legacy original/compare view settings migrate to enhanced.
 Keep continuous stream caching enabled by default and window output fixed to follow with mouse passthrough.
 The normal countdown defaults to 3 seconds; keep saved countdown and custom settings working.
 Hardware/configuration auto-detection is deferred. Keep its suggestions and scoring out of ordinary controls.
 Preserve configuration add/rename/delete, preset metadata and saved-profile migration.
 The three-step first-use coach marks are implemented in [WorkbenchOnboarding.swift](Enhancement/WorkbenchOnboarding.swift); keep them skippable, source-specific and replayable from Help.
-Preserve the no-source delayed window-selection path, countdown cancellation, restart after Stop and pending Apply Changes actions.
+Keep delayed window selection available beside the selected-window start action, including before a source is chosen. The selected-window action must offer Cancel throughout its countdown and initial engine preparation. During enhancement, show Stop Enhancement in the start action's position; preserve restart after Stop and pending Apply Changes actions.
 File output retains its fullscreen control; display and window output follow their source without a fullscreen preview option.
 The workbench is a compact controls-only window. Keep its preview endpoint disconnected; file video stays in the player and live enhancement uses its actual output view.
+Apple low latency in live window/display mode offers Content timing: General window / Automatic video. Old profiles retain General window. Automatic video requests a 60 FPS capture ceiling without replacing the saved general-mode cap, reports estimated 24/25/30 FPS or detection in progress, and leaves audio in the source app. Keep this choice hidden for files and other engines; preserve it when saving configurations.
 
 ## UI validation
 

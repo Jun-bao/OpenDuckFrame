@@ -96,6 +96,8 @@ FOUNDATION_EXPORT BOOL SPWindowNativeFits(double taskMs, double refreshHz);
 @property (nonatomic, copy) NSString *qualityID;
 /// Opt-in RIFE live stream cache. Other engines and file playback are unaffected.
 @property (nonatomic) BOOL rifeStreamEnabled;
+/// Opt-in visible 24/25/30 FPS estimation and retiming for live Apple low latency.
+@property (nonatomic) BOOL automaticVideoCadence;
 @end
 
 @interface SPLiveResolvedPlan : NSObject

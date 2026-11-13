@@ -42,6 +42,10 @@ private final class SourceSizeControls {
   var workbenchMotionPlusRequested = false
   var workbenchFileLanczosActive = false
  }
+ final class Label {
+  var stringValue = ""
+  var textColor: NSColor?
+ }
  var profile = EnhancementProfile()
  var applied = EnhancementProfile()
  var capture = Capture()
@@ -50,18 +54,41 @@ private final class SourceSizeControls {
  var filePlayer: Player?
  var filePreparing = false
  var hasPendingFormChanges = false
+ var pendingApply: EnhancementProfile?
  var countdown = EnhancementCountdown()
+ var sourceWindowPreparing = false
  var delayedWindowSelection = false
  var startImmediatelyAfterPreparation = false
  var startButton: Button? = Button()
+ var delayedStartButton: Button? = Button()
  var stopButton: Button? = Button()
+ var statusLabel = Label()
+ var selectedStarts = 0
+ var delayedStarts = 0
+ var cancellations = 0
+ var stops = 0
+ var sourceChoices = 0
 
  func selectedFilePlayer() -> Player? { filePlayer }
  var hasSelectedSource: Bool {
   // ACTUAL_SELECTED_SOURCE
  }
+ var isEnhancing: Bool {
+  // ACTUAL_IS_ENHANCING
+ }
  func refreshActions() {
   // ACTUAL_WORKBENCH_ACTIONS
+ }
+ func cancelCountdown() { cancellations += 1; countdown.cancel(); delayedWindowSelection = false; startImmediatelyAfterPreparation = false }
+ func stop() { stops += 1; pendingApply = nil }
+ func startSelectedSource() { selectedStarts += 1 }
+ func chooseCurrentKind() { sourceChoices += 1 }
+ func beginDelayedWindowSelection() { delayedStarts += 1 }
+ func triggerStart() {
+  // ACTUAL_START_HANDLER
+ }
+ func triggerDelayedStart() {
+  // ACTUAL_DELAY_HANDLER
  }
  func hasChanges(relativeTo baseline: EnhancementProfile) -> Bool {
   // ACTUAL_FORM_DIFFERENCE
@@ -74,22 +101,76 @@ private final class SourceSizeControls {
  @MainActor static func main() throws {
   let unselectedWindow = WorkbenchActionControls()
   unselectedWindow.refreshActions()
-  precondition(unselectedWindow.startButton?.isEnabled == true,
-    "Window countdown must allow automatic source selection before a source is chosen")
+  precondition(unselectedWindow.startButton?.isEnabled == false && unselectedWindow.startButton?.isHidden == false)
+  precondition(unselectedWindow.startButton?.title == "Enhance Selected Window")
+  precondition(unselectedWindow.delayedStartButton?.isEnabled == true && unselectedWindow.delayedStartButton?.isHidden == false,
+    "Delayed enhancement must remain available before a source is chosen")
+  precondition(unselectedWindow.delayedStartButton?.title == "Delayed Enhancement")
+  unselectedWindow.triggerStart()
+  precondition(unselectedWindow.sourceChoices == 1 && unselectedWindow.delayedStarts == 0,
+    "The specified-window action must not silently switch to delayed selection")
+  unselectedWindow.triggerDelayedStart()
+  precondition(unselectedWindow.delayedStarts == 1)
+
+  let selectedWindow = WorkbenchActionControls()
+  selectedWindow.activeSourceKind = "window"
+  selectedWindow.capture.target = 1
+  selectedWindow.refreshActions()
+  precondition(selectedWindow.startButton?.isEnabled == true && selectedWindow.delayedStartButton?.isEnabled == true,
+    "Selecting a window must not remove the delayed action")
+  precondition(selectedWindow.startButton?.isHidden == false && selectedWindow.delayedStartButton?.isHidden == false)
+  selectedWindow.triggerStart()
+  selectedWindow.triggerDelayedStart()
+  precondition(selectedWindow.selectedStarts == 1 && selectedWindow.delayedStarts == 1,
+    "Each action must invoke its own source-selection path")
+
+  let selectedCountdown = WorkbenchActionControls()
+  selectedCountdown.activeSourceKind = "window"
+  selectedCountdown.capture.target = 1
+  _ = selectedCountdown.countdown.begin(seconds: 3)
+  selectedCountdown.refreshActions()
+  precondition(selectedCountdown.startButton?.isEnabled == true && selectedCountdown.startButton?.title == "Cancel (3)",
+    "The selected-window countdown must offer an explicit cancel action")
+  precondition(selectedCountdown.delayedStartButton?.isEnabled == false)
+  selectedCountdown.triggerStart()
+  precondition(selectedCountdown.cancellations == 1 && !selectedCountdown.countdown.active)
+  selectedCountdown.refreshActions()
+  precondition(selectedCountdown.startButton?.isEnabled == true && selectedCountdown.startButton?.title == "Enhance Selected Window")
+
+  let preparingWindow = WorkbenchActionControls()
+  _ = preparingWindow.countdown.begin(seconds: 3)
+  preparingWindow.sourceWindowPreparing = true
+  preparingWindow.refreshActions()
+  precondition(preparingWindow.startButton?.isEnabled == true && preparingWindow.startButton?.title == "Cancel")
+  preparingWindow.triggerStart()
+  precondition(preparingWindow.cancellations == 1)
+
+  let pendingWindow = WorkbenchActionControls()
+  pendingWindow.pendingApply = EnhancementProfile()
+  pendingWindow.refreshActions()
+  precondition(pendingWindow.startButton?.isEnabled == true && pendingWindow.startButton?.title == "Cancel",
+    "A submitted start must stay cancellable while the engine prepares")
+  precondition(pendingWindow.delayedStartButton?.isEnabled == false)
+  pendingWindow.triggerStart()
+  precondition(pendingWindow.stops == 1 && pendingWindow.pendingApply == nil)
 
   let countdownWindow = WorkbenchActionControls()
   let countdownTicket = countdownWindow.countdown.begin(seconds: 1)!
   countdownWindow.delayedWindowSelection = true
   countdownWindow.refreshActions()
-  precondition(countdownWindow.startButton?.isEnabled == true && countdownWindow.startButton?.title == "Cancel")
+  precondition(countdownWindow.delayedStartButton?.isEnabled == true && countdownWindow.delayedStartButton?.title == "Cancel")
+  precondition(countdownWindow.startButton?.isEnabled == false)
   _ = countdownWindow.countdown.tick(countdownTicket)
   countdownWindow.refreshActions()
-  precondition(countdownWindow.startButton?.isEnabled == true,
+  precondition(countdownWindow.delayedStartButton?.isEnabled == true,
     "Cancel must remain available while source discovery is pending after zero")
   countdownWindow.delayedWindowSelection = false
   countdownWindow.startImmediatelyAfterPreparation = true
   countdownWindow.refreshActions()
-  precondition(countdownWindow.startButton?.isEnabled == true && countdownWindow.startButton?.title == "Cancel")
+  precondition(countdownWindow.delayedStartButton?.isEnabled == true && countdownWindow.delayedStartButton?.title == "Cancel")
+  countdownWindow.triggerDelayedStart()
+  precondition(countdownWindow.cancellations == 1 && countdownWindow.delayedStarts == 0,
+    "The delayed action must cancel while preparing the selected window")
 
   let stoppedDisplay = WorkbenchActionControls()
   stoppedDisplay.profile.sourceKind = "display"
@@ -98,6 +179,7 @@ private final class SourceSizeControls {
   stoppedDisplay.refreshActions()
   precondition(stoppedDisplay.hasSelectedSource && stoppedDisplay.startButton?.isEnabled == true,
     "A stopped display with a retained source must remain restartable")
+  precondition(stoppedDisplay.delayedStartButton?.isHidden == true && stoppedDisplay.startButton?.title == "Start Enhancement")
   stoppedDisplay.capture.target = nil
   stoppedDisplay.refreshActions()
   precondition(stoppedDisplay.startButton?.isEnabled == false)
@@ -109,9 +191,31 @@ private final class SourceSizeControls {
   activeWindow.processor.resolvedPlan.interpolationActive = true
   activeWindow.refreshActions()
   precondition(activeWindow.startButton?.isHidden == true && activeWindow.stopButton?.isHidden == false)
+  precondition(activeWindow.stopButton?.title == "Stop Enhancement")
+  precondition(activeWindow.delayedStartButton?.isHidden == false && activeWindow.delayedStartButton?.isEnabled == true,
+    "Delayed selection must remain available while enhancing a window")
   activeWindow.hasPendingFormChanges = true
   activeWindow.refreshActions()
   precondition(activeWindow.startButton?.isHidden == false && activeWindow.stopButton?.isHidden == false)
+  precondition(activeWindow.startButton?.title == "Apply Changes" && activeWindow.stopButton?.title == "Stop Enhancement")
+
+  let activeDisplay = WorkbenchActionControls()
+  activeDisplay.profile.sourceKind = "display"
+  activeDisplay.capture.running = true
+  activeDisplay.processor.resolvedPlan.scaleActive = true
+  activeDisplay.refreshActions()
+  precondition(activeDisplay.startButton?.isHidden == true && activeDisplay.stopButton?.title == "Stop Enhancement")
+  precondition(activeDisplay.delayedStartButton?.isHidden == true)
+
+  let activeFile = WorkbenchActionControls()
+  activeFile.profile.sourceKind = "file"
+  activeFile.filePlayer = WorkbenchActionControls.Player()
+  activeFile.filePlayer?.workbenchMotionPlusRequested = true
+  activeFile.refreshActions()
+  precondition(activeFile.startButton?.isHidden == true && activeFile.stopButton?.title == "Stop Enhancement")
+  activeFile.hasPendingFormChanges = true
+  activeFile.refreshActions()
+  precondition(activeFile.startButton?.title == "Apply Changes" && activeFile.stopButton?.title == "Stop Enhancement")
 
   let preparingFile = WorkbenchActionControls()
   preparingFile.profile.sourceKind = "file"
@@ -119,6 +223,8 @@ private final class SourceSizeControls {
   preparingFile.filePreparing = true
   preparingFile.refreshActions()
   precondition(preparingFile.startButton?.isEnabled == false && preparingFile.stopButton?.isHidden == false)
+  precondition(preparingFile.stopButton?.title == "Cancel")
+  precondition(preparingFile.delayedStartButton?.isHidden == true)
 
   for sourceKind in ["display", "file"] {
    let outputChanges = WorkbenchActionControls()
@@ -139,13 +245,13 @@ private final class SourceSizeControls {
     "Follow-window mode does not apply separate output-screen or fullscreen settings")
 
   for modelIndex in 0...1 {
-   for (index, width, height) in [(1, 854, 480), (2, 1280, 720), (3, 1920, 1080)] {
+   for index in [1, 2, 3] {
     let controls = SourceSizeControls()
     controls.scalePopup.indexOfSelectedItem = modelIndex
     controls.sourceWindowPopup.indexOfSelectedItem = index
     controls.changeSourceSize()
     precondition(controls.profile.windowOutputMode == "follow")
-    precondition(controls.outputSize?.0 == width * 2 && controls.outputSize?.1 == height * 2)
+    precondition(controls.outputSize?.0 == 0 && controls.outputSize?.1 == 0)
    }
   }
   for source in 0...2 {
@@ -170,6 +276,22 @@ private final class SourceSizeControls {
   precondition(WorkbenchTitle.text("Quality Workbench",version:" \n ") == "Quality Workbench")
   precondition(WorkbenchTitle.text("画质工作台",version:nil) == "画质工作台")
   var oldProfile = try JSONSerialization.jsonObject(with: JSONEncoder().encode(EnhancementProfile())) as! [String: Any]
+  oldProfile.removeValue(forKey:"automaticVideoCadence")
+  let legacyTiming = EnhancementProfileStore.decode(try JSONSerialization.data(withJSONObject:oldProfile),fallbackName:"legacy")!
+  precondition(!legacyTiming.automaticVideoCadence, "Existing profiles must retain general window timing")
+  for source in ["window", "display", "file"] {
+   for engine in ["apple.lowlatency", "apple.frc", "rife.metal"] {
+    var timing = EnhancementProfile()
+    timing.sourceKind=source; timing.interpolationEngineID=engine; timing.automaticVideoCadence=true; timing.captureLimit="30"
+    let restored=EnhancementProfileStore.decode(try JSONEncoder().encode(timing),fallbackName:"timing")!
+    let active=source != "file" && engine == "apple.lowlatency"
+    precondition(restored.automaticVideoCadence && restored.usesAutomaticVideoCadence == active)
+    precondition(restored.effectiveCaptureLimit == (active ? 60 : 30))
+    let changes=WorkbenchActionControls(); changes.profile=timing
+    var baseline=timing; baseline.automaticVideoCadence=false
+    precondition(changes.hasChanges(relativeTo:baseline) == active)
+   }
+  }
   oldProfile.removeValue(forKey:"windowOutputMode")
   let oldData = try JSONSerialization.data(withJSONObject:oldProfile)
   precondition(EnhancementProfileStore.decode(oldData,fallbackName:"legacy")?.windowOutputMode == "follow")
@@ -198,13 +320,21 @@ private final class SourceSizeControls {
      saved.srInputPreset = 720; saved.sourceWindowPreset = 480
      saved.outputWidth = 2560; saved.outputHeight = 1440; saved.rate = .multiplier(3)
      var expected = saved
-     expected.interpolationEngineID = "rife.metal"; expected.modelID = "rife-v4.25"
-     expected.interpolationQuality = ["fast", "balanced", "hq"].contains(quality) ? quality : "fast"
+     if engine == "apple.frc" {
+      expected.interpolationQuality = quality == "quality" && source != "file" ? "quality" : "normal"
+      expected.modelID = expected.interpolationQuality == "quality" ? "vt.frc.quality" : "vt.frc.normal"
+     } else if engine == "apple.lowlatency" {
+      expected.interpolationQuality = "normal"; expected.modelID = "vt.llfi.temporal.1"
+      expected.rate = .multiplier(2)
+     } else {
+      expected.interpolationEngineID = "rife.metal"; expected.modelID = "rife-v4.25"
+      expected.interpolationQuality = ["fast", "balanced", "hq"].contains(quality) ? quality : "fast"
+     }
      expected.rifeStreamEnabled = true
-     expected.scaleEngineID = "artcnn.c4f32"; expected.scaleQualityID = "none"
+     expected.scaleEngineID = "apple.low-sr"; expected.scaleQualityID = "none"
      expected.outputWidth = 0; expected.outputHeight = 0
      let restored = EnhancementProfileStore.decode(try JSONEncoder().encode(saved), fallbackName:"legacy")
-     precondition(restored == expected, "Migration must select native ArtCNN32 while preserving source, frame generation, rate and input preset")
+     precondition(restored == expected, "Migration must select Apple real-time SR while preserving source, frame generation, rate and input preset")
     }
    }
   }
@@ -240,31 +370,72 @@ private final class SourceSizeControls {
   try FileManager.default.createDirectory(at:temp,withIntermediateDirectories:true)
   defer { try? FileManager.default.removeItem(at:temp) }
   EnhancementProfileStore.testDirectory=temp
-  precondition(EnhancementProfile().scaleEngineID == "artcnn.c4f32" && EnhancementProfile().srInputPreset == 1080)
-  precondition(ArtCNNSRSelection.fromPopup(0) == "artcnn.c4f32" && ArtCNNSRSelection.fromPopup(1) == "artcnn.c4f16")
-  for legacy in ["lanczos", "metalfx.spatial", "apple.low-sr", "apple.video-sr", "anime4k", "realcugan", "unknown"] {
+  for source in ["window", "display", "file"] {
+   for oldMode in ["original", "compare"] {
+    var saved = EnhancementProfile()
+    saved.sourceKind = source; saved.viewMode = oldMode
+    saved.configName = "view-mode-test"; saved.configID = "custom:view-mode-test"
+    saved.interpolationEngineID = "apple.frc"; saved.scaleEnabled = true; saved.scaleEngineID = "apple.video-sr"
+    LiveEngineSelection.normalize(&saved)
+    var expected = saved; expected.viewMode = "enhanced"
+    let restored = EnhancementProfileStore.decode(try JSONEncoder().encode(saved), fallbackName:"legacy")
+    precondition(restored == expected, "Old view modes must restore enhanced output without changing other choices")
+    try EnhancementProfileStore.save(saved)
+    try EnhancementProfileStore.saveNamed(saved)
+    try EnhancementProfileStore.savePreset(saved, id:"preset:anime")
+    let persisted = try JSONDecoder().decode(EnhancementProfile.self, from: Data(contentsOf: EnhancementProfileStore.fileURL()))
+    precondition(persisted == expected && EnhancementProfileStore.loadNamed("view-mode-test") == expected &&
+                 EnhancementProfileStore.loadPreset("preset:anime") == expected)
+   }
+  }
+  var noViewMode = try JSONSerialization.jsonObject(with: JSONEncoder().encode(EnhancementProfile())) as! [String: Any]
+  noViewMode.removeValue(forKey: "viewMode")
+  let noViewModeData = try JSONSerialization.data(withJSONObject:noViewMode)
+  precondition(EnhancementProfileStore.decode(noViewModeData, fallbackName:"legacy")?.viewMode == "enhanced")
+  precondition(EnhancementProfile().scaleEngineID == "apple.low-sr" && EnhancementProfile().srInputPreset == 720 && !EnhancementProfile().scaleEnabled)
+  precondition(AppleSRSelection.ids == ["apple.low-sr", "apple.video-sr"] && AppleSRSelection.fromPopup(0) == "apple.low-sr" && AppleSRSelection.fromPopup(1) == "apple.video-sr")
+  for legacy in ["lanczos", "metalfx.spatial", "artcnn.c4f32", "artcnn.c4f16", "anime4k", "realcugan", "unknown"] {
    var profile = EnhancementProfile()
    profile.scaleEngineID = legacy; profile.scaleEnabled = true
    profile.srInputPreset = 0; profile.sourceWindowPreset = 1080
    profile.outputWidth = 1920; profile.outputHeight = 1080
    let migrated = EnhancementProfileStore.decode(try JSONEncoder().encode(profile), fallbackName:"legacy")!
-   precondition(migrated.scaleEngineID == "artcnn.c4f32" && migrated.srInputPreset == 1080 && migrated.outputWidth == 0 && migrated.outputHeight == 0)
+   precondition(migrated.scaleEngineID == "apple.low-sr" && migrated.srInputPreset == 720 && migrated.outputWidth == 0 && migrated.outputHeight == 0)
    precondition(migrated.scaleEnabled && migrated.sourceWindowPreset == 1080 && migrated.sourceWindowResizeActive)
    try EnhancementProfileStore.save(profile)
    let persisted = try JSONDecoder().decode(EnhancementProfile.self, from: Data(contentsOf: EnhancementProfileStore.fileURL()))
    precondition(persisted == migrated, "Save must normalize the file itself, not only its next read")
   }
-  for id in ["artcnn.c4f32", "artcnn.c4f16"] {
+  for id in ["apple.low-sr", "apple.video-sr"] {
    for preset in [0, 480, 720, 1080] {
     var profile = EnhancementProfile()
     profile.scaleEngineID = id; profile.srInputPreset = preset
     profile.configName = "ArtCNN"; profile.configID = "custom:ArtCNN"
     try EnhancementProfileStore.saveNamed(profile)
-    precondition(EnhancementProfileStore.loadNamed("ArtCNN") == profile, "Both models and an explicit input-size choice must survive named-profile save/load")
+    precondition(EnhancementProfileStore.loadNamed("ArtCNN") == profile, "Apple SR and an explicit input-size choice must survive named-profile save/load")
     try EnhancementProfileStore.savePreset(profile, id:"preset:anime")
     precondition(EnhancementProfileStore.loadPreset("preset:anime") == profile)
    }
   }
+  for source in ["window", "file"] {
+   for engine in ["rife.metal", "apple.lowlatency", "apple.frc"] {
+    for scaler in AppleSRSelection.ids {
+     var combined = EnhancementProfile()
+     combined.sourceKind = source; combined.interpolationEngineID = engine
+     combined.rate = .multiplier(4); combined.scaleEnabled = true; combined.scaleEngineID = scaler
+     LiveEngineSelection.normalize(&combined)
+     let restored = EnhancementProfileStore.decode(try JSONEncoder().encode(combined), fallbackName:"combined")
+     precondition(restored == combined, "Interpolation and Apple SR choices must survive together")
+    }
+   }
+  }
+  var legacyCombined = EnhancementProfile()
+  legacyCombined.interpolationEngineID = "apple.frc"; legacyCombined.interpolationQuality = "quality"
+  legacyCombined.scaleEnabled = true; legacyCombined.scaleEngineID = "artcnn.c4f32"; legacyCombined.srInputPreset = 1080
+  LiveEngineSelection.normalize(&legacyCombined)
+  let migratedCombined = EnhancementProfileStore.decode(try JSONEncoder().encode(legacyCombined), fallbackName:"combined")!
+  precondition(migratedCombined.interpolationEngineID == "apple.frc" && migratedCombined.modelID == "vt.frc.quality" &&
+               migratedCombined.scaleEngineID == "apple.low-sr" && migratedCombined.srInputPreset == 720 && migratedCombined.scaleEnabled)
   try FileManager.default.removeItem(at: EnhancementProfileStore.fileURL())
   try FileManager.default.removeItem(at: EnhancementProfileStore.namedDirectory())
   try FileManager.default.removeItem(at: EnhancementProfileStore.presetDirectory())
@@ -324,7 +495,7 @@ private final class SourceSizeControls {
   precondition(EnhancementProfileStore.resolvedID(custom)=="custom:游戏")
   var preset=EnhancementProfile();preset.configName="游戏";preset.configID="preset:game";preset.interpolationEngineID="apple.lowlatency"
   try EnhancementProfileStore.savePreset(preset,id:"preset:game")
-  preset.interpolationEngineID="rife.metal"
+  preset.interpolationQuality="normal";preset.modelID="vt.llfi.temporal.1"
   precondition(EnhancementProfileStore.loadNamed("游戏")==custom)
   precondition(EnhancementProfileStore.loadPreset("preset:game")==preset)
   custom.configID="custom:游戏";custom.outputWidth=1280;try EnhancementProfileStore.saveNamed(custom);try EnhancementProfileStore.save(custom)
@@ -591,9 +762,28 @@ private final class SourceSizeControls {
   precondition(TargetOverlayPolicy.screenIndex(target:NSRect(x:900,y:50,width:400,height:300),screens:cadenceScreens)==1)
   precondition(TargetOverlayPolicy.screenIndex(target:NSRect(x:2100,y:50,width:100,height:100),screens:cadenceScreens)==nil)
   precondition(VideoSRAvailability.readyFactors(isFile:false,inputReady:true,factors:[2]) == [])
-  for index in -1...8 {
-   let selected=LiveEngineSelection.fromPopup(index,quality:"normal")
-   precondition(selected.engine=="rife.metal" && selected.model=="rife-v4.25")
+  precondition(LiveEngineSelection.fromPopup(0,quality:"fast").engine == "rife.metal")
+  precondition(LiveEngineSelection.fromPopup(1,quality:"normal").engine == "apple.lowlatency")
+  precondition(LiveEngineSelection.fromPopup(2,quality:"quality").model == "vt.frc.quality")
+  for index in [-1,3,8] { precondition(LiveEngineSelection.fromPopup(index,quality:"normal").engine == "rife.metal") }
+  for engine in ["apple.lowlatency", "apple.frc"] {
+   var apple = EnhancementProfile(); apple.configName = engine; apple.configID = "custom:" + engine
+   apple.interpolationEngineID = engine; apple.interpolationQuality = "quality"; apple.rate = .multiplier(4)
+   LiveEngineSelection.normalize(&apple)
+   try EnhancementProfileStore.saveCurrent(apple)
+   precondition(EnhancementProfileStore.load() == apple && EnhancementProfileStore.loadNamed(engine) == apple,
+                "An Apple selection must survive reopening and named-config selection")
+   if engine == "apple.lowlatency" {
+    precondition(apple.rate == .multiplier(4) && apple.modelID == "vt.llfi.temporal.2")
+    apple.sourceKind = "file"; LiveEngineSelection.normalize(&apple)
+    precondition(apple.rate == .multiplier(2) && apple.modelID == "vt.llfi.temporal.1")
+    apple.sourceKind = "window"; apple.rate = .fixedFPS(numerator:60,denominator:1)
+    LiveEngineSelection.normalize(&apple); precondition(apple.rate == .multiplier(2))
+   } else {
+    precondition(apple.interpolationQuality == "quality" && apple.modelID == "vt.frc.quality")
+    apple.sourceKind = "file"; LiveEngineSelection.normalize(&apple)
+    precondition(apple.interpolationQuality == "normal" && apple.modelID == "vt.frc.normal")
+   }
   }
   precondition(LiveCoverage.modelScheduled(total:100,held:100)==0 && LiveCoverage.modelScheduled(total:100,held:40)==60 && LiveCoverage.modelScheduled(total:0,held:1)==0)
   var tracker=LiveApplyTracker(); let firstRequest=tracker.begin(); let secondRequest=tracker.begin()
@@ -607,7 +797,6 @@ private final class SourceSizeControls {
   precondition(VideoSRAvailability.readyFactors(isFile:true,inputReady:false,factors:[4]) == [])
   var videoSR=EnhancementProfile();videoSR.sourceKind="file";videoSR.scaleEnabled=true;videoSR.scaleEngineID="apple.video-sr";videoSR.outputWidth=1920;videoSR.outputHeight=1080;videoSR.interpolationEnabled=true;videoSR.interpolationEngineID="rife.metal";videoSR.modelID="rife-v4.26";videoSR.rate = .multiplier(2)
   try EnhancementProfileStore.save(videoSR);videoSR.modelID="rife-v4.25"
-  videoSR.scaleEngineID="artcnn.c4f32";videoSR.outputWidth=0;videoSR.outputHeight=0
   precondition(EnhancementProfileStore.load()==videoSR)
   _ = EnhancementText.t("Technology Library","技术库")
   precondition(EnhancementText.translated("技术库",chinese:false)=="Technology Library")

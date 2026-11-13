@@ -300,7 +300,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 var legacyObject = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
                 legacyObject.removeValue(forKey: "srInputPreset"); legacyObject.removeValue(forKey: "sourceWindowPreset")
                 let legacyData = try? JSONSerialization.data(withJSONObject: legacyObject)
-                var legacyExpected = profile; legacyExpected.srInputPreset = 0; legacyExpected.sourceWindowPreset = 0
+                var legacyExpected = profile; legacyExpected.srInputPreset = 720; legacyExpected.sourceWindowPreset = 0
                 let migrationOK = legacyData.flatMap { EnhancementProfileStore.decode($0, fallbackName: "") } == legacyExpected
                 var oldOnly = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
                 oldOnly.removeValue(forKey: "sourceWindowPreset")

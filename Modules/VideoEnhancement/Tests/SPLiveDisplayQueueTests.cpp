@@ -1,4 +1,5 @@
 #include "SPLiveDisplayQueue.h"
+#include "SPAirDisplayPolicyB.hpp"
 #include <cstdio>
 #include <cstdlib>
 
@@ -79,6 +80,24 @@ int main() {
         else changed.measurementEpoch++;
         require(displaySlotDecision(slot,43,changed,absolute+7000000) == DisplaySlotDecision::retired, "context change did not retire the pending ticket");
     }
-    std::puts("display-link pending queue assertions passed (CPU only)");
+    // An interpolated frame and the following original may both become due
+    // within one refresh. Keep each while it is within the bounded lag window.
+    spAirDisplayPolicyB::RefreshHistory refresh;
+    refresh.observe(absolute); refresh.observe(absolute + 16666667);
+    std::vector<DisplayQueueFrame> temporal={{{1,60},absolute+10000000,101,true},
+                                            {{2,60},absolute+18000000,102,true}};
+    auto bounded=spAirDisplayPolicyB::decide(temporal,absolute+20000000,refresh.intervals,refresh.count,true);
+    require(bounded.selected==0 && bounded.branch==spAirDisplayPolicyB::Branch::boundedLag,"a viable midpoint was superseded by its original");
+    temporal.erase(temporal.begin());
+    auto following=spAirDisplayPolicyB::decide(temporal,absolute+36666667,refresh.intervals,refresh.count,true);
+    require(following.selected==0,"the following original could not use the next slot");
+    temporal={{{1,60},absolute-50000000,101,true},{{2,60},absolute-40000000,102,true}};
+    auto stale=spAirDisplayPolicyB::decide(temporal,absolute,refresh.intervals,refresh.count,true);
+    require(stale.selected==1 && stale.branch==spAirDisplayPolicyB::Branch::allStaleLatest,"bounded output accumulated expired frames");
+    auto unchanged=spAirDisplayPolicyB::decide(temporal,absolute,refresh.intervals,refresh.count,false);
+    require(unchanged.selected==chooseDisplayFrame(temporal,absolute),"disabled policy changed legacy latest-frame selection");
+    temporal={{{1,60},absolute+1,101,true}};
+    require(spAirDisplayPolicyB::decide(temporal,absolute,refresh.intervals,refresh.count,true).selected==temporal.size(),"a future frame was selected early");
+    std::puts("display-link pending queue and bounded temporal assertions passed (CPU only)");
     return 0;
 }

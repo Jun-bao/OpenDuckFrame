@@ -19,14 +19,21 @@ static NSError *SPFileSRError(NSInteger code, NSString *message) {
 - (instancetype)initWithSourceWidth:(int)sourceWidth sourceHeight:(int)sourceHeight outputWidth:(int)outputWidth outputHeight:(int)outputHeight error:(NSError **)error {
     if (!(self = [super init])) return nil;
     _busy.store(false);
+    BOOL automatic = outputWidth == 0 && outputHeight == 0;
+    NSSize input = automatic ? [SPAppleLowLatencySR inputSizeForWidth:sourceWidth height:sourceHeight preset:720] : NSMakeSize(sourceWidth, sourceHeight);
+    if (automatic) {
+        NSSize output = [SPAppleLowLatencySR automaticOutputForWidth:(int)input.width height:(int)input.height];
+        outputWidth = (int)output.width; outputHeight = (int)output.height;
+    }
     if (sourceWidth < 2 || sourceHeight < 2 || outputWidth < 2 || outputHeight < 2 || (outputWidth & 1) || (outputHeight & 1) ||
         outputWidth > 3840 || outputHeight > 2160) {
-        if (error) *error = SPFileSRError(1, @"文件超分需要有效的偶数输出尺寸，最高 3840×2160。"); return nil;
+        if (error) *error = SPFileSRError(1, @"苹果实时超分不支持当前视频尺寸或倍率。"); return nil;
     }
-    double x = (double)outputWidth/sourceWidth, y = (double)outputHeight/sourceHeight;
+    double x = (double)outputWidth/input.width, y = (double)outputHeight/input.height;
     if (std::fabs(x-y) > 0.0001) { if (error) *error=SPFileSRError(2,@"Apple 超分需要保持来源宽高比。 "); return nil; }
     _engine = [[SPAppleLowLatencySR alloc] init];
-    if (![_engine prepareWidth:sourceWidth height:sourceHeight scale:(float)x error:error]) return nil;
+    _engine.allowsInputResize = (int)input.width != sourceWidth || (int)input.height != sourceHeight;
+    if (![_engine prepareWidth:(int)input.width height:(int)input.height scale:(float)x error:error]) return nil;
     if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &_outputTransfer) != noErr || !_outputTransfer) {
         [_engine invalidate]; if (error) *error=SPFileSRError(3,@"无法准备文件超分输出格式转换。 "); return nil;
     }

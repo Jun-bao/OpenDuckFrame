@@ -22,6 +22,12 @@ private final class SPDirectorySubtitleRankingCancellation: @unchecked Sendable 
     }
 }
 
+// The callback is invoked only after returning to the main queue.
+private final class SPWorkbenchScalerCompletion: @unchecked Sendable {
+    let callback: (Bool, String) -> Void
+    init(_ callback: @escaping (Bool, String) -> Void) { self.callback = callback }
+}
+
 @MainActor
 private final class LegacyChromeAdapter: PlayerChromePresenting {
     private var lastRenderedModel: ChromePresentation?
@@ -73,6 +79,7 @@ private final class LegacyChromeAdapter: PlayerChromePresenting {
 }
 
 final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenuItemValidation {
+    private var workbenchScalerPreparationGeneration: UInt64 = 0
     /// One low-priority lane process-wide. Subtitle ranking is CPU-only and may
     /// cover thousands of names; serializing it prevents several player windows
     /// from turning a background convenience into a burst of foreground CPU.
@@ -3486,15 +3493,38 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     func workbenchPrepareFileScaler(engine: String, variant: String, width: Int, height: Int, completion: @escaping (Bool, String) -> Void) {
         guard hasVideoSession, let core else { completion(false, "请先打开视频。"); return }
+        workbenchScalerPreparationGeneration &+= 1
+        let generation = workbenchScalerPreparationGeneration
+        if engine == "apple.low-sr" && width == 0 && height == 0 {
+            core.prepareFileScalerWidth(0, height: 0, engine: engine, variant: variant, completion: completion)
+            return
+        }
         let sourceWidth = Int(core.videoInfo.width), sourceHeight = Int(core.videoInfo.height)
+        if engine == "apple.video-sr" {
+            let automatic = width == 0 && height == 0
+            let input = automatic ? SPAppleVideoSR.automaticInput(width: Int32(sourceWidth), height: Int32(sourceHeight)) : NSSize(width: sourceWidth, height: sourceHeight)
+            let output = automatic ? SPAppleVideoSR.automaticOutput(width: Int32(input.width), height: Int32(input.height)) : NSSize(width: width, height: height)
+            guard input.width > 0, input.height > 0, output.width > 0, output.height > 0,
+                  output.width / input.width == output.height / input.height else {
+                completion(false, "苹果视频超分不支持当前输入尺寸或倍率。"); return
+            }
+            let factor = Int32(output.width / input.width)
+            let originalCore = ObjectIdentifier(core)
+            let delivery = SPWorkbenchScalerCompletion(completion)
+            SPAppleVideoSR.ensureModel(width: Int32(input.width), height: Int32(input.height), scale: factor) { [weak self] error in
+                let message = error?.localizedDescription
+                DispatchQueue.main.async {
+                    guard let self, self.workbenchScalerPreparationGeneration == generation else { return }
+                    guard let currentCore = self.core, ObjectIdentifier(currentCore) == originalCore else { delivery.callback(false, "视频已改变，请重新应用。"); return }
+                    guard message == nil else { delivery.callback(false, message ?? "苹果视频超分模型准备失败。"); return }
+                    currentCore.prepareFileScalerWidth(Int32(automatic ? 0 : width), height: Int32(automatic ? 0 : height), engine: engine, variant: variant, completion: delivery.callback)
+                }
+            }
+            return
+        }
         let factor: Int
         if ["anime4k", "realcugan", "artcnn.c4f16", "artcnn.c4f32"].contains(engine) { factor = 2 }
-        else if engine == "apple.video-sr" && (width == 0 || height == 0) {
-            guard let first = SPAppleVideoSR.readyScales(forWidth: Int32(sourceWidth), height: Int32(sourceHeight)).first else {
-                completion(false, "设备或当前输入不支持 Apple 视频超分。 "); return
-            }
-            factor = first.intValue
-        } else { factor = 1 }
+        else { factor = 1 }
         let resolvedWidth = width == 0 ? sourceWidth * factor : width
         let resolvedHeight = height == 0 ? sourceHeight * factor : height
         guard (2...3840).contains(resolvedWidth), (2...2160).contains(resolvedHeight), resolvedWidth % 2 == 0, resolvedHeight % 2 == 0 else {
@@ -3503,7 +3533,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         core.prepareFileScalerWidth(Int32(resolvedWidth), height: Int32(resolvedHeight), engine: engine, variant: variant, completion: completion)
     }
     func workbenchActivateFileLanczos() -> Bool { core?.activatePreparedFileLanczos() ?? false }
-    func workbenchCancelFileLanczosPreparation() { core?.cancelPreparedFileLanczos() }
+    func workbenchCancelFileLanczosPreparation() { workbenchScalerPreparationGeneration &+= 1; core?.cancelPreparedFileLanczos() }
     func workbenchDisableFileLanczos() { core?.disableFileLanczos() }
     var workbenchFileLanczosActive: Bool { core?.fileLanczosActive ?? false }
     var workbenchFileLanczosStatus: String { core?.fileLanczosStatus ?? "" }

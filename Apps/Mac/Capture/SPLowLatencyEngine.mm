@@ -6,6 +6,14 @@
 #import <CoreMedia/CoreMedia.h>
 #import <ImageIO/ImageIO.h>
 #import <atomic>
+#include <algorithm>
+#include <cmath>
+
+static NSSize SPLLFitLiveSize(int width, int height, NSInteger maxDimension, NSInteger maxPixels) {
+    double scale = std::min({1.0, (double)maxDimension / width, (double)maxDimension / height,
+                             std::sqrt((double)maxPixels / ((double)width * height))});
+    return NSMakeSize(std::max(2, (int)(width * scale) & ~1), std::max(2, (int)(height * scale) & ~1));
+}
 
 static NSError *SPLLError(NSInteger code, NSString *text) {
     return [NSError errorWithDomain:@"app.openduckframe.lowlatency" code:code userInfo:@{NSLocalizedDescriptionKey: text}];
@@ -210,6 +218,7 @@ static double SPLLCenter(CVPixelBufferRef buffer) {
     VTFrameProcessor *_processor;
     VTLowLatencyFrameInterpolationConfiguration *_config;
     VTPixelTransferSessionRef _transfer;
+    VTPixelTransferSessionRef _outputTransfer;
     dispatch_queue_t _queue;
     NSDictionary *_sourceAttributes;
     NSDictionary *_destinationAttributes;
@@ -218,7 +227,10 @@ static double SPLLCenter(CVPixelBufferRef buffer) {
     NSInteger _frames;
     int _width;
     int _height;
+    int _outputWidth;
+    int _outputHeight;
     NSString *_modelID;
+    NSString *_preparationFallbackReason;
     std::atomic<uint64_t> _epoch;
 }
 
@@ -259,12 +271,40 @@ static double SPLLCenter(CVPixelBufferRef buffer) {
 
 - (void)dealloc {
     if (_transfer) CFRelease(_transfer);
+    if (_outputTransfer) CFRelease(_outputTransfer);
 }
 
 - (NSInteger)frames { return _frames; }
 - (int)width { return _width; }
 - (int)height { return _height; }
 - (NSString *)modelID { return _modelID; }
+- (NSString *)preparationFallbackReason { return _preparationFallbackReason ?: @""; }
+
+- (BOOL)prepareLiveWidth:(int)width height:(int)height frames:(NSInteger)frames error:(NSError **)error {
+    if (width < 2 || height < 2 || (width & 1) || (height & 1) || (frames != 1 && frames != 2) || !self.class.isSupported)
+        return [self prepareWidth:width height:height frames:frames error:error];
+    // macOS 26 does not expose per-device limits. Keep that path at 720p.
+    NSInteger maxDimension = 1280, maxPixels = 1280 * 720;
+    if (@available(macOS 27.0, *)) {
+        NSInteger dimension = [VTLowLatencyFrameInterpolationConfiguration maximumDimensionForSpatialScaleFactor:1];
+        NSInteger pixels = [VTLowLatencyFrameInterpolationConfiguration maximumPixelCountForSpatialScaleFactor:1];
+        if (dimension > 0) maxDimension = dimension;
+        if (pixels > 0) maxPixels = pixels;
+    }
+    NSSize size = SPLLFitLiveSize(width, height, maxDimension, maxPixels);
+    NSError *primaryError = nil;
+    if (![self prepareWidth:(int)size.width height:(int)size.height frames:frames error:&primaryError]) {
+        NSSize fallback = SPLLFitLiveSize(width, height, MIN(maxDimension, 1280), MIN(maxPixels, 1280 * 720));
+        if (NSEqualSizes(size, fallback) || ![self prepareWidth:(int)fallback.width height:(int)fallback.height frames:frames error:error]) {
+            if (NSEqualSizes(size, fallback) && error) *error = primaryError;
+            return NO;
+        }
+        _preparationFallbackReason = primaryError.localizedDescription ?: @"Low-latency preparation failed at the larger size";
+    }
+    _outputWidth = width;
+    _outputHeight = height;
+    return YES;
+}
 
 - (BOOL)prepareWidth:(int)width height:(int)height frames:(NSInteger)frames error:(NSError **)error {
     if (width < 2 || height < 2 || (width & 1) || (height & 1)) {
@@ -322,6 +362,9 @@ static double SPLLCenter(CVPixelBufferRef buffer) {
         _frames = frames;
         _width = width;
         _height = height;
+        _outputWidth = width;
+        _outputHeight = height;
+        _preparationFallbackReason = @"";
         _modelID = frames >= 2 ? @"vt.llfi.temporal.2" : @"vt.llfi.temporal.1";
         _sourceAttributes = config.sourcePixelBufferAttributes;
         _destinationAttributes = config.destinationPixelBufferAttributes;
@@ -401,6 +444,8 @@ static double SPLLCenter(CVPixelBufferRef buffer) {
     OSType destFormat = _destFormat;
     int width = _width;
     int height = _height;
+    int outputWidth = _outputWidth;
+    int outputHeight = _outputHeight;
     NSArray<NSNumber *> *phaseCopy = [phases copy];
     dispatch_async(_queue, ^{
         if (seen != self->_epoch || !processor) {
@@ -463,7 +508,33 @@ static double SPLLCenter(CVPixelBufferRef buffer) {
                     completion(token, nil, seconds, SPLLError(12, @"低延迟输出数量和相位不一致"));
                     return;
                 }
-                completion(token, owned, seconds, nil);
+                if (outputWidth == width && outputHeight == height) {
+                    completion(token, owned, seconds, nil);
+                    return;
+                }
+                // Keep output geometry equal to the captured source. The output
+                // transfer has its own serial queue/session, separate from adapt:.
+                dispatch_async(self->_queue, ^{
+                    if (seen != self->_epoch) {
+                        completion(token, nil, seconds, SPLLError(11, @"低延迟结果属于旧会话"));
+                        return;
+                    }
+                    NSMutableArray<SPOwnedPixelBuffer *> *restored = [NSMutableArray array];
+                    if (!self->_outputTransfer) VTPixelTransferSessionCreate(kCFAllocatorDefault, &self->_outputTransfer);
+                    for (SPOwnedPixelBuffer *output in owned) {
+                        CVPixelBufferRef dst = SPLLCreate(outputWidth, outputHeight, kCVPixelFormatType_32BGRA);
+                        if (!dst || !self->_outputTransfer ||
+                            VTPixelTransferSessionTransferImage(self->_outputTransfer, output.buffer, dst) != noErr) {
+                            if (dst) CVPixelBufferRelease(dst);
+                            completion(token, nil, MAX(0, CFAbsoluteTimeGetCurrent() - started),
+                                       SPLLError(13, @"低延迟插帧输出尺寸恢复失败"));
+                            return;
+                        }
+                        SPLLAttach709(dst);
+                        [restored addObject:[[SPOwnedPixelBuffer alloc] initWithBufferNoCopy:dst]];
+                    }
+                    completion(token, restored, MAX(0, CFAbsoluteTimeGetCurrent() - started), nil);
+                });
             }];
             return;
         }

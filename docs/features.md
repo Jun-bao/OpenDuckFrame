@@ -14,7 +14,7 @@ the FPS overlay reports observed output.
 
 ## Frame generation
 
-The workbench's frame-generation engine is **ODF-VFI**, run with Metal on
+The workbench's default frame-generation engine is **ODF-VFI**, run with Metal on
 Apple silicon; resolution and quality affect throughput. ODF-VFI is a
 four-stage structural reduction of Practical-RIFE 4.25: the retained stages
 keep the upstream weights, no additional training is applied, and model
@@ -27,15 +27,56 @@ The workbench offers target-FPS and multiplier modes. X2 / X3 / X4 are requests;
 frame budget, source cadence and display refresh rate determine actual
 presentation. Continuous caching is always on; there is no separate switch.
 
-The source tree also contains other interpolation backends. They are not
-selectable in the current workbench:
+The engine selector also offers Apple's system processors. Low latency targets
+real-time enhancement; FRC is designed for quality-oriented video processing.
+FRC can be used during playback here, but its throughput and added delay depend
+on the device, dimensions and content. Neither choice guarantees the target FPS.
+These options process playback/capture; they do not export an interpolated file.
 
-| Backend | Status in the current app |
+| Engine | Workbench support |
 |---|---|
-| Apple FRC / Motion+ | Not a workbench engine. The player's own motion-smoothing menu (off / double rate) uses it on macOS 26+ with supported hardware; runtime capability checks apply |
-| Apple low-latency interpolation | Code retained; not selectable in the workbench |
-| RIFE 4.26 | Weights and loader retained; not selectable in the workbench |
-| DistilDRBA | Experimental code retained; optional model, fixed 1280×720 input and X2 midpoint |
+| ODF-VFI | Default; target FPS or X2 / X3 / X4; fast / balanced / hq |
+| Apple low latency | macOS 26+ and runtime support; live window/display X2 or X4; local file X2 only. Fixed FPS and X3 are disabled |
+| Apple FRC | macOS 15.4+ and runtime support; live target FPS or X2 / X3 / X4, standard / quality; local files standard only, fixed FPS up to 3× source rate |
+
+Saved and named profiles retain the selected engine. Changing to low latency
+selects X2 when the previous rate is unsupported. Changing to file input restricts
+low latency to X2 and FRC to standard. Unsupported hardware or input is reported
+when preparing the engine; the previous committed plan is retained on failure.
+For live Apple low latency, inference fits the runtime dimension/pixel limits on
+macOS 27+. On macOS 26, or if preparation at the larger size fails, it uses a
+conservative 720p pixel budget. Generated frames are resized back to the captured
+source dimensions; original frames, timestamps and output geometry are preserved.
+The workbench reports the actual inference size. This resizing does not enable
+super resolution and can soften generated detail. File preparation is unchanged.
+For enhanced live output, Apple low latency requests a minimum 80 ms adaptive
+buffer, subject to the existing delay and memory caps. The presenter keeps the
+oldest eligible frame within two observed refresh periods, then catches up to
+the latest frame when all queued frames are stale. This reduces avoidable
+supersession at the cost of extra input delay; queue capacity remains bounded.
+It does not change the model or promise a fixed achieved FPS. RIFE, FRC and
+source-only presentation retain their existing policies.
+
+The 0.4.3 development branch offers **Content timing → Automatic video** for
+Apple low-latency live window/display enhancement. General window remains the
+default, including migrated profiles. Automatic video estimates approximate
+24/25/30 FPS from agreement between interior picture regions; this is not decoder
+metadata and does not distinguish 23.976/24 or 29.97/30. It requests a 60 FPS capture
+ceiling while retaining the saved general-mode limit. Once locked, each rational
+video-time bucket selects the latest full capture and schedules interpolation at
+uniform phases. It does not recover missing source frames. While detection is
+unconfirmed it shows source pictures; still scenes retain an established lock.
+Small video areas, low motion, multiple central animations and other frame rates
+may not lock reliably. Use General window in those cases. Changing source,
+dimensions, plan or incompatible cadence retires the old timing context.
+
+Automatic video requests 140 ms buffering within a 160 ms time cap and the existing
+byte limit. A pending capture adds up to half a source-frame interval of lookahead;
+the buffer value is not an end-to-end latency measurement. Audio is still played
+by the source app, so this mode can introduce audio/video offset. It does not
+affect file playback, other interpolation engines or the model weights.
+The player's Motion+ menu remains a separate off/double-rate FRC control.
+RIFE 4.26 and DistilDRBA remain hidden experimental backends.
 
 On M3 MacBook Air (Mac15,12 and Mac15,13), live **window** capture with
 ODF-VFI, Fast, X2 and scaling disabled automatically selects the optimized
@@ -63,20 +104,26 @@ the requested multiplier on a slower device.
 
 ## Scaling and super resolution
 
-The normal workbench exposes ArtCNN C4F32 and the lighter C4F16 model.
-Both use the original upstream weights and produce native 2× luma; chroma is
-scaled separately. They support SDR input up to 1920×1080 and output up to
-3840×2160. HDR, cropped input and odd dimensions are rejected. Compare at the
-same output size; neither model guarantees recovery of real missing detail.
+The workbench offers Apple low-latency and Apple video super resolution on
+supported macOS 26+ devices. Scaling is off by default. Apple video SR may need
+the system model to be downloaded and live capture currently requires frame
+generation to be off. File playback uses the existing independent-frame video SR
+path; it is not a claim of temporal video history in file playback.
+
+Automatic output chooses a supported factor within the current 3840×2160 output
+budget. Live input defaults to a 720p maximum box; video SR may reduce it further
+to fit the supported factor and a 3200×1800 live output box. File input is similarly
+reduced when needed. Reducing an input can lose detail; actual quality and speed
+must be assessed on the source and device. Unsupported sizes or factors are
+reported rather than silently switching to another engine. SDR 8-bit is required.
+For file playback, Apple video SR currently requires a complete, uncropped NV12
+frame with supported 601 or 709 color metadata.
 
 Window inputs can optionally resize the selected source window before capture;
 that requires Accessibility permission and a resizable window. The source video
-must fill the captured window. Display inputs can reduce capture dimensions
-before processing. Local files use decoded source pixels directly.
-
-The repository retains Lanczos/MetalFX and experimental Apple, Anime4K and
-Real-CUGAN implementations. These are not selectable in the current normal
-workbench; their existence in source does not establish packaged availability.
+must fill the captured window. The repository retains ArtCNN, Lanczos/MetalFX,
+Anime4K and Real-CUGAN implementations but they are not selectable in the normal
+workbench.
 
 ## Local playback and subtitles
 

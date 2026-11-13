@@ -2,6 +2,21 @@
 
 All notable public releases will be documented here.
 
+## 0.5.0 — 2026-11-14
+
+- Offer ODF-VFI (default), Apple low-latency interpolation and Apple FRC in the
+  workbench, with source-specific settings and runtime capability checks.
+- Fit large live Apple low-latency inputs to supported inference sizes and
+  restore generated frames to source dimensions. Buffer eligible output frames
+  in order; reduced inference can soften detail and buffering adds latency.
+- Add optional Automatic video timing for live Apple low latency, detecting
+  common 24/25/30 FPS content and using a bounded, more uniform timeline.
+  General window stays the default; source audio may lead enhanced video.
+- Replace the device-model whitelist for Fast X2 window optimization with GPU
+  capabilities, memory limits and measured preparation timing. Keep native
+  dimensions when the preparation budget fits; otherwise use the bounded path.
+- Keep ordinary file preparation separate. No sustained FPS guarantee is added.
+
 ## 0.4.1 — 2026-11-12
 
 - Remove the fullscreen preview option for display sources; display output
