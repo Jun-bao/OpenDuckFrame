@@ -120,7 +120,7 @@ enum WorkbenchGuidePreference {
                 return EnhancementText.t("Use Stop when you want to end enhancement.", "需要结束增强时，可以点击停止。")
             }
             if sourceKind == "window" {
-                return EnhancementText.t("Choose Delayed Enhancement, then switch to the window you want to enhance.", "点击延迟增强，然后切到要增强的窗口。")
+                return EnhancementText.t("Select a window and choose Enhance Selected Window, or choose Delayed Enhancement and switch windows.", "选好窗口后点指定窗口增强；或点延迟增强，再切换窗口。")
             }
             return EnhancementText.t("After choosing a source, select Start Enhancement.", "选择来源后，点击开始增强。")
         }
