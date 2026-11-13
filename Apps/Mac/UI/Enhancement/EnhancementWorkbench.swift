@@ -1532,9 +1532,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         for player in NSApp.windows.compactMap({ $0.contentViewController as? PlayerViewController }) {
             player.setWorkbenchCountdown(text, enabled: showing && player === selected)
         }
-        if delayedWindowSelection || startImmediatelyAfterPreparation { refreshActions() }
-        else if countdown.active { startButton?.title = sourceWindowPreparing ? EnhancementText.t("Preparing…", "准备中…") : text }
-        else { refreshActions() }
+        refreshActions()
     }
 
     private func cancelCountdown() {
@@ -1797,6 +1795,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             brand.spacing = 6
             item.view = brand
             item.label = "OpenDuckFrame"
+            item.isBordered = false
             item.visibilityPriority = .high
         case ToolbarID.pages:
             var titles = [EnhancementText.t("Workbench", "工作台"), EnhancementText.t("Input", "输入源")]
@@ -3034,14 +3033,15 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private func refreshActions() {
         let enhancing = isEnhancing
+        let pendingStart = profile.sourceKind != "file" && pendingApply != nil && !enhancing
         startButton?.isHidden = enhancing && !hasPendingFormChanges && !countdown.active
             && !delayedWindowSelection && !startImmediatelyAfterPreparation
         let delayedBusy = delayedWindowSelection || startImmediatelyAfterPreparation
         delayedStartButton?.isHidden = profile.sourceKind != "window"
-        delayedStartButton?.isEnabled = delayedBusy || (!countdown.active && !filePreparing)
+        delayedStartButton?.isEnabled = delayedBusy || (!countdown.active && !filePreparing && !pendingStart)
         delayedStartButton?.title = delayedBusy ? EnhancementText.t("Cancel", "取消") : EnhancementText.t("Delayed Enhancement", "延迟增强")
-        let canCancel = countdown.active && !delayedBusy
-        let canStart = hasSelectedSource && !filePreparing && !delayedBusy
+        let canCancel = (countdown.active && !delayedBusy) || pendingStart
+        let canStart = hasSelectedSource && !filePreparing && !delayedBusy && !pendingStart
         startButton?.isEnabled = canCancel || canStart
         startButton?.toolTip = canCancel || canStart ? nil : (delayedBusy
             ? EnhancementText.t("Cancel delayed enhancement first", "请先取消延迟增强")
@@ -3052,7 +3052,15 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             let startTitle = profile.sourceKind == "window"
                 ? EnhancementText.t("Enhance Selected Window", "指定窗口增强")
                 : EnhancementText.t("Start Enhancement", "开始增强")
-            startButton?.title = filePreparing ? EnhancementText.t("Preparing…", "准备中…") : (countdown.active ? "\(countdown.remaining)" : (enhancing ? EnhancementText.t("Apply Changes", "应用更改") : startTitle))
+            if countdown.active {
+                startButton?.title = sourceWindowPreparing ? EnhancementText.t("Cancel", "取消")
+                    : String(format: EnhancementText.t("Cancel (%d)", "取消（%d）"), countdown.remaining)
+            } else if pendingStart {
+                startButton?.title = EnhancementText.t("Cancel", "取消")
+            } else {
+                startButton?.title = filePreparing ? EnhancementText.t("Preparing…", "准备中…")
+                    : (enhancing ? EnhancementText.t("Apply Changes", "应用更改") : startTitle)
+            }
         }
         stopButton?.isHidden = !enhancing && !filePreparing
         stopButton?.title = filePreparing && !enhancing
@@ -3997,6 +4005,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 #endif
         if countdown.active || delayedWindowSelection || startImmediatelyAfterPreparation {
             cancelCountdown()
+            statusLabel.stringValue = EnhancementText.t("Cancelled", "已取消")
+            statusLabel.textColor = .labelColor
+            return
+        }
+        if profile.sourceKind != "file", pendingApply != nil, !isEnhancing {
+            stop()
             statusLabel.stringValue = EnhancementText.t("Cancelled", "已取消")
             statusLabel.textColor = .labelColor
             return

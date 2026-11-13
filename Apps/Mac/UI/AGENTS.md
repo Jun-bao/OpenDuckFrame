@@ -17,7 +17,7 @@ The normal countdown defaults to 3 seconds; keep saved countdown and custom sett
 Hardware/configuration auto-detection is deferred. Keep its suggestions and scoring out of ordinary controls.
 Preserve configuration add/rename/delete, preset metadata and saved-profile migration.
 The three-step first-use coach marks are implemented in [WorkbenchOnboarding.swift](Enhancement/WorkbenchOnboarding.swift); keep them skippable, source-specific and replayable from Help.
-Keep delayed window selection available beside the selected-window start action, including before a source is chosen. During enhancement, show Stop Enhancement in the start action's position; preserve countdown cancellation, restart after Stop and pending Apply Changes actions.
+Keep delayed window selection available beside the selected-window start action, including before a source is chosen. The selected-window action must offer Cancel throughout its countdown and initial engine preparation. During enhancement, show Stop Enhancement in the start action's position; preserve restart after Stop and pending Apply Changes actions.
 File output retains its fullscreen control; display and window output follow their source without a fullscreen preview option.
 The workbench is a compact controls-only window. Keep its preview endpoint disconnected; file video stays in the player and live enhancement uses its actual output view.
 

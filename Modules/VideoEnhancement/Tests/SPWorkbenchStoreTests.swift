@@ -54,7 +54,9 @@ private final class SourceSizeControls {
  var filePlayer: Player?
  var filePreparing = false
  var hasPendingFormChanges = false
+ var pendingApply: EnhancementProfile?
  var countdown = EnhancementCountdown()
+ var sourceWindowPreparing = false
  var delayedWindowSelection = false
  var startImmediatelyAfterPreparation = false
  var startButton: Button? = Button()
@@ -64,6 +66,7 @@ private final class SourceSizeControls {
  var selectedStarts = 0
  var delayedStarts = 0
  var cancellations = 0
+ var stops = 0
  var sourceChoices = 0
 
  func selectedFilePlayer() -> Player? { filePlayer }
@@ -77,6 +80,7 @@ private final class SourceSizeControls {
   // ACTUAL_WORKBENCH_ACTIONS
  }
  func cancelCountdown() { cancellations += 1; countdown.cancel(); delayedWindowSelection = false; startImmediatelyAfterPreparation = false }
+ func stop() { stops += 1; pendingApply = nil }
  func startSelectedSource() { selectedStarts += 1 }
  func chooseCurrentKind() { sourceChoices += 1 }
  func beginDelayedWindowSelection() { delayedStarts += 1 }
@@ -119,6 +123,36 @@ private final class SourceSizeControls {
   selectedWindow.triggerDelayedStart()
   precondition(selectedWindow.selectedStarts == 1 && selectedWindow.delayedStarts == 1,
     "Each action must invoke its own source-selection path")
+
+  let selectedCountdown = WorkbenchActionControls()
+  selectedCountdown.activeSourceKind = "window"
+  selectedCountdown.capture.target = 1
+  _ = selectedCountdown.countdown.begin(seconds: 3)
+  selectedCountdown.refreshActions()
+  precondition(selectedCountdown.startButton?.isEnabled == true && selectedCountdown.startButton?.title == "Cancel (3)",
+    "The selected-window countdown must offer an explicit cancel action")
+  precondition(selectedCountdown.delayedStartButton?.isEnabled == false)
+  selectedCountdown.triggerStart()
+  precondition(selectedCountdown.cancellations == 1 && !selectedCountdown.countdown.active)
+  selectedCountdown.refreshActions()
+  precondition(selectedCountdown.startButton?.isEnabled == true && selectedCountdown.startButton?.title == "Enhance Selected Window")
+
+  let preparingWindow = WorkbenchActionControls()
+  _ = preparingWindow.countdown.begin(seconds: 3)
+  preparingWindow.sourceWindowPreparing = true
+  preparingWindow.refreshActions()
+  precondition(preparingWindow.startButton?.isEnabled == true && preparingWindow.startButton?.title == "Cancel")
+  preparingWindow.triggerStart()
+  precondition(preparingWindow.cancellations == 1)
+
+  let pendingWindow = WorkbenchActionControls()
+  pendingWindow.pendingApply = EnhancementProfile()
+  pendingWindow.refreshActions()
+  precondition(pendingWindow.startButton?.isEnabled == true && pendingWindow.startButton?.title == "Cancel",
+    "A submitted start must stay cancellable while the engine prepares")
+  precondition(pendingWindow.delayedStartButton?.isEnabled == false)
+  pendingWindow.triggerStart()
+  precondition(pendingWindow.stops == 1 && pendingWindow.pendingApply == nil)
 
   let countdownWindow = WorkbenchActionControls()
   let countdownTicket = countdownWindow.countdown.begin(seconds: 1)!
