@@ -1181,6 +1181,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private var cadenceDisplayID: UInt32 = 0
     private var fileURL: URL?
     private var shareableWindows: [SCWindowBox] = []
+    private var windowSelectionList: WindowSelectionList?
     private var shareableDisplays: [SCDisplayBox] = []
     private var ownCaptureApplications: [SCRunningApplication] = []
 
@@ -1729,7 +1730,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func updateSourceChrome(hasSource: Bool) {
-        sourceActionButton?.isHidden = false
+        sourceActionButton?.isHidden = sourceKindControl.selectedSegment == 0
         sourceMetaLabel.isHidden = !hasSource || sourceMetaLabel.stringValue.isEmpty
         (viewModeRow ?? viewMode).isHidden = !hasSource || SPRifeExperiments.airBeta
         refreshActions()
@@ -1972,7 +1973,17 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let currentRow = FormRow(current, padding: 8)
         // Keep room for the size line so choosing a source does not shift the settings below.
         currentRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 50).isActive = true
-        return column([sourceKindControl, formGroup([currentRow])], spacing: 10)
+        let windows = WindowSelectionList { [weak self] selected in
+            guard let self else { return }
+            self.cancelCountdown()
+            self.inputRouter?.stop(reason: "source_changed")
+            self.interactionArmed = false
+            self.profile.sourceKind = "window"
+            self.capture.start(filter: SCContentFilter(desktopIndependentWindow: selected))
+        }
+        windowSelectionList = windows
+        DispatchQueue.main.async { [weak windows] in windows?.reloadWindows() }
+        return column([sourceKindControl, windows, formGroup([currentRow])], spacing: 10)
     }
 
     private func column(_ views: [NSView], spacing: CGFloat = 8) -> NSStackView {
@@ -2537,6 +2548,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         applyModeVisibility()
         updateSRCapability()
         refreshSourceBar()
+        if sourceKindControl.selectedSegment == 0 { windowSelectionList?.reloadWindows() }
         refreshActions()
         persist()
         refreshPlanLabel()
@@ -2985,6 +2997,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func refreshSourceBar() {
+        windowSelectionList?.isHidden = sourceKindControl.selectedSegment != 0
         let text = hasSelectedSource ? activeSourceTitle : EnhancementText.t("No source", "未选择来源")
         sourceLabel.stringValue = text
         sourceStripLabel.stringValue = text
@@ -3018,7 +3031,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         startButton?.toolTip = canCancel || canStart ? nil : EnhancementText.t("Choose a source first", "请先选择来源")
         if delayedWindowSelection || startImmediatelyAfterPreparation {
             startButton?.title = EnhancementText.t("Cancel", "取消")
-        } else if profile.sourceKind == "window" {
+        } else if profile.sourceKind == "window" && !hasSelectedSource {
             startButton?.title = EnhancementText.t("Delayed Enhancement", "延迟增强")
         } else {
             startButton?.title = filePreparing ? EnhancementText.t("Preparing…", "准备中…") : (countdown.active ? "\(countdown.remaining)" : (enhancing ? EnhancementText.t("Apply Changes", "应用更改") : EnhancementText.t("Start Enhancement", "开始增强")))
@@ -3825,7 +3838,11 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         guard betaAllowsSessionChange() else { return }
 #endif
         cancelCountdown(); inputRouter?.stop(reason:"source_changed"); interactionArmed = false
-        profile.sourceKind = "window"; capture.presentPicker(windows: true); persist()
+        sourceKindControl.selectedSegment = 0
+        profile.sourceKind = "window"
+        showPage(0)
+        refreshSourceBar()
+        windowSelectionList?.reloadWindows()
     }
     @objc private func chooseDisplay() {
 #if ODF_AIR_BETA_DIAGNOSTIC
@@ -3962,7 +3979,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             statusLabel.textColor = .labelColor
             return
         }
-        if profile.sourceKind == "window" {
+        if profile.sourceKind == "window" && !hasSelectedSource {
             beginDelayedWindowSelection()
         } else {
             startSelectedSource()
