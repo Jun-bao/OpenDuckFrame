@@ -76,6 +76,10 @@ See [Quick start](docs/quick-start.md) for permissions and troubleshooting.
 Intel Macs, Windows, iPhone and iPad are not currently supported. A multiplier is
 a requested processing mode, not a guarantee of a particular displayed frame rate.
 
+Live Apple low latency fits inference to the device's supported size and restores
+generated frames to source dimensions. The workbench shows the inference size;
+reduced inference can soften generated detail. File input retains its native size requirements.
+
 When local-video frame generation cannot keep up, the original picture is kept and
 late generated frames are discarded instead of delaying playback. This does not
 mean the selected multiplier is reached on a slower Mac.

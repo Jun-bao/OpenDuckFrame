@@ -5288,7 +5288,16 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             let w=profile.outputWidth, h=profile.outputHeight
             let before = profile.sourceKind != "file" && profile.scaleEnabled && profile.scaleEngineID == "lanczos" &&
                 profile.srInputPreset == 0 && w > 0 && h > 0 && w < width && h < height && w * height == h * width
-            let size = before ? "\(width)×\(height) → \(w)×\(h)" : "\(width)×\(height)"
+            let currentLow = processor.resolvedPlan.engineID == "apple.lowlatency" &&
+                processor.resolvedPlan.committed && processor.resolvedPlan.interpolationActive &&
+                LiveFPSOverlay.fresh(stats: lastStats, now: ProcessInfo.processInfo.systemUptime, receipt: lastStatsReceipt,
+                    generation: capture.currentGeneration, config: processor.resolvedPlan.configVersion,
+                    running: capture.running, paused: capture.paused)
+            let processingW = currentLow ? (lastStats["lowLatencyProcessingWidth"] as? Int ?? 0) : 0
+            let processingH = currentLow ? (lastStats["lowLatencyProcessingHeight"] as? Int ?? 0) : 0
+            let size = profile.sourceKind != "file" && processingW > 0 && processingH > 0
+                ? "\(processingW)×\(processingH)"
+                : (before ? "\(width)×\(height) → \(w)×\(h)" : "\(width)×\(height)")
             return "X\(multiplier) · " + EnhancementText.t("Processing", "处理") + " \(size)"
         }
         switch profile.rate {

@@ -10,6 +10,7 @@ Build inputs and target configuration live in [Apps/Mac/project.yml](../Apps/Mac
 - [check_repo.py](check_repo.py) includes tracked and non-ignored new files in path/credential scans.
 - [l10n.py](l10n.py) provides status, export/merge and `check --full` for localized strings.
 - `test_*.sh` wrappers cover specific policies or integrations. Read the selected script for prerequisites and side effects.
+- [test_apple_live_size.sh](test_apple_live_size.sh) needs a built Debug app and Apple low-latency runtime support; it checks real inference and live activation without screen recording or physical presentation.
 - [verify_app_bundle.sh](verify_app_bundle.sh) checks a supplied packaged app and its manifest/dependency closure.
 - [lib/build_common.sh](lib/build_common.sh) and [lib/deps_lock.py](lib/deps_lock.py) provide shared dependency/staging logic.
 - [patches/README.md](patches/README.md) records downstream FFmpeg invariants.

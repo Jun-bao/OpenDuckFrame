@@ -43,6 +43,12 @@ Saved and named profiles retain the selected engine. Changing to low latency
 selects X2 when the previous rate is unsupported. Changing to file input restricts
 low latency to X2 and FRC to standard. Unsupported hardware or input is reported
 when preparing the engine; the previous committed plan is retained on failure.
+For live Apple low latency, inference fits the runtime dimension/pixel limits on
+macOS 27+. On macOS 26, or if preparation at the larger size fails, it uses a
+conservative 720p pixel budget. Generated frames are resized back to the captured
+source dimensions; original frames, timestamps and output geometry are preserved.
+The workbench reports the actual inference size. This resizing does not enable
+super resolution and can soften generated detail. File preparation is unchanged.
 The player's Motion+ menu remains a separate off/double-rate FRC control.
 RIFE 4.26 and DistilDRBA remain hidden experimental backends.
 
