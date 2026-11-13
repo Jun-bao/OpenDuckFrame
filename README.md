@@ -82,10 +82,15 @@ reduced inference can soften generated detail. File input retains its native siz
 Enhanced live output also reserves at least 80 ms of adaptive buffering, subject to
 time/memory caps, and keeps eligible frames in order within a bounded lag window.
 This trades some input responsiveness for more consistent delivery; it does not guarantee 60 FPS.
-The 0.4.3 development branch adds optional **Automatic video** timing for live Apple
+Version 0.5.0 adds optional **Automatic video** timing for live Apple
 low latency. It estimates common 24/25/30 FPS content and evens out its timeline,
 requesting extra buffering (140 ms, subject to limits). General window remains the
 default. Audio stays in the source app, so audio/video offset may be noticeable.
+
+Fast X2 window optimization uses GPU capabilities, memory limits and measured
+preparation timing instead of a device-model whitelist. It keeps native dimensions
+when the preparation budget fits; otherwise it reduces the generated-frame
+processing size. Preparation timing is not a sustained-FPS guarantee.
 
 When local-video frame generation cannot keep up, the original picture is kept and
 late generated frames are discarded instead of delaying playback. This does not

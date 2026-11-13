@@ -1,0 +1,14 @@
+<h2>OpenDuckFrame 0.5.0</h2>
+<ul>
+  <li>工作台新增 Apple 低延迟插帧与 Apple 帧率转换，ODF-VFI 仍为默认。苹果选项需要系统、硬件与输入格式支持。</li>
+  <li>修复苹果低延迟处理大窗口时无法启动的问题，并调整生成帧的缓冲与呈现顺序。缩小处理可能使细节变软，缓冲会增加延迟。</li>
+  <li>苹果低延迟实时增强可选“自动视频”，识别常见 24／25／30 FPS 并整理时间轴。默认仍是“通用窗口”；声音由来源应用播放，可能出现音画偏移。</li>
+  <li>Fast X2 窗口优化不再限定设备型号。按 GPU 能力、内存预算和准备耗时判断，预算充足保留原尺寸，不足时采用较低处理尺寸。</li>
+</ul>
+<ul>
+  <li>Adds Apple low-latency interpolation and Apple FRC alongside default ODF-VFI, subject to runtime system, hardware and input support.</li>
+  <li>Repairs large-window Apple low-latency activation and adjusts bounded buffering and frame order. Reduced inference can soften detail; buffering adds delay.</li>
+  <li>Adds optional Automatic video timing for common 24/25/30 FPS live content. General window remains the default; source audio may lead enhanced video.</li>
+  <li>Fast X2 window optimization now uses GPU capabilities, memory budgets and preparation timing instead of a device-model whitelist, preserving native size when its preparation budget fits.</li>
+</ul>
+<p>实际画质和持续帧率仍取决于设备、输入与设置。Preparation timings do not establish sustained FPS. This community build is ad-hoc signed, supports signed in-app updates, and is not Apple notarized. macOS may ask for Screen Recording or Accessibility permission again after an upgrade. 此社区版未经过 Apple 公证，升级后可能需要重新授权。</p>
