@@ -452,7 +452,7 @@ BOOL SPAirBetaEnabled(void) {
 
 NSSize SPAirBetaProcessingSize(int width, int height) {
 #if ODF_AIR_BETA_DIAGNOSTIC || ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
-    const auto choice = sp::airBetaSize(width, height);
+    const auto choice = sp::airBetaSize(width, height, [SPRifeBridge windowCaptureByteLimit]);
     if (choice.valid) return NSMakeSize(choice.processingWidth, choice.processingHeight);
 #endif
     return NSZeroSize;
@@ -460,15 +460,29 @@ NSSize SPAirBetaProcessingSize(int width, int height) {
 
 NSString *SPAirBetaSizingReason(int width, int height) {
 #if ODF_AIR_BETA_DIAGNOSTIC || ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
-    switch (sp::airBetaSize(width, height).failure) {
+    switch (sp::airBetaSize(width, height, [SPRifeBridge windowCaptureByteLimit]).failure) {
         case sp::AirBetaSizeFailure::none: return nil;
         case sp::AirBetaSizeFailure::invalidCapture: return @"采集宽高须为至少2像素的偶数，现以原帧播放";
-        case sp::AirBetaSizeFailure::outsideEnvelope: return @"窗口超过2648×1668像素的验证范围，现以原帧播放";
+        case sp::AirBetaSizeFailure::outsideEnvelope: return @"采集画面超过当前GPU的窗口处理内存预算，现以原帧播放";
         case sp::AirBetaSizeFailure::invalidProcessing: return @"处理尺寸未能满足面积与偶数约束，现以原帧播放";
         case sp::AirBetaSizeFailure::paddingExceeded: return @"模型补齐尺寸超过2048×1280，现以原帧播放";
     }
 #endif
     return @"Air实验档未启用";
+}
+
+BOOL SPWindowNativeFits(double taskMs, double refreshHz) {
+    return sp::airWindowNativeFits(taskMs, refreshHz);
+}
+
+static sp::AirWindowOptimizationInput SPWindowCapabilities() {
+    static id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    sp::AirWindowOptimizationInput input;
+    input.metalAvailable = device != nil;
+    input.appleGPU = device && [device supportsFamily:MTLGPUFamilyApple1];
+    input.unifiedMemory = device && device.hasUnifiedMemory;
+    input.captureByteLimit = [SPRifeBridge windowCaptureByteLimit];
+    return input;
 }
 
 static NSString *SPAirHardwareModel() {
@@ -2960,7 +2974,7 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
     int expectedWidth = synthetic ? 1814 : 2648, expectedHeight = synthetic ? 1142 : 1668;
 #if ODF_AIR_BETA_DIAGNOSTIC
     if (SPAirBetaEnabled() || frame.airPerformanceEnabled) {
-        const auto choice = sp::airBetaSize(frame.betaCaptureWidth, frame.betaCaptureHeight);
+        const auto choice = sp::airBetaSize(frame.betaCaptureWidth, frame.betaCaptureHeight, [SPRifeBridge windowCaptureByteLimit]);
         expectedWidth = synthetic ? choice.processingWidth : frame.betaCaptureWidth;
         expectedHeight = synthetic ? choice.processingHeight : frame.betaCaptureHeight;
     }
@@ -5239,8 +5253,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 - (void)airConfigurePerformanceRequest:(SPLivePlanRequest *)request {
     const BOOL wasCandidate = _airPerformanceCandidate;
     _airPerformanceSelection = [SPRifeBridge airPerformanceSelectionStatus];
-    sp::AirWindowOptimizationInput input;
-    input.hardware = SPAirHardwareModel().UTF8String;
+    auto input = SPWindowCapabilities();
     input.sourceKind = request.captureSourceKind;
     input.interpolation = request.interpolationEnabled;
     input.rife425 = [request.engineID isEqual:@"rife.metal"] && [request.modelID isEqual:@"rife-v4.25"];
@@ -5325,7 +5338,9 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     if (_airResidentRetiredBridge) retired = [_airResidentRetiredBridge airBetaMeasurementReadiness] ?: @{};
 #endif
     return @{ @"schema": @"odf-air-window-optimization-v1", @"hardware": SPAirHardwareModel(),
-        @"hardwareSupported": @(sp::airWindowHardwareSupported(SPAirHardwareModel().UTF8String)),
+        @"capabilitiesSupported": @(sp::airWindowCapabilitiesSupported(SPWindowCapabilities())),
+        @"captureByteLimit": @([SPRifeBridge windowCaptureByteLimit]),
+        @"preparation": _rife.windowPreparationDiagnostics ?: @{},
         @"requestEligible": @(_airPerformanceCandidate), @"candidate": @(_airPerformanceRequested),
         @"enabled": @(_airPerformanceEnabled), @"active": @(active), @"reason": reason,
         @"requestedSourceKind": @((_airPerformanceRecipe ?: _request).captureSourceKind), @"actualSourceKind": @(_airActualSourceKind),
@@ -5349,6 +5364,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 }
 
 - (void)startAsyncEngine:(SPLivePlanRequest *)request {
+    BOOL windowOptimizationEligible = NO;
 #if ODF_AIR_BETA_DIAGNOSTIC
     if (SPAirBetaEnabled()) {
         if (![request.engineID isEqual:@"rife.metal"] || ![request.modelID isEqual:@"rife-v4.25"] ||
@@ -5370,12 +5386,9 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         }
         if (_airPerformanceRequested) {
             NSString *reason = [self airPerformanceEnvironmentReason];
-            if (reason) { [self airPerformanceUsePassthrough:reason]; return; }
-            if (![self.outputPreview setAirPerformanceEnabled:YES captureWidth:_sourceWidth captureHeight:_sourceHeight]) {
-                [self airPerformanceUsePassthrough:@"窗口呈现器未就绪，现以原帧播放"]; return;
-            }
-            [self airSetPerformanceMode:YES];
-            _airPerformanceReason = @"正在准备窗口优化";
+            windowOptimizationEligible = reason == nil;
+            [self airSetPerformanceMode:NO];
+            _airPerformanceReason = reason ?: @"正在检查原尺寸处理预算";
 #if ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC
             _airResidentInstallFailure = nil;
 #endif
@@ -5405,7 +5418,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     NSString *engine = copy.engineID.length ? copy.engineID : @"apple.frc";
     NSObject *sessionJournal = _airTraceSessionActive ? _airTraceKeeperJournal : nil;
     const BOOL sessionRecordingSealed = _airTraceRecordingSaturated;
-    const BOOL performanceEnabled = _airPerformanceEnabled;
+    const BOOL performanceEnabled = windowOptimizationEligible;
     [self publishStatus:@"正在准备引擎" failed:NO];
     [self publishPlanState:1 reason:@"正在准备引擎，当前画面仍用上一份已生效的计划"];
     dispatch_async(_prepareQ, ^{
@@ -5451,11 +5464,13 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
             if (!copy.modelID.length) copy.modelID = @"rife-v4.25";
             if (!copy.qualityID.length) copy.qualityID = @"balanced";
             rife = [[SPRifeBridge alloc] init];
-            rife.airPerformanceEnabled = performanceEnabled;
             if (sessionJournal) [rife setKeeperSessionJournal:sessionJournal];
             if (sessionRecordingSealed) [rife sealServiceTraceForDiagnostics];
             rife.liveStreamEnabled = copy.rifeStreamEnabled;
-            if (![rife prepareModelID:copy.modelID quality:copy.qualityID width:width height:height error:&error]) {
+            BOOL prepared = performanceEnabled
+                ? [rife prepareWindowModelID:copy.modelID quality:copy.qualityID width:width height:height refreshHz:copy.displayRefreshHz error:&error]
+                : [rife prepareModelID:copy.modelID quality:copy.qualityID width:width height:height error:&error];
+            if (!prepared) {
                 if (sessionJournal) sessionPreparationTraceLost = YES;
                 rife = nil;
             }
@@ -5532,6 +5547,14 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
                 [self publishStatus:reason failed:YES];
                 [self publishPlanState:0 reason:reason];
                 return;
+            }
+            if (performanceEnabled) {
+                if (rife.airPerformanceEnabled && ![self.outputPreview setAirPerformanceEnabled:YES captureWidth:width captureHeight:height]) {
+                    [rife invalidate];
+                    [self airPerformanceUsePassthrough:@"窗口呈现器未就绪，现以原帧播放"]; return;
+                }
+                [self airSetPerformanceMode:rife.airPerformanceEnabled];
+                self->_airPerformanceReason = rife.airPerformanceEnabled ? @"窗口优化已生效" : @"原尺寸处理预算充足";
             }
             [self installRequest:copy lowLatency:lowLatency rife:rife distil:distil appleSR:appleSR videoSR:videoSR animeSR:animeSR cuganSR:cuganSR artCNNSR:artCNNSR];
         });
@@ -9335,7 +9358,7 @@ presentationHost:(int64_t)presentationHost
             _airBetaFormatDescription = _airBetaFormatReason ? SPAirBetaFourCC(CVPixelBufferGetPixelFormatType(item.buffer)) : @"420v · BT.709 · SDR";
         }
 #endif
-        if (SPBufferIsHDR(item.buffer) && !SPAirBetaEnabled() && !_airPerformanceRequested) {
+        if (SPBufferIsHDR(item.buffer) && !SPAirBetaEnabled()) {
             CVPixelBufferRelease(item.buffer);
             _resolved.interpolationActive = NO;
             _resolved.scaleActive = NO;
