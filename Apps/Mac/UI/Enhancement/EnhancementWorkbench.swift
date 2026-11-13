@@ -596,18 +596,40 @@ struct RecentEnhancementSource: Codable, Equatable {
 }
 
 enum LiveEngineSelection {
+    static let engines = ["rife.metal", "apple.lowlatency", "apple.frc"]
+
     static func fromPopup(_ index: Int, quality: String) -> (engine: String, model: String) {
-        ("rife.metal", "rife-v4.25")
+        let engine = engines.indices.contains(index) ? engines[index] : engines[0]
+        switch engine {
+        case "apple.lowlatency": return (engine, "vt.llfi.temporal.1")
+        case "apple.frc": return (engine, quality == "quality" ? "vt.frc.quality" : "vt.frc.normal")
+        default: return (engine, "rife-v4.25")
+        }
     }
 
-    static func validQuality(_ quality: String) -> String {
-        ["fast", "balanced", "hq"].contains(quality) ? quality : "fast"
+    static func qualities(engine: String, source: String) -> [String] {
+        switch engine {
+        case "apple.lowlatency": return ["normal"]
+        case "apple.frc": return source == "file" ? ["normal"] : ["normal", "quality"]
+        default: return ["fast", "balanced", "hq"]
+        }
+    }
+
+    static func validQuality(_ quality: String, engine: String = "rife.metal", source: String = "window") -> String {
+        let choices = qualities(engine: engine, source: source)
+        return choices.contains(quality) ? quality : choices[0]
     }
 
     static func normalize(_ profile: inout EnhancementProfile) {
-        profile.interpolationEngineID = "rife.metal"
-        profile.modelID = "rife-v4.25"
-        profile.interpolationQuality = validQuality(profile.interpolationQuality)
+        if !engines.contains(profile.interpolationEngineID) { profile.interpolationEngineID = engines[0] }
+        profile.interpolationQuality = validQuality(profile.interpolationQuality, engine: profile.interpolationEngineID, source: profile.sourceKind)
+        if profile.interpolationEngineID == "apple.lowlatency" {
+            if profile.sourceKind == "file" || profile.rate != .multiplier(4) { profile.rate = .multiplier(2) }
+            profile.modelID = profile.rate == .multiplier(4) ? "vt.llfi.temporal.2" : "vt.llfi.temporal.1"
+        } else {
+            profile.modelID = fromPopup(engines.firstIndex(of: profile.interpolationEngineID) ?? 0,
+                                        quality: profile.interpolationQuality).model
+        }
         profile.rifeStreamEnabled = true
     }
 }
@@ -743,12 +765,13 @@ enum EnhancementProfileStore {
         object["windowOutputMode"] = "follow"
         if object["configName"] == nil { object["configName"] = fallbackName }
         if object["scaleQualityID"] == nil { object["scaleQualityID"] = "none" }
-        object["interpolationEngineID"] = "rife.metal"
-        object["modelID"] = "rife-v4.25"
-        object["interpolationQuality"] = LiveEngineSelection.validQuality(object["interpolationQuality"] as? String ?? "fast")
+        if object["interpolationEngineID"] == nil { object["interpolationEngineID"] = "rife.metal" }
+        if object["modelID"] == nil { object["modelID"] = "rife-v4.25" }
+        if object["interpolationQuality"] == nil { object["interpolationQuality"] = "fast" }
         guard let normalized = try? JSONSerialization.data(withJSONObject: object),
               var profile = try? JSONDecoder().decode(EnhancementProfile.self, from: normalized),
               profile.schemaVersion == 1 else { return nil }
+        LiveEngineSelection.normalize(&profile)
         ArtCNNSRSelection.normalize(&profile)
         return profile
     }
@@ -930,6 +953,8 @@ enum EnhancementProfileStore {
         let backup = try? Data(contentsOf: url)
         var profile = EnhancementProfile()
         profile.interpolationEnabled = true
+        profile.interpolationEngineID = "apple.frc"
+        profile.modelID = "vt.frc.quality"
         profile.interpolationQuality = "quality"
         profile.rate = .fixedFPS(numerator: 60000, denominator: 1001)
         profile.scaleEnabled = true
@@ -1291,7 +1316,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let enginePopup = AnchoredPopUpButton()
     private let sourceKindControl = NSSegmentedControl(labels: ["窗口", "显示器", "视频文件"], trackingMode: .selectOne, target: nil, action: nil)
     private let phaseLabel = FittingLabel(wrappingLabelWithString: "")
-    private let compatibilityButton = NSButton(title: "改用 ODF-VFI", target: nil, action: nil)
+    private let compatibilityButton = NSButton(title: "改用 Apple 帧率转换", target: nil, action: nil)
     private var page = 0
     private var pendingApply: EnhancementProfile?
     private var liveApply = LiveApplyTracker()
@@ -1563,8 +1588,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         loadControls()
         persist()
         showWorkbench()
-        showNotice(EnhancementText.t("ODF-VFI is selected. Click Start Enhancement to apply it to this video.",
-                                    "已选择 ODF-VFI。请点击开始增强后应用到此视频。"))
+        showNotice(EnhancementText.t("Click Start Enhancement to apply the selected engine to this video.",
+                                    "点击开始增强，将所选引擎应用到此视频。"))
     }
 
     func showPlaybackFailure(_ message: String) {
@@ -2407,6 +2432,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             "ODF-VFI",
             EnhancementText.t("Available for ordinary 8-bit video. fast is the checked tier. balanced and hq stay experimental.", "可用于普通 8 位画面。fast 是已核对的档位，balanced 和 hq 仍是实验。"),
             "rife.metal|rife-v4.25", enabled: true))
+        stack.addArrangedSubview(libraryRow(EnhancementText.t("Apple low latency", "Apple 低延迟"),
+            EnhancementText.t("For real-time enhancement. Requires macOS 26+ and supported hardware.", "面向实时增强，需要 macOS 26 或更新系统及硬件支持。"),
+            "apple.lowlatency|vt.llfi.temporal.1", enabled: true))
+        stack.addArrangedSubview(libraryRow(EnhancementText.t("Apple frame-rate conversion", "Apple 帧率转换"),
+            EnhancementText.t("Quality-oriented video processing. Availability and speed depend on the device.", "偏向视频画质，可用性与速度取决于设备。"),
+            "apple.frc|vt.frc.normal", enabled: true))
         stack.addArrangedSubview(heading(EnhancementText.t("Scale and super-resolution", "缩放与超分")))
         stack.addArrangedSubview(libraryRow("ArtCNN C4F32", EnhancementText.t("2× enhancement with more detail.", "2× 增强，画质优先。"), "scale|artcnn.c4f32", enabled: true))
         stack.addArrangedSubview(libraryRow("ArtCNN C4F16", EnhancementText.t("Lightweight 2× enhancement.", "2× 增强，速度优先。"), "scale|artcnn.c4f16", enabled: true))
@@ -2513,6 +2544,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         cancelCountdown()
         inputRouter?.stop(reason:"source_changed"); interactionArmed = false
         readControls()
+        reloadQualityItems()
+        applyModeVisibility()
         updateSRCapability()
         refreshSourceBar()
         if sourceKindControl.selectedSegment == 0 { windowSelectionList?.reloadWindows() }
@@ -2922,6 +2955,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             return
         }
         profile.interpolationEnabled = true
+        if LiveEngineSelection.engines.contains(id) { profile.interpolationEngineID = id }
         LiveEngineSelection.normalize(&profile)
         loadControls()
         persist()
@@ -2932,11 +2966,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     @objc private func useFrameRateConversion() {
         cancelCountdown()
+        profile.interpolationEngineID = "apple.frc"
         LiveEngineSelection.normalize(&profile)
         profile.interpolationEnabled = true
         loadControls()
         persist()
-        statusLabel.stringValue = EnhancementText.t("ODF-VFI selected. Press Start to apply it.", "已选择 ODF-VFI。按开始后生效。")
+        statusLabel.stringValue = EnhancementText.t("Engine selected. Press Start to apply it.", "已选择引擎。按开始后生效。")
         statusLabel.textColor = .labelColor
     }
 
@@ -3049,7 +3084,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func configurePopups() {
-        enginePopup.addItems(withTitles: ["ODF-VFI"])
+        enginePopup.addItems(withTitles: ["ODF-VFI", EnhancementText.t("Apple low latency", "Apple 低延迟"),
+                                          EnhancementText.t("Apple frame-rate conversion", "Apple 帧率转换")])
         enginePopup.target = self
         enginePopup.action = #selector(engineChanged)
         qualityPopup.addItems(withTitles: ["fast", "balanced", "hq"])
@@ -4422,6 +4458,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     @objc private func engineChanged() {
         readEngineSelection()
         reloadQualityItems()
+        loadRateControls()
         controlChanged()
         recordPlanEvent("engine_selected")
     }
@@ -4491,6 +4528,11 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         sizePopup.item(at: 0)?.title = EnhancementText.t("2× source (model native)", "2×来源（模型原生）")
         sizePopup.item(at: 5)?.title = EnhancementText.t("2× source (model native)", "2×来源（模型原生）")
         scaleQualityRow?.isHidden = true
+        let lowLatency = profile.interpolationEngineID == "apple.lowlatency"
+        rateMode.setEnabled(!lowLatency, forSegment: 0)
+        for (index, multiplier) in [2, 3, 4].enumerated() {
+            multiplierControl.setEnabled(!lowLatency || multiplier == 2 || (multiplier == 4 && profile.sourceKind != "file"), forSegment: index)
+        }
         let targetRate = rateMode.selectedSegment == 0
         targetRateRow?.isHidden = !targetRate
         customRateRow?.isHidden = !targetRate || fpsPopup.indexOfSelectedItem != 7
@@ -5054,7 +5096,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             let player = selectedFilePlayer()
             if player?.workbenchMotionPlusActive == true {
                 let selected = fileApplied ?? profile
-                let name = selected.interpolationEngineID == "rife.metal" ? "ODF-VFI · \(selected.interpolationQuality)" : "Apple FRC"
+                let name = Self.engineDisplayName(selected.interpolationEngineID, model: selected.modelID)
+                    + (selected.interpolationEngineID == "rife.metal" ? " · \(selected.interpolationQuality)" : "")
                 live = EnhancementText.t("Active", "生效") + " " + name
             } else if player?.workbenchMotionPlusRequested == true {
                 live = EnhancementText.t("Preparing or waiting for compatible frames", "正在准备或等待兼容画面")
@@ -5139,7 +5182,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private static func engineDisplayName(_ engine: String, model: String) -> String {
         switch engine {
         case "apple.lowlatency": return EnhancementText.t("Apple low latency", "Apple 低延迟")
-        case "apple.frc": return "Apple FRC"
+        case "apple.frc": return EnhancementText.t("Apple frame-rate conversion", "Apple 帧率转换")
         case "rife.metal": return model == "rife-v4.26" ? "RIFE 4.26" : "ODF-VFI"
         case "distildrba.coreml": return "DistilDRBA"
         default: return engine
@@ -5151,20 +5194,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         LiveEngineSelection.normalize(&profile)
         ArtCNNSRSelection.normalize(&profile)
         interpolationSwitch.state = profile.interpolationEnabled ? .on : .off
-        enginePopup.selectItem(at: 0)
+        enginePopup.selectItem(at: LiveEngineSelection.engines.firstIndex(of: profile.interpolationEngineID) ?? 0)
         reloadQualityItems()
         sourceKindControl.selectedSegment = ["window": 0, "display": 1, "file": 2][profile.sourceKind] ?? 0
-        switch profile.rate {
-        case .multiplier(let value):
-            rateMode.selectedSegment = 1
-            multiplierControl.selectedSegment = [2, 3, 4].firstIndex(of: value) ?? 0
-        case let .fixedFPS(numerator, denominator):
-            rateMode.selectedSegment = 0
-            fpsNum.stringValue = "\(numerator)"
-            fpsDen.stringValue = "\(denominator)"
-            let label = denominator == 1 ? "\(numerator)" : EnhancementText.t("Custom", "自定义")
-            fpsPopup.selectItem(withTitle: label)
-        }
+        loadRateControls()
         scaleSwitch.state = profile.scaleEnabled ? .on : .off
         sourceWindowPopup.selectItem(at: [0,480,720,1080].firstIndex(of: profile.sourceWindowPreset) ?? 0)
         srInputPopup.selectItem(at: [0, 480, 720, 1080].firstIndex(of: profile.srInputPreset) ?? 3)
@@ -5200,14 +5233,37 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         refreshPlanLabel()
     }
 
+    private func loadRateControls() {
+        switch profile.rate {
+        case .multiplier(let value):
+            rateMode.selectedSegment = 1
+            multiplierControl.selectedSegment = [2, 3, 4].firstIndex(of: value) ?? 0
+        case let .fixedFPS(numerator, denominator):
+            rateMode.selectedSegment = 0
+            fpsNum.stringValue = "\(numerator)"
+            fpsDen.stringValue = "\(denominator)"
+            let presets: [Int64] = [24, 25, 30, 50, 60, 90, 120]
+            fpsPopup.selectItem(at: denominator == 1 ? (presets.firstIndex(of: numerator) ?? 7) : 7)
+        }
+    }
+
     private func reloadQualityItems() {
         qualityPopup.removeAllItems()
-        qualityPopup.addItems(withTitles: ["fast", "balanced", "hq"])
-        qualityPopup.selectItem(at: ["fast": 0, "balanced": 1, "hq": 2][profile.interpolationQuality] ?? 0)
-        qualityPopup.isHidden = false
-        phaseLabel.isHidden = true
+        let choices = LiveEngineSelection.qualities(engine: profile.interpolationEngineID, source: profile.sourceKind)
+        for quality in choices {
+            let title = quality == "normal" ? EnhancementText.t("Standard", "标准")
+                : (quality == "quality" ? EnhancementText.t("Quality", "画质优先") : quality)
+            qualityPopup.addItem(withTitle: title)
+            qualityPopup.lastItem?.representedObject = quality
+        }
+        qualityPopup.selectItem(at: choices.firstIndex(of: profile.interpolationQuality) ?? 0)
+        qualityPopup.isEnabled = choices.count > 1
+        interpolationQualityRow?.isHidden = profile.interpolationEngineID == "apple.lowlatency"
         compatibilityButton.isHidden = true
-        interpolationQualityRow?.isHidden = false
+        phaseLabel.isHidden = profile.interpolationEngineID == "rife.metal"
+        phaseLabel.stringValue = profile.interpolationEngineID == "apple.lowlatency" ? lowLatencyPhaseText()
+            : EnhancementText.t("Quality-oriented video processing; may add latency and may not reach the target rate.",
+                                "偏向视频画质，处理延迟较高；实际帧率取决于设备与画面。")
     }
 
     private func lowLatencyPhaseText() -> String {
@@ -5224,7 +5280,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         switch profile.rate {
         case .multiplier(2):
-            return sizeText(2)
+            return EnhancementText.t("Low latency · ", "低延迟 · ") + sizeText(2) + (profile.sourceKind == "file"
+                ? EnhancementText.t(" · Files support X2", " · 文件支持 X2")
+                : EnhancementText.t(" · Windows and displays support X2 / X4", " · 窗口与显示器支持 X2 / X4"))
         case .multiplier(3):
             return EnhancementText.t("X3 needs 1/3 and 2/3. Low-latency will not rewrite them. Use Apple frame-rate conversion.", "X3 需要 1/3 和 2/3。低延迟不会改写它们。请改用 Apple 帧率转换。")
         case .multiplier(4):
@@ -5246,7 +5304,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private func readControls() {
         profile.interpolationEnabled = interpolationSwitch.state == .on
         readEngineSelection()
-        profile.interpolationQuality = LiveEngineSelection.validQuality(qualityPopup.titleOfSelectedItem ?? "fast")
+        profile.interpolationQuality = (qualityPopup.selectedItem?.representedObject as? String) ?? "fast"
         profile.sourceKind = ["window", "display", "file"][max(0, sourceKindControl.selectedSegment)]
         if rateMode.selectedSegment == 1 {
             profile.rate = .multiplier([2, 3, 4][max(0, multiplierControl.selectedSegment)])
@@ -5259,6 +5317,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             let index = min(max(0, fpsPopup.indexOfSelectedItem), presets.count - 1)
             profile.rate = .fixedFPS(numerator: Int64(presets[index]), denominator: 1)
         }
+        LiveEngineSelection.normalize(&profile)
+        loadRateControls()
         profile.scaleEnabled = scaleSwitch.state == .on
         if profile.sourceKind == "window" { profile.sourceWindowPreset = [0,480,720,1080][max(0,min(3,sourceWindowPopup.indexOfSelectedItem))] }
         if profile.sourceKind != "window" && profile.sourceKind != "file" { profile.srInputPreset = [0, 480, 720, 1080][max(0, min(3, srInputPopup.indexOfSelectedItem))] }
