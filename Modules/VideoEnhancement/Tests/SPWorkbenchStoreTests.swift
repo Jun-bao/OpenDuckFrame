@@ -42,6 +42,10 @@ private final class SourceSizeControls {
   var workbenchMotionPlusRequested = false
   var workbenchFileLanczosActive = false
  }
+ final class Label {
+  var stringValue = ""
+  var textColor: NSColor?
+ }
  var profile = EnhancementProfile()
  var applied = EnhancementProfile()
  var capture = Capture()
@@ -54,7 +58,13 @@ private final class SourceSizeControls {
  var delayedWindowSelection = false
  var startImmediatelyAfterPreparation = false
  var startButton: Button? = Button()
+ var delayedStartButton: Button? = Button()
  var stopButton: Button? = Button()
+ var statusLabel = Label()
+ var selectedStarts = 0
+ var delayedStarts = 0
+ var cancellations = 0
+ var sourceChoices = 0
 
  func selectedFilePlayer() -> Player? { filePlayer }
  var hasSelectedSource: Bool {
@@ -62,6 +72,16 @@ private final class SourceSizeControls {
  }
  func refreshActions() {
   // ACTUAL_WORKBENCH_ACTIONS
+ }
+ func cancelCountdown() { cancellations += 1; countdown.cancel(); delayedWindowSelection = false; startImmediatelyAfterPreparation = false }
+ func startSelectedSource() { selectedStarts += 1 }
+ func chooseCurrentKind() { sourceChoices += 1 }
+ func beginDelayedWindowSelection() { delayedStarts += 1 }
+ func triggerStart() {
+  // ACTUAL_START_HANDLER
+ }
+ func triggerDelayedStart() {
+  // ACTUAL_DELAY_HANDLER
  }
  func hasChanges(relativeTo baseline: EnhancementProfile) -> Bool {
   // ACTUAL_FORM_DIFFERENCE
@@ -74,22 +94,46 @@ private final class SourceSizeControls {
  @MainActor static func main() throws {
   let unselectedWindow = WorkbenchActionControls()
   unselectedWindow.refreshActions()
-  precondition(unselectedWindow.startButton?.isEnabled == true,
-    "Window countdown must allow automatic source selection before a source is chosen")
+  precondition(unselectedWindow.startButton?.isEnabled == false && unselectedWindow.startButton?.isHidden == false)
+  precondition(unselectedWindow.startButton?.title == "Enhance Selected Window")
+  precondition(unselectedWindow.delayedStartButton?.isEnabled == true && unselectedWindow.delayedStartButton?.isHidden == false,
+    "Delayed enhancement must remain available before a source is chosen")
+  precondition(unselectedWindow.delayedStartButton?.title == "Delayed Enhancement")
+  unselectedWindow.triggerStart()
+  precondition(unselectedWindow.sourceChoices == 1 && unselectedWindow.delayedStarts == 0,
+    "The specified-window action must not silently switch to delayed selection")
+  unselectedWindow.triggerDelayedStart()
+  precondition(unselectedWindow.delayedStarts == 1)
+
+  let selectedWindow = WorkbenchActionControls()
+  selectedWindow.activeSourceKind = "window"
+  selectedWindow.capture.target = 1
+  selectedWindow.refreshActions()
+  precondition(selectedWindow.startButton?.isEnabled == true && selectedWindow.delayedStartButton?.isEnabled == true,
+    "Selecting a window must not remove the delayed action")
+  precondition(selectedWindow.startButton?.isHidden == false && selectedWindow.delayedStartButton?.isHidden == false)
+  selectedWindow.triggerStart()
+  selectedWindow.triggerDelayedStart()
+  precondition(selectedWindow.selectedStarts == 1 && selectedWindow.delayedStarts == 1,
+    "Each action must invoke its own source-selection path")
 
   let countdownWindow = WorkbenchActionControls()
   let countdownTicket = countdownWindow.countdown.begin(seconds: 1)!
   countdownWindow.delayedWindowSelection = true
   countdownWindow.refreshActions()
-  precondition(countdownWindow.startButton?.isEnabled == true && countdownWindow.startButton?.title == "Cancel")
+  precondition(countdownWindow.delayedStartButton?.isEnabled == true && countdownWindow.delayedStartButton?.title == "Cancel")
+  precondition(countdownWindow.startButton?.isEnabled == false)
   _ = countdownWindow.countdown.tick(countdownTicket)
   countdownWindow.refreshActions()
-  precondition(countdownWindow.startButton?.isEnabled == true,
+  precondition(countdownWindow.delayedStartButton?.isEnabled == true,
     "Cancel must remain available while source discovery is pending after zero")
   countdownWindow.delayedWindowSelection = false
   countdownWindow.startImmediatelyAfterPreparation = true
   countdownWindow.refreshActions()
-  precondition(countdownWindow.startButton?.isEnabled == true && countdownWindow.startButton?.title == "Cancel")
+  precondition(countdownWindow.delayedStartButton?.isEnabled == true && countdownWindow.delayedStartButton?.title == "Cancel")
+  countdownWindow.triggerDelayedStart()
+  precondition(countdownWindow.cancellations == 1 && countdownWindow.delayedStarts == 0,
+    "The delayed action must cancel while preparing the selected window")
 
   let stoppedDisplay = WorkbenchActionControls()
   stoppedDisplay.profile.sourceKind = "display"
@@ -98,6 +142,7 @@ private final class SourceSizeControls {
   stoppedDisplay.refreshActions()
   precondition(stoppedDisplay.hasSelectedSource && stoppedDisplay.startButton?.isEnabled == true,
     "A stopped display with a retained source must remain restartable")
+  precondition(stoppedDisplay.delayedStartButton?.isHidden == true && stoppedDisplay.startButton?.title == "Start Enhancement")
   stoppedDisplay.capture.target = nil
   stoppedDisplay.refreshActions()
   precondition(stoppedDisplay.startButton?.isEnabled == false)
@@ -109,6 +154,8 @@ private final class SourceSizeControls {
   activeWindow.processor.resolvedPlan.interpolationActive = true
   activeWindow.refreshActions()
   precondition(activeWindow.startButton?.isHidden == true && activeWindow.stopButton?.isHidden == false)
+  precondition(activeWindow.delayedStartButton?.isHidden == false && activeWindow.delayedStartButton?.isEnabled == true,
+    "Delayed selection must remain available while enhancing a window")
   activeWindow.hasPendingFormChanges = true
   activeWindow.refreshActions()
   precondition(activeWindow.startButton?.isHidden == false && activeWindow.stopButton?.isHidden == false)
@@ -119,6 +166,7 @@ private final class SourceSizeControls {
   preparingFile.filePreparing = true
   preparingFile.refreshActions()
   precondition(preparingFile.startButton?.isEnabled == false && preparingFile.stopButton?.isHidden == false)
+  precondition(preparingFile.delayedStartButton?.isHidden == true)
 
   for sourceKind in ["display", "file"] {
    let outputChanges = WorkbenchActionControls()

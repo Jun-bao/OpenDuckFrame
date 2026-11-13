@@ -1309,7 +1309,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let sourceStripLabel = NSTextField(labelWithString: "")
     private let sourceMetaLabel = NSTextField(labelWithString: "")
     private var startButton: NSButton?
+    private var delayedStartButton: NSButton?
     private var stopButton: NSButton?
+    private var actionButtons: NSStackView?
     private var sourceActionButton: NSButton?
     private var emptySourceButton: NSButton?
     private var guideStep: WorkbenchGuideStep?
@@ -1914,7 +1916,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             target = interpolationSwitch
             edge = .minX
         case .start:
-            target = isRunning ? stopButton : startButton
+            target = isRunning ? stopButton : (profile.sourceKind == "window" ? actionButtons : startButton)
             edge = .minY
         }
         guard let target, target.window === window, !target.isHiddenOrHasHiddenAncestor else { return }
@@ -2373,10 +2375,13 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func runPanel() -> NSView {
-        let start = button(EnhancementText.t("Delayed Enhancement", "延迟增强"), #selector(start), primary: true)
+        let start = button(EnhancementText.t("Enhance Selected Window", "指定窗口增强"), #selector(start), primary: true)
+        let delayedStart = button(EnhancementText.t("Delayed Enhancement", "延迟增强"), #selector(startDelayedWindow))
         let stop = button(EnhancementText.t("Stop", "停止"), #selector(stop))
+        delayedStart.controlSize = .large
         stop.controlSize = .large
         startButton = start
+        delayedStartButton = delayedStart
         stopButton = stop
         stop.isHidden = true
         statusLabel.font = .systemFont(ofSize: 13, weight: .medium)
@@ -2391,12 +2396,13 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             label.isHidden = label.stringValue.isEmpty
         }
         let statusColumn = column([statusLabel, statsLabel, budgetLabel], spacing: 2)
-        // Stop sits before the default action; whichever is visible alone takes the full width.
-        let actions = NSStackView(views: [stop, start])
+        // Hidden actions detach so each visible action shares the available width.
+        let actions = NSStackView(views: [stop, delayedStart, start])
         actions.orientation = .horizontal
         actions.distribution = .fillEqually
         actions.spacing = 10
         actions.detachesHiddenViews = true
+        actionButtons = actions
         return column([statusColumn, actions], spacing: 10)
     }
 
@@ -3039,16 +3045,23 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             (capture.running && (processor.resolvedPlan.interpolationActive || processor.resolvedPlan.scaleActive || (applied.sourceKind == "window" && applied.windowOutputMode != "follow")))
         startButton?.isHidden = enhancing && !hasPendingFormChanges && !countdown.active
             && !delayedWindowSelection && !startImmediatelyAfterPreparation
-        let canCancel = countdown.active || delayedWindowSelection || startImmediatelyAfterPreparation
-        let canStart = (profile.sourceKind == "window" || hasSelectedSource) && !filePreparing
+        let delayedBusy = delayedWindowSelection || startImmediatelyAfterPreparation
+        delayedStartButton?.isHidden = profile.sourceKind != "window"
+        delayedStartButton?.isEnabled = delayedBusy || (!countdown.active && !filePreparing)
+        delayedStartButton?.title = delayedBusy ? EnhancementText.t("Cancel", "取消") : EnhancementText.t("Delayed Enhancement", "延迟增强")
+        let canCancel = countdown.active && !delayedBusy
+        let canStart = hasSelectedSource && !filePreparing && !delayedBusy
         startButton?.isEnabled = canCancel || canStart
-        startButton?.toolTip = canCancel || canStart ? nil : EnhancementText.t("Choose a source first", "请先选择来源")
-        if delayedWindowSelection || startImmediatelyAfterPreparation {
-            startButton?.title = EnhancementText.t("Cancel", "取消")
-        } else if profile.sourceKind == "window" && !hasSelectedSource {
-            startButton?.title = EnhancementText.t("Delayed Enhancement", "延迟增强")
+        startButton?.toolTip = canCancel || canStart ? nil : (delayedBusy
+            ? EnhancementText.t("Cancel delayed enhancement first", "请先取消延迟增强")
+            : EnhancementText.t("Choose a source first", "请先选择来源"))
+        if profile.sourceKind == "window" && delayedBusy {
+            startButton?.title = EnhancementText.t("Enhance Selected Window", "指定窗口增强")
         } else {
-            startButton?.title = filePreparing ? EnhancementText.t("Preparing…", "准备中…") : (countdown.active ? "\(countdown.remaining)" : (enhancing ? EnhancementText.t("Apply Changes", "应用更改") : EnhancementText.t("Start Enhancement", "开始增强")))
+            let startTitle = profile.sourceKind == "window"
+                ? EnhancementText.t("Enhance Selected Window", "指定窗口增强")
+                : EnhancementText.t("Start Enhancement", "开始增强")
+            startButton?.title = filePreparing ? EnhancementText.t("Preparing…", "准备中…") : (countdown.active ? "\(countdown.remaining)" : (enhancing ? EnhancementText.t("Apply Changes", "应用更改") : startTitle))
         }
         stopButton?.isHidden = !enhancing && !filePreparing
     }
@@ -3993,17 +4006,28 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 #if ODF_AIR_BETA_DIAGNOSTIC
         guard betaAllowsSessionChange() else { return }
 #endif
+        if countdown.active || delayedWindowSelection || startImmediatelyAfterPreparation {
+            cancelCountdown()
+            statusLabel.stringValue = EnhancementText.t("Cancelled", "已取消")
+            statusLabel.textColor = .labelColor
+            return
+        }
+        guard hasSelectedSource else { chooseCurrentKind(); return }
+        startSelectedSource()
+    }
+
+    @objc private func startDelayedWindow() {
+#if ODF_AIR_BETA_DIAGNOSTIC
+        guard betaAllowsSessionChange() else { return }
+#endif
         if delayedWindowSelection || startImmediatelyAfterPreparation {
             cancelCountdown()
             statusLabel.stringValue = EnhancementText.t("Cancelled", "已取消")
             statusLabel.textColor = .labelColor
             return
         }
-        if profile.sourceKind == "window" && !hasSelectedSource {
-            beginDelayedWindowSelection()
-        } else {
-            startSelectedSource()
-        }
+        guard profile.sourceKind == "window" else { return }
+        beginDelayedWindowSelection()
     }
 
     private func hideScreenCountdown() {

@@ -36,6 +36,7 @@ import AppKit
         check(step: .source, kind: "window", running: false, text: "选择画面来源")
         check(step: .frameGeneration, kind: "window", running: false, text: "确认帧生成")
         check(step: .start, kind: "window", running: false, text: "延迟增强")
+        check(step: .start, kind: "window", running: false, text: "指定窗口增强")
         check(step: .start, kind: "file", running: false, text: "点击开始增强")
         check(step: .start, kind: "display", running: false, text: "点击开始增强")
         check(step: .start, kind: "file", running: true, text: "点击停止")
@@ -47,6 +48,7 @@ import AppKit
         precondition(skipped && advanced)
         EnhancementText.chinese = false
         check(step: .start, kind: "window", running: false, text: "Delayed Enhancement")
+        check(step: .start, kind: "window", running: false, text: "Enhance Selected Window")
         print("Guide preference, steps, actions and source-specific Chinese/English text passed")
     }
 }
