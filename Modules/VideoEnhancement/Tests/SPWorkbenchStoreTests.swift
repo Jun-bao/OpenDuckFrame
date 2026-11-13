@@ -248,6 +248,28 @@ private final class SourceSizeControls {
   try FileManager.default.createDirectory(at:temp,withIntermediateDirectories:true)
   defer { try? FileManager.default.removeItem(at:temp) }
   EnhancementProfileStore.testDirectory=temp
+  for source in ["window", "display", "file"] {
+   for oldMode in ["original", "compare"] {
+    var saved = EnhancementProfile()
+    saved.sourceKind = source; saved.viewMode = oldMode
+    saved.configName = "view-mode-test"; saved.configID = "custom:view-mode-test"
+    saved.interpolationEngineID = "apple.frc"; saved.scaleEnabled = true; saved.scaleEngineID = "apple.video-sr"
+    LiveEngineSelection.normalize(&saved)
+    var expected = saved; expected.viewMode = "enhanced"
+    let restored = EnhancementProfileStore.decode(try JSONEncoder().encode(saved), fallbackName:"legacy")
+    precondition(restored == expected, "Old view modes must restore enhanced output without changing other choices")
+    try EnhancementProfileStore.save(saved)
+    try EnhancementProfileStore.saveNamed(saved)
+    try EnhancementProfileStore.savePreset(saved, id:"preset:anime")
+    let persisted = try JSONDecoder().decode(EnhancementProfile.self, from: Data(contentsOf: EnhancementProfileStore.fileURL()))
+    precondition(persisted == expected && EnhancementProfileStore.loadNamed("view-mode-test") == expected &&
+                 EnhancementProfileStore.loadPreset("preset:anime") == expected)
+   }
+  }
+  var noViewMode = try JSONSerialization.jsonObject(with: JSONEncoder().encode(EnhancementProfile())) as! [String: Any]
+  noViewMode.removeValue(forKey: "viewMode")
+  let noViewModeData = try JSONSerialization.data(withJSONObject:noViewMode)
+  precondition(EnhancementProfileStore.decode(noViewModeData, fallbackName:"legacy")?.viewMode == "enhanced")
   precondition(EnhancementProfile().scaleEngineID == "apple.low-sr" && EnhancementProfile().srInputPreset == 720 && !EnhancementProfile().scaleEnabled)
   precondition(AppleSRSelection.ids == ["apple.low-sr", "apple.video-sr"] && AppleSRSelection.fromPopup(0) == "apple.low-sr" && AppleSRSelection.fromPopup(1) == "apple.video-sr")
   for legacy in ["lanczos", "metalfx.spatial", "artcnn.c4f32", "artcnn.c4f16", "anime4k", "realcugan", "unknown"] {

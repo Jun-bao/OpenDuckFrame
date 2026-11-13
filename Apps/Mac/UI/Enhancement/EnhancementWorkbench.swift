@@ -770,6 +770,7 @@ enum EnhancementProfileStore {
         if object["sourceWindowPreset"] == nil { object["sourceWindowPreset"] = 0 }
         if object["captureLimit"] == nil { object["captureLimit"] = "auto" }
         object["windowOutputMode"] = "follow"
+        object["viewMode"] = "enhanced"
         if object["configName"] == nil { object["configName"] = fallbackName }
         if object["scaleQualityID"] == nil { object["scaleQualityID"] = "none" }
         if object["interpolationEngineID"] == nil { object["interpolationEngineID"] = "rife.metal" }
@@ -793,6 +794,7 @@ enum EnhancementProfileStore {
 
     static func save(_ profile: EnhancementProfile) throws {
         var profile = profile
+        profile.viewMode = "enhanced"
         AppleSRSelection.normalize(&profile)
         let url = fileURL()
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -836,6 +838,7 @@ enum EnhancementProfileStore {
 
     static func savePreset(_ profile: EnhancementProfile, id: String) throws {
         var profile = profile
+        profile.viewMode = "enhanced"
         AppleSRSelection.normalize(&profile)
         guard presets.contains(where: { $0.id == id }) else { throw CocoaError(.fileWriteInvalidFileName) }
         let dir = presetDirectory()
@@ -898,6 +901,7 @@ enum EnhancementProfileStore {
 
     static func saveNamed(_ profile: EnhancementProfile) throws {
         var copy = profile
+        copy.viewMode = "enhanced"
         AppleSRSelection.normalize(&copy)
         copy.configName = safeName(profile.configName)
         let url = namedDirectory().appendingPathComponent(copy.configName + ".json")
@@ -968,7 +972,7 @@ enum EnhancementProfileStore {
         profile.scaleEngineID = "apple.low-sr"
         profile.outputWidth = 1920
         profile.outputHeight = 1080
-        profile.viewMode = "compare"
+        profile.viewMode = "enhanced"
         profile.appearance = "light"
         profile.captureLimit = "30"
         profile.recents = [RecentEnhancementSource(kind: "window", title: "Preview", bundleIdentifier: "com.example.preview")]
@@ -1252,7 +1256,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private var lastStatsReceipt: TimeInterval = 0
     private var fpsCanObserve = false
     private var fpsOutputObservable = false
-    private let viewMode = NSSegmentedControl(labels: ["E", "O", "C"], trackingMode: .selectOne, target: nil, action: nil)
     private let appearanceControl = NSSegmentedControl(labels: ["S", "L", "D"], trackingMode: .selectOne, target: nil, action: nil)
     private let languageControl = NSSegmentedControl(labels: ["中文", "English", "More"], trackingMode: .selectOne, target: nil, action: nil)
     private let languageDetail = NSTextField(wrappingLabelWithString: "")
@@ -1274,7 +1277,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private var multiplierRow: NSView?
     private var dimensionRow: NSView?
     private var fullscreenRow: NSView?
-    private var viewModeRow: NSView?
     private var formLabels: [(NSTextField, NSView)] = []
     private var hasPendingFormChanges = false
     private let captureCapPopup = NSPopUpButton()
@@ -1672,8 +1674,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         languageControl.action = #selector(languageChanged)
         languageControl.selectedSegment = EnhancementText.chinese ? 0 : 1
 
-        viewMode.segmentDistribution = .fillEqually
-        viewMode.isEnabled = !SPRifeExperiments.airBeta
         // Source stays pinned above the settings; status and actions stay pinned
         // below them. Only the settings scroll, so the footer never covers a row.
         let source = stageBand(sourceBlock(), top: 12, bottom: 12)
@@ -1740,7 +1740,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private func updateSourceChrome(hasSource: Bool) {
         sourceActionButton?.isHidden = sourceKindControl.selectedSegment == 0
         sourceMetaLabel.isHidden = !hasSource || sourceMetaLabel.stringValue.isEmpty
-        (viewModeRow ?? viewMode).isHidden = !hasSource || SPRifeExperiments.airBeta
         refreshActions()
     }
 
@@ -2315,7 +2314,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         return column(items, spacing: WorkbenchStyle.groupSpacing)
     }
 
-    /// Where and how the result is shown: display, fullscreen, view mode and the FPS overlay.
+    /// Where and how the result is shown: display, fullscreen and the FPS overlay.
     private func outputGroup() -> NSView {
         fpsSwitch.state = FPSPreference.enabled(in: .standard) ? .on : .off
         fpsSwitch.target = self
@@ -2329,9 +2328,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             check.distribution = .fill
             let fullscreen = FormRow(check)
             fullscreenRow = fullscreen
-            let viewRow = row(EnhancementText.t("View", "画面"), viewMode)
-            viewModeRow = viewRow
-            rows += [row(EnhancementText.t("Output to", "输出到"), displayPopup), fullscreen, viewRow]
+            rows += [row(EnhancementText.t("Output to", "输出到"), displayPopup), fullscreen]
         }
         rows.append(row(EnhancementText.t("Show FPS", "显示帧率"), fpsSwitch))
         return formGroup(rows)
@@ -2531,15 +2528,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func redrawPreview() {
-        if profile.sourceKind == "file" { selectedFilePlayer()?.workbenchSetFileViewMode(profile.viewMode); return }
+        if profile.sourceKind == "file" { selectedFilePlayer()?.workbenchSetFileViewMode("enhanced"); return }
         applyAirBetaPreset(&profile)
-        let mode: SPLiveViewMode
-        switch profile.viewMode {
-        case "original": mode = .original
-        case "compare": mode = .compare
-        default: mode = .enhanced
-        }
-        processor.setViewMode(mode)
+        processor.setViewMode(.enhanced)
     }
 
     @objc private func changeWindow() {
@@ -3117,8 +3108,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         rateMode.action = #selector(controlChanged)
         multiplierControl.target = self
         multiplierControl.action = #selector(controlChanged)
-        viewMode.target = self
-        viewMode.action = #selector(viewModeChanged)
         appearanceControl.target = self
         appearanceControl.action = #selector(appearanceChanged)
         for control in [qualityPopup, fpsPopup, scalePopup, scaleQualityPopup, srInputPopup, sourceWindowPopup, sizePopup, displayPopup] {
@@ -3147,9 +3136,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         fullscreenCheck.title = EnhancementText.t("Fullscreen on output display", "在输出显示器全屏")
         rateMode.setLabel(EnhancementText.t("Target FPS", "目标帧率"), forSegment: 0)
         rateMode.setLabel(EnhancementText.t("Multiplier", "倍率"), forSegment: 1)
-        viewMode.setLabel(EnhancementText.t("Enhanced", "增强"), forSegment: 0)
-        viewMode.setLabel(EnhancementText.t("Original", "原始"), forSegment: 1)
-        viewMode.setLabel(EnhancementText.t("Compare", "对比"), forSegment: 2)
         appearanceControl.setLabel(EnhancementText.t("System", "系统"), forSegment: 0)
         appearanceControl.setLabel(EnhancementText.t("Light", "浅色"), forSegment: 1)
         appearanceControl.setLabel(EnhancementText.t("Dark", "深色"), forSegment: 2)
@@ -3171,7 +3157,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 self.lastFileStatsUpdate = now
                 self.updateSRCapability()
                 if let player = self.selectedFilePlayer() {
-                    player.workbenchSetFileViewMode(self.profile.viewMode)
+                    player.workbenchSetFileViewMode("enhanced")
                     let fps = player.workbenchPresentedFPS
                     let rate = fps > 0 ? String(format: EnhancementText.t("Output %.1f fps", "输出约 %.1f fps"), fps) : ""
                     let coverage = player.workbenchMotionPlusRequested ? String(format: EnhancementText.t("Generated-pair coverage %.0f%%", "生成帧对覆盖率 %.0f%%"), player.workbenchInterpolationCoverage * 100) : ""
@@ -4444,32 +4430,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     @objc private func showLibrary() { showPage(2) }
 
-    @objc private func viewModeChanged() {
-        cancelCountdown()
-        inputRouter?.stop(reason:"view_changed")
-        interactionArmed = false
-        fileApplyError = ""
-        readControls()
-        if profile.sourceKind == "file" {
-            selectedFilePlayer()?.workbenchSetFileViewMode(profile.viewMode)
-            persist(); refreshPlanLabel()
-            statusLabel.stringValue = EnhancementText.t("Preview mode changed", "预览模式已切换")
-            statusLabel.textColor = .labelColor
-            return
-        }
-        let mode: SPLiveViewMode
-        switch profile.viewMode {
-        case "original": mode = .original
-        case "compare": mode = .compare
-        default: mode = .enhanced
-        }
-        processor.setViewMode(mode)
-        persist()
-        refreshPlanLabel()
-        statusLabel.stringValue = EnhancementText.t("Preview mode changed", "预览模式已切换")
-        statusLabel.textColor = .labelColor
-    }
-
     @objc private func engineChanged() {
         readEngineSelection()
         reloadQualityItems()
@@ -4502,13 +4462,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         readControls()
         updateSRCapability()
         applyModeVisibility()
-        let mode: SPLiveViewMode
-        switch profile.viewMode {
-        case "original": mode = .original
-        case "compare": mode = .compare
-        default: mode = .enhanced
-        }
-        processor.setViewMode(mode)
+        processor.setViewMode(.enhanced)
         persist()
         refreshPlanLabel()
         if capture.running { statusLabel.stringValue = EnhancementText.t("Pending", "待应用") }
@@ -5050,11 +5004,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         request.outputWidth = Int32(profile.outputWidth)
         request.outputHeight = Int32(profile.outputHeight)
-        switch profile.viewMode {
-        case "original": request.viewMode = .original
-        case "compare": request.viewMode = .compare
-        default: request.viewMode = .enhanced
-        }
+        request.viewMode = .enhanced
         request.displayRefreshHz = Double(cadenceScreen(for: profile)?.maximumFramesPerSecond ?? 60)
         request.captureCapFPS = Int32(Int(profile.captureLimit) ?? 0)
         return request
@@ -5240,7 +5190,6 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         heightField.stringValue = "\(profile.outputHeight)"
         fullscreenCheck.state = profile.outputFullscreen ? .on : .off
         profile.windowOutputMode = "follow"
-        viewMode.selectedSegment = ["enhanced": 0, "original": 1, "compare": 2][profile.viewMode] ?? 0
         appearanceControl.selectedSegment = ["system": 0, "light": 1, "dark": 2][profile.appearance] ?? 0
         captureCapPopup.selectItem(at: ["auto": 0, "30": 1, "60": 2][profile.captureLimit] ?? 0)
         capture.captureCapFPS = Int(profile.captureLimit) ?? 0
@@ -5359,7 +5308,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         if profile.sourceKind == "file" { profile.outputFullscreen = fullscreenCheck.state == .on }
         profile.windowOutputMode = "follow"
-        profile.viewMode = ["enhanced", "original", "compare"][max(0, viewMode.selectedSegment)]
+        profile.viewMode = "enhanced"
         profile.appearance = ["system", "light", "dark"][max(0, appearanceControl.selectedSegment)]
         profile.captureLimit = ["auto", "30", "60"][max(0, min(2, captureCapPopup.indexOfSelectedItem))]
         profile.soundMode = "sourceApplication"

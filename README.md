@@ -19,8 +19,8 @@ your Mac, without an account or uploading your picture.
   Apple options require runtime hardware/system support. Watch the actual output rate.
   Achieved performance depends on the source, settings and Mac.
 - **Upscaling.** Choose Apple real-time or Apple video super resolution on supported macOS 26+ systems. Larger inputs may be reduced before processing. Live Apple video SR currently requires frame generation to be off.
-- **A workbench for everyday use.** Save profiles for games, films and animation;
-  compare original and enhanced output. Window and display output follow the
+- **A workbench for everyday use.** Save profiles for games, films and animation.
+  Window and display output follow the
   source; video-file output can go fullscreen on a selected display.
 - **A local video player, too.** Open formats including MKV, MP4, MOV and WebM,
   with subtitles, HDR playback on compatible displays, playback resume, speed
@@ -56,7 +56,7 @@ checks from the same menu. Updating never uploads your media.
    selected and enhanced automatically. The countdown defaults to 3 seconds and can
    be set from 1 to 20 seconds in the workbench **Settings**. For a display or
    video file, press **Start Enhancement**.
-4. Use the original / enhanced / comparison controls and FPS display to check the result.
+4. Watch the enhanced output and use the FPS display to observe the output rate.
 
 See [Quick start](docs/quick-start.md) for permissions and troubleshooting.
 

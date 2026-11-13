@@ -39,8 +39,7 @@ ODF-VFI; a new named configuration copies the current settings.
    to enhance before the countdown ends. The focused window is selected and
    enhancement starts automatically. The countdown defaults to 3 seconds and
    can be set from 1 to 20 seconds in **Settings**. Display and video-file inputs
-   keep **Start Enhancement**. Compare **Original**, **Enhanced**, and
-   **Comparison** views in the output settings; use the FPS overlay to observe actual output.
+   keep **Start Enhancement**. Use the FPS overlay to observe actual output.
 4. Save a profile once you have settings that work for your content.
 
 Frame generation creates intermediate pictures; it does not change the source
