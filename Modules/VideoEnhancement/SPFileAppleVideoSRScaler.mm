@@ -19,16 +19,24 @@ static NSError *SPFileVideoSRError(NSInteger code, NSString *message) {
 - (instancetype)initWithSourceWidth:(int)sourceWidth sourceHeight:(int)sourceHeight outputWidth:(int)outputWidth outputHeight:(int)outputHeight error:(NSError **)error {
     if (!(self = [super init])) return nil;
     _busy.store(false);
+    BOOL automatic = outputWidth == 0 && outputHeight == 0;
+    NSSize input = automatic ? [SPAppleVideoSR automaticInputForWidth:sourceWidth height:sourceHeight] : NSMakeSize(sourceWidth, sourceHeight);
+    if (automatic) {
+        NSSize output = [SPAppleVideoSR automaticOutputForWidth:(int)input.width height:(int)input.height];
+        outputWidth = (int)output.width; outputHeight = (int)output.height;
+    }
     if (sourceWidth < 2 || sourceHeight < 2 || outputWidth < 2 || outputHeight < 2 || (outputWidth & 1) || (outputHeight & 1) ||
         outputWidth > 3840 || outputHeight > 2160) {
         if (error) *error = SPFileVideoSRError(1, @"文件超分需要有效的偶数输出尺寸，最高 3840×2160。"); return nil;
     }
-    if(outputWidth%sourceWidth || outputHeight%sourceHeight || outputWidth/sourceWidth!=outputHeight/sourceHeight || outputWidth/sourceWidth<2) {
+    int inputWidth = (int)input.width, inputHeight = (int)input.height;
+    if(inputWidth < 2 || inputHeight < 2 || outputWidth%inputWidth || outputHeight%inputHeight || outputWidth/inputWidth!=outputHeight/inputHeight || outputWidth/inputWidth<2) {
         if(error)*error=SPFileVideoSRError(2,@"Apple 视频超分需要设备支持的整数倍率和来源宽高比。");return nil;
     }
-    int factor=outputWidth/sourceWidth;
+    int factor=outputWidth/inputWidth;
     _engine = [[SPAppleVideoSR alloc] init];
-    if (![_engine prepareWidth:sourceWidth height:sourceHeight scale:factor error:error]) return nil;
+    _engine.allowsInputResize = inputWidth != sourceWidth || inputHeight != sourceHeight;
+    if (![_engine prepareWidth:inputWidth height:inputHeight scale:factor error:error]) return nil;
     if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &_outputTransfer) != noErr || !_outputTransfer) {
         [_engine invalidate]; if (error) *error=SPFileVideoSRError(3,@"无法准备文件超分输出格式转换。 "); return nil;
     }

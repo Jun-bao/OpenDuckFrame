@@ -4109,8 +4109,10 @@ static BOOL spThumbsEnabled(void) {
             finish(NO, error.localizedDescription ?: @"文件缩放准备失败。");
             return;
         }
+        const int expectedWidth = width == 0 ? candidate.outputWidth : width;
+        const int expectedHeight = height == 0 ? candidate.outputHeight : height;
         BOOL submitted = [candidate submit:sample ptsUs:samplePTS completion:^(CVPixelBufferRef output, NSError *failure) {
-            BOOL valid = output && CVPixelBufferGetWidth(output) == (size_t)width && CVPixelBufferGetHeight(output) == (size_t)height && CVPixelBufferGetPixelFormatType(output) == format;
+            BOOL valid = output && CVPixelBufferGetWidth(output) == (size_t)expectedWidth && CVPixelBufferGetHeight(output) == (size_t)expectedHeight && CVPixelBufferGetPixelFormatType(output) == format;
             if (output) CVPixelBufferRelease(output);
             finish(valid, failure.localizedDescription ?: @"");
         }];

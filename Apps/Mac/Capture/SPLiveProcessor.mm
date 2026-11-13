@@ -655,6 +655,26 @@ NSSize SPLiveSRInputSize(int width, int height, int preset) {
     return NSMakeSize(MAX(2, ((int)(width * factor)) & ~1), MAX(2, ((int)(height * factor)) & ~1));
 }
 
+static NSSize SPLiveSRInputSizeForRequest(int width, int height, SPLivePlanRequest *request) {
+    int preset = request.scaleEnabled ? request.srInputPreset : 0;
+    if (request.scaleEnabled && request.scaleEngine == SPLiveScaleAppleLowLatencySR)
+        return [SPAppleLowLatencySR inputSizeForWidth:width height:height preset:preset];
+    NSSize input = SPLiveSRInputSize(width, height, preset);
+    if (request.scaleEnabled && request.scaleEngine == SPLiveScaleAppleVideoSR && request.outputWidth == 0 && request.outputHeight == 0) {
+        NSSize effective = [SPAppleVideoSR automaticInputForWidth:(int)input.width height:(int)input.height];
+        NSSize output = [SPAppleVideoSR automaticOutputForWidth:(int)effective.width height:(int)effective.height];
+        // Leave room for the source, compare frame, and temporal output buffers
+        // within the live queue's 160 MiB budget.
+        if (output.width > 3200 || output.height > 1800) {
+            double ratio = MIN(3200.0 / output.width, 1800.0 / output.height);
+            effective = [SPAppleVideoSR automaticInputForWidth:MAX(4, ((int)(effective.width * ratio)) & ~3)
+                                                         height:MAX(4, ((int)(effective.height * ratio)) & ~3)];
+        }
+        return effective;
+    }
+    return input;
+}
+
 @implementation SPLivePlanRequest
 - (id)copyWithZone:(NSZone *)zone {
     (void)zone;
@@ -4591,8 +4611,8 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         @"r8ReportedSlotBytesScope": @"deduplicated CVPixelBufferGetDataSize for queued slot buffers, not resident or total GPU/VT process memory",
         @"sourceWidth": @(_width),
         @"sourceHeight": @(_height),
-        @"srInputWidth": @((int)SPLiveSRInputSize(_width, _height, _request.scaleEnabled ? _request.srInputPreset : 0).width),
-        @"srInputHeight": @((int)SPLiveSRInputSize(_width, _height, _request.scaleEnabled ? _request.srInputPreset : 0).height),
+        @"srInputWidth": @((int)SPLiveSRInputSizeForRequest(_width, _height, _request).width),
+        @"srInputHeight": @((int)SPLiveSRInputSizeForRequest(_width, _height, _request).height),
         @"lowLatencyPreScale": @([self requestUsesLowPrescale:_request width:_width height:_height]),
         @"lowLatencyPrescaledInputs": @(_lowPrescaleInputs), @"lowLatencySyntheticNoRescale": @(_lowSyntheticNoRescale),
         @"processingWidth": @(processingWidth),
@@ -4651,18 +4671,24 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 
 - (BOOL)validateRequest:(SPLivePlanRequest *)request reason:(NSString **)reason {
     BOOL sourceGuard = request.requiredSourceWidth || request.requiredSourceHeight || request.requiredSourceWindowID || request.requiredSourcePID || request.requiredSourceAfterHost;
-    if (sourceGuard && (request.requiredSourceWidth < 2 || request.requiredSourceHeight < 2 || !request.requiredSourceWindowID || request.requiredSourcePID <= 0 || !request.requiredSourceAfterHost || request.srInputPreset != 0 || !request.scaleEnabled ||
-        (request.scaleEngine != SPLiveScaleMetalFX && !SPLiveIsNative2xScaleEngine(request.scaleEngine)))) {
+    BOOL appleLowSR = request.scaleEngine == SPLiveScaleAppleLowLatencySR || request.scaleEngine == SPLiveScaleAppleVideoSR;
+    if (sourceGuard && (request.requiredSourceWidth < 2 || request.requiredSourceHeight < 2 || !request.requiredSourceWindowID || request.requiredSourcePID <= 0 || !request.requiredSourceAfterHost || (!appleLowSR && request.srInputPreset != 0) || !request.scaleEnabled ||
+        (!appleLowSR && request.scaleEngine != SPLiveScaleMetalFX && !SPLiveIsNative2xScaleEngine(request.scaleEngine)))) {
         if (reason) *reason = @"来源窗口尺寸计划无效或缺少已确认的窗口身份。";
         return NO;
     }
-    if (sourceGuard) {
+    if (sourceGuard && !appleLowSR) {
         BOOL nativeOutput = request.outputWidth == request.requiredSourceWidth*2 && request.outputHeight == request.requiredSourceHeight*2;
         BOOL autoAnimation = SPLiveIsNative2xScaleEngine(request.scaleEngine) && request.outputWidth == 0 && request.outputHeight == 0;
         if (!nativeOutput && !autoAnimation) { if (reason) *reason = @"来源窗口模式需要匹配的 2× 输出尺寸。"; return NO; }
     }
     if (request.scaleEnabled && request.scaleEngine == SPLiveScaleAppleVideoSR && request.interpolationEnabled) {
         if (reason) *reason = @"Apple 视频超分暂不支持同时插帧，请先关闭帧生成。";
+        return NO;
+    }
+    if (request.scaleEnabled && request.scaleEngine == SPLiveScaleAppleVideoSR &&
+        (int64_t)request.outputWidth * request.outputHeight > 3200LL * 1800) {
+        if (reason) *reason = @"苹果视频超分的实时输出尺寸过大，请选择自动输出或更小尺寸。";
         return NO;
     }
     if (request.interpolationEnabled && request.rateKind == SPLiveRateMultiplier &&
@@ -5318,6 +5344,28 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     [self publishStatus:@"正在准备引擎" failed:NO];
     [self publishPlanState:1 reason:@"正在准备引擎，当前画面仍用上一份已生效的计划"];
     dispatch_async(_prepareQ, ^{
+        if (copy.scaleEnabled && copy.scaleEngine == SPLiveScaleAppleVideoSR) {
+            NSSize input = SPLiveSRInputSizeForRequest(width, height, copy);
+            BOOL automatic = copy.outputWidth == 0 && copy.outputHeight == 0;
+            NSSize output = automatic ? [SPAppleVideoSR automaticOutputForWidth:(int)input.width height:(int)input.height] : NSMakeSize(copy.outputWidth, copy.outputHeight);
+            int factor = input.width > 0 ? (int)llround(output.width / input.width) : 0;
+            if (factor >= 2 && ![SPAppleVideoSR isReadyForWidth:(int)input.width height:(int)input.height scale:factor]) {
+                dispatch_async(self->_q, ^{ if (token == self->_prepareToken) [self publishStatus:@"正在准备苹果视频超分模型，可能需要下载" failed:NO]; });
+                [SPAppleVideoSR ensureModelForWidth:(int)input.width height:(int)input.height scale:factor completion:^(NSError *modelError) {
+                    dispatch_async(self->_q, ^{
+                        if (token != self->_prepareToken) return;
+                        self->_preparing = NO;
+                        if (modelError) {
+                            self->_asyncPrepareFailed = YES;
+                            self->_resolved.unavailableReason = modelError.localizedDescription;
+                            [self publishStatus:modelError.localizedDescription failed:YES];
+                            [self publishPlanState:0 reason:modelError.localizedDescription];
+                        } else [self updateRequest:copy];
+                    });
+                }];
+                return;
+            }
+        }
         NSError *error = nil;
         BOOL sessionPreparationTraceLost = NO;
         SPLowLatencyEngine *lowLatency = nil;
@@ -5353,15 +5401,19 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         }
         BOOL needsAsyncInterpolation = [self requestUsesAsyncEngine:copy];
         if (!error && [self requestUsesAsyncScale:copy]) {
-            NSSize effective = SPLiveSRInputSize(width, height, copy.srInputPreset);
+            NSSize effective = SPLiveSRInputSizeForRequest(width, height, copy);
             int width = (int)effective.width, height = (int)effective.height;
-            BOOL autoAnime = SPLiveIsNative2xScaleEngine(copy.scaleEngine) && copy.outputWidth == 0 && copy.outputHeight == 0;
-            int targetWidth = autoAnime ? width * 2 : copy.outputWidth;
-            int targetHeight = autoAnime ? height * 2 : copy.outputHeight;
+            BOOL automatic = copy.outputWidth == 0 && copy.outputHeight == 0;
+            BOOL autoAnime = SPLiveIsNative2xScaleEngine(copy.scaleEngine) && automatic;
+            BOOL autoApple = automatic && (copy.scaleEngine == SPLiveScaleAppleLowLatencySR || copy.scaleEngine == SPLiveScaleAppleVideoSR);
+            NSSize appleOutput = !autoApple ? NSZeroSize : (copy.scaleEngine == SPLiveScaleAppleVideoSR ?
+                [SPAppleVideoSR automaticOutputForWidth:width height:height] : [SPAppleLowLatencySR automaticOutputForWidth:width height:height]);
+            int targetWidth = autoAnime ? width * 2 : (autoApple ? (int)appleOutput.width : copy.outputWidth);
+            int targetHeight = autoAnime ? height * 2 : (autoApple ? (int)appleOutput.height : copy.outputHeight);
             float scale = width > 0 ? (float)targetWidth / (float)width : 0;
             float scaleH = height > 0 ? (float)targetHeight / (float)height : 0;
             if (targetWidth < 2 || targetHeight < 2 || fabsf(scale - scaleH) > 0.0001f) {
-                error = SPLiveError(37, @"低延迟超分需要与来源比例一致的明确输出尺寸。 ");
+                error = SPLiveError(37, @"苹果超分不支持当前输入尺寸或输出倍率，请缩小超分输入尺寸并选择自动输出。 ");
             } else {
                 if (SPLiveIsNative2xScaleEngine(copy.scaleEngine)) {
                     if (fabsf(scale - 2.0f) > 0.0001f) error = SPLiveError(39, @"该动画超分当前使用 2× 来源尺寸。");
@@ -5772,10 +5824,14 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         default: _resolved.scaleEngineID = @"lanczos"; break;
     }
     _resolved.scaleQualityID = _request.scaleEngine == SPLiveScaleRealCUGAN ? (_request.scaleQualityID ?: @"none") : @"";
-    BOOL autoAnime = _request.scaleEnabled && SPLiveIsNative2xScaleEngine(_request.scaleEngine) && _request.outputWidth == 0 && _request.outputHeight == 0;
-    NSSize effective = SPLiveSRInputSize(_width, _height, _request.scaleEnabled ? _request.srInputPreset : 0);
-    _resolved.outputWidth = autoAnime ? (int)effective.width * 2 : (_request.scaleEnabled ? _request.outputWidth : _width);
-    _resolved.outputHeight = autoAnime ? (int)effective.height * 2 : (_request.scaleEnabled ? _request.outputHeight : _height);
+    BOOL automatic = _request.scaleEnabled && _request.outputWidth == 0 && _request.outputHeight == 0;
+    BOOL autoAnime = automatic && SPLiveIsNative2xScaleEngine(_request.scaleEngine);
+    NSSize effective = SPLiveSRInputSizeForRequest(_width, _height, _request);
+    BOOL autoApple = automatic && (_request.scaleEngine == SPLiveScaleAppleLowLatencySR || _request.scaleEngine == SPLiveScaleAppleVideoSR);
+    NSSize appleOutput = !autoApple ? NSZeroSize : (_request.scaleEngine == SPLiveScaleAppleVideoSR ?
+        [SPAppleVideoSR automaticOutputForWidth:(int)effective.width height:(int)effective.height] : [SPAppleLowLatencySR automaticOutputForWidth:(int)effective.width height:(int)effective.height]);
+    _resolved.outputWidth = autoAnime ? (int)effective.width * 2 : (autoApple ? (int)appleOutput.width : (_request.scaleEnabled ? _request.outputWidth : _width));
+    _resolved.outputHeight = autoAnime ? (int)effective.height * 2 : (autoApple ? (int)appleOutput.height : (_request.scaleEnabled ? _request.outputHeight : _height));
     double target = 0;
     if (_request.interpolationEnabled && _request.rateKind == SPLiveRateFixedFPS && _request.fpsDenominator > 0) {
         target = (double)_request.fpsNumerator / (double)_request.fpsDenominator;
@@ -6486,7 +6542,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     if (!sample.valid || !_resolved.committed || _resolved.configVersion != _configVersion) return @{};
     return @{ @"endpoint": _scoreOutput ? @"output" : @"preview", @"sourceWidth": @(sample.sourceWidth), @"sourceHeight": @(sample.sourceHeight),
         @"processingWidth": @(sample.processingWidth), @"processingHeight": @(sample.processingHeight),
-        @"srInputWidth": @((int)SPLiveSRInputSize(_width, _height, _request.scaleEnabled ? _request.srInputPreset : 0).width), @"srInputHeight": @((int)SPLiveSRInputSize(_width, _height, _request.scaleEnabled ? _request.srInputPreset : 0).height),
+        @"srInputWidth": @((int)SPLiveSRInputSizeForRequest(_width, _height, _request).width), @"srInputHeight": @((int)SPLiveSRInputSizeForRequest(_width, _height, _request).height),
         @"bufferWidth": @(sample.bufferWidth), @"bufferHeight": @(sample.bufferHeight), @"drawableWidth": @(sample.drawableWidth), @"drawableHeight": @(sample.drawableHeight),
         @"presentedTimeNs": @(sample.presentedTimeNs), @"sourceGeneration": @(_sourceGeneration), @"configVersion": @(_configVersion), @"measurementEpoch": @(_measurementEpoch),
         @"engineID": _resolved.engineID ?: @"", @"modelID": _resolved.modelID ?: @"", @"downsampled": @([self requestUsesLowPrescale:_request width:_width height:_height]) };
@@ -8922,11 +8978,15 @@ presentationHost:(int64_t)presentationHost
         _resolved.unavailableReason = @"";
     }
     if (_request.scaleEnabled) {
-        BOOL autoAnime = SPLiveIsNative2xScaleEngine(_request.scaleEngine) && _request.outputWidth == 0 && _request.outputHeight == 0;
-        NSSize effective = SPLiveSRInputSize(_width, _height, _request.srInputPreset);
+        BOOL automatic = _request.outputWidth == 0 && _request.outputHeight == 0;
+        BOOL autoAnime = SPLiveIsNative2xScaleEngine(_request.scaleEngine) && automatic;
+        NSSize effective = SPLiveSRInputSizeForRequest(_width, _height, _request);
         int inputW = (int)effective.width, inputH = (int)effective.height;
-        int outW = autoAnime ? inputW * 2 : (_request.outputWidth > 0 ? (_request.outputWidth & ~1) : _width);
-        int outH = autoAnime ? inputH * 2 : (_request.outputHeight > 0 ? (_request.outputHeight & ~1) : _height);
+        BOOL autoApple = automatic && (_request.scaleEngine == SPLiveScaleAppleLowLatencySR || _request.scaleEngine == SPLiveScaleAppleVideoSR);
+        NSSize appleOutput = !autoApple ? NSZeroSize : (_request.scaleEngine == SPLiveScaleAppleVideoSR ?
+            [SPAppleVideoSR automaticOutputForWidth:inputW height:inputH] : [SPAppleLowLatencySR automaticOutputForWidth:inputW height:inputH]);
+        int outW = autoAnime ? inputW * 2 : (autoApple ? (int)appleOutput.width : (_request.outputWidth > 0 ? (_request.outputWidth & ~1) : _width));
+        int outH = autoAnime ? inputH * 2 : (autoApple ? (int)appleOutput.height : (_request.outputHeight > 0 ? (_request.outputHeight & ~1) : _height));
         if (outW < 2 || outH < 2) {
             if (error) *error = SPLiveError(33, @"输出尺寸无效");
             return NO;
@@ -9154,8 +9214,8 @@ presentationHost:(int64_t)presentationHost
         }
         if (width != _width || height != _height || rawSizeChanged) {
             if (_sessionReady && _resolved.scaleActive && _request.scaleEnabled && (_request.scaleEngine == SPLiveScaleAppleLowLatencySR || _request.scaleEngine == SPLiveScaleAppleVideoSR)) {
-                NSSize previous = SPLiveSRInputSize(_width, _height, _request.srInputPreset);
-                NSSize next = SPLiveSRInputSize(width, height, _request.srInputPreset);
+                NSSize previous = SPLiveSRInputSizeForRequest(_width, _height, _request);
+                NSSize next = SPLiveSRInputSizeForRequest(width, height, _request);
                 int outW=0, outH=0;
                 if (sp::resizedNativeSROutput((int)previous.width, (int)previous.height, _request.outputWidth, _request.outputHeight,
                                                (int)next.width, (int)next.height, outW, outH)) {
@@ -11391,52 +11451,64 @@ presentationHost:(int64_t)presentationHost
 
 + (NSDictionary<NSString *, id> *)runVideoSRPipelineContract {
     SPLiveProcessor *p = [[SPLiveProcessor alloc] init];
-    CVPixelBufferRef input = SPCreateBuffer(480, 270, kCVPixelFormatType_32BGRA);
+    CVPixelBufferRef input = SPCreateBuffer(1920, 1080, kCVPixelFormatType_32BGRA);
     if (!input) return @{ @"ok": @NO, @"reason": @"source allocation" };
     CVPixelBufferLockBaseAddress(input, 0);
     memset(CVPixelBufferGetBaseAddress(input), 80, CVPixelBufferGetBytesPerRow(input) * CVPixelBufferGetHeight(input));
     CVPixelBufferUnlockBaseAddress(input, 0);
     [p adoptSourceGeneration:1];
-    dispatch_sync(p->_q, ^{ p->_width=480; p->_height=270; });
+    dispatch_sync(p->_q, ^{ p->_width=1920; p->_height=1080; p->_testRecordSRInput=YES; });
     SPLivePlanRequest *request=[[SPLivePlanRequest alloc] init];
     request.scaleEnabled=YES; request.scaleEngine=SPLiveScaleAppleVideoSR;
-    request.outputWidth=1920; request.outputHeight=1080; request.viewMode=SPLiveViewCompare;
+    request.outputWidth=0; request.outputHeight=0; request.viewMode=SPLiveViewCompare;
+    NSSize effective=SPLiveSRInputSizeForRequest(1920,1080,request);
+    NSSize expected=[SPAppleVideoSR automaticOutputForWidth:(int)effective.width height:(int)effective.height];
     [p updateRequest:request];
     __block BOOL ready=NO;
     for (int i=0;i<400&&!ready;i++) { usleep(50000); dispatch_sync(p->_q, ^{ready=p->_sessionReady && p->_videoSR && p->_resolved.scaleActive;}); }
     if (!ready) { CVPixelBufferRelease(input); [p stop]; return @{ @"ok":@NO, @"reason":@"video SR prepare", @"stats":[p stats] }; }
     __block uint64_t config=0; dispatch_sync(p->_q, ^{config=p->_configVersion;});
+    SPLivePlanRequest *large=[request copy]; large.outputWidth=3840; large.outputHeight=2160;
+    __block BOOL oversizedRejected=NO;
+    dispatch_sync(p->_q, ^{oversizedRejected=![p validateRequest:large reason:nil];});
     SPLivePlanRequest *bad=[request copy]; bad.interpolationEnabled=YES; bad.engineID=@"apple.frc"; bad.multiplier=2;
     [p updateRequest:bad];
     __block BOOL rejectedWithoutReplacing=NO;
     dispatch_sync(p->_q, ^{rejectedWithoutReplacing=p->_configVersion==config && p->_videoSR && p->_sessionReady && !p->_request.interpolationEnabled;});
-    int64_t future=SPHostNow()+SPRationalToHost(sp::spMake(20,1));
-    dispatch_sync(p->_q, ^{
-        for (int i=0;i<3;i++) {
+    int64_t future=SPHostNow()+SPRationalToHost(sp::spMake(120,1));
+    __block int observed=0; __block BOOL sizes=YES, comparison=YES, failed=NO;
+    for (int frame=0;frame<3;frame++) {
+        dispatch_sync(p->_q, ^{
+            int i=frame;
             uint64_t id=11+i;
             p->_held[id].source=CVPixelBufferRetain(input);p->_held[id].host=future+SPRationalToHost(sp::spMake(i,30));p->_held[id].pts=sp::spMake(i,30);
             [p enqueueSourceIdentity:id pts:sp::spMake(i,30) host:p->_held[id].host generation:1 force:NO];
-        }
-    });
-    __block int observed=0; __block BOOL sizes=YES, comparison=YES;
-    for (int i=0;i<400&&observed<3;i++) {usleep(50000);dispatch_sync(p->_q, ^{
-        observed=0;for(const SPPlaySlot &slot:p->_slots){
-            if(slot.sourceGeneration!=1 || slot.synthetic)continue;
-            if(sp::spCmp(slot.pts,sp::spMake(0,1))>=0 && sp::spCmp(slot.pts,sp::spMake(2,30))<=0)observed++;
-            sizes=sizes && CVPixelBufferGetWidth(slot.enhanced)==1920 && CVPixelBufferGetHeight(slot.enhanced)==1080 && CVPixelBufferGetPixelFormatType(slot.enhanced)==kCVPixelFormatType_32BGRA;
-            comparison=comparison && slot.original && CVPixelBufferGetWidth(slot.original)==1920;
-        }
-    });}
+        });
+        for (int i=0;i<400&&observed<frame+1&&!failed;i++) {usleep(50000);dispatch_sync(p->_q, ^{
+            failed=p->_srFailed;
+            if (p->_lastEnhanced && sp::spCmp(p->_lastRedrawPts,sp::spMake(frame,30))==0) {
+                observed=frame+1;
+                sizes=sizes && CVPixelBufferGetWidth(p->_lastEnhanced)==(size_t)expected.width && CVPixelBufferGetHeight(p->_lastEnhanced)==(size_t)expected.height && CVPixelBufferGetPixelFormatType(p->_lastEnhanced)==kCVPixelFormatType_32BGRA;
+                comparison=comparison && p->_lastOriginal && CVPixelBufferGetWidth(p->_lastOriginal)==(size_t)expected.width;
+            }
+        });}
+        if (failed || observed<frame+1) break;
+    }
+    __block NSString *firstError=nil; dispatch_sync(p->_q, ^{firstError=p->_testSRError;});
     [p adoptSourceGeneration:2];dispatch_sync(p->_q,^{});
     [p pushPixelBuffer:input ptsNum:1 ptsDen:1 host:future generation:2];
     __block BOOL secondReady=NO;
     for(int i=0;i<400&&!secondReady;i++){usleep(50000);dispatch_sync(p->_q,^{secondReady=p->_sourceGeneration==2 && p->_sessionReady && p->_videoSR && p->_resolved.scaleActive;});}
     [p pushPixelBuffer:input ptsNum:31 ptsDen:30 host:future+SPRationalToHost(sp::spMake(1,30)) generation:2];
     __block BOOL newOutput=NO,oldOutput=NO;
-    for(int i=0;i<400&&!newOutput;i++){usleep(50000);dispatch_sync(p->_q,^{for(const SPPlaySlot &slot:p->_slots){if(slot.sourceGeneration!=2)oldOutput=YES;if(slot.sourceGeneration==2&&sp::spCmp(slot.pts,sp::spMake(31,30))==0&&CVPixelBufferGetWidth(slot.enhanced)==1920)newOutput=YES;}});}
+    for(int i=0;i<400&&!newOutput;i++){usleep(50000);dispatch_sync(p->_q,^{
+        newOutput=p->_sourceGeneration==2 && p->_lastEnhanced && sp::spCmp(p->_lastRedrawPts,sp::spMake(31,30))==0 && CVPixelBufferGetWidth(p->_lastEnhanced)==(size_t)expected.width;
+        for(const SPPlaySlot &slot:p->_slots) if(slot.sourceGeneration!=2) oldOutput=YES;
+    });}
+    __block NSString *lastError=nil; dispatch_sync(p->_q, ^{lastError=p->_testSRError;});
     CVPixelBufferRelease(input);[p stop];
-    BOOL ok=ready&&rejectedWithoutReplacing&&observed==3&&sizes&&comparison&&secondReady&&newOutput&&!oldOutput;
-    return @{ @"ok":@(ok), @"prepared":@(ready), @"outputFramesWithOriginalPTS":@(observed), @"outputBGRAAndSize":@(sizes), @"compareBaseline":@(comparison), @"unverifiedCombinationRejectedAndOldPlanKept":@(rejectedWithoutReplacing), @"newGenerationSession":@(secondReady), @"newGenerationOutput":@(newOutput), @"oldGenerationOutput":@(oldOutput), @"note":@"Synthetic sources only; real capture, visual quality, UI persistence and performance remain unverified." };
+    BOOL ok=ready&&rejectedWithoutReplacing&&oversizedRejected&&observed==3&&sizes&&comparison&&secondReady&&newOutput&&!oldOutput;
+    return @{ @"ok":@(ok), @"prepared":@(ready), @"outputFramesWithOriginalPTS":@(observed), @"outputBGRAAndSize":@(sizes), @"compareBaseline":@(comparison), @"unverifiedCombinationRejectedAndOldPlanKept":@(rejectedWithoutReplacing), @"oversizedLiveOutputRejected":@(oversizedRejected), @"newGenerationSession":@(secondReady), @"newGenerationOutput":@(newOutput), @"oldGenerationOutput":@(oldOutput), @"firstError":firstError ?: @"", @"lastError":lastError ?: @"", @"automaticOutput":@[@((int)expected.width),@((int)expected.height)], @"note":@"Synthetic sources only; real capture, visual quality, UI persistence and performance remain unverified." };
 }
 
 + (NSDictionary<NSString *, id> *)runSRPipelineContractWithPreset:(int)preset {
@@ -11457,7 +11529,7 @@ presentationHost:(int64_t)presentationHost
     dispatch_sync(p->_q, ^{ p->_width = width; p->_height = height; p->_testRecordSRInput = YES; });
     SPLivePlanRequest *request = [[SPLivePlanRequest alloc] init];
     request.scaleEnabled = YES; request.scaleEngine = SPLiveScaleAppleLowLatencySR; request.srInputPreset = preset;
-    request.outputWidth = 1920; request.outputHeight = 1080; request.viewMode = SPLiveViewCompare;
+    request.outputWidth = preset ? 0 : 1920; request.outputHeight = preset ? 0 : 1080; request.viewMode = SPLiveViewCompare;
     [p updateRequest:request];
     __block BOOL ready = NO;
     for (int i = 0; i < 400 && !ready; ++i) {
