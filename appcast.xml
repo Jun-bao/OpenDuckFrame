@@ -6,6 +6,31 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>OpenDuckFrame</title>
         <item>
+            <title>0.5.0</title>
+            <pubDate>Sat, 14 Nov 2026 00:34:01 +0800</pubDate>
+            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
+            <sparkle:version>42</sparkle:version>
+            <sparkle:shortVersionString>0.5.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>OpenDuckFrame 0.5.0</h2>
+<ul>
+  <li>工作台新增 Apple 低延迟插帧与 Apple 帧率转换，ODF-VFI 仍为默认。苹果选项需要系统、硬件与输入格式支持。</li>
+  <li>修复苹果低延迟处理大窗口时无法启动的问题，并调整生成帧的缓冲与呈现顺序。缩小处理可能使细节变软，缓冲会增加延迟。</li>
+  <li>苹果低延迟实时增强可选“自动视频”，识别常见 24／25／30 FPS 并整理时间轴。默认仍是“通用窗口”；声音由来源应用播放，可能出现音画偏移。</li>
+  <li>Fast X2 窗口优化不再限定设备型号。按 GPU 能力、内存预算和准备耗时判断，预算充足保留原尺寸，不足时采用较低处理尺寸。</li>
+</ul>
+<ul>
+  <li>Adds Apple low-latency interpolation and Apple FRC alongside default ODF-VFI, subject to runtime system, hardware and input support.</li>
+  <li>Repairs large-window Apple low-latency activation and adjusts bounded buffering and frame order. Reduced inference can soften detail; buffering adds delay.</li>
+  <li>Adds optional Automatic video timing for common 24/25/30 FPS live content. General window remains the default; source audio may lead enhanced video.</li>
+  <li>Fast X2 window optimization now uses GPU capabilities, memory budgets and preparation timing instead of a device-model whitelist, preserving native size when its preparation budget fits.</li>
+</ul>
+<p>实际画质和持续帧率仍取决于设备、输入与设置。Preparation timings do not establish sustained FPS. This community build is ad-hoc signed, supports signed in-app updates, and is not Apple notarized. macOS may ask for Screen Recording or Accessibility permission again after an upgrade. 此社区版未经过 Apple 公证，升级后可能需要重新授权。</p>
+]]></description>
+            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.5.0/OpenDuckFrame-0.5.0.zip" length="43143535" type="application/octet-stream" sparkle:edSignature="PvpDBZ8U6/9AavbwA7rHUaezUQeUP93PnXzxjTxxWnSjLsoRmEHD5c2UMfI9TGTP6PWR4bTXrLF0SIDWgToGBQ=="/>
+        </item>
+        <item>
             <title>0.4.1</title>
             <pubDate>Thu, 12 Nov 2026 20:24:13 +0800</pubDate>
             <link>https://github.com/Jun-bao/OpenDuckFrame</link>
@@ -50,29 +75,9 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
 ]]></description>
             <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.4.0/OpenDuckFrame-0.4.0.zip" length="43104771" type="application/octet-stream" sparkle:edSignature="CkQs3Og6Ti76VHeaxuapLr+rDWrKYnndbRRkdfsbckAXYX6VGCtdOXbjaPhDuzSq9XUP7oqaTfwNvg+nDiTaDw=="/>
         </item>
-        <item>
-            <title>0.3.3</title>
-            <pubDate>Wed, 11 Nov 2026 21:08:23 +0800</pubDate>
-            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
-            <sparkle:version>29</sparkle:version>
-            <sparkle:shortVersionString>0.3.3</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<h2>OpenDuckFrame 0.3.3</h2>
-<ul>
-  <li>Frame generation now uses ODF-VFI, a four-stage model derived from RIFE 4.25, as its default model.</li>
-  <li>Reduced model processing overhead while retaining continuous caching and the existing Air window optimizations.</li>
-  <li>Window optimization uses bounded feedback during startup calibration, retaining the same final timing limits when GPU costs shift during warmup.</li>
-  <li>Existing enhancement profiles remain compatible. Scaling and super-resolution settings are unchanged.</li>
-</ul>
-<p>ODF-VFI is a structural reduction of the upstream model, not a lossless-quality guarantee. Results depend on the source content.</p>
-<p>This community build is ad-hoc signed and supports signed in-app updates. It is not Apple notarized.</p>
-]]></description>
-            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.3.3/OpenDuckFrame-0.3.3.zip" length="42968206" type="application/octet-stream" sparkle:edSignature="v6RdPgQ1qLo5iAMeJp3q4hl/QodmtbBe2lMBxmykw1xaqF/qeyEPpIg7Z8GPXg/HMQtqMRv9Pgb5bRwDKL0MAw=="/>
-        </item>
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: wcmwQ56icarFHA8ksL9np+UcbRQaduRcRzDB4ELGG7ZmHMrL45gmR0lkevPCZkfOWbtrxGnPowedAsL5DcZmBw==
-length: 5459
+edSignature: e3fq5MSSaEyQq140cJkJaBQNflpGAupfA9/vjoA2ul7QDxSEsMjOmpyEObrvN5PkazcffeAprw5X03kU6XsXDQ==
+length: 6496
 -->
