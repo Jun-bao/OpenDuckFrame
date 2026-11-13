@@ -25,6 +25,14 @@ static const NSInteger SPRifeBridgeErrorOutputPoolExhausted = 10;
 /// Set before prepare for the supported automatic window configuration.
 @property (nonatomic) BOOL airPerformanceEnabled;
 + (NSDictionary<NSString *, id> *)airPerformanceSelectionStatus;
++ (uint64_t)windowCaptureByteLimit;
++ (BOOL)windowOptimizationCapabilitiesSupported;
+/// Prepares full-size first; only a measured budget miss or preparation failure
+/// selects the bounded window fallback. File callers keep prepareModelID unchanged.
+- (BOOL)prepareWindowModelID:(NSString *)modelID quality:(NSString *)quality
+                      width:(int32_t)width height:(int32_t)height
+                  refreshHz:(double)refreshHz error:(NSError **)error;
+@property (nonatomic, readonly) NSDictionary<NSString *, id> *windowPreparationDiagnostics;
 /// Trace-only process gate; false in normal builds. No trace arrays in streamDiagnostics.
 @property (nonatomic, readonly) BOOL serviceTraceEnabled;
 - (void)setServiceTraceToken:(uint64_t)token configVersion:(uint64_t)configVersion

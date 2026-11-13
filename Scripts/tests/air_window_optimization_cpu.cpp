@@ -5,7 +5,8 @@
 
 int main() {
     sp::AirWindowOptimizationInput baseline;
-    baseline.hardware = "Mac15,12";
+    baseline.metalAvailable = baseline.appleGPU = baseline.unifiedMemory = true;
+    baseline.captureByteLimit = 64ULL * 1024 * 1024;
     baseline.sourceKind = 1;
     baseline.interpolation = baseline.rife425 = baseline.fast = true;
     baseline.multiplierRate = baseline.stream = true;
@@ -21,9 +22,7 @@ int main() {
     production = baseline; production.original = false;
     assert(sp::airWindowOptimizationReason(production));
     auto input = baseline;
-    input.hardware = "Mac15,13";
-    assert(!sp::airWindowOptimizationReason(input));
-    input.hardware = "Mac14,13";
+    input.metalAvailable = false;
     assert(sp::airWindowOptimizationReason(input));
     for (int64_t source : {0LL, 2LL, 3LL, 4294967297LL}) {
         input = baseline; input.sourceKind = source;

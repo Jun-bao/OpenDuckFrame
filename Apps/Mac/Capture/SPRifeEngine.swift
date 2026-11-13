@@ -5,9 +5,7 @@ import Foundation
 import RifeMetal
 import VideoToolbox
 import os
-#if ODF_AIR_RESIDENT_KEEPALIVE_DIAGNOSTIC || ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC
 import Metal
-#endif
 #if ODF_AIR_SERVICE_TRACE
 import Darwin
 import RifeMetalCore
@@ -87,6 +85,19 @@ final class SPRifeBridge: NSObject {
     @objc var liveStreamEnabled = false
     /// Set by the live-window eligibility gate before preparing this instance.
     @objc var airPerformanceEnabled = false
+    private var windowPreparation: [String: Any] = [:]
+    @objc var windowPreparationDiagnostics: [String: Any] {
+        state.lock(); defer { state.unlock() }; return windowPreparation
+    }
+    private static let windowDevice = MTLCreateSystemDefaultDevice()
+    @objc static func windowCaptureByteLimit() -> UInt64 {
+        guard let device = windowDevice, device.hasUnifiedMemory,
+              device.supportsFamily(.apple1) else { return 0 }
+        return min(64 * 1024 * 1024, UInt64(device.maxBufferLength), device.recommendedMaxWorkingSetSize / 32)
+    }
+    @objc static func windowOptimizationCapabilitiesSupported() -> Bool {
+        windowCaptureByteLimit() > 0
+    }
     /// Selection intent only. The loaded production identity is validated in prepare.
     @objc(airPerformanceSelectionStatus)
     static func airPerformanceSelectionStatus() -> [String: Any] {
@@ -336,6 +347,52 @@ final class SPRifeBridge: NSObject {
         diagnosticLock.lock(); diagnosticCounts[name, default: 0] += 1; diagnosticLock.unlock()
     }
     private let traceLog = OSLog(subsystem: "app.chuanflow.throughput", category: "RIFE")
+
+    @objc(prepareWindowModelID:quality:width:height:refreshHz:error:)
+    func prepareWindow(modelID: String, quality: String, width: Int32, height: Int32, refreshHz: Double) throws {
+        if let reason = SPAirBetaSizingReason(width, height) { throw Self.error(24, reason) }
+        var receipt: [String: Any] = ["scope": "synthetic preparation timing; not sustained FPS",
+                                     "refreshHz": refreshHz, "capturePixels": [width, height]]
+        airPerformanceEnabled = false
+        do {
+            try prepare(modelID: modelID, quality: quality, width: width, height: height)
+            state.lock(); let engine = interpolator; state.unlock()
+            guard let engine else { throw Self.error(2, "RIFE native preparation is unavailable") }
+            let previous = try ownedBGRA(Self.nv12(width: Int(width), height: Int(height), luma: 32))
+            let current = try ownedBGRA(Self.nv12(width: Int(width), height: Int(height), luma: 180))
+            let output = try ownedBGRA(Self.nv12(width: Int(width), height: Int(height), luma: 16))
+            let probe = try engine.makeStream(width: Int(width), height: Int(height))
+            defer { probe.reset() }
+            _ = try probe.push(previous, timesteps: [0.5])
+            guard try probe.push(current, into: output) else { throw Self.error(2, "RIFE native stream warmup failed") }
+            var times: [Double] = []
+            for _ in 0..<3 {
+                let start = ProcessInfo.processInfo.systemUptime
+                guard try probe.push(current, into: output) else { throw Self.error(2, "RIFE native stream output missing") }
+                times.append((ProcessInfo.processInfo.systemUptime - start) * 1000)
+            }
+            receipt["timingScope"] = "warmed live stream push into reusable output; excludes capture/conversion/presentation"
+            let median = times.sorted()[1]
+            receipt["nativeSamplesMs"] = times
+            receipt["nativeMedianMs"] = median
+            if SPWindowNativeFits(median, refreshHz) {
+                receipt["mode"] = "native"
+                state.lock(); windowPreparation = receipt; state.unlock()
+                return
+            }
+            receipt["fallbackReason"] = "native-preparation-exceeds-frame-budget"
+        } catch {
+            receipt["fallbackReason"] = "native-preparation-failed"
+            receipt["nativePreparationError"] = String(describing: error)
+        }
+        invalidate()
+        airPerformanceEnabled = true
+        state.lock(); windowPreparation = receipt; state.unlock()
+        try prepare(modelID: modelID, quality: quality, width: width, height: height)
+        receipt["mode"] = "bounded-window"
+        receipt["processingPixels"] = [processingWidth, processingHeight]
+        state.lock(); windowPreparation = receipt; state.unlock()
+    }
 
     @objc(prepareModelID:quality:width:height:error:)
     func prepare(modelID: String, quality: String, width: Int32, height: Int32) throws {
@@ -659,7 +716,7 @@ final class SPRifeBridge: NSObject {
                         bridge.airServiceEvent(.prescaleProcessDimensions, token: token,
                             detail: UInt64(smallWidth), value: Double(smallHeight), cacheEpoch: bridge.airPrescaleCacheEpoch)
 #endif
-                        guard smallWidth == 1814, smallHeight == 1142 else {
+                        guard smallWidth == processWidth, smallHeight == processHeight else {
                             throw Self.error(22, "RIFE prescale process dimensions changed")
                         }
                         return small
@@ -688,7 +745,7 @@ final class SPRifeBridge: NSObject {
                     bridge.airServiceEvent(.prescaleSyntheticDimensions, token: token,
                         detail: UInt64(fullWidth), value: Double(fullHeight), cacheEpoch: bridge.airPrescaleCacheEpoch)
 #endif
-                    guard fullWidth == 2648, fullHeight == 1668 else {
+                    guard fullWidth == captureWidth, fullHeight == captureHeight else {
                         throw Self.error(22, "RIFE prescale synthetic dimensions changed")
                     }
                     return full

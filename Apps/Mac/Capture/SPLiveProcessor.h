@@ -48,6 +48,7 @@ FOUNDATION_EXPORT BOOL SPLiveCanPrepareMetalFX(int width, int height);
 FOUNDATION_EXPORT BOOL SPAirBetaEnabled(void);
 FOUNDATION_EXPORT NSSize SPAirBetaProcessingSize(int captureWidth, int captureHeight);
 FOUNDATION_EXPORT NSString *_Nullable SPAirBetaSizingReason(int captureWidth, int captureHeight);
+FOUNDATION_EXPORT BOOL SPWindowNativeFits(double taskMs, double refreshHz);
 
 /// Synchronous spatial scaler. Callers serialize access on their own worker queue.
 @interface SPSpatialScaler : NSObject
