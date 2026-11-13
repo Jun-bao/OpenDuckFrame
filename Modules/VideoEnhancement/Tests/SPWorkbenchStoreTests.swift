@@ -198,8 +198,16 @@ private final class SourceSizeControls {
      saved.srInputPreset = 720; saved.sourceWindowPreset = 480
      saved.outputWidth = 2560; saved.outputHeight = 1440; saved.rate = .multiplier(3)
      var expected = saved
-     expected.interpolationEngineID = "rife.metal"; expected.modelID = "rife-v4.25"
-     expected.interpolationQuality = ["fast", "balanced", "hq"].contains(quality) ? quality : "fast"
+     if engine == "apple.frc" {
+      expected.interpolationQuality = quality == "quality" && source != "file" ? "quality" : "normal"
+      expected.modelID = expected.interpolationQuality == "quality" ? "vt.frc.quality" : "vt.frc.normal"
+     } else if engine == "apple.lowlatency" {
+      expected.interpolationQuality = "normal"; expected.modelID = "vt.llfi.temporal.1"
+      expected.rate = .multiplier(2)
+     } else {
+      expected.interpolationEngineID = "rife.metal"; expected.modelID = "rife-v4.25"
+      expected.interpolationQuality = ["fast", "balanced", "hq"].contains(quality) ? quality : "fast"
+     }
      expected.rifeStreamEnabled = true
      expected.scaleEngineID = "apple.low-sr"; expected.scaleQualityID = "none"
      expected.outputWidth = 0; expected.outputHeight = 0
@@ -265,6 +273,25 @@ private final class SourceSizeControls {
     precondition(EnhancementProfileStore.loadPreset("preset:anime") == profile)
    }
   }
+  for source in ["window", "file"] {
+   for engine in ["rife.metal", "apple.lowlatency", "apple.frc"] {
+    for scaler in AppleSRSelection.ids {
+     var combined = EnhancementProfile()
+     combined.sourceKind = source; combined.interpolationEngineID = engine
+     combined.rate = .multiplier(4); combined.scaleEnabled = true; combined.scaleEngineID = scaler
+     LiveEngineSelection.normalize(&combined)
+     let restored = EnhancementProfileStore.decode(try JSONEncoder().encode(combined), fallbackName:"combined")
+     precondition(restored == combined, "Interpolation and Apple SR choices must survive together")
+    }
+   }
+  }
+  var legacyCombined = EnhancementProfile()
+  legacyCombined.interpolationEngineID = "apple.frc"; legacyCombined.interpolationQuality = "quality"
+  legacyCombined.scaleEnabled = true; legacyCombined.scaleEngineID = "artcnn.c4f32"; legacyCombined.srInputPreset = 1080
+  LiveEngineSelection.normalize(&legacyCombined)
+  let migratedCombined = EnhancementProfileStore.decode(try JSONEncoder().encode(legacyCombined), fallbackName:"combined")!
+  precondition(migratedCombined.interpolationEngineID == "apple.frc" && migratedCombined.modelID == "vt.frc.quality" &&
+               migratedCombined.scaleEngineID == "apple.low-sr" && migratedCombined.srInputPreset == 720 && migratedCombined.scaleEnabled)
   try FileManager.default.removeItem(at: EnhancementProfileStore.fileURL())
   try FileManager.default.removeItem(at: EnhancementProfileStore.namedDirectory())
   try FileManager.default.removeItem(at: EnhancementProfileStore.presetDirectory())
@@ -324,7 +351,7 @@ private final class SourceSizeControls {
   precondition(EnhancementProfileStore.resolvedID(custom)=="custom:游戏")
   var preset=EnhancementProfile();preset.configName="游戏";preset.configID="preset:game";preset.interpolationEngineID="apple.lowlatency"
   try EnhancementProfileStore.savePreset(preset,id:"preset:game")
-  preset.interpolationEngineID="rife.metal"
+  preset.interpolationQuality="normal";preset.modelID="vt.llfi.temporal.1"
   precondition(EnhancementProfileStore.loadNamed("游戏")==custom)
   precondition(EnhancementProfileStore.loadPreset("preset:game")==preset)
   custom.configID="custom:游戏";custom.outputWidth=1280;try EnhancementProfileStore.saveNamed(custom);try EnhancementProfileStore.save(custom)
@@ -591,9 +618,28 @@ private final class SourceSizeControls {
   precondition(TargetOverlayPolicy.screenIndex(target:NSRect(x:900,y:50,width:400,height:300),screens:cadenceScreens)==1)
   precondition(TargetOverlayPolicy.screenIndex(target:NSRect(x:2100,y:50,width:100,height:100),screens:cadenceScreens)==nil)
   precondition(VideoSRAvailability.readyFactors(isFile:false,inputReady:true,factors:[2]) == [])
-  for index in -1...8 {
-   let selected=LiveEngineSelection.fromPopup(index,quality:"normal")
-   precondition(selected.engine=="rife.metal" && selected.model=="rife-v4.25")
+  precondition(LiveEngineSelection.fromPopup(0,quality:"fast").engine == "rife.metal")
+  precondition(LiveEngineSelection.fromPopup(1,quality:"normal").engine == "apple.lowlatency")
+  precondition(LiveEngineSelection.fromPopup(2,quality:"quality").model == "vt.frc.quality")
+  for index in [-1,3,8] { precondition(LiveEngineSelection.fromPopup(index,quality:"normal").engine == "rife.metal") }
+  for engine in ["apple.lowlatency", "apple.frc"] {
+   var apple = EnhancementProfile(); apple.configName = engine; apple.configID = "custom:" + engine
+   apple.interpolationEngineID = engine; apple.interpolationQuality = "quality"; apple.rate = .multiplier(4)
+   LiveEngineSelection.normalize(&apple)
+   try EnhancementProfileStore.saveCurrent(apple)
+   precondition(EnhancementProfileStore.load() == apple && EnhancementProfileStore.loadNamed(engine) == apple,
+                "An Apple selection must survive reopening and named-config selection")
+   if engine == "apple.lowlatency" {
+    precondition(apple.rate == .multiplier(4) && apple.modelID == "vt.llfi.temporal.2")
+    apple.sourceKind = "file"; LiveEngineSelection.normalize(&apple)
+    precondition(apple.rate == .multiplier(2) && apple.modelID == "vt.llfi.temporal.1")
+    apple.sourceKind = "window"; apple.rate = .fixedFPS(numerator:60,denominator:1)
+    LiveEngineSelection.normalize(&apple); precondition(apple.rate == .multiplier(2))
+   } else {
+    precondition(apple.interpolationQuality == "quality" && apple.modelID == "vt.frc.quality")
+    apple.sourceKind = "file"; LiveEngineSelection.normalize(&apple)
+    precondition(apple.interpolationQuality == "normal" && apple.modelID == "vt.frc.normal")
+   }
   }
   precondition(LiveCoverage.modelScheduled(total:100,held:100)==0 && LiveCoverage.modelScheduled(total:100,held:40)==60 && LiveCoverage.modelScheduled(total:0,held:1)==0)
   var tracker=LiveApplyTracker(); let firstRequest=tracker.begin(); let secondRequest=tracker.begin()

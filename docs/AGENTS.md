@@ -8,7 +8,7 @@ Use current source and the actual tested artifact to determine present product b
 
 ## Keep user-facing facts current
 
-The normal workbench exposes ODF-VFI, a four-stage structural reduction of RIFE 4.25 using upstream weights without retraining. Earlier visible model names and references to additional engines can be historical.
+The normal workbench exposes ODF-VFI (default), Apple low latency and Apple FRC. ODF-VFI is a four-stage structural reduction of RIFE 4.25 using upstream weights without retraining. Document Apple source/rate limits and runtime capability requirements; FRC is quality-oriented, not guaranteed real-time or an offline export feature.
 Continuous caching defaults on, window output follows the source, and the normal delay defaults to 3 seconds.
 Automatic hardware/configuration detection remains deferred.
 When a task changes shipping behavior, update relevant English guides and README.md together with README.zh-CN.md.

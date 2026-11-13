@@ -5,7 +5,7 @@
 <p align="center"><a href="https://openduckframe.cn/en/">Official website</a> · <b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
 <p align="center">Apple silicon · macOS 14+ · <a href="LICENSE">MIT</a></p>
 
-Frame generation uses **ODF-VFI**, a four-stage structural reduction of RIFE 4.25. It keeps the upstream weights without retraining and reduces model processing overhead. Existing RIFE 4.25 profiles remain compatible and run ODF-VFI; the app validates the actual four-stage weights when loading. Visual results remain content-dependent.
+Frame generation defaults to **ODF-VFI**, a four-stage structural reduction of RIFE 4.25. It keeps the upstream weights without retraining and reduces model processing overhead. Existing RIFE 4.25 profiles remain compatible and run ODF-VFI; the app validates the actual four-stage weights when loading. Visual results remain content-dependent.
 
 ## About
 
@@ -14,8 +14,9 @@ Select a browser window, game or stream, a display, or a local video file, then
 control frame generation and upscaling from one workbench. Processing happens on
 your Mac, without an account or uploading your picture.
 
-- **Frame generation.** ODF-VFI is the workbench's frame-generation model. Select a
-  target frame rate or X2 / X3 / X4, and watch the actual output rate.
+- **Frame generation.** Choose ODF-VFI (default), Apple low latency, or Apple FRC.
+  Available frame-rate and quality settings follow the selected engine and source;
+  Apple options require runtime hardware/system support. Watch the actual output rate.
   Achieved performance depends on the source, settings and Mac.
 - **Upscaling.** Choose Apple real-time or Apple video super resolution on supported macOS 26+ systems. Larger inputs may be reduced before processing. Live Apple video SR currently requires frame generation to be off.
 - **A workbench for everyday use.** Save profiles for games, films and animation;
@@ -32,7 +33,7 @@ The player has 17 interface languages; the enhancement workbench supports Chines
 and English. Experimental backends and constraints are described in [the feature guide](docs/features.md).
 
 <p align="center"><img src="Website/assets/openduckframe-library-v2.webp" alt="The OpenDuckFrame v0.1.0 technology library on macOS" width="900"></p>
-<p align="center"><sub>Earlier v0.1.0 interface. The current technology library lists ODF-VFI as its only frame-generation model.</sub></p>
+<p align="center"><sub>Earlier v0.1.0 interface. The current technology library lists ODF-VFI and two Apple interpolation options.</sub></p>
 
 ## Get started
 
@@ -65,6 +66,8 @@ See [Quick start](docs/quick-start.md) for permissions and troubleshooting.
 |---|---|
 | App and local playback | Apple silicon Mac, macOS 14 or later |
 | Window / display capture | Screen Recording permission; protected content may not be capturable |
+| Apple low-latency interpolation | macOS 26+ and runtime support; live X2/X4, file X2 |
+| Apple FRC | macOS 15.4+ and runtime support; quality-oriented, added delay and speed vary |
 | Apple super resolution | macOS 26+ and a supported Mac; sizes and factors depend on the processor; video SR may download an Apple model |
 | ODF-VFI frame generation | Apple silicon; throughput depends on resolution, quality and display rate |
 | Subtitle generation and translation | macOS 26+ and an available system language model |
