@@ -13,6 +13,7 @@ Keep source generation, configuration epochs, frame ownership, timestamps and ca
 Keep source identity separate from capture running state; Stop can retain a selectable source.
 Preserve verified source/content geometry, Retina/display mappings and stale-frame rejection when following windows.
 Keep capture callbacks distinct from source-content changes and physical presentation observations.
+For capture and inference sizing or performance admission, follow the root [hardware optimization scope](../../../AGENTS.md#hardware-optimization-scope). Derive limits from the selected source and engine capabilities; do not turn a test machine's model identifier or screen dimensions into product eligibility rules. Keep model identifiers in diagnostic evidence, and preserve real API compatibility checks.
 UI selectors and persisted profile behavior belong to [UI](../UI/AGENTS.md).
 File cadence and shared provider contracts belong to [VideoEnhancement](../../../Modules/VideoEnhancement/AGENTS.md).
 
