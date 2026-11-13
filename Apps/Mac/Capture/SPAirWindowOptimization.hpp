@@ -22,8 +22,12 @@ struct AirWindowOptimizationInput {
     bool compiled = false;
 };
 
+// Air window optimization is validated on the fanless Air silicon: the M3 Air
+// (Mac15,12 / Mac15,13) and the M5 Air (Mac17,3). Every other Air variant runs
+// the same recipe, so the gate is the silicon class rather than one board.
 inline bool airWindowHardwareSupported(const char *hardware) {
-    return hardware && (!std::strcmp(hardware, "Mac15,12") || !std::strcmp(hardware, "Mac15,13"));
+    return hardware && (!std::strcmp(hardware, "Mac15,12") || !std::strcmp(hardware, "Mac15,13") ||
+                         !std::strcmp(hardware, "Mac17,3"));
 }
 
 inline const char *airWindowOptimizationReason(const AirWindowOptimizationInput &input) {

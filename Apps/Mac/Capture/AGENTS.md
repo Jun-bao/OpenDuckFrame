@@ -23,6 +23,8 @@ Choose the scripts relevant to the changed policy and read their prerequisites f
 `./Scripts/test_capture_resize_policy.sh` checks resize state and stale callback guards.
 `./Scripts/test_content_frame_gate.sh` checks content gating.
 `./Scripts/test_output_geometry.sh` and `./Scripts/test_shared_geometry.sh` cover geometry policies.
+`./Scripts/test_air_window_optimization.sh` checks the Air window optimization hardware gate.
+`./Scripts/test_air_beta_sizing.sh` checks the Air capture envelope and adaptive processing sizing.
 These checks do not establish Screen Recording permission, real source capture or physical output correctness.
 For a live task, record selected source, dimensions, generation/configuration and actual presented output.
 Capture, requested target and presented FPS are separate measurements.

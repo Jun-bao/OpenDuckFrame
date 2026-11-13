@@ -659,7 +659,7 @@ final class SPRifeBridge: NSObject {
                         bridge.airServiceEvent(.prescaleProcessDimensions, token: token,
                             detail: UInt64(smallWidth), value: Double(smallHeight), cacheEpoch: bridge.airPrescaleCacheEpoch)
 #endif
-                        guard smallWidth == 1814, smallHeight == 1142 else {
+                        guard smallWidth == bridge.preparedProcessingWidth, smallHeight == bridge.preparedProcessingHeight else {
                             throw Self.error(22, "RIFE prescale process dimensions changed")
                         }
                         return small
@@ -688,7 +688,7 @@ final class SPRifeBridge: NSObject {
                     bridge.airServiceEvent(.prescaleSyntheticDimensions, token: token,
                         detail: UInt64(fullWidth), value: Double(fullHeight), cacheEpoch: bridge.airPrescaleCacheEpoch)
 #endif
-                    guard fullWidth == 2648, fullHeight == 1668 else {
+                    guard fullWidth == bridge.preparedCaptureWidth, fullHeight == bridge.preparedCaptureHeight else {
                         throw Self.error(22, "RIFE prescale synthetic dimensions changed")
                     }
                     return full

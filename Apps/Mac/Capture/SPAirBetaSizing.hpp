@@ -16,11 +16,16 @@ struct AirBetaSizeChoice {
     AirBetaSizeFailure failure = AirBetaSizeFailure::invalidCapture;
 };
 
-inline AirBetaSizeChoice airBetaSize(int width, int height) {
+// The Air recipe's verified envelope was measured on the M3 Air panel
+// (2648x1668). The adaptive downscale below already keeps every input inside
+// the model's own limits, so the capture envelope follows the panel instead of
+// one board's size: larger captures are scaled down to the same area budget
+// instead of being rejected outright.
+inline AirBetaSizeChoice airBetaSize(int width, int height, int envelopeWidth = 4096, int envelopeHeight = 2560) {
     AirBetaSizeChoice result;
     result.captureWidth = width; result.captureHeight = height;
     if (width < 2 || height < 2 || (width & 1) || (height & 1)) return result;
-    if (width > 2648 || height > 1668) {
+    if (width > envelopeWidth || height > envelopeHeight) {
         result.failure = AirBetaSizeFailure::outsideEnvelope;
         return result;
     }

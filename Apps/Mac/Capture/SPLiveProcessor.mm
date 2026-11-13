@@ -462,7 +462,7 @@ NSString *SPAirBetaSizingReason(int width, int height) {
     switch (sp::airBetaSize(width, height).failure) {
         case sp::AirBetaSizeFailure::none: return nil;
         case sp::AirBetaSizeFailure::invalidCapture: return @"采集宽高须为至少2像素的偶数，现以原帧播放";
-        case sp::AirBetaSizeFailure::outsideEnvelope: return @"窗口超过2648×1668像素的验证范围，现以原帧播放";
+        case sp::AirBetaSizeFailure::outsideEnvelope: return @"窗口超过4096×2560像素的验证范围，现以原帧播放";
         case sp::AirBetaSizeFailure::invalidProcessing: return @"处理尺寸未能满足面积与偶数约束，现以原帧播放";
         case sp::AirBetaSizeFailure::paddingExceeded: return @"模型补齐尺寸超过2048×1280，现以原帧播放";
     }
