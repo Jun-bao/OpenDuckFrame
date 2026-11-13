@@ -1900,7 +1900,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private func showGuideStep() {
         guard let step = guideStep, page == 0, let window, window.isVisible else { return }
-        let isRunning = startButton?.isHidden == true && stopButton?.isHidden == false
+        let isRunning = isEnhancing
         let target: NSView?
         let edge: NSRectEdge
         switch step {
@@ -2370,7 +2370,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private func runPanel() -> NSView {
         let start = button(EnhancementText.t("Enhance Selected Window", "指定窗口增强"), #selector(start), primary: true)
         let delayedStart = button(EnhancementText.t("Delayed Enhancement", "延迟增强"), #selector(startDelayedWindow))
-        let stop = button(EnhancementText.t("Stop", "停止"), #selector(stop))
+        let stop = button(EnhancementText.t("Stop Enhancement", "关闭增强"), #selector(stop), primary: true)
         delayedStart.controlSize = .large
         stop.controlSize = .large
         startButton = start
@@ -2390,7 +2390,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         let statusColumn = column([statusLabel, statsLabel, budgetLabel], spacing: 2)
         // Hidden actions detach so each visible action shares the available width.
-        let actions = NSStackView(views: [stop, delayedStart, start])
+        let actions = NSStackView(views: [delayedStart, start, stop])
         actions.orientation = .horizontal
         actions.distribution = .fillEqually
         actions.spacing = 10
@@ -3026,10 +3026,14 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
     }
 
-    private func refreshActions() {
+    private var isEnhancing: Bool {
         let player = selectedFilePlayer()
-        let enhancing = profile.sourceKind == "file" ? ((player?.workbenchMotionPlusRequested ?? false) || (player?.workbenchFileLanczosActive ?? false)) :
+        return profile.sourceKind == "file" ? ((player?.workbenchMotionPlusRequested ?? false) || (player?.workbenchFileLanczosActive ?? false)) :
             (capture.running && (processor.resolvedPlan.interpolationActive || processor.resolvedPlan.scaleActive || (applied.sourceKind == "window" && applied.windowOutputMode != "follow")))
+    }
+
+    private func refreshActions() {
+        let enhancing = isEnhancing
         startButton?.isHidden = enhancing && !hasPendingFormChanges && !countdown.active
             && !delayedWindowSelection && !startImmediatelyAfterPreparation
         let delayedBusy = delayedWindowSelection || startImmediatelyAfterPreparation
@@ -3051,6 +3055,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             startButton?.title = filePreparing ? EnhancementText.t("Preparing…", "准备中…") : (countdown.active ? "\(countdown.remaining)" : (enhancing ? EnhancementText.t("Apply Changes", "应用更改") : startTitle))
         }
         stopButton?.isHidden = !enhancing && !filePreparing
+        stopButton?.title = filePreparing && !enhancing
+            ? EnhancementText.t("Cancel", "取消")
+            : EnhancementText.t("Stop Enhancement", "关闭增强")
     }
 
     /// Form controls share one trailing column; switches keep their native size.

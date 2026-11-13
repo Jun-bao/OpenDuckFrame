@@ -70,6 +70,9 @@ private final class SourceSizeControls {
  var hasSelectedSource: Bool {
   // ACTUAL_SELECTED_SOURCE
  }
+ var isEnhancing: Bool {
+  // ACTUAL_IS_ENHANCING
+ }
  func refreshActions() {
   // ACTUAL_WORKBENCH_ACTIONS
  }
@@ -154,11 +157,31 @@ private final class SourceSizeControls {
   activeWindow.processor.resolvedPlan.interpolationActive = true
   activeWindow.refreshActions()
   precondition(activeWindow.startButton?.isHidden == true && activeWindow.stopButton?.isHidden == false)
+  precondition(activeWindow.stopButton?.title == "Stop Enhancement")
   precondition(activeWindow.delayedStartButton?.isHidden == false && activeWindow.delayedStartButton?.isEnabled == true,
     "Delayed selection must remain available while enhancing a window")
   activeWindow.hasPendingFormChanges = true
   activeWindow.refreshActions()
   precondition(activeWindow.startButton?.isHidden == false && activeWindow.stopButton?.isHidden == false)
+  precondition(activeWindow.startButton?.title == "Apply Changes" && activeWindow.stopButton?.title == "Stop Enhancement")
+
+  let activeDisplay = WorkbenchActionControls()
+  activeDisplay.profile.sourceKind = "display"
+  activeDisplay.capture.running = true
+  activeDisplay.processor.resolvedPlan.scaleActive = true
+  activeDisplay.refreshActions()
+  precondition(activeDisplay.startButton?.isHidden == true && activeDisplay.stopButton?.title == "Stop Enhancement")
+  precondition(activeDisplay.delayedStartButton?.isHidden == true)
+
+  let activeFile = WorkbenchActionControls()
+  activeFile.profile.sourceKind = "file"
+  activeFile.filePlayer = WorkbenchActionControls.Player()
+  activeFile.filePlayer?.workbenchMotionPlusRequested = true
+  activeFile.refreshActions()
+  precondition(activeFile.startButton?.isHidden == true && activeFile.stopButton?.title == "Stop Enhancement")
+  activeFile.hasPendingFormChanges = true
+  activeFile.refreshActions()
+  precondition(activeFile.startButton?.title == "Apply Changes" && activeFile.stopButton?.title == "Stop Enhancement")
 
   let preparingFile = WorkbenchActionControls()
   preparingFile.profile.sourceKind = "file"
@@ -166,6 +189,7 @@ private final class SourceSizeControls {
   preparingFile.filePreparing = true
   preparingFile.refreshActions()
   precondition(preparingFile.startButton?.isEnabled == false && preparingFile.stopButton?.isHidden == false)
+  precondition(preparingFile.stopButton?.title == "Cancel")
   precondition(preparingFile.delayedStartButton?.isHidden == true)
 
   for sourceKind in ["display", "file"] {

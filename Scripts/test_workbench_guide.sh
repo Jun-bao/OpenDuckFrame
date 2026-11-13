@@ -39,7 +39,7 @@ import AppKit
         check(step: .start, kind: "window", running: false, text: "指定窗口增强")
         check(step: .start, kind: "file", running: false, text: "点击开始增强")
         check(step: .start, kind: "display", running: false, text: "点击开始增强")
-        check(step: .start, kind: "file", running: true, text: "点击停止")
+        check(step: .start, kind: "file", running: true, text: "点击关闭增强")
         let content = WorkbenchGuideContent(step: .source, sourceKind: "window", alreadyRunning: false,
             skip: { skipped = true }, advance: { advanced = true })
         let buttons = content.view.subviews.compactMap { $0 as? NSButton }
