@@ -16,6 +16,7 @@
 #include "SPAirSourceConversion.hpp"
 #include "SPAirDisplayPolicyB.hpp"
 #import "SPRateSchedule.hpp"
+#include "SPVideoCadence.hpp"
 #import "SPLiveDisplayQueue.h"
 #import "SPRifePairAffineClock.hpp"
 #import "SPFPSMeter.hpp"
@@ -702,6 +703,7 @@ static NSSize SPLiveSRInputSizeForRequest(int width, int height, SPLivePlanReque
     copy.modelID = self.modelID ?: @"";
     copy.qualityID = self.qualityID ?: @"";
     copy.rifeStreamEnabled = self.rifeStreamEnabled;
+    copy.automaticVideoCadence = self.automaticVideoCadence;
     copy.captureSourceKind = self.captureSourceKind;
     return copy;
 }
@@ -3300,7 +3302,31 @@ struct SPLiveInbound {
     int64_t host = 0;
     int64_t readyHost = 0;
     uint64_t generation = 0;
+    uint64_t videoRevision = 0, videoContext = 0;
+    int videoFPS = 0;
+    int64_t videoPhaseNs = 0;
+    bool videoRetimed = false, videoDiscontinuity = false;
 };
+
+static bool SPVideoSamples(CVPixelBufferRef buffer, sp::VideoLumaSamples &samples) {
+    const OSType format = CVPixelBufferGetPixelFormatType(buffer);
+    const bool planar = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+    if (!planar && format != kCVPixelFormatType_32BGRA) return false;
+    if (CVPixelBufferLockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return false;
+    const auto *base = (const uint8_t *)(planar ? CVPixelBufferGetBaseAddressOfPlane(buffer, 0) : CVPixelBufferGetBaseAddress(buffer));
+    const size_t stride = planar ? CVPixelBufferGetBytesPerRowOfPlane(buffer, 0) : CVPixelBufferGetBytesPerRow(buffer);
+    const size_t width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer);
+    if (base && width && height) for (size_t zone = 0; zone < samples.size(); ++zone) {
+        for (size_t y = 0; y < 9; ++y) for (size_t x = 0; x < 16; ++x) {
+            const size_t px = std::min(width-1, size_t(width*(0.08 + (zone%3 + (x+0.5)/16.0)*0.84/3)));
+            const size_t py = std::min(height-1, size_t(height*(0.12 + (zone/3 + (y+0.5)/9.0)*0.76/2)));
+            const uint8_t *p = base + py*stride + px*(planar ? 1 : 4);
+            samples[zone][y*16+x] = planar ? p[0] : uint8_t((29*p[0] + 150*p[1] + 77*p[2]) >> 8);
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
+    return base && width && height;
+}
 
 struct SPLiveJob {
     uint64_t diagnosticID = 0;
@@ -3652,6 +3678,19 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     sp::SPRateScheduler _scheduler;
     std::mutex _inMx;
     std::deque<SPLiveInbound> _inbound;
+    // Sampling/detection runs before the bounded inference input queue. Its
+    // state is protected by _inMx, independently of model processing speed.
+    std::atomic<bool> _videoSamplingEnabled;
+    sp::VideoCadenceDetector _videoDetector;
+    uint64_t _videoIngressRevision, _videoIngressContext, _videoIngressGeneration;
+    int _videoIngressWidth, _videoIngressHeight;
+    // Retiming and pending-frame ownership belong exclusively to _q.
+    uint64_t _videoConfiguration, _videoRequestRevision, _videoContext, _videoPendingToken;
+    int _videoDetectedFPS;
+    sp::VideoCadenceClock _videoClock;
+    SPLiveInbound _videoPending;
+    int64_t _videoPendingIndex, _videoLastEmittedIndex;
+    uint64_t _videoRetimedFrames, _videoCoalescedInputs;
     sp::FPSMeter _copiedMeter; // protected by _inMx, before inbound eviction
     uint64_t _copiedGeneration, _copiedFrames;
     BOOL _pumpQueued;
@@ -3795,6 +3834,9 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 - (instancetype)init {
     if (!(self = [super init])) return nil;
     _airOutputSubmitDeadlineFailures.store(0, std::memory_order_relaxed);
+    _videoSamplingEnabled.store(false);
+    _videoLastEmittedIndex = INT64_MIN;
+    _videoConfiguration = UINT64_MAX;
     if (SPAirFullMeasurementTraceRequested())
         _measurementTrace = std::make_shared<spAirMeasurement::Trace>(spAirMeasurement::processorCapacity);
     _airRobustSourceLeadRequested = SPAirRobustSourceLeadRequested();
@@ -3952,6 +3994,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 
 - (BOOL)nativeBudgetForSnapshot:(const sp::NativeCadenceSnapshot &)snapshot {
     return !_stopped && _request.interpolationEnabled && _request.rateKind == SPLiveRateMultiplier &&
+        ![self automaticVideoCadenceActive] &&
         snapshot.active && snapshot.generation == _sourceGeneration &&
         snapshot.width == _sourceWidth && snapshot.height == _sourceHeight &&
         snapshot.captureLimit == _request.captureCapFPS && snapshot.refreshHz == _request.displayRefreshHz;
@@ -4390,7 +4433,15 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         requestedFPS = (double)_request.fpsNumerator / (double)_request.fpsDenominator;
     else if (_resolved.committed && _resolved.interpolationActive && _request.interpolationEnabled && _request.rateKind == SPLiveRateMultiplier && inputFPS > 0)
         requestedFPS = inputFPS * _request.multiplier;
+    if ([self automaticVideoCadenceActive]) requestedFPS = _resolved.committed && _resolved.interpolationActive && _videoDetectedFPS > 0
+        ? _videoDetectedFPS * _request.multiplier : -1;
     NSDictionary *result = @{
+        @"automaticVideoCadence": @([self automaticVideoCadenceActive]),
+        @"detectedVideoFPS": @(_videoDetectedFPS),
+        @"videoRetimedFrames": @(_videoRetimedFrames),
+        @"videoCoalescedInputs": @(_videoCoalescedInputs),
+        @"videoPendingInput": @(_videoPending.buffer != nullptr),
+        @"videoCadenceNote": @"Visible-content estimate, not decoder metadata. Coalesced captures are window updates, not a count of missing video frames.",
         @"airWindowOptimization": windowOptimization,
         @"pumpedInputSequence": @(_processedSequence),
         @"capturePressureEvents": @(_capturePressureEvents),
@@ -5673,6 +5724,9 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 }
 
 - (void)discardQueuedStateOnQueue {
+    [self cancelVideoPendingInput];
+    _videoClock.reset(); _videoDetectedFPS = 0; _videoContext = 0;
+    _videoLastEmittedIndex = INT64_MIN; _videoConfiguration = UINT64_MAX;
     [self resetRateBudgetOnQueue];
     _fpsMeter.reset();
     _pumpedCaptureMeter.reset();
@@ -6318,6 +6372,8 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
               readyHost:(int64_t)readyHost
              generation:(uint64_t)generation {
     if (!buffer || ptsDen == 0) return;
+    sp::VideoLumaSamples videoSamples{};
+    const bool sampledVideo = _videoSamplingEnabled.load() && SPVideoSamples(buffer, videoSamples);
     CVPixelBufferRetain(buffer);
     std::lock_guard<std::mutex> lock(_inMx);
     if (generation >= _copiedGeneration) {
@@ -6341,6 +6397,17 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     item.host = host;
     item.readyHost = readyHost > 0 ? readyHost : host;
     item.generation = generation;
+    if (sampledVideo && _videoSamplingEnabled.load() && generation >= _videoIngressGeneration && ptsDen > 0) {
+        const int width = (int)CVPixelBufferGetWidth(buffer), height = (int)CVPixelBufferGetHeight(buffer);
+        if (generation != _videoIngressGeneration || width != _videoIngressWidth || height != _videoIngressHeight) {
+            _videoDetector.reset(); ++_videoIngressContext;
+            _videoIngressGeneration = generation; _videoIngressWidth = width; _videoIngressHeight = height;
+        }
+        const __int128 ns = (__int128)ptsNum * 1000000000 / ptsDen;
+        if (ns >= INT64_MIN && ns <= INT64_MAX) _videoDetector.observe(videoSamples, (int64_t)ns);
+        item.videoRevision = _videoIngressRevision; item.videoContext = _videoIngressContext;
+        item.videoFPS = _videoDetector.fps(); item.videoPhaseNs = _videoDetector.phaseNs();
+    }
     _inbound.push_back(item);
     if (!_pumpQueued) {
         _pumpQueued = YES;
@@ -7217,6 +7284,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
 
 - (void)recomputeInteractiveDelay {
     double cap = _request.quality == SPFRCQualityHigh ? SPQualityCapSec : SPInteractiveCapSec;
+    if ([self automaticVideoCadenceActive]) cap = 0.160;
 #if defined(ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC) && ODF_AIR_PRESENTATION_GUARD_DIAGNOSTIC == 1
     if (_airInteractiveCap125msRequested && _request.quality != SPFRCQualityHigh) cap = 0.125;
 #endif
@@ -7304,7 +7372,7 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     // Window capture carries uneven video/UI timestamps. Reserve time for the
     // following source, conversion and a display slot before releasing X2/X4
     // output; the existing time/byte caps below still bound retained work.
-    if (_lowLatency && !_nativeBudgetActive) wanted = MAX(wanted, 0.080);
+    if (_lowLatency && !_nativeBudgetActive) wanted = MAX(wanted, [self automaticVideoCadenceActive] ? 0.140 : 0.080);
     if (_lowLatency && [self requestUsesLowPrescale:_request width:_width height:_height] && _captureToOutputReadyNs.size() >= 8) {
         // Include actual capture-to-ready time, which also covers pre-scaling,
         // conversion, asynchronous delivery and comparison baseline work.
@@ -9085,6 +9153,107 @@ presentationHost:(int64_t)presentationHost
     if (!ok) [self publishStatus:error.localizedDescription ?: @"准备失败" failed:YES];
 }
 
+- (BOOL)automaticVideoCadenceActive {
+    return !_stopped && _request.automaticVideoCadence && _request.interpolationEnabled &&
+        [_request.engineID isEqualToString:@"apple.lowlatency"] && _request.captureSourceKind != SPLiveCaptureSourceKindFile;
+}
+
+- (void)cancelVideoPendingInput {
+    ++_videoPendingToken;
+    if (_videoPending.buffer) CVPixelBufferRelease(_videoPending.buffer);
+    _videoPending = {};
+}
+
+- (void)resetVideoOutputTimeline {
+    [self cancelVideoPendingInput];
+    _videoClock.reset(); _videoLastEmittedIndex = INT64_MIN;
+    [self retireClockTimeline];
+    _haveAnchor = NO; _haveLastPts = NO; _havePreviousSourcePts = NO; _haveInterval = NO;
+    _havePair = NO; _previousSourceIdentity = 0;
+    [self resetSchedulerOnQueue];
+}
+
+- (void)syncVideoCadenceMode {
+    const bool enabled = [self automaticVideoCadenceActive];
+    const bool wasEnabled = _videoSamplingEnabled.load();
+    if (_videoConfiguration == _configVersion && enabled == wasEnabled) return;
+    _videoConfiguration = _configVersion;
+    if (!enabled && !wasEnabled) return;
+    {
+        std::lock_guard<std::mutex> lock(_inMx);
+        _videoSamplingEnabled.store(enabled);
+        _videoDetector.reset(); ++_videoIngressContext;
+        _videoRequestRevision = ++_videoIngressRevision;
+    }
+    _videoDetectedFPS = 0; _videoContext = 0;
+    [self resetVideoOutputTimeline];
+}
+
+- (SPLiveInbound)takeRetimedVideoInput {
+    SPLiveInbound item = _videoPending; _videoPending = {};
+    const auto pts = _videoClock.pts(_videoPendingIndex);
+    item.ptsNum = pts.num; item.ptsDen = pts.den; item.videoRetimed = true;
+    item.videoDiscontinuity = _videoLastEmittedIndex != INT64_MIN && _videoPendingIndex - _videoLastEmittedIndex > 1;
+    _videoLastEmittedIndex = _videoPendingIndex; ++_videoRetimedFrames;
+    return item;
+}
+
+- (void)retimeVideoBatch:(std::deque<SPLiveInbound> &)batch {
+    [self syncVideoCadenceMode];
+    if (![self automaticVideoCadenceActive]) {
+        for (auto i = batch.begin(); i != batch.end();) {
+            if (i->videoRetimed) { CVPixelBufferRelease(i->buffer); i = batch.erase(i); }
+            else ++i;
+        }
+        return;
+    }
+    std::deque<SPLiveInbound> ready;
+    for (auto item : batch) {
+        if (item.generation != _sourceGeneration || _stopped) { CVPixelBufferRelease(item.buffer); continue; }
+        if (item.videoRetimed) {
+            if (item.videoRevision == _videoRequestRevision && item.videoContext == _videoContext) ready.push_back(item);
+            else CVPixelBufferRelease(item.buffer);
+            continue;
+        }
+        const int fps = item.videoRevision == _videoRequestRevision ? item.videoFPS : 0;
+        if (fps != _videoDetectedFPS || item.videoContext != _videoContext) {
+            [self resetVideoOutputTimeline];
+            for (auto old : ready) CVPixelBufferRelease(old.buffer);
+            ready.clear(); _videoDetectedFPS = fps; _videoContext = item.videoContext;
+            if (fps) _videoClock.start(fps, (int64_t)((__int128)item.ptsNum * 1000000000 / item.ptsDen), item.videoPhaseNs);
+        }
+        if (!fps) { ready.push_back(item); continue; }
+        const int64_t captureNs = (int64_t)((__int128)item.ptsNum * 1000000000 / item.ptsDen);
+        const int64_t index = _videoClock.index(captureNs);
+        if (index <= _videoLastEmittedIndex || (_videoPending.buffer && index < _videoPendingIndex)) {
+            ++_videoCoalescedInputs; CVPixelBufferRelease(item.buffer); continue;
+        }
+        if (_videoPending.buffer && index > _videoPendingIndex) ready.push_back([self takeRetimedVideoInput]);
+        if (_videoPending.buffer) {
+            ++_videoCoalescedInputs; CVPixelBufferRelease(_videoPending.buffer);
+            _videoPending = item;
+            continue;
+        }
+        _videoPending = item; _videoPendingIndex = index;
+        const uint64_t token = ++_videoPendingToken;
+        const int64_t remainingNs = std::max(int64_t{0}, _videoClock.closesNs(index) - captureNs);
+        // Close from the capture host, not from a delayed inference queue entry.
+        const int64_t elapsedNs = SPHostToNs(SPHostNow() - item.host);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, std::max(int64_t{0}, remainingNs - elapsedNs)), _q, ^{
+            if (token != self->_videoPendingToken || !self->_videoPending.buffer) return;
+            if (self->_stopped) { [self cancelVideoPendingInput]; return; }
+            const auto closed = [self takeRetimedVideoInput];
+            std::lock_guard<std::mutex> lock(self->_inMx);
+            self->_inbound.push_front(closed);
+            if (!self->_pumpQueued) {
+                self->_pumpQueued = YES;
+                dispatch_async(self->_q, ^{ [self pump]; });
+            }
+        });
+    }
+    batch.swap(ready);
+}
+
 - (void)pump {
     std::deque<SPLiveInbound> batch;
     {
@@ -9092,6 +9261,7 @@ presentationHost:(int64_t)presentationHost
         batch.swap(_inbound);
         _pumpQueued = NO;
     }
+    [self retimeVideoBatch:batch];
     if (SPR7Passthrough() || !_request.interpolationEnabled) {
         // Coalesce only already-buffered frames of the current source. Pick
         // the greatest valid PTS rather than blindly trusting callback order.
@@ -9313,12 +9483,12 @@ presentationHost:(int64_t)presentationHost
         }
         uint8_t luma[64];
         SPSampleLuma(item.buffer, luma, 64);
-        BOOL cut = NO;
+        BOOL cut = item.videoDiscontinuity;
         BOOL changed = YES;
         BOOL comparableLuma = _haveLuma && _r7LumaGeneration == _sourceGeneration &&
             _r7LumaConfig == _configVersion && _r7LumaEpoch == _measurementEpoch;
         if (_haveLuma) {
-            cut = sp::spDetectSceneCut(_previousLuma, luma, 64);
+            cut = cut || sp::spDetectSceneCut(_previousLuma, luma, 64);
             int64_t mad = 0;
             for (int i = 0; i < 64; ++i) {
                 int delta = (int)luma[i] - (int)_previousLuma[i];
@@ -9386,7 +9556,8 @@ presentationHost:(int64_t)presentationHost
         }
         [self updateRateBudgetOnQueue];
         BOOL engineReady = _engine != nil || _lowLatency != nil || _rife != nil || _distil != nil;
-        if (_request.interpolationEnabled && _sessionReady && engineReady) {
+        if (_request.interpolationEnabled && _sessionReady && engineReady &&
+            (![self automaticVideoCadenceActive] || item.videoRetimed)) {
             sp::SPScheduleInput input;
             input.pts = sp::spMake(item.ptsNum, item.ptsDen);
             input.identity = identity;

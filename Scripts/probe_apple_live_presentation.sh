@@ -1,13 +1,13 @@
 #!/bin/bash
-# Opens an owned synthetic test window for 23 seconds. Does not capture the screen.
+# Opens an owned synthetic test window for 23–26 seconds. Does not capture the screen.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
-  echo "usage: $0 OUTPUT.json [steady|jitter]" >&2
+  echo "usage: $0 OUTPUT.json [steady|jitter|source25|auto24|auto25|auto30]" >&2
   exit 2
 fi
 PROFILE="${2:-jitter}"
-case "$PROFILE" in steady|jitter) ;; *) echo 'expected steady or jitter' >&2; exit 2 ;; esac
+case "$PROFILE" in steady|jitter|source25|auto24|auto25|auto30) ;; *) echo 'expected steady, jitter, source25, auto24, auto25 or auto30' >&2; exit 2 ;; esac
 PRODUCTS="${ODF_TEST_FRAMEWORKS_DIR:-$ROOT/.build/Build/Products/Debug}"
 DYLIB="$PRODUCTS/OpenDuckFrame.app/Contents/MacOS/OpenDuckFrame.debug.dylib"
 [ -f "$DYLIB" ] || { echo 'Build the Debug app first.' >&2; exit 2; }

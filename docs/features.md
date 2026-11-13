@@ -56,6 +56,25 @@ the latest frame when all queued frames are stale. This reduces avoidable
 supersession at the cost of extra input delay; queue capacity remains bounded.
 It does not change the model or promise a fixed achieved FPS. RIFE, FRC and
 source-only presentation retain their existing policies.
+
+The 0.4.3 development branch offers **Content timing → Automatic video** for
+Apple low-latency live window/display enhancement. General window remains the
+default, including migrated profiles. Automatic video estimates approximate
+24/25/30 FPS from agreement between interior picture regions; this is not decoder
+metadata and does not distinguish 23.976/24 or 29.97/30. It requests a 60 FPS capture
+ceiling while retaining the saved general-mode limit. Once locked, each rational
+video-time bucket selects the latest full capture and schedules interpolation at
+uniform phases. It does not recover missing source frames. While detection is
+unconfirmed it shows source pictures; still scenes retain an established lock.
+Small video areas, low motion, multiple central animations and other frame rates
+may not lock reliably. Use General window in those cases. Changing source,
+dimensions, plan or incompatible cadence retires the old timing context.
+
+Automatic video requests 140 ms buffering within a 160 ms time cap and the existing
+byte limit. A pending capture adds up to half a source-frame interval of lookahead;
+the buffer value is not an end-to-end latency measurement. Audio is still played
+by the source app, so this mode can introduce audio/video offset. It does not
+affect file playback, other interpolation engines or the model weights.
 The player's Motion+ menu remains a separate off/double-rate FRC control.
 RIFE 4.26 and DistilDRBA remain hidden experimental backends.
 

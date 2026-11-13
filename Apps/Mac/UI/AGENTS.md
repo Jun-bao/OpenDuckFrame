@@ -20,6 +20,7 @@ The three-step first-use coach marks are implemented in [WorkbenchOnboarding.swi
 Keep delayed window selection available beside the selected-window start action, including before a source is chosen. The selected-window action must offer Cancel throughout its countdown and initial engine preparation. During enhancement, show Stop Enhancement in the start action's position; preserve restart after Stop and pending Apply Changes actions.
 File output retains its fullscreen control; display and window output follow their source without a fullscreen preview option.
 The workbench is a compact controls-only window. Keep its preview endpoint disconnected; file video stays in the player and live enhancement uses its actual output view.
+Apple low latency in live window/display mode offers Content timing: General window / Automatic video. Old profiles retain General window. Automatic video requests a 60 FPS capture ceiling without replacing the saved general-mode cap, reports estimated 24/25/30 FPS or detection in progress, and leaves audio in the source app. Keep this choice hidden for files and other engines; preserve it when saving configurations.
 
 ## UI validation
 
