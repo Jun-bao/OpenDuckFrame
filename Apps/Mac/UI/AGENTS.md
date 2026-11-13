@@ -11,6 +11,7 @@ Own native windows, menus, player interaction and enhancement configuration here
 [Enhancement/LiveFPSOverlay.swift](Enhancement/LiveFPSOverlay.swift) formats live FPS observations.
 The engine selector offers ODF-VFI (default), Apple low latency and Apple FRC. Preserve each engine when loading and saving profiles. ODF-VFI has fast/balanced/hq tiers; persisted `rife-v4.25` identifiers remain for compatibility. Apple low latency uses X2/X4 for live capture and X2 for files, without fixed FPS or X3. FRC has standard/quality tiers for live capture and standard for files. Keep rate controls and quality choices consistent with the selected source and engine.
 The workbench offers Apple low-latency and Apple video super resolution; preserve the disabled-by-default scale switch and migrate legacy scaler profiles without altering frame-generation settings.
+The workbench always shows enhanced output; legacy original/compare view settings migrate to enhanced.
 Keep continuous stream caching enabled by default and window output fixed to follow with mouse passthrough.
 The normal countdown defaults to 3 seconds; keep saved countdown and custom settings working.
 Hardware/configuration auto-detection is deferred. Keep its suggestions and scoring out of ordinary controls.
