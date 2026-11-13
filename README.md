@@ -76,6 +76,17 @@ See [Quick start](docs/quick-start.md) for permissions and troubleshooting.
 Intel Macs, Windows, iPhone and iPad are not currently supported. A multiplier is
 a requested processing mode, not a guarantee of a particular displayed frame rate.
 
+Live Apple low latency fits inference to the device's supported size and restores
+generated frames to source dimensions. The workbench shows the inference size;
+reduced inference can soften generated detail. File input retains its native size requirements.
+Enhanced live output also reserves at least 80 ms of adaptive buffering, subject to
+time/memory caps, and keeps eligible frames in order within a bounded lag window.
+This trades some input responsiveness for more consistent delivery; it does not guarantee 60 FPS.
+The 0.4.3 development branch adds optional **Automatic video** timing for live Apple
+low latency. It estimates common 24/25/30 FPS content and evens out its timeline,
+requesting extra buffering (140 ms, subject to limits). General window remains the
+default. Audio stays in the source app, so audio/video offset may be noticeable.
+
 When local-video frame generation cannot keep up, the original picture is kept and
 late generated frames are discarded instead of delaying playback. This does not
 mean the selected multiplier is reached on a slower Mac.

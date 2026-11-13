@@ -276,6 +276,22 @@ private final class SourceSizeControls {
   precondition(WorkbenchTitle.text("Quality Workbench",version:" \n ") == "Quality Workbench")
   precondition(WorkbenchTitle.text("画质工作台",version:nil) == "画质工作台")
   var oldProfile = try JSONSerialization.jsonObject(with: JSONEncoder().encode(EnhancementProfile())) as! [String: Any]
+  oldProfile.removeValue(forKey:"automaticVideoCadence")
+  let legacyTiming = EnhancementProfileStore.decode(try JSONSerialization.data(withJSONObject:oldProfile),fallbackName:"legacy")!
+  precondition(!legacyTiming.automaticVideoCadence, "Existing profiles must retain general window timing")
+  for source in ["window", "display", "file"] {
+   for engine in ["apple.lowlatency", "apple.frc", "rife.metal"] {
+    var timing = EnhancementProfile()
+    timing.sourceKind=source; timing.interpolationEngineID=engine; timing.automaticVideoCadence=true; timing.captureLimit="30"
+    let restored=EnhancementProfileStore.decode(try JSONEncoder().encode(timing),fallbackName:"timing")!
+    let active=source != "file" && engine == "apple.lowlatency"
+    precondition(restored.automaticVideoCadence && restored.usesAutomaticVideoCadence == active)
+    precondition(restored.effectiveCaptureLimit == (active ? 60 : 30))
+    let changes=WorkbenchActionControls(); changes.profile=timing
+    var baseline=timing; baseline.automaticVideoCadence=false
+    precondition(changes.hasChanges(relativeTo:baseline) == active)
+   }
+  }
   oldProfile.removeValue(forKey:"windowOutputMode")
   let oldData = try JSONSerialization.data(withJSONObject:oldProfile)
   precondition(EnhancementProfileStore.decode(oldData,fallbackName:"legacy")?.windowOutputMode == "follow")
