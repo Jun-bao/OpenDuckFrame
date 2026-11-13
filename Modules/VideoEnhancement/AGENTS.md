@@ -20,6 +20,7 @@ Preserve model identity, quality tier, dimensions, padding, color metadata and c
 Policy sources have focused tests in [Tests](Tests/) with wrappers under Scripts.
 Use `./Scripts/test_rate_budget.sh` for budget and FPS HUD behavior.
 Use `./Scripts/test_presentation_order.sh` or `./Scripts/test_presentation_budget.sh` for their respective policies.
+Use `./Scripts/test_live_display_queue.sh` for live queue selection and bounded lag. The visible Apple live presentation probe and its scope are documented in the capture entry.
 Read file-provider/scaler test scripts before running them; some need built frameworks, models, macOS features or GPU work.
 Select the existing test that exercises the changed normal entry point.
 [Shaders/FrameBudget.metal](Shaders/FrameBudget.metal) produces lazily loaded FrameBudget.metallib in the media framework.

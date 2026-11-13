@@ -1533,6 +1533,8 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
     consumes:(std::vector<SPAirSlotConsumeEvent> *)consumes consumeTotal:(uint64_t *)consumeTotal snapshot:(SPAirSlotSnapshot *)snapshot;
 - (BOOL)copyAirSlotCallbacks:(std::vector<SPAirSlotCallbackEvent> *)events total:(uint64_t *)total
     mainCallerSynchronouslyOnProcessorQueue:(BOOL)safe unsupported:(uint64_t *)unsupported;
+- (void)setLowLatencyPresentationEnabled:(BOOL)enabled;
+- (BOOL)boundedPresentationEnabled;
 @end
 
 @implementation SPLivePreviewView {
@@ -1593,6 +1595,7 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
     BOOL _airPreparedTextureDiagnostic;
     spAirMeasurement::TracePtr _measurementTrace;
     std::atomic<bool> _airPerformanceEnabled;
+    std::atomic<bool> _lowLatencyPresentationEnabled;
     std::atomic<int64_t> _selectionGuardNs;
     int64_t _diagnosticSelectionGuardNs;
     std::unique_ptr<SPAirFrameRing> _airCadenceFrames;
@@ -1622,6 +1625,7 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
     if (SPAirFullMeasurementTraceRequested())
         _measurementTrace = std::make_shared<spAirMeasurement::Trace>(spAirMeasurement::viewCapacity);
     _airPerformanceEnabled.store(false);
+    _lowLatencyPresentationEnabled.store(false);
     const BOOL legacyAirRecipe = SPAirBetaEnabled() ||
         (strcmp(getenv("ODF_AIR_FUSED_RIFE_PRESENT_DIAGNOSTIC") ?: "", "1") == 0 &&
          strcmp(getenv("ODF_AIR_RIFE_PRESCALE_DIAGNOSTIC") ?: "", "1") == 0 &&
@@ -1756,6 +1760,15 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
 }
 
 - (BOOL)airPerformanceEnabled { return _airPerformanceEnabled.load(std::memory_order_acquire); }
+- (BOOL)boundedPresentationEnabled {
+    return [self airPerformanceEnabled] || _lowLatencyPresentationEnabled.load();
+}
+- (void)setLowLatencyPresentationEnabled:(BOOL)enabled {
+    if (_lowLatencyPresentationEnabled.exchange(enabled) != enabled) {
+        std::lock_guard<std::mutex> lock(_presentationMutex);
+        [self resetAirDisplayPolicyLocked];
+    }
+}
 - (int64_t)selectionGuardNs { return _selectionGuardNs.load(); }
 
 - (void)setPresentedVideoReadbackEnabled:(BOOL)enabled {
@@ -2551,7 +2564,7 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
         std::lock_guard<std::mutex> lock(_presentationMutex);
         history = _displayTimerTrace; total = _displayTimerTraceCount;
         pendingFrames = _pendingPresentations.count; pendingSlot = _prospectiveSlot != nil;
-        ruleBEnabled = _airPerformanceEnabled.load(); ruleBDecision = _airRuleBLastDecision;
+        ruleBEnabled = [self boundedPresentationEnabled]; ruleBDecision = _airRuleBLastDecision;
         ruleBDecisionCount = _airRuleBDecisionCount; ruleBHistoryCount = _airRuleBLastHistoryCount;
     }
     // Build diagnostic objects outside the deadline-sensitive publication lock.
@@ -2653,7 +2666,7 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
                 }
             }
             slot->timing = {++_nextDisplaySlotToken, context, (int64_t)(deadline * 1e9), (int64_t)(displayTime * 1e9), [self selectionGuardNs]};
-            slot->ruleBEnabled = [self airPerformanceEnabled];
+            slot->ruleBEnabled = [self boundedPresentationEnabled];
             if (slot->ruleBEnabled) {
                 _airDisplayRefreshHistory.observe(slot->timing.displayNs);
                 slot->ruleBHistory = _airDisplayRefreshHistory;
@@ -2729,7 +2742,7 @@ static NSDictionary *SPAirFusedRenderExport(const SPAirFusedRenderPtr &record) {
             std::vector<sp::DisplayQueueFrame> timings;
             for (SPDisplayFrameRequest *pending in _pendingPresentations) timings.push_back(SPDisplayFrameTiming(pending));
             const uint64_t measurementChoiceBegin = _measurementTrace ? SPHostNow() : 0;
-            const bool ruleBEnabled = slot->ruleBEnabled && [self airPerformanceEnabled];
+            const bool ruleBEnabled = slot->ruleBEnabled && [self boundedPresentationEnabled];
             const auto ruleB = spAirDisplayPolicyB::decide(timings, slot->timing.displayNs,
                 slot->ruleBHistory.intervals, slot->ruleBHistory.count, ruleBEnabled);
             const auto selected = ruleB.selected;
@@ -7288,6 +7301,10 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
         renderMargin = (double)_airDelayAlignmentMarginNs / 1e9;
     }
     double wanted = lead + process + renderMargin;
+    // Window capture carries uneven video/UI timestamps. Reserve time for the
+    // following source, conversion and a display slot before releasing X2/X4
+    // output; the existing time/byte caps below still bound retained work.
+    if (_lowLatency && !_nativeBudgetActive) wanted = MAX(wanted, 0.080);
     if (_lowLatency && [self requestUsesLowPrescale:_request width:_width height:_height] && _captureToOutputReadyNs.size() >= 8) {
         // Include actual capture-to-ready time, which also covers pre-scaling,
         // conversion, asynchronous delivery and comparison baseline work.
@@ -7579,6 +7596,9 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
          frameID:(uint64_t)frameID
 presentationHost:(int64_t)presentationHost
           redraw:(BOOL)redraw {
+    const BOOL lowLatencyPresentation = _lowLatency && _resolved.interpolationActive && !_nativeBudgetActive && _request.viewMode == SPLiveViewEnhanced;
+    [self.preview setLowLatencyPresentationEnabled:lowLatencyPresentation];
+    [self.outputPreview setLowLatencyPresentationEnabled:lowLatencyPresentation];
     [self.preview setDiagnosticsConfig:_configVersion epoch:_measurementEpoch];
     [self.outputPreview setDiagnosticsConfig:_configVersion epoch:_measurementEpoch];
     [self.preview setPresentationClockEpoch:_clockEpoch];

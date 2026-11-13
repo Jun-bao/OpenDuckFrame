@@ -79,6 +79,9 @@ a requested processing mode, not a guarantee of a particular displayed frame rat
 Live Apple low latency fits inference to the device's supported size and restores
 generated frames to source dimensions. The workbench shows the inference size;
 reduced inference can soften generated detail. File input retains its native size requirements.
+Enhanced live output also reserves at least 80 ms of adaptive buffering, subject to
+time/memory caps, and keeps eligible frames in order within a bounded lag window.
+This trades some input responsiveness for more consistent delivery; it does not guarantee 60 FPS.
 
 When local-video frame generation cannot keep up, the original picture is kept and
 late generated frames are discarded instead of delaying playback. This does not

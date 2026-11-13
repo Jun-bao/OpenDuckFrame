@@ -11,6 +11,7 @@ Build inputs and target configuration live in [Apps/Mac/project.yml](../Apps/Mac
 - [l10n.py](l10n.py) provides status, export/merge and `check --full` for localized strings.
 - `test_*.sh` wrappers cover specific policies or integrations. Read the selected script for prerequisites and side effects.
 - [test_apple_live_size.sh](test_apple_live_size.sh) needs a built Debug app and Apple low-latency runtime support; it checks real inference and live activation without screen recording or physical presentation.
+- [test_live_display_queue.sh](test_live_display_queue.sh) checks live display queue selection on CPU. [probe_apple_live_presentation.sh](probe_apple_live_presentation.sh) needs a built Debug app, an active graphical session and Apple low-latency support; it opens an owned window for 23 seconds and records actual presentation. Run GPU comparisons sequentially, with the same source profile and display conditions.
 - [verify_app_bundle.sh](verify_app_bundle.sh) checks a supplied packaged app and its manifest/dependency closure.
 - [lib/build_common.sh](lib/build_common.sh) and [lib/deps_lock.py](lib/deps_lock.py) provide shared dependency/staging logic.
 - [patches/README.md](patches/README.md) records downstream FFmpeg invariants.

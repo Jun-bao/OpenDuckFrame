@@ -49,6 +49,13 @@ conservative 720p pixel budget. Generated frames are resized back to the capture
 source dimensions; original frames, timestamps and output geometry are preserved.
 The workbench reports the actual inference size. This resizing does not enable
 super resolution and can soften generated detail. File preparation is unchanged.
+For enhanced live output, Apple low latency requests a minimum 80 ms adaptive
+buffer, subject to the existing delay and memory caps. The presenter keeps the
+oldest eligible frame within two observed refresh periods, then catches up to
+the latest frame when all queued frames are stale. This reduces avoidable
+supersession at the cost of extra input delay; queue capacity remains bounded.
+It does not change the model or promise a fixed achieved FPS. RIFE, FRC and
+source-only presentation retain their existing policies.
 The player's Motion+ menu remains a separate off/double-rate FRC control.
 RIFE 4.26 and DistilDRBA remain hidden experimental backends.
 
