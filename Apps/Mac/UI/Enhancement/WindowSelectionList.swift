@@ -13,7 +13,7 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
     }
     private let select: (SCWindow) -> Void
     private var entries: [Entry] = []
-    private var refreshGeneration = 0
+    private var loading = false
     private var updating = false
     private var selectedID: CGWindowID?
     private let table = NSTableView()
@@ -64,18 +64,27 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
     required init?(coder: NSCoder) { nil }
 
     @objc private func refreshRequested() {
-        if !CGPreflightScreenCaptureAccess() { _ = CGRequestScreenCaptureAccess() }
         reloadWindows()
     }
 
     @objc func reloadWindows() {
-        refreshGeneration += 1
-        let generation = refreshGeneration
+        guard !loading else { return }
+        loading = true
+        guard ScreenCapturePermission.shared.ensureAccess() else {
+            loading = false
+            updating = true
+            entries = []
+            table.reloadData()
+            updating = false
+            footer.stringValue = EnhancementText.t("Allow Screen Recording in System Settings, then restart the app.", "请在系统设置中允许录屏，然后重新打开应用。")
+            return
+        }
         footer.stringValue = EnhancementText.t("Loading windows…", "正在获取窗口…")
         Task { @MainActor [weak self] in
+            defer { self?.loading = false }
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
-                guard let self, generation == self.refreshGeneration else { return }
+                guard let self else { return }
                 let bounds = content.displays.map { CGDisplayBounds($0.displayID) }
                 let ownPID = ProcessInfo.processInfo.processIdentifier
                 self.entries = content.windows.compactMap { window in
@@ -105,7 +114,7 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
                     ? EnhancementText.t("No windows found. Check Screen Recording permission, then refresh.", "没有找到窗口，请检查屏幕录制权限后刷新。")
                     : String(format: EnhancementText.t("%d windows · ★ estimated full screen first · includes off-screen windows", "共 %d 个窗口（★按尺寸估计全屏并优先；包含其他空间或未显示的窗口）"), self.entries.count)
             } catch {
-                guard let self, generation == self.refreshGeneration else { return }
+                guard let self else { return }
                 self.updating = true
                 self.entries = []
                 self.table.reloadData()

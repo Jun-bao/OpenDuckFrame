@@ -1990,7 +1990,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             self.capture.start(filter: SCContentFilter(desktopIndependentWindow: selected))
         }
         windowSelectionList = windows
-        DispatchQueue.main.async { [weak windows] in windows?.reloadWindows() }
+        DispatchQueue.main.async { [weak self, weak windows] in
+            if self?.profile.sourceKind == "window" { windows?.reloadWindows() }
+        }
         return column([sourceKindControl, windows, formGroup([currentRow])], spacing: 10)
     }
 
@@ -3899,6 +3901,11 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     @objc private func refreshShareable() {
+        guard ScreenCapturePermission.shared.ensureAccess() else {
+            statusLabel.stringValue = EnhancementText.t("Allow Screen Recording in System Settings, then restart the app.", "请在系统设置中允许录屏，然后重新打开应用。")
+            statusLabel.textColor = .systemOrange
+            return
+        }
         capture.refreshShareable { [weak self] result in
                 guard let self else { return }
                 switch result {
@@ -4079,6 +4086,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private func selectFocusedWindow(_ target: TargetOverlayPolicy.WindowMetadata?, ticket: UInt64) {
         guard let target else {
             failDelayedSelection(EnhancementText.t("No active app window. Try again and switch to the window to enhance.", "未找到聚焦的应用窗口，请重试并切到要增强的窗口。"))
+            return
+        }
+        guard ScreenCapturePermission.shared.ensureAccess() else {
+            failDelayedSelection(EnhancementText.t("Allow Screen Recording in System Settings, then restart the app.", "请在系统设置中允许录屏，然后重新打开应用。"))
             return
         }
         statusLabel.stringValue = EnhancementText.t("Preparing the active window…", "正在准备聚焦窗口…")
