@@ -36,6 +36,12 @@ The workbench offers ODF-VFI, Apple low-latency interpolation and Apple frame-ra
 Automatic hardware/configuration detection is deferred. Keep new recommendations or automatic tuning within an explicit task.
 Preserve internal SP symbols and existing interfaces unless the task calls for their migration.
 
+## Hardware optimization scope
+
+Optimize the product for supported devices, not for the owner's particular computer. A personal test machine is a validation sample, not a product requirement. Do not add per-owner performance recipes, device-model whitelists or fixed capture/processing sizes copied from that machine's screen.
+Use shared processing paths and capability-based limits: actual input geometry, available APIs, memory budgets and measured processing/presentation performance. Genuine platform compatibility restrictions must follow documented API requirements; keep them separate from performance tuning. Do not fix an existing device-specific optimization merely by adding another model identifier to its whitelist.
+Keep performance and quality claims limited to the hardware, inputs and settings actually tested. One successful device test does not establish support or stable FPS for a whole chip family. These rules guide future changes; they do not authorize unrelated removal or refactoring of existing optimizations.
+
 ## Git collaboration
 
 Fetch and inspect the current target branch before development. Use the remote default branch when none is specified.

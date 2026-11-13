@@ -16,15 +16,18 @@ struct AirBetaSizeChoice {
     AirBetaSizeFailure failure = AirBetaSizeFailure::invalidCapture;
 };
 
-inline AirBetaSizeChoice airBetaSize(int width, int height) {
+// Bound an owned BGRA capture by bytes, independently of panel dimensions or
+// orientation. Runtime callers further limit this to the GPU working-set budget.
+inline AirBetaSizeChoice airBetaSize(int width, int height, uint64_t captureByteLimit = 64ULL * 1024 * 1024) {
     AirBetaSizeChoice result;
     result.captureWidth = width; result.captureHeight = height;
     if (width < 2 || height < 2 || (width & 1) || (height & 1)) return result;
-    if (width > 2648 || height > 1668) {
+    if (width > 16384 || height > 16384 || (uint64_t)width * height > captureByteLimit / 4) {
         result.failure = AirBetaSizeFailure::outsideEnvelope;
         return result;
     }
-    constexpr int64_t maximumArea = 1814LL * 1142;
+    // Shared Fast fallback budget: at most 1080p area, with 256-pixel model padding.
+    constexpr int64_t maximumArea = 1920LL * 1080;
     const double area = (double)width * (double)height;
     result.scale = std::min({1.0, std::sqrt((double)maximumArea / area), 2048.0 / width, 1280.0 / height});
     int processingWidth = 2 * (int)std::floor(width * result.scale / 2.0 + 0.5);

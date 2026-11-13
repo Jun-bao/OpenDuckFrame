@@ -1,12 +1,15 @@
 #pragma once
 
-#include <cstring>
 #include <cstdint>
+#include <cmath>
 
 namespace sp {
 
 struct AirWindowOptimizationInput {
-    const char *hardware = "";
+    bool metalAvailable = false;
+    bool appleGPU = false;
+    bool unifiedMemory = false;
+    uint64_t captureByteLimit = 0;
     int64_t sourceKind = 0;
     bool interpolation = false;
     bool rife425 = false;
@@ -22,13 +25,21 @@ struct AirWindowOptimizationInput {
     bool compiled = false;
 };
 
-inline bool airWindowHardwareSupported(const char *hardware) {
-    return hardware && (!std::strcmp(hardware, "Mac15,12") || !std::strcmp(hardware, "Mac15,13"));
+inline bool airWindowCapabilitiesSupported(const AirWindowOptimizationInput &input) {
+    return input.metalAvailable && input.appleGPU && input.unifiedMemory && input.captureByteLimit > 0;
+}
+
+// Preparation timings decide whether the ordinary full-size path has enough
+// headroom for one generated picture per display interval. This is admission
+// evidence, not a promise of sustained presentation FPS.
+inline bool airWindowNativeFits(double taskMs, double refreshHz) {
+    return std::isfinite(taskMs) && taskMs > 0 && std::isfinite(refreshHz) && refreshHz > 0 &&
+        taskMs <= 0.75 * 1000.0 / refreshHz;
 }
 
 inline const char *airWindowOptimizationReason(const AirWindowOptimizationInput &input) {
     if (!input.compiled) return "feature-not-compiled";
-    if (!airWindowHardwareSupported(input.hardware)) return "hardware-not-supported";
+    if (!airWindowCapabilitiesSupported(input)) return "required-gpu-capabilities-unavailable";
     if (input.sourceKind != 1) return "source-is-not-window";
     if (!input.interpolation || !input.rife425) return "requires-rife-4.25";
     if (!input.fast) return "requires-fast-quality";
