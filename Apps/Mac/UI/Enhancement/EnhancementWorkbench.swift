@@ -1792,11 +1792,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             icon.heightAnchor.constraint(equalToConstant: 22).isActive = true
             let name = NSTextField(labelWithString: "OpenDuckFrame")
             name.font = WorkbenchStyle.brandFont
-            let shortVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
-            let version = NSTextField(labelWithString: "v" + shortVersion)
-            version.font = WorkbenchStyle.captionFont
-            version.textColor = .secondaryLabelColor
-            let brand = NSStackView(views: [icon, name, version])
+            let brand = NSStackView(views: [icon, name])
             brand.alignment = .centerY
             brand.spacing = 6
             item.view = brand
