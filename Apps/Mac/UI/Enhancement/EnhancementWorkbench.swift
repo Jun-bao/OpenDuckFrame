@@ -76,6 +76,11 @@ private enum WorkbenchStyle {
             ("低延迟不能表达固定帧率里的任意相位。请改用 Apple 帧率转换，或改成 X2 / X4。", "For a fixed frame rate, use Apple frame-rate conversion, or choose X2 / X4."),
             ("低延迟只提供 1/2，或 1/4、1/2、3/4。X3 的 1/3 和 2/3 不会被改写，可改用 Apple 帧率转换。", "Low-latency interpolation supports X2 or X4; use Apple frame-rate conversion for X3."),
             ("该动画超分当前使用 2× 来源尺寸。", "This animation scaler currently uses 2× the source size."),
+            ("苹果超分不支持当前输入尺寸或输出倍率，请缩小超分输入尺寸并选择自动输出。", "Apple super resolution does not support this input or output. Reduce the SR input size and choose automatic output."),
+            ("正在准备苹果视频超分模型，可能需要下载", "Preparing the Apple video super resolution model; a download may be needed"),
+            ("苹果视频超分不支持当前输入尺寸或倍率。", "Apple video super resolution does not support this input or factor."),
+            ("苹果视频超分的实时输出尺寸过大，请选择自动输出或更小尺寸。", "The live Apple video super resolution output is too large. Choose automatic or a smaller output."),
+            ("苹果实时超分不支持当前视频尺寸或倍率。", "Apple real-time super resolution does not support this video size or factor."),
             ("准备失败，仍使用上一份可用计划", "Preparation failed; the previous plan remains active."),
             ("引擎还没有准备好", "The engine is not ready yet."),
             ("输出尺寸无效", "Invalid output size."),
@@ -634,21 +639,23 @@ enum LiveEngineSelection {
     }
 }
 
-enum ArtCNNSRSelection {
-    static let ids = ["artcnn.c4f32", "artcnn.c4f16"]
+enum AppleSRSelection {
+    static let ids = ["apple.low-sr", "apple.video-sr"]
     static func contains(_ id: String) -> Bool { ids.contains(id) }
     static func fromPopup(_ index: Int) -> String { ids.indices.contains(index) ? ids[index] : ids[0] }
     static func popupIndex(_ id: String) -> Int { ids.firstIndex(of: id) ?? 0 }
-    static func title(_ id: String) -> String { id == ids[1] ? "ArtCNN C4F16" : "ArtCNN C4F32" }
+    @MainActor static func title(_ id: String) -> String {
+        id == "apple.video-sr" ? EnhancementText.t("Apple video super resolution", "苹果视频超分") : EnhancementText.t("Apple real-time super resolution", "苹果实时超分")
+    }
 
     static func normalize(_ profile: inout EnhancementProfile) {
         if !contains(profile.scaleEngineID) {
             profile.scaleEngineID = ids[0]
             profile.outputWidth = 0
             profile.outputHeight = 0
-            if profile.srInputPreset == 0 { profile.srInputPreset = 1080 }
+            if profile.srInputPreset == 0 || profile.srInputPreset == 1080 { profile.srInputPreset = 720 }
         }
-        if ![0, 480, 720, 1080].contains(profile.srInputPreset) { profile.srInputPreset = 1080 }
+        if ![0, 480, 720, 1080].contains(profile.srInputPreset) { profile.srInputPreset = 720 }
         profile.scaleQualityID = "none"
     }
 }
@@ -680,9 +687,9 @@ struct EnhancementProfile: Codable, Equatable {
     var rifeStreamEnabled = true
     var rate = RateRequest.multiplier(2)
     var scaleEnabled = false
-    var scaleEngineID = "artcnn.c4f32"
+    var scaleEngineID = "apple.low-sr"
     var scaleQualityID = "none"
-    var srInputPreset = 1080
+    var srInputPreset = 720
     var sourceWindowPreset = 0
     var outputWidth = 0
     var outputHeight = 0
@@ -729,8 +736,8 @@ private func applyAirBetaPreset(_ profile: inout EnhancementProfile) {
     profile.modelID = "rife-v4.25"
     profile.rate = .multiplier(2)
     profile.scaleEnabled = false
-    profile.scaleEngineID = "artcnn.c4f32"
-    profile.srInputPreset = 1080
+    profile.scaleEngineID = "apple.low-sr"
+    profile.srInputPreset = 720
     profile.sourceWindowPreset = 0
     profile.outputWidth = 0
     profile.outputHeight = 0
@@ -758,8 +765,8 @@ enum EnhancementProfileStore {
     static func decode(_ data: Data, fallbackName: String) -> EnhancementProfile? {
         guard var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         object["rifeStreamEnabled"] = true
-        if object["srInputPreset"] == nil { object["srInputPreset"] = 1080 }
-        if object["scaleEngineID"] == nil { object["scaleEngineID"] = "artcnn.c4f32" }
+        if object["srInputPreset"] == nil { object["srInputPreset"] = 720 }
+        if object["scaleEngineID"] == nil { object["scaleEngineID"] = "apple.low-sr" }
         if object["sourceWindowPreset"] == nil { object["sourceWindowPreset"] = 0 }
         if object["captureLimit"] == nil { object["captureLimit"] = "auto" }
         object["windowOutputMode"] = "follow"
@@ -772,7 +779,7 @@ enum EnhancementProfileStore {
               var profile = try? JSONDecoder().decode(EnhancementProfile.self, from: normalized),
               profile.schemaVersion == 1 else { return nil }
         LiveEngineSelection.normalize(&profile)
-        ArtCNNSRSelection.normalize(&profile)
+        AppleSRSelection.normalize(&profile)
         return profile
     }
 
@@ -786,7 +793,7 @@ enum EnhancementProfileStore {
 
     static func save(_ profile: EnhancementProfile) throws {
         var profile = profile
-        ArtCNNSRSelection.normalize(&profile)
+        AppleSRSelection.normalize(&profile)
         let url = fileURL()
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let data = try JSONEncoder().encode(profile)
@@ -829,7 +836,7 @@ enum EnhancementProfileStore {
 
     static func savePreset(_ profile: EnhancementProfile, id: String) throws {
         var profile = profile
-        ArtCNNSRSelection.normalize(&profile)
+        AppleSRSelection.normalize(&profile)
         guard presets.contains(where: { $0.id == id }) else { throw CocoaError(.fileWriteInvalidFileName) }
         let dir = presetDirectory()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -891,7 +898,7 @@ enum EnhancementProfileStore {
 
     static func saveNamed(_ profile: EnhancementProfile) throws {
         var copy = profile
-        ArtCNNSRSelection.normalize(&copy)
+        AppleSRSelection.normalize(&copy)
         copy.configName = safeName(profile.configName)
         let url = namedDirectory().appendingPathComponent(copy.configName + ".json")
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -958,7 +965,7 @@ enum EnhancementProfileStore {
         profile.interpolationQuality = "quality"
         profile.rate = .fixedFPS(numerator: 60000, denominator: 1001)
         profile.scaleEnabled = true
-        profile.scaleEngineID = "artcnn.c4f16"
+        profile.scaleEngineID = "apple.low-sr"
         profile.outputWidth = 1920
         profile.outputHeight = 1080
         profile.viewMode = "compare"
@@ -1206,7 +1213,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private let scalePopup = NSPopUpButton()
     private let scaleQualityPopup = NSPopUpButton()
     private var scaleQualityRow: NSView?
-    private var artCNNLibraryButtons: [String: NSButton] = [:]
+    private var srLibraryButtons: [String: NSButton] = [:]
     private let sizePopup = AnchoredPopUpButton()
     private let srInputPopup = NSPopUpButton()
     private let srInputHelp = NSButton(title: "", target: nil, action: nil)
@@ -1215,6 +1222,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private var srInputRow: NSView?
     private var sourceWindowRow: NSView?
     private let sourceWindowHint = FittingLabel(wrappingLabelWithString: "")
+    private let srInputHint = FittingLabel(wrappingLabelWithString: "")
     private var sourceWindowPreparing = false
     private var sourceWindowConfirmedAfter: UInt64 = 0
     private var sourceWindowConfirmedStarted: TimeInterval = 0
@@ -2278,6 +2286,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             srInputHelp.setAccessibilityLabel(EnhancementText.t("SR input size help", "超分输入尺寸帮助"))
             let srRow = row(EnhancementText.t("SR input size", "超分输入尺寸"), srInputPopup, help: srInputHelp)
             srInputRow = srRow
+            srInputHint.stringValue = EnhancementText.t("Larger inputs are reduced before super resolution; detail may be lost.", "大于输入尺寸的画面会先缩小，可能损失细节。")
+            srInputHint.font = WorkbenchStyle.captionFont
+            srInputHint.textColor = .secondaryLabelColor
+            srInputHint.maximumNumberOfLines = 0
             sourceWindowHelp.bezelStyle = .helpButton
             sourceWindowHelp.setAccessibilityLabel(EnhancementText.t("Source window size help", "来源窗口尺寸帮助"))
             sourceWindowHelp.toolTip = EnhancementText.t("The selected window is resized before capture. The video must fill that window for the video itself to be 720p; browser toolbars and borders are not video. Requires Accessibility permission and a resizable window. Try 720p first; final clarity depends on the source and engine.", "开始时会调整所选来源窗口，再采集画面。视频须铺满该窗口，视频本身才可能是720p；浏览器工具栏和边框不是视频。需要辅助功能权限且窗口可调整大小。建议先从720p试起，最终清晰度取决于片源与引擎。")
@@ -2290,7 +2302,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             let dimensions = row("W×H", pair(widthField, heightField, joinedBy: "×"))
             dimensionRow = dimensions
             let scale = column([row(EnhancementText.t("Technology", "技术"), scalePopup), qualityRow,
-                                srRow, windowRow, sourceWindowHint,
+                                srRow, srInputHint, windowRow, sourceWindowHint,
                                 row(EnhancementText.t("Output size", "输出尺寸"), sizePopup),
                                 dimensions], spacing: 0)
             scale.setCustomSpacing(8, after: sourceWindowHint)
@@ -2441,8 +2453,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             EnhancementText.t("Quality-oriented video processing. Availability and speed depend on the device.", "偏向视频画质，可用性与速度取决于设备。"),
             "apple.frc|vt.frc.normal", enabled: true))
         stack.addArrangedSubview(heading(EnhancementText.t("Scale and super-resolution", "缩放与超分")))
-        stack.addArrangedSubview(libraryRow("ArtCNN C4F32", EnhancementText.t("2× enhancement with more detail.", "2× 增强，画质优先。"), "scale|artcnn.c4f32", enabled: true))
-        stack.addArrangedSubview(libraryRow("ArtCNN C4F16", EnhancementText.t("Lightweight 2× enhancement.", "2× 增强，速度优先。"), "scale|artcnn.c4f16", enabled: true))
+        stack.addArrangedSubview(libraryRow(AppleSRSelection.title("apple.low-sr"), EnhancementText.t("Low-latency super resolution for real-time use.", "适合实时使用的低延迟超分。"), "scale|apple.low-sr", enabled: true))
+        stack.addArrangedSubview(libraryRow(AppleSRSelection.title("apple.video-sr"), EnhancementText.t("Apple video super resolution; its system model may need downloading.", "苹果视频超分，可能需要下载系统模型。"), "scale|apple.video-sr", enabled: true))
         return stack
     }
 
@@ -2478,10 +2490,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         if enabled {
             let use = button(EnhancementText.t("Use", "使用"), #selector(useLibrary(_:)), primary: true)
             use.identifier = NSUserInterfaceItemIdentifier(identifier)
-            if identifier.hasPrefix("scale|artcnn.") {
+            if identifier.hasPrefix("scale|apple.") {
                 let id = String(identifier.dropFirst(6))
-                artCNNLibraryButtons[id] = use
-                use.isEnabled = SPArtCNNSR.isPackagedForThisSystem()
+                srLibraryButtons[id] = use
+                use.isEnabled = id == "apple.video-sr" ? SPAppleVideoSR.isSupported() : SPAppleLowLatencySR.isSupported()
             }
             line.addArrangedSubview(use)
         } else {
@@ -2566,7 +2578,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             profile.modelID = "rife-v4.25"
             profile.rate = .multiplier(2)
             profile.scaleEnabled = true
-            profile.scaleEngineID = "artcnn.c4f32"
+            profile.scaleEngineID = "apple.low-sr"
             profile.outputWidth = 0
             profile.outputHeight = 0
         case "preset:film":
@@ -2576,7 +2588,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             profile.modelID = "rife-v4.25"
             profile.rate = .multiplier(2)
             profile.scaleEnabled = true
-            profile.scaleEngineID = "artcnn.c4f32"
+            profile.scaleEngineID = "apple.low-sr"
             profile.outputWidth = 0
             profile.outputHeight = 0
         case "preset:anime":
@@ -2586,7 +2598,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             profile.interpolationQuality = "fast"
             profile.rate = .multiplier(2)
             profile.scaleEnabled = true
-            profile.scaleEngineID = "artcnn.c4f32"
+            profile.scaleEngineID = "apple.low-sr"
             profile.outputWidth = 0
             profile.outputHeight = 0
         default:
@@ -2945,7 +2957,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let parts = (sender.identifier?.rawValue ?? "").split(separator: "|").map(String.init)
         guard let id = parts.first, !id.isEmpty else { return }
         if id == "scale", parts.count > 1 {
-            guard ArtCNNSRSelection.contains(parts[1]), SPArtCNNSR.isPackagedForThisSystem() else { return }
+            guard AppleSRSelection.contains(parts[1]), (parts[1] == "apple.video-sr" ? SPAppleVideoSR.isSupported() : SPAppleLowLatencySR.isSupported()) else { return }
             profile.outputWidth = 0; profile.outputHeight = 0
             profile.scaleEnabled = true
             profile.scaleEngineID = parts[1]
@@ -3092,7 +3104,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         enginePopup.action = #selector(engineChanged)
         qualityPopup.addItems(withTitles: ["fast", "balanced", "hq"])
         fpsPopup.addItems(withTitles: ["24", "25", "30", "50", "60", "90", "120", EnhancementText.t("Custom", "自定义")])
-        scalePopup.addItems(withTitles: ArtCNNSRSelection.ids.map(ArtCNNSRSelection.title))
+        scalePopup.addItems(withTitles: AppleSRSelection.ids.map(AppleSRSelection.title))
         scaleQualityPopup.addItems(withTitles: [EnhancementText.t("Off", "不降噪"), EnhancementText.t("Low", "轻度"), EnhancementText.t("Medium", "中等"), EnhancementText.t("Strong", "强")])
         srInputPopup.addItems(withTitles: [EnhancementText.t("Source size", "保持采集尺寸"), "480p (≤854×480)", "720p (≤1280×720)", "1080p (≤1920×1080)"])
         sourceWindowPopup.addItems(withTitles: [EnhancementText.t("Keep current size", "保持当前尺寸"), "480p (854×480)", "720p (1280×720)", "1080p (1920×1080)"])
@@ -3365,16 +3377,17 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private func updateSRCapability() {
         if SPRifeExperiments.airBeta { applyModeVisibility(); return }
-        let packaged = SPArtCNNSR.isPackagedForThisSystem()
-        for (index, id) in ArtCNNSRSelection.ids.enumerated() {
-            scalePopup.item(at: index)?.isEnabled = packaged
-            artCNNLibraryButtons[id]?.isEnabled = packaged
+        for (index, id) in AppleSRSelection.ids.enumerated() {
+            let supported = id == "apple.video-sr" ? SPAppleVideoSR.isSupported() : SPAppleLowLatencySR.isSupported()
+            scalePopup.item(at: index)?.isEnabled = supported
+            srLibraryButtons[id]?.isEnabled = supported
         }
         applyModeVisibility()
     }
 
     private func selectOutputSize(_ w: Int, _ h: Int) {
         switch (w,h) {
+        case (0,0): sizePopup.selectItem(at: 5)
         case (1280,720): sizePopup.selectItem(at: 1)
         case (1920,1080): sizePopup.selectItem(at: 2)
         case (2560,1440): sizePopup.selectItem(at: 3)
@@ -4149,17 +4162,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 statusLabel.stringValue = EnhancementText.t("The source window size is invalid.", "来源窗口尺寸无效。")
                 statusLabel.textColor = .systemRed; return
             }
-            guard ArtCNNSRSelection.contains(snapshot.scaleEngineID) else {
-                statusLabel.stringValue = EnhancementText.t("Choose a supported 2× scaling engine.", "请选择支持 2× 的缩放引擎。")
-                statusLabel.textColor = .systemRed; return
-            }
-            if !SPArtCNNSR.isPackagedForThisSystem() {
-                statusLabel.stringValue = EnhancementText.t("The selected 2× engine is unavailable in this build.", "当前安装包没有所选 2× 引擎。")
-                statusLabel.textColor = .systemRed; return
-            }
-            let width = snapshot.sourceWindowPreset == 480 ? 854 : (snapshot.sourceWindowPreset == 720 ? 1280 : 1920)
-            if (snapshot.outputWidth != width*2 || snapshot.outputHeight != snapshot.sourceWindowPreset*2) && !(snapshot.outputWidth == 0 && snapshot.outputHeight == 0) {
-                statusLabel.stringValue = EnhancementText.t("Choose the matching 2× output size.", "请选择与来源窗口匹配的 2× 输出尺寸。")
+            guard AppleSRSelection.contains(snapshot.scaleEngineID), (snapshot.scaleEngineID == "apple.video-sr" ? SPAppleVideoSR.isSupported() : SPAppleLowLatencySR.isSupported()) else {
+                statusLabel.stringValue = EnhancementText.t("The selected Apple super resolution is unavailable on this Mac.", "这台 Mac 不支持所选的苹果超分。")
                 statusLabel.textColor = .systemRed; return
             }
         }
@@ -4485,13 +4489,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let chosenWindowPreset = [0,480,720,1080][max(0,min(3,sourceWindowPopup.indexOfSelectedItem))]
         let windowPresetChanged = sourceKindControl.selectedSegment == 0 && chosenWindowPreset != profile.sourceWindowPreset
         let windowResizeSelected = sourceKindControl.selectedSegment == 0 && scaleSwitch.state == .on && chosenWindowPreset > 0
-        if windowResizeSelected && windowPresetChanged && ArtCNNSRSelection.ids.indices.contains(selectedEngine) {
-            let w = chosenWindowPreset == 480 ? 854 : (chosenWindowPreset == 720 ? 1280 : 1920)
-            selectOutputSize(w*2, chosenWindowPreset*2)
+        if windowResizeSelected && windowPresetChanged && AppleSRSelection.ids.indices.contains(selectedEngine) {
+            selectOutputSize(0, 0)
         }
-        let wasLanczos = !ArtCNNSRSelection.contains(profile.scaleEngineID)
-        if wasLanczos { srInputPopup.selectItem(at: [0,480,720,1080].firstIndex(of: profile.srInputPreset == 0 ? 1080 : profile.srInputPreset) ?? 3) }
-        let engineID = ArtCNNSRSelection.fromPopup(selectedEngine)
+        let wasLanczos = !AppleSRSelection.contains(profile.scaleEngineID)
+        if wasLanczos { srInputPopup.selectItem(at: [0,480,720,1080].firstIndex(of: profile.srInputPreset == 0 ? 720 : profile.srInputPreset) ?? 2) }
+        let engineID = AppleSRSelection.fromPopup(selectedEngine)
         let scaleJustEnabled = scaleSwitch.state == .on && !profile.scaleEnabled
         sizePopup.item(at: 5)?.isEnabled = true
         sizePopup.item(at: 0)?.isEnabled = false
@@ -4512,7 +4515,16 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     }
 
     private func applyModeVisibility() {
-        srInputRow?.isHidden = profile.sourceKind == "window"
+        srInputRow?.isHidden = profile.sourceKind == "file"
+        if profile.scaleEngineID == "apple.video-sr" {
+            srInputHint.stringValue = profile.sourceKind == "file"
+                ? EnhancementText.t("Apple video SR may reduce large inputs and download a system model.", "苹果视频超分可能先缩小大画面并下载系统模型。")
+                : EnhancementText.t("Apple video SR may reduce large inputs and download a system model. Turn off frame generation for window or display capture.", "苹果视频超分可能先缩小大画面并下载系统模型；采集窗口或显示器时请关闭帧生成。")
+        } else {
+            srInputHint.stringValue = profile.sourceKind == "file"
+                ? EnhancementText.t("Large inputs may be reduced before super resolution; detail may be lost.", "大尺寸画面可能先缩小，可能损失细节。")
+                : EnhancementText.t("Larger inputs are reduced before super resolution; detail may be lost.", "大于输入尺寸的画面会先缩小，可能损失细节。")
+        }
         sourceWindowRow?.isHidden = profile.sourceKind != "window"
         sourceWindowPopup.isEnabled = profile.sourceKind == "window" && profile.scaleEnabled
         sourceWindowHint.isHidden = profile.sourceKind != "window" || (profile.scaleEnabled && profile.sourceWindowPreset == 0)
@@ -4521,7 +4533,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             : EnhancementText.t("Scaling is off; the saved window size is not applied.", "缩放已关闭；已保存的窗口尺寸不会应用。")
         srInputPopup.isEnabled = profile.sourceKind != "file"
         let help = profile.sourceKind == "file"
-            ? EnhancementText.t("Video files use decoded pixels; this control applies to live capture.", "视频文件使用解码后的原始像素；此选项适用于实时采集。")
+            ? EnhancementText.t("The input size for video files is adjusted automatically to fit the selected Apple scaler.", "视频文件的输入尺寸会按所选苹果超分自动调整。")
             : EnhancementText.t("This reduces the captured image before scaling; it does not identify the source video resolution. Lower input may trade quality for speed and does not guarantee a sharper image.", "此选项会先缩小采集画面，再进行缩放；它不代表自动识别到了片源分辨率。较低输入尺寸可能以画质换速度，不保证画面更清晰。")
         srInputHelp.toolTip = help
         srInputPopup.toolTip = help
@@ -4536,8 +4548,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         // Width and height are only entered for a custom output size; presets name their size.
         dimensionRow?.isHidden = !editable
-        sizePopup.item(at: 0)?.title = EnhancementText.t("2× source (model native)", "2×来源（模型原生）")
-        sizePopup.item(at: 5)?.title = EnhancementText.t("2× source (model native)", "2×来源（模型原生）")
+        sizePopup.item(at: 0)?.title = EnhancementText.t("Automatic", "自动")
+        sizePopup.item(at: 5)?.title = EnhancementText.t("Automatic (supported factor)", "自动（支持的倍率）")
         scaleQualityRow?.isHidden = true
         let lowLatency = profile.interpolationEngineID == "apple.lowlatency"
         rateMode.setEnabled(!lowLatency, forSegment: 0)
@@ -4847,7 +4859,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             fileApplyError = EnhancementText.t("The selected display is unavailable.", "所选显示器不可用。")
             statusLabel.stringValue = fileApplyError; statusLabel.textColor = .systemRed; return
         }
-        guard !profile.scaleEnabled || ArtCNNSRSelection.contains(profile.scaleEngineID) else {
+        guard !profile.scaleEnabled || AppleSRSelection.contains(profile.scaleEngineID) else {
             fileApplyError = EnhancementText.t("This scaler is not connected to file playback yet.", "这个缩放引擎尚未接入文件播放。")
             statusLabel.stringValue = fileApplyError; statusLabel.textColor = .systemRed; return
         }
@@ -4959,7 +4971,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
 
     private func fileStatus() -> String {
         if !fileApplyError.isEmpty { return fileApplyError }
-        if profile.scaleEnabled && !ArtCNNSRSelection.contains(profile.scaleEngineID) { return EnhancementText.t("This scaler is not connected to file playback yet.", "这个缩放引擎尚未接入文件播放。") }
+        if profile.scaleEnabled && !AppleSRSelection.contains(profile.scaleEngineID) { return EnhancementText.t("This scaler is not connected to file playback yet.", "这个缩放引擎尚未接入文件播放。") }
         if profile.interpolationEnabled && !["apple.frc", "rife.metal", "apple.lowlatency", "distildrba.coreml"].contains(profile.interpolationEngineID) {
             return EnhancementText.t("This interpolation engine is not connected to file playback yet; current playback is unchanged.", "这个插帧引擎尚未接入文件播放，当前播放保持不变。")
         }
@@ -4975,7 +4987,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         let fps = player?.workbenchPresentedFPS ?? 0
         let size = player?.workbenchFileLanczosSize ?? (0, 0)
-        let scalerName = ArtCNNSRSelection.title(active.scaleEngineID)
+        let scalerName = AppleSRSelection.title(active.scaleEngineID)
         let scaler = (player?.workbenchFileLanczosActive ?? false) ? "\(scalerName) \(size.0)×\(size.1) · " : ""
         return scaler + mode + (fps > 0 ? String(format: " · %.1f FPS", fps) : "")
     }
@@ -4992,7 +5004,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         var profile = snapshot ?? self.profile
         applyAirBetaPreset(&profile)
         LiveEngineSelection.normalize(&profile)
-        ArtCNNSRSelection.normalize(&profile)
+        AppleSRSelection.normalize(&profile)
         let request = SPLivePlanRequest()
         if profile.sourceKind == "file" {
             request.captureSourceKind = .file
@@ -5028,8 +5040,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         }
         request.scaleEnabled = profile.scaleEnabled
         request.scaleQualityID = profile.scaleQualityID
-        request.scaleEngine = profile.scaleEngineID == "artcnn.c4f16" ? .artCNN16 : .artCNN32
-        request.srInputPreset = Int32(profile.sourceKind == "window" || profile.sourceKind == "file" ? 0 : profile.srInputPreset)
+        request.scaleEngine = profile.scaleEngineID == "apple.video-sr" ? .appleVideoSR : .appleLowLatencySR
+        request.srInputPreset = Int32(profile.sourceKind == "file" ? 0 : profile.srInputPreset)
         if profile.sourceWindowResizeActive, case let .window(id, owner) = capture.target {
             request.requiredSourceWidth = Int32(profile.sourceWindowPreset == 480 ? 854 : (profile.sourceWindowPreset == 720 ? 1280 : 1920))
             request.requiredSourceHeight = Int32(profile.sourceWindowPreset)
@@ -5100,7 +5112,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let liveEngine = processor.resolvedPlan.engineID ?? ""
         let liveModel = processor.resolvedPlan.modelID ?? ""
         let scaleEngine = processor.resolvedPlan.scaleEngineID ?? ""
-        let scaleName = ArtCNNSRSelection.contains(scaleEngine) ? ArtCNNSRSelection.title(scaleEngine) : scaleEngine
+        let scaleName = AppleSRSelection.contains(scaleEngine) ? AppleSRSelection.title(scaleEngine) : scaleEngine
         let parts = [processor.resolvedPlan.interpolationActive ? "\(liveEngine) \(liveModel)" : "", processor.resolvedPlan.scaleActive ? scaleName : ""].filter { !$0.isEmpty }.joined(separator: " + ")
         let live: String
         if profile.sourceKind == "file" {
@@ -5203,7 +5215,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
     private func loadControls() {
         applyAirBetaPreset(&profile)
         LiveEngineSelection.normalize(&profile)
-        ArtCNNSRSelection.normalize(&profile)
+        AppleSRSelection.normalize(&profile)
         interpolationSwitch.state = profile.interpolationEnabled ? .on : .off
         enginePopup.selectItem(at: LiveEngineSelection.engines.firstIndex(of: profile.interpolationEngineID) ?? 0)
         reloadQualityItems()
@@ -5211,10 +5223,10 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         loadRateControls()
         scaleSwitch.state = profile.scaleEnabled ? .on : .off
         sourceWindowPopup.selectItem(at: [0,480,720,1080].firstIndex(of: profile.sourceWindowPreset) ?? 0)
-        srInputPopup.selectItem(at: [0, 480, 720, 1080].firstIndex(of: profile.srInputPreset) ?? 3)
+        srInputPopup.selectItem(at: [0, 480, 720, 1080].firstIndex(of: profile.sourceKind == "file" ? 720 : profile.srInputPreset) ?? 2)
         scaleQualityPopup.selectItem(at: ["none", "light", "medium", "strong"].firstIndex(of: profile.scaleQualityID) ?? 0)
         updateSRCapability()
-        scalePopup.selectItem(at: ArtCNNSRSelection.popupIndex(profile.scaleEngineID))
+        scalePopup.selectItem(at: AppleSRSelection.popupIndex(profile.scaleEngineID))
         sizePopup.item(at: 5)?.isEnabled = true
         sizePopup.item(at: 0)?.isEnabled = false
         switch (profile.outputWidth, profile.outputHeight) {
@@ -5332,8 +5344,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         loadRateControls()
         profile.scaleEnabled = scaleSwitch.state == .on
         if profile.sourceKind == "window" { profile.sourceWindowPreset = [0,480,720,1080][max(0,min(3,sourceWindowPopup.indexOfSelectedItem))] }
-        if profile.sourceKind != "window" && profile.sourceKind != "file" { profile.srInputPreset = [0, 480, 720, 1080][max(0, min(3, srInputPopup.indexOfSelectedItem))] }
-        profile.scaleEngineID = ArtCNNSRSelection.fromPopup(scalePopup.indexOfSelectedItem)
+        if profile.sourceKind != "file" { profile.srInputPreset = [0, 480, 720, 1080][max(0, min(3, srInputPopup.indexOfSelectedItem))] }
+        profile.scaleEngineID = AppleSRSelection.fromPopup(scalePopup.indexOfSelectedItem)
         profile.scaleQualityID = "none"
         switch sizePopup.indexOfSelectedItem {
         case 0: profile.outputWidth = 0; profile.outputHeight = 0

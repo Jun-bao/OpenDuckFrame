@@ -5,10 +5,16 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-/// Experimental component only. The caller keeps its own bounded scheduling,
-/// applies generation/config checks and does not use this as a synchronous scaler.
+/// The caller owns bounded scheduling and generation/config checks.
 @interface SPAppleLowLatencySR : NSObject
++ (BOOL)isSupported;
 + (NSArray<NSNumber *> *)supportedFactorsForWidth:(int)width height:(int)height;
+/// An optional maximum input box, aligned for supported fractional factors.
++ (NSSize)inputSizeForWidth:(int)width height:(int)height preset:(int)preset;
+/// Largest supported factor with an even output, or NSZeroSize when unavailable.
++ (NSSize)automaticOutputForWidth:(int)width height:(int)height;
+/// File playback can reduce a decoded frame during the existing pixel transfer.
+@property (nonatomic) BOOL allowsInputResize;
 /// Called off the UI and live scheduling queues. A failed prepare leaves no session.
 - (BOOL)prepareWidth:(int)width height:(int)height scale:(float)scale error:(NSError *_Nullable *_Nullable)error;
 /// At most one job is in flight. The source is retained until the callback and

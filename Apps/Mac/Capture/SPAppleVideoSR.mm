@@ -46,6 +46,59 @@ static void SPVideoSREnd(id processor) { if (@available(macOS 15.4,*)) [(VTFrame
     if (_previousOutput) CVPixelBufferRelease(_previousOutput);
     if (_transfer) CFRelease(_transfer);
 }
++ (BOOL)isSupported {
+    if (@available(macOS 26.0,*)) return VTSuperResolutionScalerConfiguration.supported;
+    return NO;
+}
++ (NSSize)automaticInputForWidth:(int)width height:(int)height {
+    if (width < 4 || height < 4 || !self.isSupported) return NSZeroSize;
+    if (@available(macOS 26.0,*)) {
+        NSArray<NSNumber *> *factors = [VTSuperResolutionScalerConfiguration.supportedScaleFactors sortedArrayUsingSelector:@selector(compare:)];
+        for (NSNumber *number in factors) {
+            int factor = number.intValue;
+            if (factor < 2) continue;
+            double ratio = MIN(1.0, MIN(1920.0 / width, MIN(1080.0 / height,
+                MIN(3840.0 / ((double)width * factor), 2160.0 / ((double)height * factor)))));
+            int w = MAX(4, ((int)(width * ratio)) & ~3), h = MAX(4, ((int)(height * ratio)) & ~3);
+            VTSuperResolutionScalerConfiguration *config = [[VTSuperResolutionScalerConfiguration alloc]
+                initWithFrameWidth:w frameHeight:h scaleFactor:factor inputType:VTSuperResolutionScalerConfigurationInputTypeVideo
+                usePrecomputedFlow:NO qualityPrioritization:VTSuperResolutionScalerConfigurationQualityPrioritizationNormal revision:VTSuperResolutionScalerConfigurationRevision1];
+            if (config) return NSMakeSize(w,h);
+        }
+    }
+    return NSZeroSize;
+}
++ (NSSize)automaticOutputForWidth:(int)width height:(int)height {
+    if (width < 4 || height < 4 || !self.isSupported) return NSZeroSize;
+    if (@available(macOS 26.0,*)) {
+        for (NSNumber *number in [VTSuperResolutionScalerConfiguration.supportedScaleFactors sortedArrayUsingSelector:@selector(compare:)]) {
+            int factor = number.intValue;
+            if (factor < 2 || (int64_t)width * factor > 3840 || (int64_t)height * factor > 2160) continue;
+            VTSuperResolutionScalerConfiguration *config = [[VTSuperResolutionScalerConfiguration alloc]
+                initWithFrameWidth:width frameHeight:height scaleFactor:factor inputType:VTSuperResolutionScalerConfigurationInputTypeVideo
+                usePrecomputedFlow:NO qualityPrioritization:VTSuperResolutionScalerConfigurationQualityPrioritizationNormal revision:VTSuperResolutionScalerConfigurationRevision1];
+            if (config) return NSMakeSize(width * factor, height * factor);
+        }
+    }
+    return NSZeroSize;
+}
++ (void)ensureModelForWidth:(int)width height:(int)height scale:(int)scale completion:(void (^)(NSError *))completion {
+    if (@available(macOS 26.0,*)) {
+        VTSuperResolutionScalerConfiguration *config = [[VTSuperResolutionScalerConfiguration alloc]
+            initWithFrameWidth:width frameHeight:height scaleFactor:scale inputType:VTSuperResolutionScalerConfigurationInputTypeVideo
+            usePrecomputedFlow:NO qualityPrioritization:VTSuperResolutionScalerConfigurationQualityPrioritizationNormal revision:VTSuperResolutionScalerConfigurationRevision1];
+        if (!self.isSupported || !config) { completion(SPVideoSRError(2,@"苹果视频超分不支持当前输入尺寸或倍率。")); return; }
+        if (config.configurationModelStatus == VTSuperResolutionScalerConfigurationModelStatusReady) {
+            completion([self isReadyForWidth:width height:height scale:scale] ? nil : SPVideoSRError(2,@"苹果视频超分不支持当前画面格式或尺寸。")); return;
+        }
+        if (config.configurationModelStatus == VTSuperResolutionScalerConfigurationModelStatusDownloading) {
+            completion(SPVideoSRError(3,@"苹果视频超分模型正在下载，请稍后重试。")); return;
+        }
+        [config downloadConfigurationModelWithCompletionHandler:^(NSError *error) { completion(error); }];
+        return;
+    }
+    completion(SPVideoSRError(5,@"视频超分需要 macOS 26 或更高版本。"));
+}
 + (BOOL)isReadyForWidth:(int)width height:(int)height scale:(int)scale {
     if (width<2 || height<2 || scale<=1 || (int64_t)width*scale>3840 || (int64_t)height*scale>2160) return NO;
     if (@available(macOS 26.0,*)) {
@@ -118,7 +171,8 @@ static void SPVideoSREnd(id processor) { if (@available(macOS 15.4,*)) [(VTFrame
     if(tf) CFRelease(tf); if(hdr) return NO;
     __block id processor=nil; __block uint64_t seen=0;
     @synchronized(self) {
-        if (!_processor || _inflight || CVPixelBufferGetWidth(source)!=(size_t)_width || CVPixelBufferGetHeight(source)!=(size_t)_height) return NO;
+        if (!_processor || _inflight || (!self.allowsInputResize &&
+            (CVPixelBufferGetWidth(source)!=(size_t)_width || CVPixelBufferGetHeight(source)!=(size_t)_height))) return NO;
         _inflight=YES;processor=_processor;seen=_epoch;
     }
     CVPixelBufferRetain(source);
@@ -137,6 +191,11 @@ static void SPVideoSREnd(id processor) { if (@available(macOS 15.4,*)) [(VTFrame
         if(!self->_transfer)VTPixelTransferSessionCreate(NULL,&self->_transfer);
         if(!input || !self->_transfer || VTPixelTransferSessionTransferImage(self->_transfer,source,input)!=noErr){if(input)CVPixelBufferRelease(input);[self clearHistoryOnQueue];finish(NULL,SPVideoSRError(7,@"视频超分输入格式转换失败。"));return;}
         CVBufferPropagateAttachments(source,input);
+        if (self.allowsInputResize) {
+            CVBufferRemoveAttachment(input,kCVImageBufferCleanApertureKey);
+            CVBufferRemoveAttachment(input,kCVImageBufferPreferredCleanApertureKey);
+            CVBufferRemoveAttachment(input,kCVImageBufferDisplayDimensionsKey);
+        }
         CVPixelBufferRef output=SPVideoSRBuffer(self->_outWidth,self->_outHeight,self->_destinationFormat,self->_destinationAttributes);
         if(!output){CVPixelBufferRelease(input);[self clearHistoryOnQueue];finish(NULL,SPVideoSRError(8,@"视频超分输出分配失败。"));return;}
         CVBufferPropagateAttachments(source,output);
