@@ -12,6 +12,7 @@ static NSError *SPFileVideoSRError(NSInteger code, NSString *message) {
 @implementation SPFileAppleVideoSRScaler {
     SPAppleVideoSR *_engine;
     VTPixelTransferSessionRef _outputTransfer;
+    CVPixelBufferPoolRef _videoRangePool, _fullRangePool;
     int _sourceWidth, _sourceHeight, _outputWidth, _outputHeight;
     std::atomic<bool> _busy;
 }
@@ -43,7 +44,7 @@ static NSError *SPFileVideoSRError(NSInteger code, NSString *message) {
     _sourceWidth=sourceWidth; _sourceHeight=sourceHeight; _outputWidth=outputWidth; _outputHeight=outputHeight;
     return self;
 }
-- (void)dealloc { [_engine invalidate]; if (_outputTransfer) CFRelease(_outputTransfer); }
+- (void)dealloc { [_engine invalidate]; if (_outputTransfer) CFRelease(_outputTransfer); if (_videoRangePool) CFRelease(_videoRangePool); if (_fullRangePool) CFRelease(_fullRangePool); }
 - (int)outputWidth { return _outputWidth; }
 - (int)outputHeight { return _outputHeight; }
 - (NSDictionary<NSString *,id> *)submissionDiagnostics { NSMutableDictionary *d=[_engine.submissionDiagnostics mutableCopy];d[@"temporal"]=@NO;d[@"mode"]=@"Random";return d; }
@@ -76,10 +77,16 @@ static NSError *SPFileVideoSRError(NSInteger code, NSString *message) {
     BOOL submitted=[_engine submitRandomSource:source pts:CMTimeMake(ptsUs,1000000) token:0 completion:^(uint64_t token, CVPixelBufferRef output, double elapsed, NSError *failure) {
         (void)token; (void)elapsed;
         if (!output || failure) { if (output) CVPixelBufferRelease(output); CVPixelBufferRelease(source); self->_busy.store(false); completion(NULL,failure ?: SPFileVideoSRError(5,@"文件 Apple 视频超分（逐帧实验）失败。")); return; }
-        NSDictionary *attrs=@{(id)kCVPixelBufferIOSurfacePropertiesKey:@{},(id)kCVPixelBufferMetalCompatibilityKey:@YES};
+        CVPixelBufferPoolRef *pool=format==kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ? &self->_fullRangePool : &self->_videoRangePool;
+        if (!*pool) {
+            NSDictionary *attrs=@{(id)kCVPixelBufferWidthKey:@(self->_outputWidth),(id)kCVPixelBufferHeightKey:@(self->_outputHeight),(id)kCVPixelBufferPixelFormatTypeKey:@(format),(id)kCVPixelBufferIOSurfacePropertiesKey:@{},(id)kCVPixelBufferMetalCompatibilityKey:@YES};
+            CVPixelBufferPoolCreate(kCFAllocatorDefault,NULL,(__bridge CFDictionaryRef)attrs,pool);
+        }
+        NSDictionary *limit=@{(id)kCVPixelBufferPoolAllocationThresholdKey:@4};
         CVPixelBufferRef nv12=NULL;
-        CVReturn create=CVPixelBufferCreate(kCFAllocatorDefault,self->_outputWidth,self->_outputHeight,format,(__bridge CFDictionaryRef)attrs,&nv12);
+        CVReturn create=*pool ? CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault,*pool,(__bridge CFDictionaryRef)limit,&nv12) : kCVReturnError;
         if (nv12) {
+            CVBufferRemoveAllAttachments(nv12);
             // VT must see the target matrix and range before conversion.
             CVBufferPropagateAttachments(source,nv12);
             CVBufferRemoveAttachment(nv12,kCVImageBufferCleanApertureKey);
