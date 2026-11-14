@@ -5181,8 +5181,14 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         refreshActions()
         let awaitingStart = profile.sourceKind != "file" && capture.running && !isEnhancing
             && pendingApply == nil && !countdown.active && liveApplyFailure.isEmpty && reason.isEmpty
+            && statusLabel.textColor != .systemRed && statusLabel.textColor != .systemOrange
             && (profile.interpolationEnabled || profile.scaleEnabled)
-        let pending = (formDiffers || awaitingStart) ? EnhancementText.t("Pending", "待应用") + " \(Self.engineDisplayName(profile.interpolationEngineID, model: profile.modelID)) \(rate)" : ""
+        let pendingFeatures = [
+            profile.interpolationEnabled ? "\(Self.engineDisplayName(profile.interpolationEngineID, model: profile.modelID)) \(rate)" : "",
+            profile.scaleEnabled ? AppleSRSelection.title(profile.scaleEngineID) : ""
+        ].filter { !$0.isEmpty }.joined(separator: " + ")
+        let pending = (formDiffers || awaitingStart)
+            ? [EnhancementText.t("Pending", "待应用"), pendingFeatures].filter { !$0.isEmpty }.joined(separator: " ") : ""
         if awaitingStart {
             statusLabel.stringValue = [live, pending].filter { !$0.isEmpty }.joined(separator: " · ")
             statusLabel.textColor = .secondaryLabelColor

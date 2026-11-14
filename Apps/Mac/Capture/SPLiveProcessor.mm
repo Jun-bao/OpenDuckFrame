@@ -7395,7 +7395,8 @@ static NSDictionary *SPAirDelayAlignmentExport(const std::vector<SPAirDelayAlign
     // Window capture carries uneven video/UI timestamps. Reserve time for the
     // following source, conversion and a display slot before releasing X2/X4
     // output; the existing time/byte caps below still bound retained work.
-    if (_lowLatency && !_nativeBudgetActive) wanted = MAX(wanted, [self automaticVideoCadenceActive] ? 0.140 : 0.080);
+    if (_lowLatency && !_nativeBudgetActive && _request.viewMode == SPLiveViewEnhanced)
+        wanted = MAX(wanted, [self automaticVideoCadenceActive] ? 0.140 : 0.080);
     if (_lowLatency && [self requestUsesLowPrescale:_request width:_width height:_height] && _captureToOutputReadyNs.size() >= 8) {
         // Include actual capture-to-ready time, which also covers pre-scaling,
         // conversion, asynchronous delivery and comparison baseline work.
@@ -10031,7 +10032,18 @@ presentationHost:(int64_t)presentationHost
     request.outputWidth=1920; request.outputHeight=1080; request.viewMode=SPLiveViewCompare;
     request.captureCapFPS=60; request.displayRefreshHz=120; [p updateRequest:request];
     __block BOOL prepared=NO;
-    for(int i=0;i<600&&!prepared;i++) { usleep(10000); dispatch_sync(p->_q, ^{ prepared=p->_sessionReady && p->_lowLatency.width==1920 && p->_lowLatency.height==1080 && p->_resolved.committed; }); }
+    __block int inferenceWidth=0,inferenceHeight=0;
+    for(int i=0;i<600&&!prepared;i++) {
+        usleep(10000);
+        dispatch_sync(p->_q, ^{
+            inferenceWidth=p->_lowLatency.width; inferenceHeight=p->_lowLatency.height;
+            // Live inference may be fitted to device limits. Output geometry is
+            // checked independently below against the requested 1920x1080.
+            prepared=p->_sessionReady && inferenceWidth>0 && inferenceHeight>0 &&
+                inferenceWidth<=1920 && inferenceHeight<=1080 &&
+                !(inferenceWidth&1) && !(inferenceHeight&1) && p->_resolved.committed;
+        });
+    }
     if(!prepared) { NSString *reason=p.resolvedPlan.unavailableReason ?: @"prepare timeout"; [p stop]; for(auto f:frames)CVPixelBufferRelease(f); return @{ @"ok":@NO, @"prepared":@NO, @"error":reason }; }
     int64_t start=SPHostNow(),last=start;
     for(int i=0;i<count;i++) { SPWaitUntilHost(start+SPRationalToHost(sp::spMake(i,60))); last=SPHostNow(); [p pushPixelBuffer:frames[i%4] ptsNum:i ptsDen:60 host:last generation:1]; }
@@ -10047,9 +10059,10 @@ presentationHost:(int64_t)presentationHost
         sizeOK=p->_lastEnhanced && CVPixelBufferGetWidth(p->_lastEnhanced)==1920 && CVPixelBufferGetHeight(p->_lastEnhanced)==1080;
         baseline=p->_lastOriginal && CVPixelBufferGetWidth(p->_lastOriginal)==1920 && CVPixelBufferGetHeight(p->_lastOriginal)==1080;
         stats=[p currentStats]; pendingTrace=[p->_testPendingTrace copy] ?: @[]; });
-    SPLivePlanRequest *bad=[request copy]; bad.requestID=502; bad.outputWidth=1918; [p updateRequest:bad];
+    // Size fitting can accept the old 1918px case. X3 is explicitly unsupported.
+    SPLivePlanRequest *bad=[request copy]; bad.requestID=502; bad.multiplier=3; [p updateRequest:bad];
     __block BOOL rejectedRetained=NO;
-    for(int i=0;i<600&&!rejectedRetained;i++) { usleep(10000); dispatch_sync(p->_q, ^{ rejectedRetained=p->_resolved.unavailableReason.length>0 && p->_resolved.committed && p->_lowLatency.width==1920; }); }
+    for(int i=0;i<600&&!rejectedRetained;i++) { usleep(10000); dispatch_sync(p->_q, ^{ rejectedRetained=p->_resolved.unavailableReason.length>0 && p->_resolved.committed && p->_lowLatency.width==inferenceWidth && p->_lowLatency.height==inferenceHeight; }); }
     __block uint64_t baselineMatches=0, baselineMismatches=0, prescaledInputs=0, noRescale=0;
     dispatch_sync(p->_q, ^{ baselineMatches=p->_testBaselineMatches; baselineMismatches=p->_testBaselineMismatches;
         prescaledInputs=p->_lowPrescaleInputs; noRescale=p->_lowSyntheticNoRescale; });
@@ -10062,8 +10075,9 @@ presentationHost:(int64_t)presentationHost
     for(auto f:frames)CVPixelBufferRelease(f);
     BOOL ok=prepared && sizeOK && baseline && ordered && grid && src>0 && syn>0 && rejectedRetained && generationClear && staleRejected && stoppedClean && baselineMatches>0 && baselineMismatches==0 && prescaledInputs>0 && noRescale>0;
     return @{ @"ok":@(ok), @"prepared":@(prepared), @"sourceSize":@[@2560,@1440], @"sourceFormat":@"NV12 video-range", @"processingSize":@[@1920,@1080],
+        @"inferenceSize":@[@(inferenceWidth),@(inferenceHeight)], @"outputSize":@[@1920,@1080],
         @"outputSizeCorrect":@(sizeOK), @"baselineSizeCorrect":@(baseline), @"playoutSources":@(src), @"playoutSynthetic":@(syn),
-        @"ptsOrdered":@(ordered), @"ptsOn120Grid":@(grid), @"inputCount":@(count), @"invalidAspectRetainsPlan":@(rejectedRetained), @"sourceGenerationClears":@(generationClear), @"oldGenerationRejected":@(staleRejected), @"stopReleasesEngineAndFrames":@(stoppedClean),
+        @"ptsOrdered":@(ordered), @"ptsOn120Grid":@(grid), @"inputCount":@(count), @"unsupportedMultiplierRetainsPlan":@(rejectedRetained), @"sourceGenerationClears":@(generationClear), @"oldGenerationRejected":@(staleRejected), @"stopReleasesEngineAndFrames":@(stoppedClean),
         @"sourceABaselineMatches":@(baselineMatches), @"sourceABaselineMismatches":@(baselineMismatches), @"prescaledInputs":@(prescaledInputs), @"syntheticNoRescale":@(noRescale),
         @"stableIntervalPTS":@"[0.3,1.3)", @"stableSource":@(stableSrc), @"stableSynthetic":@(stableSyn), @"stableExpectedEach":@60, @"stableMissing120Ticks":missingTicks ?: @[],
         @"inputHzObserved":@(sourceHz), @"forcedOriginalRealtimePolicy":@(forceRealtime), @"pendingTrace":pendingTrace,

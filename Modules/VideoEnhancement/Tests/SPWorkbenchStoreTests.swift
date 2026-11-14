@@ -30,21 +30,29 @@ private final class SourceSizeControls {
  struct Capture {
   var running = false
   var target: Int?
+  var currentGeneration: UInt64 = 1
  }
  struct Plan {
   var interpolationActive = false
   var scaleActive = false
+  var committed = false
+  var unavailableReason: String? = ""
+  var engineID: String? = "rife.metal", modelID: String? = "rife-v4.25", scaleEngineID: String? = "apple.low-sr"
+  var outputWidth = 0, outputHeight = 0
+  var configVersion: UInt64 = 1
  }
  struct Processor {
   var resolvedPlan = Plan()
  }
  final class Player {
+  var workbenchMotionPlusActive = false
   var workbenchMotionPlusRequested = false
   var workbenchFileLanczosActive = false
  }
  final class Label {
   var stringValue = ""
   var textColor: NSColor?
+  var toolTip: String?
  }
  var profile = EnhancementProfile()
  var applied = EnhancementProfile()
@@ -55,6 +63,9 @@ private final class SourceSizeControls {
  var filePreparing = false
  var hasPendingFormChanges = false
  var pendingApply: EnhancementProfile?
+ var fileApplied: EnhancementProfile?
+ var liveApplyFailure = ""
+ var lastStats: [String: Any] = [:]
  var countdown = EnhancementCountdown()
  var sourceWindowPreparing = false
  var delayedWindowSelection = false
@@ -63,6 +74,7 @@ private final class SourceSizeControls {
  var delayedStartButton: Button? = Button()
  var stopButton: Button? = Button()
  var statusLabel = Label()
+ var planLabel = Label(), sizeChainLabel = Label(), fileLimitLabel = Label()
  var selectedStarts = 0
  var delayedStarts = 0
  var cancellations = 0
@@ -70,6 +82,16 @@ private final class SourceSizeControls {
  var sourceChoices = 0
 
  func selectedFilePlayer() -> Player? { filePlayer }
+ func selectedScreen() -> NSScreen? { nil }
+ func fileStatus() -> String { "" }
+ func updateAirBetaStatus(_ stats: [String: Any]) {}
+ func updateWindowOptimizationStatus(_ stats: [String: Any]) {}
+ static func engineDisplayName(_ engine: String, model: String) -> String {
+  // ACTUAL_ENGINE_DISPLAY_NAME
+ }
+ func refreshPlanLabel() {
+  // ACTUAL_REFRESH_PLAN_LABEL
+ }
  var hasSelectedSource: Bool {
   // ACTUAL_SELECTED_SOURCE
  }
@@ -99,6 +121,52 @@ private final class SourceSizeControls {
 
 @main struct TestRunner {
  @MainActor static func main() throws {
+  for color in [NSColor.systemRed, NSColor.systemOrange] {
+   let failedPreview = WorkbenchActionControls()
+   failedPreview.capture.running = true
+   failedPreview.statusLabel.stringValue = "Source preparation failed: permission required"
+   failedPreview.statusLabel.textColor = color
+   failedPreview.refreshPlanLabel()
+   precondition(failedPreview.statusLabel.stringValue == "Source preparation failed: permission required"
+     && failedPreview.statusLabel.textColor == color,
+     "Periodic plan refresh must preserve source/preparation errors and warnings")
+   failedPreview.statusLabel.textColor = .labelColor
+   failedPreview.statusLabel.stringValue = "Original preview"
+   failedPreview.refreshPlanLabel()
+   precondition(failedPreview.statusLabel.stringValue == "Previewing the original · Pending ODF-VFI X2",
+     "A recovered raw preview must show enabled settings even when the form matches the baseline")
+  }
+  let scalePreview = WorkbenchActionControls()
+  scalePreview.capture.running = true
+  scalePreview.profile.interpolationEnabled = false
+  scalePreview.profile.scaleEnabled = true
+  for scaler in AppleSRSelection.ids {
+   scalePreview.profile.scaleEngineID = scaler
+   scalePreview.applied = scalePreview.profile
+   scalePreview.refreshPlanLabel()
+   let expected = "Previewing the original · Pending " + AppleSRSelection.title(scaler)
+   precondition(scalePreview.statusLabel.stringValue == expected && !scalePreview.hasPendingFormChanges,
+     "Scale-only preview must name the enabled scaler and omit the disabled interpolation engine and rate")
+  }
+  scalePreview.profile.interpolationEnabled = true
+  scalePreview.refreshPlanLabel()
+  precondition(scalePreview.statusLabel.stringValue.contains("ODF-VFI X2 + " + AppleSRSelection.title(scalePreview.profile.scaleEngineID)))
+  scalePreview.profile.interpolationEnabled = false
+  scalePreview.profile.scaleEnabled = false
+  scalePreview.applied = scalePreview.profile
+  scalePreview.statusLabel.stringValue = "Original preview"
+  scalePreview.refreshPlanLabel()
+  precondition(!scalePreview.planLabel.stringValue.contains("Pending") && scalePreview.statusLabel.stringValue == "Original preview")
+  for preparing in [true, false] {
+   let waiting = WorkbenchActionControls()
+   waiting.capture.running = true
+   waiting.statusLabel.stringValue = "Starting or preparing"
+   if preparing { waiting.pendingApply = waiting.profile }
+   else { _ = waiting.countdown.begin() }
+   waiting.refreshPlanLabel()
+   precondition(waiting.statusLabel.stringValue == "Starting or preparing",
+     "Pending-preview copy must not replace countdown or engine preparation")
+  }
   let unselectedWindow = WorkbenchActionControls()
   unselectedWindow.refreshActions()
   precondition(unselectedWindow.startButton?.isEnabled == false && unselectedWindow.startButton?.isHidden == false)

@@ -20,12 +20,16 @@ start_handler=source.split('@objc private func start() {',1)[1].split('    @objc
 delay_handler=source.split('@objc private func startDelayedWindow() {',1)[1].split('    private func hideScreenCountdown()',1)[0].rsplit('}',1)[0]
 plan_label=source.split('private func refreshPlanLabel()',1)[1]
 form_difference='let formDiffers ='+plan_label.split('let formDiffers =',1)[1].split('hasPendingFormChanges = formDiffers',1)[0]
+refresh_plan=source.split('private func refreshPlanLabel() {',1)[1].split('    private func updateWindowOptimizationStatus',1)[0].rsplit('}',1)[0]
+engine_name=source.split('private static func engineDisplayName(_ engine: String, model: String) -> String {',1)[1].split('    private func loadControls()',1)[0].rsplit('}',1)[0]
 test=test.replace('// ACTUAL_SELECTED_SOURCE',selected_source)
 test=test.replace('// ACTUAL_IS_ENHANCING',enhancing)
 test=test.replace('// ACTUAL_WORKBENCH_ACTIONS',actions)
 test=test.replace('// ACTUAL_START_HANDLER',start_handler)
 test=test.replace('// ACTUAL_DELAY_HANDLER',delay_handler)
 test=test.replace('// ACTUAL_FORM_DIFFERENCE',form_difference)
+test=test.replace('// ACTUAL_REFRESH_PLAN_LABEL',refresh_plan)
+test=test.replace('// ACTUAL_ENGINE_DISPLAY_NAME',engine_name)
 pathlib.Path(sys.argv[2]).write_text(prefix+'\n'+test)
 PY
 xcrun swiftc -parse-as-library "$ROOT/Apps/Mac/UI/Enhancement/LiveFPSOverlay.swift" "$TEST_DIR/source.swift" -o "$TEST_DIR/test"
