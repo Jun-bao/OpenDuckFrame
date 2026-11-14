@@ -10,7 +10,7 @@ Build inputs and target configuration live in [Apps/Mac/project.yml](../Apps/Mac
 - [check_repo.py](check_repo.py) includes tracked and non-ignored new files in path/credential scans.
 - [l10n.py](l10n.py) provides status, export/merge and `check --full` for localized strings.
 - `test_*.sh` wrappers cover specific policies or integrations. Read the selected script for prerequisites and side effects.
-- `test_screen_capture_permission.sh` and `test_window_permission_fallback.sh` cover the permission gate and denied-access refresh button without changing macOS privacy settings.
+- `test_screen_capture_permission.sh` and `test_window_permission_prompt.sh` cover the permission gate and denied-access refresh button without changing macOS privacy settings.
 - [test_apple_live_size.sh](test_apple_live_size.sh) needs a built Debug app and Apple low-latency runtime support; it checks real inference and live activation without screen recording or physical presentation.
 - `bash Scripts/test_low_latency_smoke_contract.sh` checks the low2k preparation predicate on CPU, including 720p and 1080p inference. The GPU smoke separately checks restored output and baseline geometry.
 - [test_live_display_queue.sh](test_live_display_queue.sh) checks live display queue selection on CPU. [probe_apple_live_presentation.sh](probe_apple_live_presentation.sh) needs a built Debug app, an active graphical session and Apple low-latency support; it opens an owned window for 23 seconds and records actual presentation. Run GPU comparisons sequentially, with the same source profile and display conditions.

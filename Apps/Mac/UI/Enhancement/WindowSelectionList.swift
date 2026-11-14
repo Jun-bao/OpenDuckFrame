@@ -34,8 +34,9 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
         case window(Entry)
     }
     private let select: (SCWindow) -> Void
-    private let selectUsingSystemPicker: () -> Void
     private let permission: ScreenCapturePermission
+    private var permissionRequestInProgress = false
+    private var awaitingPermissionReturn = false
     private var entries: [Entry] = []
     private var rows: [Row] = []
     private var expandedGroups: Set<String> = []
@@ -45,11 +46,8 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
     private let table = WindowSelectionTable()
     private let footer = NSTextField(labelWithString: "")
 
-    init(permission: ScreenCapturePermission? = nil,
-         selectUsingSystemPicker: @escaping () -> Void,
-         select: @escaping (SCWindow) -> Void) {
+    init(permission: ScreenCapturePermission? = nil, select: @escaping (SCWindow) -> Void) {
         self.permission = permission ?? .shared
-        self.selectUsingSystemPicker = selectUsingSystemPicker
         self.select = select
         super.init(frame: .zero)
         let heading = NSTextField(labelWithString: EnhancementText.t("Target window", "目标窗口"))
@@ -91,6 +89,8 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
             footer.trailingAnchor.constraint(equalTo: trailingAnchor),
             footer.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
+        NotificationCenter.default.addObserver(self, selector: #selector(applicationDidBecomeActive),
+            name: NSApplication.didBecomeActiveNotification, object: nil)
     }
     required init?(coder: NSCoder) { nil }
 
@@ -99,34 +99,36 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
     }
 
     func refreshFromUser() {
-        guard !loading else { return }
-        guard permission.hasAccess else {
-            if #available(macOS 15.2, *) {
-                // The system picker grants access to the chosen window for
-                // this capture session without full Screen Recording access.
-                selectUsingSystemPicker()
-            } else if permission.ensureAccess() {
-                reloadWindows()
-            } else {
-                showLegacyPermissionHelp()
-            }
-            return
+        guard !loading, !permissionRequestInProgress, window?.attachedSheet == nil else { return }
+        if !permission.hasAccess {
+            // CGRequestScreenCaptureAccess can run a nested event loop.
+            permissionRequestInProgress = true
+            let allowed = permission.ensureAccess()
+            permissionRequestInProgress = false
+            guard allowed else { showPermissionHelp(); return }
         }
         reloadWindows()
     }
 
-    private func showLegacyPermissionHelp() {
-        guard let window else { return }
+    @objc private func applicationDidBecomeActive() {
+        guard awaitingPermissionReturn, permission.hasAccess else { return }
+        awaitingPermissionReturn = false
+        reloadWindows()
+    }
+
+    private func showPermissionHelp() {
+        guard let window, window.attachedSheet == nil else { return }
         let alert = NSAlert()
         alert.messageText = EnhancementText.t("Screen Recording access needed", "需要屏幕录制权限")
         alert.informativeText = EnhancementText.t(
-            "This macOS version requires Screen Recording access to select and enhance a window.",
-            "当前 macOS 版本需要屏幕录制权限，才能选择并增强窗口。")
+            "Refreshing the window list requires Screen Recording access. Allow OpenDuckFrame in System Settings, then return to the app. If macOS asks to reopen the app, follow its prompt.",
+            "刷新窗口列表需要屏幕录制权限。请在系统设置中允许 OpenDuckFrame，然后返回应用。如果 macOS 提示重新打开，请按提示操作。")
         alert.addButton(withTitle: EnhancementText.t("Open System Settings", "打开系统设置"))
         alert.addButton(withTitle: EnhancementText.t("Cancel", "取消"))
-        alert.beginSheetModal(for: window) { response in
+        alert.beginSheetModal(for: window) { [weak self] response in
             guard response == .alertFirstButtonReturn,
                   let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") else { return }
+            self?.awaitingPermissionReturn = true
             NSWorkspace.shared.open(url)
         }
     }
@@ -141,11 +143,7 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
             rows = []
             table.reloadData()
             updating = false
-            if #available(macOS 15.2, *) {
-                footer.stringValue = EnhancementText.t("No Screen Recording access. Click Refresh list to choose a window.", "未获屏幕录制权限，点击“刷新列表”在弹窗中选择窗口。")
-            } else {
-                footer.stringValue = EnhancementText.t("Click Refresh list to allow Screen Recording.", "点击“刷新列表”开启屏幕录制权限。")
-            }
+            footer.stringValue = EnhancementText.t("Screen Recording access is needed. Click Refresh list to allow access.", "需要屏幕录制权限，点击“刷新列表”申请授权。")
             footer.toolTip = footer.stringValue
             return
         }

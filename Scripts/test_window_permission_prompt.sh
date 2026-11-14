@@ -7,6 +7,6 @@ trap 'rm -rf "$TEST_DIR"' EXIT
 xcrun swiftc -parse-as-library \
     "$ROOT/Apps/Mac/UI/Enhancement/ScreenCapturePermission.swift" \
     "$ROOT/Apps/Mac/UI/Enhancement/WindowSelectionList.swift" \
-    "$ROOT/Modules/VideoEnhancement/Tests/SPWindowPermissionFallbackTests.swift" \
+    "$ROOT/Modules/VideoEnhancement/Tests/SPWindowPermissionPromptTests.swift" \
     -o "$TEST_DIR/test"
 "$TEST_DIR/test"
