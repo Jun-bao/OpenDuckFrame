@@ -3074,7 +3074,9 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                     : (enhancing ? EnhancementText.t("Apply Changes", "应用更改") : startTitle)
             }
         }
-        stopButton?.isHidden = !enhancing && !filePreparing
+        // Source preview and a failed initial plan still own a live capture.
+        let liveCaptureRunning = profile.sourceKind != "file" && capture.running
+        stopButton?.isHidden = !enhancing && !filePreparing && !liveCaptureRunning
         stopButton?.title = filePreparing && !enhancing
             ? EnhancementText.t("Cancel", "取消")
             : EnhancementText.t("Stop Enhancement", "关闭增强")
@@ -3372,6 +3374,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 self?.statusLabel.stringValue = EnhancementText.runtime(text)
                 self?.statusLabel.textColor = failed ? .systemRed : .labelColor
                 if !failed, let self, self.capture.running { self.rememberRunningSource() }
+                self?.refreshActions()
             }
         }
         let sink = CaptureProcessorSink(processor)
@@ -5176,7 +5179,20 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
             || (profile.sourceKind == "file" && profile.outputFullscreen != baseline.outputFullscreen)
         hasPendingFormChanges = formDiffers
         refreshActions()
-        let pending = formDiffers ? EnhancementText.t("Pending", "待应用") + " \(Self.engineDisplayName(profile.interpolationEngineID, model: profile.modelID)) \(rate)" : ""
+        let awaitingStart = profile.sourceKind != "file" && capture.running && !isEnhancing
+            && pendingApply == nil && !countdown.active && liveApplyFailure.isEmpty && reason.isEmpty
+            && statusLabel.textColor != .systemRed && statusLabel.textColor != .systemOrange
+            && (profile.interpolationEnabled || profile.scaleEnabled)
+        let pendingFeatures = [
+            profile.interpolationEnabled ? "\(Self.engineDisplayName(profile.interpolationEngineID, model: profile.modelID)) \(rate)" : "",
+            profile.scaleEnabled ? AppleSRSelection.title(profile.scaleEngineID) : ""
+        ].filter { !$0.isEmpty }.joined(separator: " + ")
+        let pending = (formDiffers || awaitingStart)
+            ? [EnhancementText.t("Pending", "待应用"), pendingFeatures].filter { !$0.isEmpty }.joined(separator: " ") : ""
+        if awaitingStart {
+            statusLabel.stringValue = [live, pending].filter { !$0.isEmpty }.joined(separator: " · ")
+            statusLabel.textColor = .secondaryLabelColor
+        }
         let sizeChain = profile.sourceKind != "file" && capture.running && processor.resolvedPlan.committed
             ? LiveSizeChain.text(lastStats, generation: capture.currentGeneration, config: processor.resolvedPlan.configVersion) : ""
         if !sizeChain.isEmpty, let chain = lastStats["sizeChain"] as? [String: Any], let w = chain["srInputWidth"] as? Int, let h = chain["srInputHeight"] as? Int, w > 0, h > 0 {
@@ -5196,7 +5212,8 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                   generation: capture.currentGeneration, config: processor.resolvedPlan.configVersion,
                   running: capture.running, paused: capture.paused),
               let runtime = stats["airWindowOptimization"] as? [String: Any],
-              runtime["requestEligible"] as? Bool == true else {
+              runtime["requestEligible"] as? Bool == true,
+              runtime["enabled"] as? Bool == true else {
             if !lastWindowOptimizationStatus.isEmpty, statusLabel.stringValue == lastWindowOptimizationStatus {
                 statusLabel.stringValue = ""
             }
@@ -6011,7 +6028,16 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
                 ? EnhancementText.t("The selected output display is unavailable.", "所选输出显示器不可用。")
                 : EnhancementText.t("Waiting for the target content position; output remains hidden.", "正在等待目标内容位置，增强画面暂时隐藏。")
             statusLabel.textColor = .systemOrange
-        } else if state.contentRectVerified && outputFrame != nil { targetGeometryWarned = false }
+        } else if state.contentRectVerified && outputFrame != nil {
+            if targetGeometryWarned && planActive && [
+                EnhancementText.t("The selected output display is unavailable.", "所选输出显示器不可用。"),
+                EnhancementText.t("Waiting for the target content position; output remains hidden.", "正在等待目标内容位置，增强画面暂时隐藏。")
+            ].contains(statusLabel.stringValue) {
+                statusLabel.stringValue = EnhancementText.t("Enhancement running", "增强运行")
+                statusLabel.textColor = .labelColor
+            }
+            targetGeometryWarned = false
+        }
         var hudFrame = state.frame
         if planActive && alignedInput && state.contentRectVerified, let frame = outputFrame, let panel = outputWindow {
             let followsWindow: Bool
