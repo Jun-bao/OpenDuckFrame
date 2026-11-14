@@ -19,6 +19,17 @@ final class SPUpdateUsageDelegate: NSObject {
         feedURL?.absoluteString == "https://openduckframe.app/updates/appcast.xml"
     }
 
+    @objc(updater:didFindValidUpdate:)
+    func updater(_ updater: NSObject, didFindValidUpdate item: NSObject) {
+        guard let version = item.value(forKey: "versionString") as? String else { return }
+        SPSoftwareUpdater.setAvailableUpdate(version: version)
+    }
+
+    @objc(updaterDidNotFindUpdate:error:)
+    func updaterDidNotFindUpdate(_ updater: NSObject, error: NSError) {
+        SPSoftwareUpdater.setAvailableUpdate(version: nil)
+    }
+
     @objc(feedParametersForUpdater:sendingSystemProfile:)
     func feedParameters(for updater: NSObject, sendingSystemProfile: Bool) -> [[String: String]] {
         guard isEnabled() else { return [] }
