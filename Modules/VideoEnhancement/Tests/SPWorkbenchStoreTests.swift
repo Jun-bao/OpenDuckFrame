@@ -1,4 +1,6 @@
 enum AppLanguage { static var current: String? { nil }; static func effectiveLanguage(for code: String?) -> String? { "en" } }
+// Simulate runtime API availability without depending on the test Mac's GPU.
+enum VTLowLatencyFrameInterpolationConfiguration { static var isSupported = false }
 
 // Execute the production handler's size-selection section with control values,
 // without opening windows or writing a live profile.
@@ -121,6 +123,25 @@ private final class SourceSizeControls {
 
 @main struct TestRunner {
  @MainActor static func main() throws {
+  if #available(macOS 26.0, *) {
+   VTLowLatencyFrameInterpolationConfiguration.isSupported = true
+   let appleDefault = EnhancementProfile()
+   precondition(appleDefault.interpolationEngineID == "apple.lowlatency" && appleDefault.modelID == "vt.llfi.temporal.1"
+     && appleDefault.interpolationQuality == "normal" && appleDefault.rate == .multiplier(2)
+     && !appleDefault.scaleEnabled && !appleDefault.automaticVideoCadence)
+   var reset = EnhancementProfile()
+   reset.interpolationEngineID = "rife.metal"; reset.modelID = "rife-v4.25"; reset.interpolationQuality = "hq"
+   applyDefaultPreset(&reset)
+   precondition(reset.interpolationEngineID == "apple.lowlatency" && reset.interpolationQuality == "normal")
+   var savedODF = appleDefault
+   savedODF.interpolationEngineID = "rife.metal"; savedODF.modelID = "rife-v4.25"; savedODF.interpolationQuality = "fast"
+   let restoredODF = EnhancementProfileStore.decode(try JSONEncoder().encode(savedODF), fallbackName: "saved")!
+   precondition(restoredODF.interpolationEngineID == "rife.metal" && restoredODF.modelID == "rife-v4.25",
+     "Changing factory defaults must preserve an explicit saved ODF engine")
+  }
+  VTLowLatencyFrameInterpolationConfiguration.isSupported = false
+  precondition(EnhancementProfile().interpolationEngineID == "rife.metal",
+    "Unsupported OS/device must retain the available ODF-VFI factory default")
   for color in [NSColor.systemRed, NSColor.systemOrange] {
    let failedPreview = WorkbenchActionControls()
    failedPreview.capture.running = true

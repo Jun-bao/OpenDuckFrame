@@ -5,7 +5,7 @@
 <p align="center"><a href="https://openduckframe.cn/en/">Official website</a> · <b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
 <p align="center">Apple silicon · macOS 14+ · <a href="LICENSE">MIT</a></p>
 
-Frame generation defaults to **ODF-VFI**, a four-stage structural reduction of RIFE 4.25. It keeps the upstream weights without retraining and reduces model processing overhead. Existing RIFE 4.25 profiles remain compatible and run ODF-VFI; the app validates the actual four-stage weights when loading. Visual results remain content-dependent.
+First use and resetting the default preset select **Apple low latency, X2** on supported macOS 26+ devices, with ODF-VFI fast X2 as the fallback on other supported Macs. Saved engine choices are preserved. ODF-VFI remains selectable: it is a four-stage structural reduction of RIFE 4.25 using the upstream weights without retraining. Existing RIFE 4.25 profiles remain compatible and run ODF-VFI; the app validates the actual four-stage weights when loading. Visual results remain content-dependent.
 
 ## About
 
@@ -14,7 +14,7 @@ Select a browser window, game or stream, a display, or a local video file, then
 control frame generation and upscaling from one workbench. Processing happens on
 your Mac, without an account or uploading your picture.
 
-- **Frame generation.** Choose ODF-VFI (default), Apple low latency, or Apple FRC.
+- **Frame generation.** Choose Apple low latency (default where supported), ODF-VFI, or Apple FRC.
   Available frame-rate and quality settings follow the selected engine and source;
   Apple options require runtime hardware/system support. Watch the actual output rate.
   Achieved performance depends on the source, settings and Mac.
