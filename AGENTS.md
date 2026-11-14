@@ -32,6 +32,7 @@ Contribution and release requirements live in [CONTRIBUTING.md](CONTRIBUTING.md)
 ## Product boundaries
 
 Processing is local. Preserve user media, source permissions, profiles and playback state.
+When replacing an installed app, verify signing identity and actual permission usability as described in [Mac permission continuity](Apps/Mac/AGENTS.md#permission-continuity-when-replacing-an-app).
 The workbench offers ODF-VFI, Apple low-latency interpolation and Apple frame-rate conversion (FRC). ODF-VFI remains the default and is a four-stage structural reduction of RIFE 4.25 using upstream weights without retraining. The internal `rife-v4.25` profile and resource identifiers remain for compatibility. Existing backend and experiment code has a wider scope.
 Automatic hardware/configuration detection is deferred. Keep new recommendations or automatic tuning within an explicit task.
 Preserve internal SP symbols and existing interfaces unless the task calls for their migration.
