@@ -184,6 +184,27 @@ private final class SourceSizeControls {
   stoppedDisplay.refreshActions()
   precondition(stoppedDisplay.startButton?.isEnabled == false)
 
+  for kind in ["window", "display"] {
+   let preview = WorkbenchActionControls()
+   preview.profile.sourceKind = kind
+   preview.activeSourceKind = kind
+   preview.capture.target = 1
+   preview.capture.running = true
+   preview.refreshActions()
+   precondition(!preview.isEnhancing && preview.stopButton?.isHidden == false,
+     "A source-only capture must remain stoppable before an engine commits or after preparation fails")
+   precondition(preview.startButton?.isHidden == false && preview.startButton?.isEnabled == true,
+     "Showing Stop for source preview must preserve the enhancement start action")
+   preview.pendingApply = preview.profile
+   preview.refreshActions()
+   precondition(preview.startButton?.title == "Cancel" && preview.stopButton?.isHidden == false)
+   preview.capture.running = false
+   preview.pendingApply = nil
+   preview.refreshActions()
+   precondition(preview.stopButton?.isHidden == true && preview.startButton?.isEnabled == true,
+     "Stopping a preview must retain the source for restart")
+  }
+
   let activeWindow = WorkbenchActionControls()
   activeWindow.activeSourceKind = "window"
   activeWindow.capture.target = 1
