@@ -34,6 +34,9 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
         case window(Entry)
     }
     private let select: (SCWindow) -> Void
+    private let permission: ScreenCapturePermission
+    private var permissionRequestInProgress = false
+    private var lastKnownPermission: Bool
     private var entries: [Entry] = []
     private var rows: [Row] = []
     private var expandedGroups: Set<String> = []
@@ -43,7 +46,10 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
     private let table = WindowSelectionTable()
     private let footer = NSTextField(labelWithString: "")
 
-    init(select: @escaping (SCWindow) -> Void) {
+    init(permission: ScreenCapturePermission? = nil, select: @escaping (SCWindow) -> Void) {
+        let permission = permission ?? .shared
+        self.permission = permission
+        self.lastKnownPermission = permission.hasAccess
         self.select = select
         super.init(frame: .zero)
         let heading = NSTextField(labelWithString: EnhancementText.t("Target window", "目标窗口"))
@@ -85,29 +91,73 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
             footer.trailingAnchor.constraint(equalTo: trailingAnchor),
             footer.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
+        NotificationCenter.default.addObserver(self, selector: #selector(applicationDidBecomeActive),
+            name: NSApplication.didBecomeActiveNotification, object: nil)
     }
     required init?(coder: NSCoder) { nil }
 
     @objc private func refreshRequested() {
+        refreshFromUser()
+    }
+
+    func refreshFromUser() {
+        guard !loading, !permissionRequestInProgress, window?.attachedSheet == nil else { return }
+        if !permission.hasAccess {
+            // CGRequestScreenCaptureAccess can run a nested event loop.
+            permissionRequestInProgress = true
+            let allowed = permission.ensureAccess()
+            permissionRequestInProgress = false
+            guard allowed else { showPermissionHelp(); return }
+        }
         reloadWindows()
+    }
+
+    @objc private func applicationDidBecomeActive() {
+        guard permission.hasAccess != lastKnownPermission else { return }
+        reloadWindows()
+    }
+
+    private func showPermissionHelp() {
+        guard let window, window.attachedSheet == nil else { return }
+        let alert = NSAlert()
+        alert.messageText = EnhancementText.t("Screen Recording access needed", "需要屏幕录制权限")
+        alert.informativeText = String(format: EnhancementText.t(
+            "Refreshing the window list requires Screen Recording access. Allow OpenDuckFrame in System Settings.\n\nIf it is already enabled but still does not work, remove the old OpenDuckFrame entry, use + to add the current app at %@, and follow any macOS prompt to reopen it.",
+            "刷新窗口列表需要屏幕录制权限，请在系统设置中允许 OpenDuckFrame。\n\n如果开关已打开但仍无法使用，请先移除旧的 OpenDuckFrame，再点击“＋”添加当前应用（%@），并按 macOS 提示重新打开。"),
+            Bundle.main.bundleURL.path)
+        alert.addButton(withTitle: EnhancementText.t("Open System Settings", "打开系统设置"))
+        alert.addButton(withTitle: EnhancementText.t("Cancel", "取消"))
+        alert.beginSheetModal(for: window) { response in
+            guard response == .alertFirstButtonReturn,
+                  let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") else { return }
+            NSWorkspace.shared.open(url)
+        }
     }
 
     @objc func reloadWindows() {
         guard !loading else { return }
+        lastKnownPermission = permission.hasAccess
         loading = true
-        guard ScreenCapturePermission.shared.ensureAccess() else {
+        guard lastKnownPermission else {
             loading = false
             updating = true
             entries = []
             rows = []
             table.reloadData()
             updating = false
-            footer.stringValue = EnhancementText.t("Allow Screen Recording in System Settings, then restart the app.", "请在系统设置中允许录屏，然后重新打开应用。")
+            footer.stringValue = EnhancementText.t("Screen Recording access is needed. Click Refresh list to allow access.", "需要屏幕录制权限，点击“刷新列表”申请授权。")
+            footer.toolTip = footer.stringValue
             return
         }
         footer.stringValue = EnhancementText.t("Loading windows…", "正在获取窗口…")
+        footer.toolTip = nil
         Task { @MainActor [weak self] in
-            defer { self?.loading = false }
+            defer {
+                if let self {
+                    self.loading = false
+                    if self.permission.hasAccess != self.lastKnownPermission { self.reloadWindows() }
+                }
+            }
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
                 guard let self else { return }

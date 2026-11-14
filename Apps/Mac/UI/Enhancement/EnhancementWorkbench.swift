@@ -3938,7 +3938,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         profile.sourceKind = "window"
         showPage(0)
         refreshSourceBar()
-        windowSelectionList?.reloadWindows()
+        windowSelectionList?.refreshFromUser()
     }
     @objc private func chooseDisplay() {
 #if ODF_AIR_BETA_DIAGNOSTIC

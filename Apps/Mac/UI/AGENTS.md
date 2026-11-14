@@ -18,6 +18,7 @@ Hardware/configuration auto-detection is deferred. Keep its suggestions and scor
 Preserve configuration add/rename/delete, preset metadata and saved-profile migration.
 The three-step first-use coach marks are implemented in [WorkbenchOnboarding.swift](Enhancement/WorkbenchOnboarding.swift); keep them skippable, source-specific and replayable from Help.
 Keep delayed window selection available beside the selected-window start action, including before a source is chosen. The selected-window action must offer Cancel throughout its countdown and initial engine preparation. During enhancement, show Stop Enhancement in the start action's position; preserve restart after Stop and pending Apply Changes actions.
+The window list requires Screen Recording access. Automatic refresh does not prompt; an explicit refresh requests access and, if it remains denied, explains the need and links directly to System Settings. Refresh must not open the system window picker. After returning from Settings, refresh the list if access is available.
 Live source preview and failed initial preparation also retain a Stop action while capture runs. Show unapplied enhancement settings in the visible status. Optional window-optimization eligibility is not the interpolation state; never present its ineligibility reason as source-only playback when the ordinary engine is active.
 Periodic preview status must preserve existing errors and warnings. Pending settings name only enabled features; a scale-only preview must not advertise a disabled interpolation engine or frame multiplier.
 File output retains its fullscreen control; display and window output follow their source without a fullscreen preview option.
@@ -28,6 +29,7 @@ Apple low latency in live window/display mode offers Content timing: General win
 
 Run `./Scripts/test_workbench_store.sh` for profile, countdown or workbench action changes.
 Run `./Scripts/test_workbench_guide.sh` for coach-mark preferences, navigation and source-specific guidance.
+Run `./Scripts/test_screen_capture_permission.sh` and `./Scripts/test_window_permission_prompt.sh` for window selection permission changes; the latter does not replace native permission and capture validation.
 Use the existing localization catalog and EnhancementText flow according to the current surface.
 Verify actual English/Chinese, light/dark, source types, long names and keyboard actions when affected.
 Check default 560×700, minimum 540×620, native fullscreen and ordinary window resizing for layout changes.
