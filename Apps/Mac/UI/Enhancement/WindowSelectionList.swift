@@ -36,7 +36,7 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
     private let select: (SCWindow) -> Void
     private let permission: ScreenCapturePermission
     private var permissionRequestInProgress = false
-    private var awaitingPermissionReturn = false
+    private var lastKnownPermission: Bool
     private var entries: [Entry] = []
     private var rows: [Row] = []
     private var expandedGroups: Set<String> = []
@@ -47,7 +47,9 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
     private let footer = NSTextField(labelWithString: "")
 
     init(permission: ScreenCapturePermission? = nil, select: @escaping (SCWindow) -> Void) {
-        self.permission = permission ?? .shared
+        let permission = permission ?? .shared
+        self.permission = permission
+        self.lastKnownPermission = permission.hasAccess
         self.select = select
         super.init(frame: .zero)
         let heading = NSTextField(labelWithString: EnhancementText.t("Target window", "目标窗口"))
@@ -111,8 +113,7 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
     }
 
     @objc private func applicationDidBecomeActive() {
-        guard awaitingPermissionReturn, permission.hasAccess else { return }
-        awaitingPermissionReturn = false
+        guard permission.hasAccess != lastKnownPermission else { return }
         reloadWindows()
     }
 
@@ -120,23 +121,24 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
         guard let window, window.attachedSheet == nil else { return }
         let alert = NSAlert()
         alert.messageText = EnhancementText.t("Screen Recording access needed", "需要屏幕录制权限")
-        alert.informativeText = EnhancementText.t(
-            "Refreshing the window list requires Screen Recording access. Allow OpenDuckFrame in System Settings, then return to the app. If macOS asks to reopen the app, follow its prompt.",
-            "刷新窗口列表需要屏幕录制权限。请在系统设置中允许 OpenDuckFrame，然后返回应用。如果 macOS 提示重新打开，请按提示操作。")
+        alert.informativeText = String(format: EnhancementText.t(
+            "Refreshing the window list requires Screen Recording access. Allow OpenDuckFrame in System Settings.\n\nIf it is already enabled but still does not work, remove the old OpenDuckFrame entry, use + to add the current app at %@, and follow any macOS prompt to reopen it.",
+            "刷新窗口列表需要屏幕录制权限，请在系统设置中允许 OpenDuckFrame。\n\n如果开关已打开但仍无法使用，请先移除旧的 OpenDuckFrame，再点击“＋”添加当前应用（%@），并按 macOS 提示重新打开。"),
+            Bundle.main.bundleURL.path)
         alert.addButton(withTitle: EnhancementText.t("Open System Settings", "打开系统设置"))
         alert.addButton(withTitle: EnhancementText.t("Cancel", "取消"))
-        alert.beginSheetModal(for: window) { [weak self] response in
+        alert.beginSheetModal(for: window) { response in
             guard response == .alertFirstButtonReturn,
                   let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") else { return }
-            self?.awaitingPermissionReturn = true
             NSWorkspace.shared.open(url)
         }
     }
 
     @objc func reloadWindows() {
         guard !loading else { return }
+        lastKnownPermission = permission.hasAccess
         loading = true
-        guard permission.hasAccess else {
+        guard lastKnownPermission else {
             loading = false
             updating = true
             entries = []
@@ -150,7 +152,12 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
         footer.stringValue = EnhancementText.t("Loading windows…", "正在获取窗口…")
         footer.toolTip = nil
         Task { @MainActor [weak self] in
-            defer { self?.loading = false }
+            defer {
+                if let self {
+                    self.loading = false
+                    if self.permission.hasAccess != self.lastKnownPermission { self.reloadWindows() }
+                }
+            }
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
                 guard let self else { return }
