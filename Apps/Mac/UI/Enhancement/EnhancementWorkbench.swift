@@ -2038,7 +2038,12 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         let currentRow = FormRow(current, padding: 8)
         // Keep room for the size line so choosing a source does not shift the settings below.
         currentRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 50).isActive = true
-        let windows = WindowSelectionList { [weak self] selected in
+        let windows = WindowSelectionList(selectUsingSystemPicker: { [weak self] in
+#if ODF_AIR_BETA_DIAGNOSTIC
+            guard self?.betaAllowsSessionChange() == true else { return }
+#endif
+            self?.capture.presentPicker(windows: true)
+        }) { [weak self] selected in
             guard let self else { return }
             self.cancelCountdown()
             self.inputRouter?.stop(reason: "source_changed")
@@ -3938,7 +3943,7 @@ final class EnhancementWorkbenchController: NSWindowController, NSWindowDelegate
         profile.sourceKind = "window"
         showPage(0)
         refreshSourceBar()
-        windowSelectionList?.reloadWindows()
+        windowSelectionList?.refreshFromUser()
     }
     @objc private func chooseDisplay() {
 #if ODF_AIR_BETA_DIAGNOSTIC

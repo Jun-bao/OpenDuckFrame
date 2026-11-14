@@ -15,6 +15,8 @@ final class ScreenCapturePermission {
         self.request = request
     }
 
+    var hasAccess: Bool { preflight() }
+
     func ensureAccess() -> Bool {
         if preflight() { return true }
         if !requested {
