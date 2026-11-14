@@ -37,7 +37,7 @@ These options process playback/capture; they do not export an interpolated file.
 
 | Engine | Workbench support |
 |---|---|
-| ODF-VFI | Default; target FPS or X2 / X3 / X4; fast / balanced / hq |
+| ODF-VFI | Default when Apple low latency is unavailable; target FPS or X2 / X3 / X4; fast / balanced / hq |
 | Apple low latency | macOS 26+ and runtime support; live window/display X2 or X4; local file X2 only. Fixed FPS and X3 are disabled |
 | Apple FRC | macOS 15.4+ and runtime support; live target FPS or X2 / X3 / X4, standard / quality; local files standard only, fixed FPS up to 3× source rate |
 

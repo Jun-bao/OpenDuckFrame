@@ -21,8 +21,10 @@ Accessibility permission again after an upgrade.
 
 ## Start with a simple setup
 
-On a fresh installation, frame generation is enabled with ODF-VFI, fast
-quality, and X2 rate. Window output follows the source, and scaling is off.
+On a fresh installation or when resetting the default preset, frame generation
+uses Apple low latency at X2 when macOS 26+ and the runtime support it. Other
+supported devices use ODF-VFI, fast quality and X2. Window output follows the
+source, and scaling is off.
 Continuous caching is always on; there is no separate switch to find or enable.
 Existing saved settings are retained, and profiles saved with RIFE 4.25 use
 ODF-VFI; a new named configuration copies the current settings.
@@ -35,11 +37,12 @@ ODF-VFI; a new named configuration copies the current settings.
    frame generation at X2, or Apple real-time super resolution. Apple video SR
    is also available on supported devices; live video SR requires frame generation
    to be off. Higher resolutions and multipliers require more processing time.
-3. For a window, press **Delayed Enhancement**, then focus the window you want
-   to enhance before the countdown ends. The focused window is selected and
-   enhancement starts automatically. The countdown defaults to 3 seconds and
-   can be set from 1 to 20 seconds in **Settings**. Display and video-file inputs
-   keep **Start Enhancement**. Use the FPS overlay to observe actual output.
+3. For a window, select it in the grouped list and press **Enhance Selected
+   Window**, or press **Delayed Enhancement** and focus the desired window
+   before the countdown ends. The countdown defaults to 3 seconds and can be
+   set from 1 to 20 seconds in **Settings**. Display and video-file inputs keep
+   **Start Enhancement**. Automatically resizing a source window also requires
+   Accessibility access. Use the FPS overlay to observe actual output.
 4. Save a profile once you have settings that work for your content.
 
 Frame generation creates intermediate pictures; it does not change the source
