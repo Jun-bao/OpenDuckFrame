@@ -2,6 +2,17 @@ import AppKit
 import CoreGraphics
 @preconcurrency import ScreenCaptureKit
 
+@MainActor
+private final class WindowSelectionTable: NSTableView {
+    var groupKeyAction: ((Int, UInt16) -> Bool)?
+
+    override func keyDown(with event: NSEvent) {
+        if [UInt16(123), 124, 49, 36, 76].contains(event.keyCode),
+           groupKeyAction?(selectedRow, event.keyCode) == true { return }
+        super.keyDown(with: event)
+    }
+}
+
 /// Inline list: keep the ScreenCaptureKit identity associated with each row.
 @MainActor
 final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDelegate {
@@ -29,7 +40,7 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
     private var loading = false
     private var updating = false
     private var selectedID: CGWindowID?
-    private let table = NSTableView()
+    private let table = WindowSelectionTable()
     private let footer = NSTextField(labelWithString: "")
 
     init(select: @escaping (SCWindow) -> Void) {
@@ -53,6 +64,7 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
         table.intercellSpacing = NSSize(width: 0, height: 1)
         table.dataSource = self
         table.delegate = self
+        table.groupKeyAction = { [weak self] row, key in self?.handleGroupKey(row: row, key: key) ?? false }
         table.focusRingType = .default
         scroll.documentView = table
         footer.textColor = .secondaryLabelColor
@@ -134,7 +146,7 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
             }
         }
     }
-    private func rebuildRows() {
+    private func rebuildRows(focusGroup: String? = nil) {
         let groups = Dictionary(grouping: entries, by: \.appKey).map { key, entries in
             Group(key: key, name: entries[0].appName, entries: entries)
         }.sorted { left, right in
@@ -148,7 +160,13 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
         }
         updating = true
         table.reloadData()
-        if let id = selectedID, let row = rows.firstIndex(where: {
+        if let key = focusGroup, let row = rows.firstIndex(where: {
+            if case let .group(group) = $0 { return group.key == key }
+            return false
+        }) {
+            table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            table.scrollRowToVisible(row)
+        } else if let id = selectedID, let row = rows.firstIndex(where: {
             if case let .window(entry) = $0 { return entry.window.windowID == id }
             return false
         }) {
@@ -161,16 +179,26 @@ final class WindowSelectionList: NSView, NSTableViewDataSource, NSTableViewDeleg
 
     @objc private func toggleGroup(_ sender: NSButton) {
         guard rows.indices.contains(sender.tag), case let .group(group) = rows[sender.tag] else { return }
-        if expandedGroups.contains(group.key) { expandedGroups.remove(group.key) }
-        else { expandedGroups.insert(group.key) }
-        rebuildRows()
+        setGroup(group, expanded: !expandedGroups.contains(group.key))
+    }
+
+    private func setGroup(_ group: Group, expanded: Bool) {
+        if expanded { expandedGroups.insert(group.key) }
+        else { expandedGroups.remove(group.key) }
+        rebuildRows(focusGroup: group.key)
+    }
+
+    private func handleGroupKey(row: Int, key: UInt16) -> Bool {
+        guard rows.indices.contains(row), case let .group(group) = rows[row] else { return false }
+        switch key {
+        case 123: setGroup(group, expanded: false)
+        case 124: setGroup(group, expanded: true)
+        default: setGroup(group, expanded: !expandedGroups.contains(group.key))
+        }
+        return true
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
-    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
-        if case .window = rows[row] { return true }
-        return false
-    }
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         switch rows[row] {
         case let .group(group):
