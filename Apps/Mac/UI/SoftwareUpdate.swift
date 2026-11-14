@@ -17,6 +17,29 @@ import AppKit
 // Developer ID signature, both of which remain outside the source repository.
 @MainActor
 enum SPSoftwareUpdater {
+    static let availabilityChanged = Notification.Name("SPUpdateAvailabilityChanged")
+    private static let availableUpdateKey = "SPAvailableUpdate"
+
+    static var hasAvailableUpdate: Bool {
+        guard isConfigured,
+              let saved = UserDefaults.standard.dictionary(forKey: availableUpdateKey),
+              let version = saved["version"] as? String,
+              let feed = saved["feed"] as? String,
+              feed == Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String,
+              let current = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        else { return false }
+        return version.compare(current, options: .numeric) == .orderedDescending
+    }
+
+    static func setAvailableUpdate(version: String?) {
+        if let version,
+           let feed = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String {
+            UserDefaults.standard.set(["version": version, "feed": feed], forKey: availableUpdateKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: availableUpdateKey)
+        }
+        NotificationCenter.default.post(name: availabilityChanged, object: nil)
+    }
     /// Enable only when both the appcast URL and EdDSA public key are present.
     /// This reads Info.plist only, so menu construction can call it safely.
     nonisolated static var isConfigured: Bool {

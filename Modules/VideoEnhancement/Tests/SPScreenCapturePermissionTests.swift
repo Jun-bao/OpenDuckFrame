@@ -13,6 +13,8 @@ struct ScreenCapturePermissionTests {
             return false
         })
 
+        precondition(!gate.hasAccess)
+        precondition(requests == 0, "Checking status alone must not request access")
         precondition(!gate.ensureAccess())
         for _ in 0..<20 { precondition(!gate.ensureAccess()) }
         precondition(requests == 1, "Repeated refreshes must not repeat the request")
