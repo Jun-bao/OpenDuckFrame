@@ -31,3 +31,9 @@ For normal delivery, reconcile copies and registrations with the root rule for `
 Verify the exact running binary and version/build before using its UI as evidence.
 App Store, ad-hoc community and Developer ID lanes have distinct signing and packaging requirements.
 Read [RELEASING.md](../../RELEASING.md) before changing distribution behavior.
+
+## Permission continuity when replacing an app
+
+Compare the existing and replacement apps' designated signing requirements before replacing the installed app. Ad-hoc signatures can change with each build, so a macOS privacy switch may remain enabled for an older identity while the new app has no access. Prefer an appropriate stable signing identity for successive local test builds when one is available; an Apple Development identity is for local testing and is not a Developer ID release or notarization.
+
+After installation, verify the running app's actual Screen Recording access and ability to refresh the window list, rather than treating the Settings toggle as proof. Also check other permissions needed by the requested feature, such as Accessibility or Input Monitoring for interactive input; do not prompt for unrelated capabilities. Preserve user profiles and existing permissions; change or reset only this app's relevant authorization when necessary and authorized. If macOS requires the user to confirm, unlock or reopen the app, surface that requirement without attempting to bypass it. Record the app version/build, signing lane and verification result; do not put certificate identities, credentials or machine-specific paths in this repository.

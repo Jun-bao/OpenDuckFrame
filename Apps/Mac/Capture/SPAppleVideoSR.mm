@@ -5,14 +5,22 @@
 static NSError *SPVideoSRError(NSInteger code, NSString *message) {
     return [NSError errorWithDomain:@"app.openduckframe.apple-video-sr" code:code userInfo:@{NSLocalizedDescriptionKey:message}];
 }
-static CVPixelBufferRef SPVideoSRBuffer(int width, int height, OSType format, NSDictionary *required) {
+static CVPixelBufferPoolRef SPVideoSRPool(int width, int height, OSType format, NSDictionary *required) {
     NSDictionary *local=@{(id)kCVPixelBufferWidthKey:@(width),(id)kCVPixelBufferHeightKey:@(height),
       (id)kCVPixelBufferPixelFormatTypeKey:@(format),(id)kCVPixelBufferIOSurfacePropertiesKey:@{},
       (id)kCVPixelBufferMetalCompatibilityKey:@YES};
     CFDictionaryRef attrs=NULL;
     if (CVPixelBufferCreateResolvedAttributesDictionary(NULL,(__bridge CFArrayRef)@[required,local],&attrs)!=kCVReturnSuccess || !attrs) return NULL;
-    CVPixelBufferRef result=NULL; CVReturn code=CVPixelBufferCreate(NULL,width,height,format,attrs,&result); CFRelease(attrs);
+    CVPixelBufferPoolRef result=NULL; CVReturn code=CVPixelBufferPoolCreate(NULL,NULL,attrs,&result); CFRelease(attrs);
     return code==kCVReturnSuccess ? result : NULL;
+}
+static CVPixelBufferRef SPVideoSRBuffer(CVPixelBufferPoolRef pool) {
+    if (!pool) return NULL;
+    NSDictionary *limit=@{(id)kCVPixelBufferPoolAllocationThresholdKey:@4};
+    CVPixelBufferRef result=NULL;
+    if (CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(NULL,pool,(__bridge CFDictionaryRef)limit,&result)!=kCVReturnSuccess) return NULL;
+    CVBufferRemoveAllAttachments(result);
+    return result;
 }
 static OSType SPVideoSRFormat(NSDictionary *attrs, NSArray<NSNumber *> *fallback) {
     id value=attrs[(id)kCVPixelBufferPixelFormatTypeKey];
@@ -27,6 +35,7 @@ static void SPVideoSREnd(id processor) { if (@available(macOS 15.4,*)) [(VTFrame
     id _processor;
     NSDictionary *_sourceAttributes, *_destinationAttributes;
     VTPixelTransferSessionRef _transfer;
+    CVPixelBufferPoolRef _sourcePool, _destinationPool;
     CVPixelBufferRef _previousSource, _previousOutput;
     CMTime _previousPTS;
     OSType _sourceFormat, _destinationFormat;
@@ -45,6 +54,8 @@ static void SPVideoSREnd(id processor) { if (@available(macOS 15.4,*)) [(VTFrame
     if (_previousSource) CVPixelBufferRelease(_previousSource);
     if (_previousOutput) CVPixelBufferRelease(_previousOutput);
     if (_transfer) CFRelease(_transfer);
+    if (_sourcePool) CFRelease(_sourcePool);
+    if (_destinationPool) CFRelease(_destinationPool);
 }
 + (BOOL)isSupported {
     if (@available(macOS 26.0,*)) return VTSuperResolutionScalerConfiguration.supported;
@@ -137,8 +148,18 @@ static void SPVideoSREnd(id processor) { if (@available(macOS 15.4,*)) [(VTFrame
         if (!config || config.configurationModelStatus!=VTSuperResolutionScalerConfigurationModelStatusReady) { if(error)*error=SPVideoSRError(3,@"视频超分模型尚未就绪。"); return NO; }
         VTFrameProcessor *processor=[[VTFrameProcessor alloc] init]; NSError *local=nil;
         if (![processor startSessionWithConfiguration:config error:&local]) { if(error)*error=local ?: SPVideoSRError(4,@"视频超分会话创建失败。"); return NO; }
+        OSType sourceFormat=SPVideoSRFormat(config.sourcePixelBufferAttributes,config.frameSupportedPixelFormats);
+        OSType destinationFormat=SPVideoSRFormat(config.destinationPixelBufferAttributes,config.frameSupportedPixelFormats);
+        CVPixelBufferPoolRef sourcePool=SPVideoSRPool(width,height,sourceFormat,config.sourcePixelBufferAttributes);
+        CVPixelBufferPoolRef destinationPool=SPVideoSRPool(width*scale,height*scale,destinationFormat,config.destinationPixelBufferAttributes);
+        if (!sourcePool || !destinationPool) {
+            if (sourcePool) CFRelease(sourcePool); if (destinationPool) CFRelease(destinationPool);
+            SPVideoSREnd(processor); if(error)*error=SPVideoSRError(8,@"视频超分缓冲池创建失败。"); return NO;
+        }
         @synchronized(self) {
-            if (_processor || _inflight || _epoch!=seen) { SPVideoSREnd(processor); if(error)*error=SPVideoSRError(1,@"视频超分会话状态已改变。"); return NO; }
+            if (_processor || _inflight || _epoch!=seen) { CFRelease(sourcePool); CFRelease(destinationPool); SPVideoSREnd(processor); if(error)*error=SPVideoSRError(1,@"视频超分会话状态已改变。"); return NO; }
+            if (_sourcePool) CFRelease(_sourcePool); if (_destinationPool) CFRelease(_destinationPool);
+            _sourcePool=sourcePool; _destinationPool=destinationPool;
             _processor=processor; _sourceAttributes=[config.sourcePixelBufferAttributes copy]; _destinationAttributes=[config.destinationPixelBufferAttributes copy];
             _sourceFormat=SPVideoSRFormat(_sourceAttributes,config.frameSupportedPixelFormats); _destinationFormat=SPVideoSRFormat(_destinationAttributes,config.frameSupportedPixelFormats);
             _width=width;_height=height;_outWidth=width*scale;_outHeight=height*scale;_epoch++;
@@ -187,7 +208,7 @@ static void SPVideoSREnd(id processor) { if (@available(macOS 15.4,*)) [(VTFrame
         BOOL stale; @synchronized(self){stale=seen!=self->_epoch;}
         if(stale){finish(NULL,nil);return;}
         if (discontinuity || (CMTIME_IS_NUMERIC(self->_previousPTS) && CMTimeCompare(pts,self->_previousPTS)<=0)) [self clearHistoryOnQueue];
-        CVPixelBufferRef input=SPVideoSRBuffer(self->_width,self->_height,self->_sourceFormat,self->_sourceAttributes);
+        CVPixelBufferRef input=SPVideoSRBuffer(self->_sourcePool);
         if(!self->_transfer)VTPixelTransferSessionCreate(NULL,&self->_transfer);
         if(!input || !self->_transfer || VTPixelTransferSessionTransferImage(self->_transfer,source,input)!=noErr){if(input)CVPixelBufferRelease(input);[self clearHistoryOnQueue];finish(NULL,SPVideoSRError(7,@"视频超分输入格式转换失败。"));return;}
         CVBufferPropagateAttachments(source,input);
@@ -196,7 +217,7 @@ static void SPVideoSREnd(id processor) { if (@available(macOS 15.4,*)) [(VTFrame
             CVBufferRemoveAttachment(input,kCVImageBufferPreferredCleanApertureKey);
             CVBufferRemoveAttachment(input,kCVImageBufferDisplayDimensionsKey);
         }
-        CVPixelBufferRef output=SPVideoSRBuffer(self->_outWidth,self->_outHeight,self->_destinationFormat,self->_destinationAttributes);
+        CVPixelBufferRef output=SPVideoSRBuffer(self->_destinationPool);
         if(!output){CVPixelBufferRelease(input);[self clearHistoryOnQueue];finish(NULL,SPVideoSRError(8,@"视频超分输出分配失败。"));return;}
         CVBufferPropagateAttachments(source,output);
         if (@available(macOS 26.0,*)) {

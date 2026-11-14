@@ -14,8 +14,10 @@ the FPS overlay reports observed output.
 
 ## Frame generation
 
-The workbench's default frame-generation engine is **ODF-VFI**, run with Metal on
-Apple silicon; resolution and quality affect throughput. ODF-VFI is a
+New and reset default profiles use **Apple low latency, X2** when the macOS 26+
+runtime reports support. Other supported Macs retain **ODF-VFI fast X2**.
+Existing saved engine choices and legacy RIFE profiles remain unchanged.
+ODF-VFI runs with Metal on Apple silicon; resolution and quality affect throughput. It is a
 four-stage structural reduction of Practical-RIFE 4.25: the retained stages
 keep the upstream weights, no additional training is applied, and model
 processing overhead is lower. It does not guarantee lossless quality for every
