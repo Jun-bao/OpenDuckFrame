@@ -5,6 +5,7 @@ import Darwin
 import Metal
 import MetalFX
 @preconcurrency import ScreenCaptureKit
+import VideoToolbox
 
 extension Notification.Name {
     static let odfMotionPlusChanged = Notification.Name("openduckframe.motionPlusChanged")
@@ -603,6 +604,13 @@ struct RecentEnhancementSource: Codable, Equatable {
 enum LiveEngineSelection {
     static let engines = ["rife.metal", "apple.lowlatency", "apple.frc"]
 
+    static var defaultSelection: (engine: String, model: String, quality: String) {
+        if #available(macOS 26.0, *), VTLowLatencyFrameInterpolationConfiguration.isSupported {
+            return ("apple.lowlatency", "vt.llfi.temporal.1", "normal")
+        }
+        return ("rife.metal", "rife-v4.25", "fast")
+    }
+
     static func fromPopup(_ index: Int, quality: String) -> (engine: String, model: String) {
         let engine = engines.indices.contains(index) ? engines[index] : engines[0]
         switch engine {
@@ -682,8 +690,8 @@ struct EnhancementProfile: Codable, Equatable {
     var sourceTitle = ""
     var sourceBundleIdentifier = ""
     var interpolationEnabled = true
-    var interpolationEngineID = "rife.metal"
-    var interpolationQuality = "fast"
+    var interpolationEngineID = LiveEngineSelection.defaultSelection.engine
+    var interpolationQuality = LiveEngineSelection.defaultSelection.quality
     var rifeStreamEnabled = true
     var rate = RateRequest.multiplier(2)
     var scaleEnabled = false
@@ -705,7 +713,7 @@ struct EnhancementProfile: Codable, Equatable {
     var automaticVideoCadence = false
     var configName = "默认"
     var configID: String? = nil
-    var modelID = "rife-v4.25"
+    var modelID = LiveEngineSelection.defaultSelection.model
     var recents: [RecentEnhancementSource] = []
 
     var sourceWindowResizeActive: Bool {
