@@ -6,6 +6,31 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>OpenDuckFrame</title>
         <item>
+            <title>0.6.2</title>
+            <pubDate>Sat, 14 Nov 2026 20:23:14 +0800</pubDate>
+            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
+            <sparkle:version>49</sparkle:version>
+            <sparkle:shortVersionString>0.6.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>OpenDuckFrame 0.6.2</h2>
+<ul>
+  <li>在支持的 macOS 26 及更新系统中，首次使用或恢复默认配置时选择 Apple 低延迟 2 倍插帧；其他受支持设备使用 ODF-VFI fast X2，已有配置的引擎选择不变。</li>
+  <li>窗口列表按应用分组，支持展开与键盘选择；需要屏幕录制权限时，刷新列表会引导授权，并在权限生效后重新获取窗口。</li>
+  <li>有新版本可用时，工作台设置按钮旁显示下载入口。</li>
+  <li>苹果视频超分复用有上限的缓冲区，减少重复分配；实际画质和流畅度仍取决于设备、片源与设置。</li>
+</ul>
+<ul>
+  <li>On supported macOS 26+ systems, new and reset default profiles select Apple low-latency interpolation at 2×. Other supported devices use ODF-VFI fast X2; saved engine choices are preserved.</li>
+  <li>The window list groups windows by app and supports keyboard navigation. Refresh guides Screen Recording permission and reloads the list when access becomes available.</li>
+  <li>A download control appears beside Settings when an update is available.</li>
+  <li>Apple video super resolution reuses bounded buffers to reduce repeated allocation. Actual quality and smoothness depend on the device, source and settings.</li>
+</ul>
+<p>苹果插帧和超分需要受支持的系统、硬件和输入；缩小输入可能损失细节，增强也可能增加延迟。此社区版使用临时签名，未经过 Apple 公证，升级后可能需要重新授予屏幕录制或辅助功能权限。 Apple interpolation and super resolution require supported systems, hardware and input. Reducing input can lose detail, and enhancement may add latency. This ad-hoc-signed community build is not Apple notarized; macOS may ask for Screen Recording or Accessibility permission again after an upgrade.</p>
+]]></description>
+            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.6.2/OpenDuckFrame-0.6.2.zip" length="43160313" type="application/octet-stream" sparkle:edSignature="4ygMr3sdHwAr2MMNjjUi52oXpcpwQ/iMEJCrnOrNubzGdqQn9O+A1DUwvOcm2HjSvxWx+4Wn1Q7ks9Y5bevsBQ=="/>
+        </item>
+        <item>
             <title>0.5.0</title>
             <pubDate>Sat, 14 Nov 2026 00:34:01 +0800</pubDate>
             <link>https://github.com/Jun-bao/OpenDuckFrame</link>
@@ -51,33 +76,9 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
 ]]></description>
             <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.4.1/OpenDuckFrame-0.4.1.zip" length="43104537" type="application/octet-stream" sparkle:edSignature="9cdjt/+Kw17OvIJY62BiYFSjX95UqP0i2uatC3Am7KNFBueLuwXbFQ+/wMTG8+LuLgiIiiszCEOlbsOmQwQaCA=="/>
         </item>
-        <item>
-            <title>0.4.0</title>
-            <pubDate>Thu, 12 Nov 2026 18:12:04 +0800</pubDate>
-            <link>https://github.com/Jun-bao/OpenDuckFrame</link>
-            <sparkle:version>35</sparkle:version>
-            <sparkle:shortVersionString>0.4.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<h2>OpenDuckFrame 0.4.0</h2>
-<ul>
-  <li>重新设计紧凑工作台：分组设置、对齐的控件列、独立滚动区域，以及固定的来源与开始／停止操作区。</li>
-  <li>新增 ArtCNN C4F32 / C4F16 原生 2× SDR 超分，可与 ODF-VFI 补帧分别配置。</li>
-  <li>新增可跳过、可从帮助菜单重看的三步新手引导。</li>
-</ul>
-<ul>
-  <li>A redesigned compact workbench with grouped settings, aligned controls and fixed source/action areas.</li>
-  <li>ArtCNN C4F32 / C4F16 native 2× SDR super resolution, independently configurable from ODF-VFI frame generation.</li>
-  <li>A skippable three-step guide that can be replayed from Help.</li>
-</ul>
-<p>ArtCNN 输入不超过 1920×1080，原生 2× 输出不超过 3840×2160。实际画质和帧率取决于输入、设置与设备。</p>
-<p>This community build is ad-hoc signed and supports signed in-app updates. It is not Apple notarized. macOS may ask for Screen Recording or Accessibility permission again after an upgrade. 此社区版未经过 Apple 公证，升级后可能需要重新授权。</p>
-]]></description>
-            <enclosure url="https://github.com/Jun-bao/OpenDuckFrame/releases/download/v0.4.0/OpenDuckFrame-0.4.0.zip" length="43104771" type="application/octet-stream" sparkle:edSignature="CkQs3Og6Ti76VHeaxuapLr+rDWrKYnndbRRkdfsbckAXYX6VGCtdOXbjaPhDuzSq9XUP7oqaTfwNvg+nDiTaDw=="/>
-        </item>
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: e3fq5MSSaEyQq140cJkJaBQNflpGAupfA9/vjoA2ul7QDxSEsMjOmpyEObrvN5PkazcffeAprw5X03kU6XsXDQ==
-length: 6496
+edSignature: INqOdyj911y8oMffCCpL+bI3UUOTSOLf4Zk9jZYbz766Xb7i5JD2X6UBDjW0XkBE8/WrXD2na0GolRhnFNHhCA==
+length: 7252
 -->
