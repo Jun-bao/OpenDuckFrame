@@ -1,0 +1,14 @@
+<h2>OpenDuckFrame 0.6.2</h2>
+<ul>
+  <li>在支持的 macOS 26 及更新系统中，首次使用或恢复默认配置时选择 Apple 低延迟 2 倍插帧；其他受支持设备使用 ODF-VFI fast X2，已有配置的引擎选择不变。</li>
+  <li>窗口列表按应用分组，支持展开与键盘选择；需要屏幕录制权限时，刷新列表会引导授权，并在权限生效后重新获取窗口。</li>
+  <li>有新版本可用时，工作台设置按钮旁显示下载入口。</li>
+  <li>苹果视频超分复用有上限的缓冲区，减少重复分配；实际画质和流畅度仍取决于设备、片源与设置。</li>
+</ul>
+<ul>
+  <li>On supported macOS 26+ systems, new and reset default profiles select Apple low-latency interpolation at 2×. Other supported devices use ODF-VFI fast X2; saved engine choices are preserved.</li>
+  <li>The window list groups windows by app and supports keyboard navigation. Refresh guides Screen Recording permission and reloads the list when access becomes available.</li>
+  <li>A download control appears beside Settings when an update is available.</li>
+  <li>Apple video super resolution reuses bounded buffers to reduce repeated allocation. Actual quality and smoothness depend on the device, source and settings.</li>
+</ul>
+<p>苹果插帧和超分需要受支持的系统、硬件和输入；缩小输入可能损失细节，增强也可能增加延迟。此社区版使用临时签名，未经过 Apple 公证，升级后可能需要重新授予屏幕录制或辅助功能权限。 Apple interpolation and super resolution require supported systems, hardware and input. Reducing input can lose detail, and enhancement may add latency. This ad-hoc-signed community build is not Apple notarized; macOS may ask for Screen Recording or Accessibility permission again after an upgrade.</p>
